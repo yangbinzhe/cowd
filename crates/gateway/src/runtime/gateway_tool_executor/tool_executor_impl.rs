@@ -103,7 +103,9 @@ impl ToolExecutor for GatewayToolExecutor {
     }
 
     fn validate_tool_input(&self, tool_name: &str, input: &str) -> Result<String, ToolError> {
-        let canonical_name = <Self as ToolExecutor>::resolve_tool_name(self, tool_name)
+        let lease = self.tool_host.pin_snapshot();
+        let canonical_name = lease.snapshot().catalog.canonical_name(tool_name)
+            .filter(|name| self.allowed_tools.as_ref().is_none_or(|allowed| allowed.contains(name)))
             .ok_or_else(|| {
                 // A name the model got subtly wrong is one character from working, and a
                 // refusal that only says "not registered" makes it guess again. codex and
@@ -111,9 +113,7 @@ impl ToolExecutor for GatewayToolExecutor {
                 // suggestion engine already exists here and was wired only to the CLI and
                 // slash commands. One live run re-issued the same invented tool name
                 // sixteen times against exactly this silence.
-                let registered = self
-                    .tool_host
-                    .pin_snapshot()
+                let registered = lease
                     .snapshot()
                     .catalog
                     .definitions(None)
@@ -139,7 +139,7 @@ impl ToolExecutor for GatewayToolExecutor {
             )));
         }
         let mut value = serde_json::from_str::<serde_json::Value>(input)
-            .map_err(|error| self.input_contract_error(&canonical_name, error))?;
+            .map_err(|error| self.input_contract_error_with_lease(&canonical_name, error, &lease, None))?;
         // The repair belongs here, at the boundary that already holds the
         // pinned schema, not in the dispatch path. It used to live only inside
         // `execute_runtime_tool_with_binding`, which is downstream of this
@@ -150,7 +150,7 @@ impl ToolExecutor for GatewayToolExecutor {
         // frame-repair budget spent, three Teams and zero Tasks, verdict
         // `partial`.
         let repaired_fields =
-            self.coerce_string_typed_structured_fields(&canonical_name, &mut value);
+            self.coerce_string_typed_structured_fields_with_lease(&canonical_name, &mut value, &lease);
         if !repaired_fields.is_empty() {
             tracing::info!(
                 tool_name,
@@ -158,10 +158,13 @@ impl ToolExecutor for GatewayToolExecutor {
                 "coerced string-typed structured tool input fields at the schema boundary"
             );
         }
-        self.tool_host
-            .pin_snapshot()
+        lease
             .validate_input(&canonical_name, &value)
             .map_err(|error| {
+                let reason = match &error {
+                    tools::ToolHostError::InputContract { reason, .. } => Some(reason.as_str()),
+                    _ => None,
+                };
                 // A schema refusal that names only the first thing the checker
                 // tripped on sends the model off to fix the wrong thing. One live
                 // frame was refused with "send an array, not a JSON-encoded
@@ -173,7 +176,12 @@ impl ToolExecutor for GatewayToolExecutor {
                     Some(hint) => format!("{error}. {hint}"),
                     None => error.to_string(),
                 };
-                self.input_contract_error(&canonical_name, message)
+                let extra = reason.and_then(|reason| lease.snapshot().catalog.definitions(None).into_iter()
+                    .find(|definition| definition.name == canonical_name)
+                    .and_then(|definition| harness_contract::tool_input_contract::orchestrate_extra_root_fields(
+                        &canonical_name, reason, &definition.input_schema, &value)));
+                let message = extra.map_or(message.clone(), |hint| format!("{message}. {hint}"));
+                self.input_contract_error_with_lease(&canonical_name, message, &lease, reason)
             })
             // Hand back the bytes Runtime will actually dispatch so the
             // transcript, the governed plan and the execution cannot disagree.
@@ -224,26 +232,6 @@ impl ToolExecutor for GatewayToolExecutor {
         )
     }
 
-    fn prepare_governed_invocations(
-        &self,
-        requests: &[runtime::tool_dispatch::ToolRequest],
-    ) -> Vec<harness_contract::tool::GovernedToolInvocation> {
-        let lease = self.tool_host.pin_snapshot();
-        requests
-            .iter()
-            .map(|request| {
-                let input = serde_json::from_str::<serde_json::Value>(&request.input)
-                    .unwrap_or(serde_json::Value::Null);
-                lease.prepare_governed_invocation(
-                    request.tool_use_id.clone(),
-                    &request.tool_name,
-                    &input,
-                    &request.depends_on,
-                )
-            })
-            .collect()
-    }
-
     async fn execute_authorized_output(
         &self,
         authorization: &harness_contract::tool::ToolExecutionAuthorization,
@@ -252,6 +240,18 @@ impl ToolExecutor for GatewayToolExecutor {
     ) -> Result<harness_contract::context::ToolOutputDraft, ToolError> {
         self.execute_authorized_output_with_progress(authorization, tool_name, input, None, None)
             .await
+    }
+
+    async fn execute_root_action_with_invocation(
+        &self, request: &runtime::RuntimeToolExecutionRequest,
+        capability: &runtime::agentic::action_invocation::VerifiedActionInvocation,
+    ) -> Result<harness_contract::context::ToolOutputDraft, ToolError> {
+        let outcome = runtime::RuntimeExecutionHost::execute_runtime_tool_with_action_invocation(self, request, capability).await;
+        match outcome.status {
+            runtime::RuntimeToolExecutionStatus::Executed => Ok(harness_contract::context::ToolOutputDraft::bounded_inline(outcome.output.unwrap_or_default())),
+            runtime::RuntimeToolExecutionStatus::Unknown => Err(ToolError::unknown(outcome.error.unwrap_or_else(|| "root action outcome is unknown".into()))),
+            _ => Err(ToolError::new(outcome.error.unwrap_or_else(|| "root action blocked".into()))),
+        }
     }
 
     async fn execute_step_authorized_invocation_output(

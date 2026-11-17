@@ -1002,6 +1002,26 @@ fn write_tool_call_artifacts(
     Ok(())
 }
 
+/// The artifact file name one live scenario is written to.
+///
+/// The writer numbers the scenarios in the order they ran and sanitizes the
+/// id. A reference that names a file has to name *that* file, so the writer
+/// and every reference use this one function instead of two habits that can
+/// drift apart.
+pub(crate) fn live_scenario_artifact_name(index: usize, scenario_id: &str) -> String {
+    let safe_id = scenario_id
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || character == '-' || character == '_' {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    format!("{:03}-{safe_id}.json", index + 1)
+}
+
 fn write_live_scenario_artifacts(report: &Value, root: &Path) -> Result<(), String> {
     let live = report
         .get("live_gateway_scenario_details")
@@ -1021,18 +1041,8 @@ fn write_live_scenario_artifacts(report: &Value, root: &Path) -> Result<(), Stri
             .and_then(Value::as_str)
             .filter(|value| !value.is_empty())
             .unwrap_or("unnamed");
-        let safe_id = id
-            .chars()
-            .map(|character| {
-                if character.is_ascii_alphanumeric() || character == '-' || character == '_' {
-                    character
-                } else {
-                    '_'
-                }
-            })
-            .collect::<String>();
         fs::write(
-            root.join(format!("{:03}-{safe_id}.json", index + 1)),
+            root.join(live_scenario_artifact_name(index, id)),
             serde_json::to_string_pretty(scenario).map_err(|error| error.to_string())?,
         )
         .map_err(|error| error.to_string())?;

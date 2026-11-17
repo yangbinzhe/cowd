@@ -4,23 +4,44 @@ mod identity;
 pub(crate) use identity::review_result_identity;
 mod policy;
 pub(crate) mod read_source;
+pub(crate) mod reason_code;
 mod results;
+
+// The rebuild record and its entry point belong to the review evidence domain,
+// but a refusal travels outward as a reason string, so the runner half of the
+// rebuild loop (T1b) consumes them through this module rather than reaching
+// into `results`.
+pub(crate) use results::{
+    node_review_ref, pin_result_source_ticketed, ReviewEvidenceError, ReviewRepinTicket,
+};
+// The rebuild entry and its two refusal shapes are consumed only by tests until
+// T1b wires them into dispatch. Keeping them unconditional trips
+// #![deny(unused_imports)] in the production profile, so they are gated exactly
+// like `coverage::evidence_contains` below; T1b's wiring lifts this gate back
+// with no other edit.
+#[cfg(test)]
+pub(crate) use results::{repin_at_fresh_head, RepinRejection, ReviewSourceMovement};
 // The record-path entries re-verify a proof without a live action, so they
 // are the fixture and completion-lane entry points as well.
 #[cfg(test)]
 pub(crate) use coverage::evidence_contains;
 pub(crate) use coverage::validate_review_coverage;
-pub(crate) use current_review::{CurrentReviewContext, ReviewActionIdentity};
+pub(crate) use current_review::{AuthenticatedHistoricalPolicyCall, AuthenticatedMemberApprovalEvidence, CurrentReviewContext, ReviewActionIdentity};
+#[allow(unused_imports)]
+pub(crate) use current_review::AuthenticatedMemberLeaseEvidence;
+#[allow(unused_imports)]
+pub(crate) use current_review::{authenticate_original_member_lease_transition, AuthenticatedMemberLeaseTransition};
 #[allow(unused_imports)]
 pub(crate) use policy::{
-    committed_proof_sources, completion_admission_context, effect_review_snapshot,
+    completion_admission_context, completion_admission_context_from_prepared, effect_review_snapshot,
     proof_input_snapshot, proof_input_snapshot_for_action, root_self_review_policy,
     validate_applied_proof_inputs, validate_proof_inputs, validate_proof_inputs_for_action,
-    CompletionAdmissionContext, ProofInputSnapshot,
+    CompletionAdmissionContext, ProofInputSnapshot, VerifiedConclusionProof,
+    validate_applied_proof_for_conclusion,
 };
 pub(crate) use policy::{nested_parent_material, read_delivery_snapshot_for_scope};
 #[cfg(test)]
-pub(crate) use policy::verify_nested_read_for_test;
+pub(crate) use policy::{verify_nested_read_for_test, collect_actual_nested_from_original_host_for_test};
 // Independent review reads existing Runtime receipts; it never mints effects.
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -32,6 +53,38 @@ use sha2::{Digest, Sha256};
 use super::program::AgenticProgramProjection;
 use crate::RuntimeServices;
 
+/// The closing producer-metadata fence of an independent review.
+///
+/// Every published cut came out of a bounded read: the resolution paged each
+/// stream up to that cut and validated its per-source sequence, so a stream that
+/// grew afterwards added nothing this review can cite. Comparing the live head
+/// for strict equality is the same defect the result package's own cut fence had
+/// (030 T7): a busy Session could never settle, and this sentence is recognised
+/// by neither review classifier, so the refusal landed untyped. The comparison now
+/// goes through the one shared judgment. What still refuses is unchanged - growth
+/// of a source the review judges, a head that moved backwards, and a cut above the
+/// head - and the refusal wording is kept character for character.
+fn verify_producer_metadata_cuts<'sources>(
+    store: &crate::RuntimeEventStore,
+    sources: impl Iterator<Item = &'sources crate::ExpectedStreamRevision>,
+) -> Result<(), String> {
+    for source in sources {
+        let observed = store
+            .stream_revision(&source.stream_id)
+            .map_err(|error| error.to_string())?;
+        if !results::result_cut_remains_consistent(
+            &source.stream_id,
+            source.expected_revision,
+            observed,
+        ) {
+            return Err(
+                "producer metadata changed during result resolution; retry current results".into(),
+            );
+        }
+    }
+    Ok(())
+}
+
 #[derive(Clone, Copy, Default)]
 pub(crate) struct ResultContentReaders<'reader> {
     pub artifacts: Option<&'reader crate::ArtifactStore>,
@@ -42,35 +95,202 @@ pub(crate) struct ResultContentReaders<'reader> {
 #[derive(Clone)]
 pub(crate) struct ProcessInputVerifier {
     scope_locks: std::sync::Arc<crate::execution_core::graph::resources::ScopeLockManager>,
+    workspace_root: Option<std::path::PathBuf>,
 }
 
 pub(crate) struct ProcessInputFrame {
-    verifier: ProcessInputVerifier,
+    verifier: Option<ProcessInputVerifier>,
     retained: std::sync::Mutex<BTreeMap<String, ProcessInputGuard>>,
+    artifact_owner: String,
+    artifact_pins: std::sync::Mutex<BTreeMap<String, ReviewArtifactPin>>,
+}
+
+struct ReviewArtifactPin {
+    store: crate::ArtifactStore,
+    artifact: harness_contract::context::ArtifactRef,
+    owner: String,
+}
+
+impl Drop for ReviewArtifactPin {
+    fn drop(&mut self) {
+        let selector_hash = format!("{:x}", Sha256::digest(self.artifact.selector.as_bytes()));
+        let owner_hash = format!("{:x}", Sha256::digest(self.owner.as_bytes()));
+        match self.store.unpin(&self.artifact, &self.owner) {
+            Ok(()) => tracing::info!(%selector_hash, %owner_hash,
+                cleanup = "unpin_returned_ok", record_class = "not_rolled_back",
+                "review artifact pin cleanup"),
+            Err(_) => tracing::warn!(%selector_hash, %owner_hash,
+                cleanup = "unpin_unconfirmed", record_class = "not_rolled_back",
+                "review artifact pin cleanup failed"),
+        }
+    }
 }
 
 struct ProcessInputGuard {
     _lease: crate::execution_core::graph::resources::ScopeLockLease,
     _descriptors: Vec<std::fs::File>,
     checked_runs: BTreeSet<String>,
+    protected_files: BTreeMap<String, (String, u64)>,
 }
 
 impl ProcessInputVerifier {
     pub(crate) fn new(
         scope_locks: std::sync::Arc<crate::execution_core::graph::resources::ScopeLockManager>,
     ) -> Self {
-        Self { scope_locks }
+        Self { scope_locks, workspace_root: None }
+    }
+
+    pub(crate) fn with_workspace(scope_locks: std::sync::Arc<crate::execution_core::graph::resources::ScopeLockManager>, workspace_root: std::path::PathBuf) -> Self {
+        Self { scope_locks, workspace_root: Some(workspace_root) }
     }
 
     pub(crate) fn frame(&self) -> ProcessInputFrame {
         ProcessInputFrame {
-            verifier: self.clone(),
+            verifier: Some(self.clone()),
             retained: std::sync::Mutex::new(BTreeMap::new()),
+            artifact_owner: format!("review-proof:{}", uuid::Uuid::new_v4()),
+            artifact_pins: std::sync::Mutex::new(BTreeMap::new()),
         }
     }
 }
 
 impl ProcessInputFrame {
+    pub(crate) fn without_process_verifier() -> Self {
+        Self {
+            verifier: None,
+            retained: std::sync::Mutex::new(BTreeMap::new()),
+            artifact_owner: format!("review-proof:{}", uuid::Uuid::new_v4()),
+            artifact_pins: std::sync::Mutex::new(BTreeMap::new()),
+        }
+    }
+    fn retain_artifact(&self, store: &crate::ArtifactStore,
+        artifact: &harness_contract::context::ArtifactRef) -> Result<(), String> {
+        let mut pins = self.artifact_pins.lock().map_err(|error| error.to_string())?;
+        if let Some(existing) = pins.get(&artifact.selector) {
+            if existing.artifact != *artifact {
+                return Err("review artifact identity changed while preparing".into());
+            }
+            return Ok(());
+        }
+        if let Err(error) = store.pin(artifact, &self.artifact_owner, crate::ARTIFACT_PERMANENT_PIN_UNTIL_MS) {
+            let selector_hash = format!("{:x}", Sha256::digest(artifact.selector.as_bytes()));
+            let owner_hash = format!("{:x}", Sha256::digest(self.artifact_owner.as_bytes()));
+            tracing::warn!(%selector_hash, %owner_hash, pin_result = "error_unclassified",
+                cleanup = "not_attempted", record_class = "may_have_become_live",
+                "review artifact pin was not confirmed");
+            return Err(error.to_string());
+        }
+        pins.insert(artifact.selector.clone(), ReviewArtifactPin {
+            store: store.clone(), artifact: artifact.clone(), owner: self.artifact_owner.clone(),
+        });
+        Ok(())
+    }
+    fn retains_exact_artifact(&self, artifact: &harness_contract::context::ArtifactRef) -> bool {
+        self.artifact_pins.lock().ok().and_then(|pins| pins.get(&artifact.selector)
+            .map(|pin| pin.artifact == *artifact)).unwrap_or(false)
+    }
+    pub(crate) fn retains_pinned_read(&self, selector: &str, digest: &str, bytes: u64) -> bool {
+        self.artifact_pins.lock().ok().and_then(|pins| pins.get(selector).map(|pin|
+            pin.artifact.selector == selector
+                && pin.artifact.sha256.trim_start_matches("sha256:") == digest.trim_start_matches("sha256:")
+                && pin.artifact.bytes == bytes)).unwrap_or(false)
+    }
+    pub(crate) fn has_original_file_workspace(&self) -> bool {
+        self.verifier.as_ref().is_some_and(|verifier| verifier.workspace_root.is_some())
+    }
+
+    /// Retain the exact authenticated File acquisition under the existing
+    /// workspace owner. This protects writers using the same scope manager;
+    /// external writers are not represented by that lease.
+    pub(crate) fn retain_original_file(&self, target: &harness_contract::goal::ProofEffectTarget, sha256: &str, bytes: u64) -> Result<(), String> {
+        #[cfg(target_os = "linux")]
+        {
+            use std::io::Read;
+            use std::os::unix::fs::MetadataExt;
+            use sha2::{Digest, Sha256};
+            use crate::execution_core::graph::resources::{ScopeLockMode, ScopeLockRequest, ScopedResource};
+            let verifier = self.verifier.as_ref().ok_or("original File verifier unavailable")?;
+            let workspace = verifier.workspace_root.as_deref().ok_or("original File workspace owner unavailable")?;
+            let resolver = crate::path_identity::WorkspacePathIdentityResolver::discover(workspace).map_err(|error| error.to_string())?;
+            let path = &target.path.workspace_relative_path;
+            let canonical = resolver.resolve_existing(path).map_err(|error| error.to_string())?;
+            if !target.exact || canonical.workspace_id != target.path.workspace_id
+                || canonical.repository_id != target.path.repository_id
+                || canonical.workspace_relative_path != *path
+                || canonical.repository_relative_path != target.path.repository_relative_path
+                || canonical.object_kind != target.path.object_kind {
+                return Err("original File identity differs from workspace owner".into());
+            }
+            let mut retained = self.retained.lock().map_err(|_| "original File frame poisoned")?;
+            let key = resolver.workspace_id().to_string();
+            let lease = if retained.contains_key(&key) { None } else {
+                Some(verifier.scope_locks.try_acquire([ScopeLockRequest {
+                    scope: ScopedResource::workspace(&key).map_err(|error| error.to_string())?, mode: ScopeLockMode::Read,
+                }]).map_err(|error| error.to_string())?.ok_or("original File scope busy")?)
+            };
+            let root = std::fs::File::from(rustix::fs::openat2(rustix::fs::CWD, workspace,
+                rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::DIRECTORY | rustix::fs::OFlags::CLOEXEC,
+                rustix::fs::Mode::empty(), rustix::fs::ResolveFlags::NO_SYMLINKS | rustix::fs::ResolveFlags::NO_MAGICLINKS)
+                .map_err(|error| error.to_string())?);
+            let open = || -> Result<std::fs::File, String> {
+                rustix::fs::openat2(&root, path.as_str(), rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::CLOEXEC | rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::NONBLOCK,
+                    rustix::fs::Mode::empty(), rustix::fs::ResolveFlags::BENEATH | rustix::fs::ResolveFlags::NO_SYMLINKS | rustix::fs::ResolveFlags::NO_MAGICLINKS)
+                    .map(std::fs::File::from).map_err(|error| error.to_string())
+            };
+            let root_before = root.metadata().map_err(|error| error.to_string())?;
+            let named_root = workspace.symlink_metadata().map_err(|error| error.to_string())?;
+            if !root_before.is_dir() || named_root.file_type().is_symlink() || root_before.dev() != named_root.dev() || root_before.ino() != named_root.ino() {
+                return Err("original File workspace changed".into());
+            }
+            let mut file = open()?;
+            let before = file.metadata().map_err(|error| error.to_string())?;
+            if !before.is_file() || before.nlink() != 1 || before.len() != bytes { return Err("original File extent changed".into()); }
+            let mut hash = Sha256::new();
+            let mut total = 0u64;
+            let mut buffer = [0u8; 65536];
+            loop { let count = file.read(&mut buffer).map_err(|error| error.to_string())?; if count == 0 { break; }
+                total = total.checked_add(count as u64).ok_or("original File size overflow")?;
+                if total > bytes { return Err("original File grew during validation".into()); }
+                hash.update(&buffer[..count]); }
+            let after = file.metadata().map_err(|error| error.to_string())?;
+            let named = open()?.metadata().map_err(|error| error.to_string())?;
+            let identity = |m: &std::fs::Metadata| (m.dev(), m.ino(), m.nlink(), m.len(), m.mtime(), m.mtime_nsec(), m.ctime(), m.ctime_nsec());
+            let root_after = workspace.symlink_metadata().map_err(|error| error.to_string())?;
+            if total != bytes || format!("{:x}", hash.finalize()) != sha256.trim_start_matches("sha256:")
+                || identity(&before) != identity(&after) || identity(&after) != identity(&named)
+                || root_after.file_type().is_symlink() || root_after.dev() != root_before.dev() || root_after.ino() != root_before.ino() {
+                return Err("original File changed during validation".into());
+            }
+            if let Some(guard) = retained.get_mut(&key) {
+                if guard.protected_files.get(path).is_some_and(|old| old.0.trim_start_matches("sha256:") != sha256.trim_start_matches("sha256:") || old.1 != bytes) {
+                    return Err("original File identity conflicts with retained guard".into());
+                }
+                guard.protected_files.insert(path.clone(), (sha256.to_owned(), bytes));
+                guard._descriptors.extend([file, root]);
+            } else {
+                retained.insert(key, ProcessInputGuard { _lease: lease.ok_or("original File scope lease missing")?, _descriptors: vec![file, root], checked_runs: BTreeSet::new(), protected_files: BTreeMap::from([(path.clone(), (sha256.to_owned(), bytes))]) });
+            }
+            Ok(())
+        }
+        #[cfg(not(target_os = "linux"))]
+        { let _ = (target, sha256, bytes); Err("original File protected FD unsupported".into()) }
+    }
+
+    pub(crate) fn retains_process_input_run(&self, call_key: &str) -> bool {
+        self.retained.lock().ok().is_some_and(|guards|
+            guards.values().any(|guard| guard.checked_runs.contains(call_key)))
+    }
+    /// Only files actually checked by the original Process input owner are
+    /// covered: its workspace read lease and open descriptors remain held.
+    pub(crate) fn retains_exact_file(
+        &self, target: &harness_contract::goal::ProofEffectTarget,
+        digest: &str, bytes: Option<u64>,
+    ) -> bool {
+        self.retained.lock().ok().and_then(|guards| guards.get(&target.path.workspace_id)
+            .and_then(|guard| guard.protected_files.get(&target.path.workspace_relative_path))
+            .map(|(sha, size)| sha.trim_start_matches("sha256:") == digest.trim_start_matches("sha256:")
+                && bytes.is_none_or(|bytes| bytes == *size))).unwrap_or(false)
+    }
     fn validate(
         &self,
         store: &std::sync::Arc<crate::RuntimeEventStore>,
@@ -120,6 +340,13 @@ impl ProcessInputFrame {
         let key = resolver.workspace_id().to_string();
         if let Some(guard) = retained.get_mut(&key) {
             let descriptors = policy::validate_current_process_inputs(workspace, run)?;
+            for input in &run.fact.admission.inputs {
+                let identity = (input.sha256.clone(), input.bytes);
+                if guard.protected_files.insert(input.relative_path.clone(), identity.clone())
+                    .is_some_and(|previous| previous != identity) {
+                    return Err("bounded process protected File identity changed".into());
+                }
+            }
             if guard
                 .checked_runs
                 .insert(run.fact.admission.binding.call_key.clone())
@@ -135,6 +362,7 @@ impl ProcessInputFrame {
         };
         let lease = self
             .verifier
+            .as_ref().ok_or("bounded process selected input verifier context missing")?
             .scope_locks
             .try_acquire([request])
             .map_err(|error| error.to_string())?
@@ -146,6 +374,8 @@ impl ProcessInputFrame {
                 _lease: lease,
                 _descriptors: descriptors,
                 checked_runs: BTreeSet::from([run.fact.admission.binding.call_key.clone()]),
+                protected_files: run.fact.admission.inputs.iter().map(|input|
+                    (input.relative_path.clone(), (input.sha256.clone(), input.bytes))).collect(),
             },
         );
         Ok(())
@@ -487,7 +717,7 @@ fn selected_work(
     goal: Option<&harness_contract::goal::GoalContract>,
     references: &[String],
     publication_sources: &mut BTreeMap<String, u64>,
-) -> Result<(Vec<String>, Vec<String>, String), String> {
+) -> Result<(Vec<String>, Vec<String>, String), results::ReviewEvidenceError> {
     let required = goal
         .into_iter()
         .flat_map(|goal| &goal.obligations)
@@ -678,6 +908,17 @@ fn semantic_task_contract(task: &super::program::AgenticTaskProjection) -> serde
         "failed_attempts",
         "review_generation",
         "failed_review_attempts",
+        // 033 S7: the two accounts are bookkeeping, not work - the manifest
+        // pins semantic work only.
+        "structural_execution_stalls",
+        "structural_review_stalls",
+        // 033 S8 (R102 rework): the review duty is a workflow duty, not
+        // semantic work for the worker, so it stays out of both manifests -
+        // and so do the two review measures, which count verdicts rather
+        // than state work.
+        "review_obligation",
+        "reviews_applied",
+        "reviews_accepted",
         "last_failure",
         "cancel_requested_by",
         "cancel_reason_ref",
@@ -825,6 +1066,31 @@ fn resolve_result_refs(program: &AgenticProgramProjection, result_refs: &[String
 pub(crate) struct IndependentReview {
     pub producers: Vec<String>,
     pub verification: ObjectiveReviewVerification,
+    /// The required writes this review settled as failed, in the closure
+    /// projection's entry shape. They travel BESIDE the proof: the proof's
+    /// digests must not change, and a failure that is not named anywhere
+    /// would be silence.
+    pub required_write_failures: Vec<serde_json::Value>,
+}
+
+fn retain_producer_material_cuts(
+    material: &BTreeMap<String, u64>,
+    snapshot: &[crate::ExpectedStreamRevision],
+) -> Result<BTreeMap<String, u64>, String> {
+    let mut sources = BTreeMap::new();
+    for source in snapshot {
+        if sources.insert(source.stream_id.clone(), source.expected_revision)
+            .is_some_and(|previous| previous != source.expected_revision)
+        {
+            return Err("producer snapshot has conflicting source cuts".into());
+        }
+    }
+    for (source, revision) in material {
+        if sources.get(source) != Some(revision) {
+            return Err("producer material source cut changed during closure".into());
+        }
+    }
+    Ok(sources)
 }
 
 struct ReadCoverage {
@@ -843,6 +1109,20 @@ struct ReadCoverage {
 /// primer advertises as the one reader that does not count.
 fn counts_as_physical_read(tool_name: &str) -> bool {
     matches!(tool_name, "evidence_retrieve" | "read_ref")
+}
+
+/// Whether this read carries its own read-acquisition seal.
+///
+/// The seal is judged by its value, not by the presence of a key: the store
+/// writes the seal into the read's receipt payload, and a key whose value is
+/// json null carries no seal - that is the shape the truncated receipt of the
+/// live run has. The decoder is used exactly as the seal path uses it, so
+/// the seal's decoding and its authentication are unchanged by this fact;
+/// it only says whether the seal is there.
+fn read_carries_acquisition_seal(event_payload: &serde_json::Value) -> bool {
+    let seal = &event_payload[crate::context_evidence::READ_ACQUISITION_FIELD];
+    seal.is_object()
+        && crate::context_evidence::decode_read_acquisition(seal).is_ok()
 }
 
 /// Whether two references name the same object under either spelling.
@@ -971,7 +1251,7 @@ pub(crate) fn validate_explicit_process_evidence(
     store: &std::sync::Arc<crate::RuntimeEventStore>,
     verification: &harness_contract::goal::ObjectiveReviewVerification,
     explicit_evidence_refs: &[String],
-) -> Result<(), String> {
+) -> Result<(), results::ReviewEvidenceError> {
     let claims = verification
         .reads
         .iter()
@@ -1100,7 +1380,7 @@ pub(crate) fn validate_bounded_process_retirement(
     primary: &crate::DurableRuntimeEvent,
     artifacts: Option<&crate::ArtifactStore>,
 ) -> Result<Vec<crate::ExpectedStreamRevision>, String> {
-    let run = results::authenticate_bounded_process(store, primary)?;
+    let run = results::authenticate_bounded_process(store, primary).map_err(|error| error.to_string())?;
     results::process_has_no_external_effects(&run)?;
     results::validate_process_archives(
         &run,
@@ -1111,7 +1391,7 @@ pub(crate) fn validate_bounded_process_retirement(
         },
     )?;
     let mut cuts = BTreeMap::new();
-    results::retain_process_execution(store, &run, &mut cuts)?;
+    results::retain_process_execution(store, &run, &mut cuts).map_err(|error| error.to_string())?;
     Ok(cuts
         .into_iter()
         .map(
@@ -1193,7 +1473,7 @@ fn validate_process_claims(
     runs: &[results::AuthenticatedProcessExecution],
     claimed: &[String],
     deliveries: &policy::ReviewDeliverySnapshot,
-) -> Result<Vec<results::AuthenticatedProcessExecution>, String> {
+) -> Result<Vec<results::AuthenticatedProcessExecution>, results::ReviewEvidenceError> {
     let claims = claimed
         .iter()
         .filter(|reference| is_process_body_receipt(reference))
@@ -1266,7 +1546,7 @@ fn select_process_witnesses(
     >,
     explicit_evidence_refs: &[String],
     deliveries: &policy::ReviewDeliverySnapshot,
-) -> Result<std::collections::BTreeMap<String, Vec<String>>, String> {
+) -> Result<std::collections::BTreeMap<String, Vec<String>>, results::ReviewEvidenceError> {
     let mut selected: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for (result, runs) in runs_by_result {
         let mut refs = BTreeSet::new();
@@ -1423,6 +1703,20 @@ fn effect_observation_refs(
     Ok(actual.into_iter().collect())
 }
 
+fn directory_read_packet<'a>(
+    packets: &'a [AgentTaskPacket],
+    source: &str,
+) -> Result<&'a AgentTaskPacket, String> {
+    let mut matches = packets.iter().filter(|packet| source == format!(
+        "execution-agent-receipts:{}:{}:{}", packet.graph_id(), packet.node_id(), packet.attempt));
+    let packet = matches.next().ok_or("directory read original packet unavailable or ambiguous")?;
+    let digest = proof_value_digest(packet);
+    if matches.any(|other| proof_value_digest(other) != digest) {
+        return Err("directory read original packet unavailable or ambiguous".into());
+    }
+    Ok(packet)
+}
+
 /// The review path reads through the durable-verified store, not the hot cache.
 /// Event notification precedes the writer's cache publish, so a hot read can miss
 /// a graph that exists; a failure produced by that window is timing, not a dead
@@ -1431,26 +1725,36 @@ fn effect_observation_refs(
 async fn physical_packet(
     services: &RuntimeServices,
     graph_id: &str,
+    original: &harness_contract::agent_action::OriginalAgentExecution,
 ) -> Result<AgentTaskPacket, String> {
     let graph = services
         .graph_state_store()
         .load_current_async(graph_id.to_string())
         .await
         .map_err(|error| error.to_string())?;
-    graph
-        .nodes
-        .iter()
+    let mut packets = graph.nodes.iter()
         .filter(|node| node.kind == harness_contract::execution_graph::ExecutionNodeKind::AgentTask)
-        .filter_map(|node| {
-            serde_json::from_str::<AgentTaskPacket>(&node.payload_ref)
-                .ok()
-                .filter(|packet| {
-                    packet_identity_matches(packet.graph_id(), packet.run_id(), graph_id)
-                        && packet.node_id() == node.id
-                })
-        })
-        .next()
-        .ok_or_else(|| format!("review physical Agent packet missing:{graph_id}"))
+        .filter_map(|node| serde_json::from_str::<AgentTaskPacket>(&node.payload_ref).ok()
+            .filter(|packet| packet_identity_matches(packet.graph_id(), packet.run_id(), graph_id)
+                && packet.node_id() == node.id));
+    let mut packet = packets.next().ok_or_else(|| format!("review physical Agent packet missing:{graph_id}"))?;
+    if packets.next().is_some() { return Err("review physical Agent packet ambiguous".into()); }
+    if original.graph_id != graph.id || original.node_id != packet.node_id()
+        || original.attempt == 0
+        || graph.recovery_cursor.node_attempts.get(packet.node_id()) != Some(&original.attempt)
+    {
+        return Err("review original physical attempt is stale or foreign".into());
+    }
+    let binding = services.graph_state_store()
+        .current_binding(&graph, packet.node_id(), original.attempt)
+        .map_err(|error| error.to_string())?;
+    let (ticket, _) = services.graph_state_store()
+        .binding_start_ticket(&graph, packet.node_id(), &binding)
+        .map_err(|error| error.to_string())?;
+    crate::execution_core::graph::validate_node_ticket_start(services.event_store(), &ticket, None)
+        .map_err(|error| error.to_string())?;
+    packet.attempt = original.attempt;
+    Ok(packet)
 }
 
 /// The identity check in the caller's namespace.
@@ -1473,6 +1777,45 @@ fn packet_identity_matches(
     }
 }
 
+/// The shared aggregate streams a review reads while other actors keep
+/// appending to them: the reviewed Session stream, the physical lineage
+/// stream of the reviewed graph, and the execution graph streams themselves.
+///
+/// All are append-only and every event in them is located by sequence, so an
+/// append that lands while this review reads does not change the material it
+/// already pinned. The execution graph streams grow on their own while the
+/// review reads them - a sibling node migrating already advances the root
+/// graph and its child graphs - and that growth moves nothing inside the
+/// pinned window, because the window locates its material by sequence. The
+/// prefixes are the ones the product already classifies by (`results.rs`
+/// Session cuts, `execution_core/graph/commit_pipeline.rs` lineage stream ids,
+/// and the product's own execution graph id forms `agentic-graph:` and
+/// `session-ingress-graph:`); no new classification dimension is introduced.
+fn source_grows_during_review(source: &str) -> bool {
+    // A5: normalize before the prefix test. A delegated read reaches this
+    // predicate in its run-id form (`run:agentic-graph:...`), because the
+    // reviewer pins the un-normalized ticket graph id, while the store looks
+    // that id up under the graph id alone. A rule that depends on every
+    // caller remembering the normalization is not a rule.
+    let source = crate::execution_core::graph::graph_id_for_lookup(source);
+    source.starts_with("session:")
+        || source.starts_with("execution-lineage:")
+        || source.starts_with("agentic-graph:")
+        || source.starts_with("session-ingress-graph:")
+}
+
+/// Whether re-pinning a source inside one review resolution may accept a head
+/// that moved.
+///
+/// Only growth on a shared aggregate stream is admissible. A head that moved
+/// backwards means the stream was truncated or replaced, so the material the
+/// review already read may no longer be there; growth on any other source
+/// means the object under review itself moved. Both still refuse - this
+/// decides nothing about content, identity or authority.
+pub(crate) fn repin_accepts_moved_head(source: &str, previous: u64, revision: u64) -> bool {
+    revision > previous && source_grows_during_review(source)
+}
+
 /// Why a TaskReview-scoped physical attempt cannot validate this review.
 ///
 /// Returns the specific reason, or `Ok(())` when every condition holds. The
@@ -1490,30 +1833,30 @@ fn task_review_attempt_rejection(
     task: &crate::agentic::program::AgenticTaskProjection,
     graph_id: &str,
     attempt: u32,
+    verified_node_attempt: u32,
     agent_id: &str,
     membership_id: &str,
     result_refs: &[String],
     condition_ref: Option<&str>,
 ) -> Result<(), String> {
-    if task.review_generation.saturating_add(1) != u64::from(attempt) {
-        return Err(format!(
-            "review attempt generation is stale: Task {} is at review generation {} and this \
-             physical run is attempt {}; inspect the Task and continue from its current revision",
-            task.task_id, task.review_generation, attempt
-        ));
+    // Business generation belongs to the registered Program attempt. The
+    // physical node attempt is a separate graph-ticket namespace.
+    if attempt == 0 || attempt != verified_node_attempt {
+        return Err("review physical node attempt is stale".into());
     }
     let active = task.active_attempts.get(graph_id).is_some_and(|candidate| {
-        candidate.mode == harness_contract::agent_action::AgentAttemptMode::Review
-            && candidate.generation.saturating_add(1) == u64::from(attempt)
+        candidate.execution_id == graph_id
+            && candidate.mode == harness_contract::agent_action::AgentAttemptMode::Review
+            && candidate.generation == task.review_generation
             && candidate.agent_id == agent_id
             && candidate.membership_id == membership_id
     });
     if !active {
         return Err(format!(
             "review attempt is not the active Review attempt for Task {}: Runtime has no Review \
-             attempt at generation {} bound to this graph, agent and membership; re-read the \
+             attempt bound to this graph, agent and membership; re-read the \
              Task and let Runtime dispatch the current attempt",
-            task.task_id, attempt
+            task.task_id
         ));
     }
     if condition_ref.is_none()
@@ -1631,6 +1974,7 @@ impl RuntimeServices {
             None,
         )
         .await
+        .map_err(|error| error.to_string())
     }
 
     pub(crate) async fn independent_result_review_with_evidence(
@@ -1641,7 +1985,7 @@ impl RuntimeServices {
         condition_ref: Option<&str>,
         explicit_evidence_refs: &[String],
         current_review: Option<&CurrentReviewContext<'_>>,
-    ) -> Result<IndependentReview, String> {
+    ) -> Result<IndependentReview, results::ReviewEvidenceError> {
         let process_verifier = ProcessInputVerifier::new(std::sync::Arc::clone(self.scope_locks()));
         let process_frame = process_verifier.frame();
         // A review names the delivered results it covers, and a model routinely
@@ -1665,6 +2009,7 @@ impl RuntimeServices {
                     .execution_id
                     .as_deref()
                     .ok_or("review has no physical run")?,
+                actor.original_execution.as_ref().ok_or("review original physical binding unobserved")?,
             )
             .await?;
             let scope = packet
@@ -1699,6 +2044,7 @@ impl RuntimeServices {
                     task,
                     packet.graph_id(),
                     packet.attempt,
+                    packet.attempt, // authenticated by physical_packet above
                     &scope.agent_id,
                     &scope.membership_id,
                     result_refs,
@@ -1772,19 +2118,12 @@ impl RuntimeServices {
             None
         };
 
-        for source in resolved.iter().flat_map(|result| &result.effect_sources) {
-            if self
-                .event_store()
-                .stream_revision(&source.stream_id)
-                .map_err(|error| error.to_string())?
-                != source.expected_revision
-            {
-                return Err(
-                    "producer metadata changed during result resolution; retry current results"
-                        .into(),
-                );
-            }
-        }
+        verify_producer_metadata_cuts(
+            self.event_store(),
+            resolved
+                .iter()
+                .flat_map(|result| result.effect_sources.iter()),
+        )?;
         for result in &resolved {
             for producer in &result.producers {
                 if independence_required
@@ -1926,7 +2265,7 @@ impl RuntimeServices {
                 // all four requirements, so a model whose Task had the right
                 // capability but the wrong definition was told both were wrong
                 // and had no way to tell which.
-                return Err(unmet_obligation_error(&obligation.obligation_id, required));
+                return Err(unmet_obligation_error(&obligation.obligation_id, required).into());
             }
         }
         if coverage.is_empty() {
@@ -1936,7 +2275,7 @@ impl RuntimeServices {
             // what Runtime considered current and no spelling to try.
             let current =
                 crate::agentic::supervision::completion_ready_result_artifact_refs(program);
-            return Err(no_current_results_error(&current));
+            return Err(no_current_results_error(&current).into());
         }
         let reviewer_packet = packet.clone();
         let delivery_snapshot = policy::review_delivery_snapshot(
@@ -1997,7 +2336,7 @@ impl RuntimeServices {
                  (evidence_retrieve or read_ref, following every next_request to the end). \
                  A read by another Agent or by the root does not count for a delegated reviewer.",
                 missing.join(",")
-            ));
+            ).into());
         }
         let mut verification = ObjectiveReviewVerification {
             input_set: None,
@@ -2392,6 +2731,21 @@ impl RuntimeServices {
                     .graph_state_store()
                     .load(packet.graph_id())
                     .map_err(|error| error.to_string())?;
+                // The material producer packet is attempt-specific. The node
+                // payload is its immutable template; validate the exact original
+                // NodesStarted ticket before binding the physical attempt to it.
+                let original_binding = self.graph_state_store()
+                    .current_binding(&graph, packet.node_id(), packet.attempt)
+                    .map_err(|error| error.to_string())?;
+                let (original_ticket, original_node) = self.graph_state_store()
+                    .binding_start_ticket(&graph, packet.node_id(), &original_binding)
+                    .map_err(|error| error.to_string())?;
+                crate::execution_core::graph::validate_node_ticket_start(
+                    self.event_store(), &original_ticket, None,
+                ).map_err(|error| error.to_string())?;
+                if !graph.nodes.iter().any(|node| node == &original_node) {
+                    return Err("recursive material original node changed".into());
+                }
                 if packet.session_id() != actor.session_id
                     || packet.binding.as_ref().is_none_or(|binding| {
                         !crate::agent::binding::recompute_binding_digest(binding)
@@ -2621,7 +2975,7 @@ impl RuntimeServices {
             if material_revision != current_revision {
                 return Err(format!(
                     "recursive material enumeration cut changed: source={source} expected={material_revision} observed={current_revision} discovery_cursor={material_discovery_cursor}; rebuild the whole review"
-                ));
+                ).into());
             }
             let mut offset = 0;
             loop {
@@ -2659,6 +3013,7 @@ impl RuntimeServices {
                         && event.payload["status"] == "completed"
                         && event.activity_binding().is_some_and(|binding| {
                             binding.session_id == actor.session_id
+                                && binding.agent_run_id.is_none()
                                 && root_materials.contains(&binding.root_execution_id)
                                 && binding_is_owned_by_root(
                                     &binding,
@@ -2710,7 +3065,8 @@ impl RuntimeServices {
                                 packet.node_id()
                             ))
                     }) || event.activity_binding().is_some_and(|binding| {
-                        primary_roots.contains(&binding.root_execution_id)
+                        binding.agent_run_id.is_none()
+                            && primary_roots.contains(&binding.root_execution_id)
                             && binding_is_owned_by_root(&binding, Some(&binding.root_execution_id))
                     });
                     let event_key = (source.clone(), event.event_id.clone());
@@ -2787,6 +3143,21 @@ impl RuntimeServices {
                         if let Some(output) = output.and_then(|output| {
                             serde_json::from_str::<serde_json::Value>(&output).ok()
                         }) {
+                            // G-d: the material judgment is about the material,
+                            // not about the scope. This read has an authenticated
+                            // material when it carries its own read-acquisition
+                            // seal, or when its material output resolved as
+                            // available and was authenticated against its
+                            // original source identity below. A seal is judged by
+                            // its value: a key whose value is json null carries
+                            // no seal. The seal's decoding and authentication are
+                            // unchanged, and the extent predicate further down is
+                            // unchanged.
+                            let read_carries_seal =
+                                read_carries_acquisition_seal(&event.payload);
+                            if read_carries_seal {
+                                immutable_material = true;
+                            }
                             if output["kind"] == "evidence_retrieve" && output["available"] == true
                             {
                                 if let Some(selector) = output["evidence_ref"].as_str() {
@@ -2861,12 +3232,17 @@ impl RuntimeServices {
                                         },
                                         &mut acquisition,
                                     )?;
+                                    let review_ref =
+                                        node_review_ref(&seal.graph_id, &seal.node_id);
                                     for original in [&original_primary, &index] {
-                                        results::pin_result_source(
+                                        pin_result_source_ticketed(
                                             self.event_store(),
+                                            &review_ref,
+                                            seal.attempt,
                                             &original.stream_id,
                                             &mut acquisition.sources,
-                                        )?;
+                                        )
+                                        .map_err(results::ReviewEvidenceError::from_repin)?;
                                         acquisition.material_events.push(
                                             harness_contract::goal::ProofInputEvent {
                                                 stream_id: original.stream_id.clone(),
@@ -2996,8 +3372,12 @@ impl RuntimeServices {
                                     {
                                         return Err("immutable review material does not match its original source identity".into());
                                     }
-                                    immutable_material =
-                                        scope.as_ref().is_none_or(|scope| scope.targets.is_empty());
+                                    // The chain above authenticated this material
+                                    // against its original source identity: the
+                                    // original primary and its index were
+                                    // resolved and the content matched. The
+                                    // scope's targets are not a proxy for that.
+                                    immutable_material = true;
                                     for source in material
                                         .iter()
                                         .flat_map(|material| &material.result_sources)
@@ -3025,7 +3405,52 @@ impl RuntimeServices {
                             }
                         }
                     }
-                    if !immutable_material
+                    // An authenticated Program-directory read is metadata,
+                    // not an artifact or a physical workspace acquisition.
+                    let mut directory_metadata = false;
+                    if !immutable_material && packet_read && name == "read_ref"
+                        && event.payload[crate::context_evidence::READ_ACQUISITION_FIELD].is_null()
+                        && scope.as_ref().is_none_or(|scope| !scope.complete || scope.targets.is_empty()) {
+                        let packet = directory_read_packet(&packets, &source)?;
+                        let key = event.payload["idempotency_key"].as_str().ok_or("directory read original key missing")?;
+                        let primary_stream = format!("execution-effect:{key}");
+                        let mut authenticated = policy::ActualInputSnapshot {
+                            file_dependencies: Vec::new(), immutable_inputs: Vec::new(),
+                            sources: material_revisions.clone(), material_events: Vec::new(), canonical_facts: Vec::new(),
+                        };
+                        pin_result_source_ticketed(
+                            self.event_store(),
+                            &node_review_ref(packet.graph_id(), packet.node_id()),
+                            packet.attempt,
+                            &primary_stream,
+                            &mut authenticated.sources,
+                        )
+                        .map_err(results::ReviewEvidenceError::from_repin)?;
+                        let original = self.event_store().event_by_idempotency_key(&primary_stream, &format!("{key}:read-receipt"))
+                            .map_err(|error| error.to_string())?.ok_or("directory read original primary missing")?;
+                        if original.commit_cursor > material_discovery_cursor {
+                            return Err("directory read crosses the review discovery cut".into());
+                        }
+                        policy::verify_actual_read_pair(&original, &event)?;
+                        if !original.payload[crate::context_evidence::READ_ACQUISITION_FIELD].is_null() {
+                            return Err("directory read primary/index seal differs".into());
+                        }
+                        let input = policy::authenticate_unsealed_delegated_input(
+                            self.event_store(), &original, &event, packet, &mut authenticated)?;
+                        if crate::agentic::action_invocation::read_ref_directory_input(&input)?.is_some() {
+                            let original_fact = harness_contract::goal::ProofInputEvent {
+                                stream_id: original.stream_id.clone(), sequence: original.sequence,
+                                event_id: original.event_id.clone(), payload_digest: proof_value_digest(&original.payload),
+                            };
+                            if !material_events.contains(&original_fact) { material_events.push(original_fact); }
+                            for fact in authenticated.material_events {
+                                if !material_events.contains(&fact) { material_events.push(fact); }
+                            }
+                            material_revisions = authenticated.sources;
+                            directory_metadata = true;
+                        }
+                    }
+                    if !directory_metadata && !immutable_material
                         && !policy::goal_metadata_tool(name)
                         && (packets.iter().any(|packet| {
                             !initial_material_packets.contains(packet.graph_id())
@@ -3047,7 +3472,7 @@ impl RuntimeServices {
                                 .into(),
                         );
                     }
-                    if !immutable_material
+                    if !directory_metadata && !immutable_material
                         && counts_as_physical_read(name)
                         && scope
                             .as_ref()
@@ -3132,7 +3557,7 @@ impl RuntimeServices {
                     return Err(format!(
                         "actual input source moved after material discovery: source {source} \
                          moved from revision {previous} to {revision}"
-                    ));
+                    ).into());
                 }
             }
         }
@@ -3249,6 +3674,10 @@ impl RuntimeServices {
             readers,
             current_review.map(ReviewActionIdentity::Live),
         )?;
+        // The one place the entries are made: the review's own snapshot names
+        // every required write that ran and failed. The snapshot's own fields
+        // are moved into the proof below, so the entries are taken first.
+        let required_write_failures = coverage::required_write_failure_entries(&snapshot);
         verification.work_manifest_digest = snapshot.work_digest;
         verification.effect_manifest_digest = Some(snapshot.effects.digest);
         // The identity of the review control call this proof was built
@@ -3266,14 +3695,13 @@ impl RuntimeServices {
         inputs.acceptance_policy_digest = snapshot.policy_digest;
         inputs.task_refs = snapshot.task_refs;
         inputs.artifact_refs = snapshot.artifact_refs;
-        inputs.source_revisions = snapshot
-            .sources
-            .into_iter()
-            .map(|source| (source.stream_id, source.expected_revision))
-            .collect();
+        inputs.source_revisions = retain_producer_material_cuts(
+            &inputs.source_revisions, &snapshot.sources,
+        )?;
         Ok(IndependentReview {
             producers: producers.into_iter().collect(),
             verification,
+            required_write_failures,
         })
     }
 
@@ -3308,6 +3736,24 @@ impl RuntimeServices {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn producer_closure_retains_each_discovered_material_cut() {
+        let material = BTreeMap::from([("effect:original".to_string(), 3)]);
+        let source = |stream: &str, revision| crate::ExpectedStreamRevision {
+            stream_id: stream.into(), expected_revision: revision,
+        };
+        let stable = retain_producer_material_cuts(
+            &material, &[source("effect:original", 3), source("session:one", 7)],
+        ).unwrap();
+        assert_eq!(stable["effect:original"], 3);
+        assert_eq!(stable["session:one"], 7);
+        assert!(retain_producer_material_cuts(&material, &[source("session:one", 7)]).is_err());
+        assert!(retain_producer_material_cuts(&material, &[source("effect:original", 4)]).is_err());
+        assert!(retain_producer_material_cuts(
+            &material, &[source("effect:original", 3), source("effect:original", 4)],
+        ).is_err());
+    }
 
     /// An intent and a read in the same delegated receipt stream carry the
     /// same logical sequence under the same payload key, so only a genuine
@@ -3394,6 +3840,671 @@ mod tests {
         assert!(refusal.contains("Publish a Task"), "{refusal}");
     }
 
+    /// A reader that reports one revision per stream. The A2 assertions are
+    /// about the pin, so the reader only has to answer heads.
+    struct A2PinReader {
+        revisions: std::collections::BTreeMap<String, u64>,
+    }
+
+    impl super::read_source::ReadAuthSource for A2PinReader {
+        fn stream_revision(&mut self, stream: &str) -> Result<u64, String> {
+            Ok(self.revisions.get(stream).copied().unwrap_or_default())
+        }
+        fn event_by_idempotency_key(
+            &mut self,
+            _stream: &str,
+            _key: &str,
+        ) -> Result<Option<crate::DurableRuntimeEvent>, String> {
+            Ok(None)
+        }
+        fn list_stream_after(
+            &mut self,
+            _stream: &str,
+            _after: u64,
+            _through: u64,
+            _limit: usize,
+            _bytes: usize,
+        ) -> Result<Vec<crate::DurableRuntimeEvent>, String> {
+            Ok(Vec::new())
+        }
+        fn transaction_stream_revision_exact(
+            &mut self,
+            _transaction: &str,
+            _stream: &str,
+        ) -> Result<Option<crate::CommittedStreamRevision>, String> {
+            Ok(None)
+        }
+        fn resolve_graph_record(
+            &mut self,
+            _record: &crate::DurableRuntimeEvent,
+        ) -> Result<serde_json::Value, String> {
+            Ok(serde_json::Value::Null)
+        }
+    }
+
+    /// A2f-P1: an execution graph head that grew while the review was reading
+    /// is another actor advancing it, and the review goes on. The same pin
+    /// path refuses a head that moved backwards.
+    #[test]
+    fn a2f_a_growing_execution_graph_head_is_admissible_and_a_backwards_head_is_not() {
+        let mut reader = A2PinReader { revisions: std::collections::BTreeMap::new() };
+        let mut cuts = std::collections::BTreeMap::new();
+        reader.revisions.insert("agentic-graph:abc".to_string(), 4);
+        assert_eq!(
+            super::results::pin_result_source_with_reader(
+                &mut reader,
+                "agentic-graph:abc",
+                &mut cuts
+            )
+            .expect("the first pin"),
+            4
+        );
+        // The graph advanced while this review was reading it.
+        reader.revisions.insert("agentic-graph:abc".to_string(), 5);
+        assert_eq!(
+            super::results::pin_result_source_with_reader(
+                &mut reader,
+                "agentic-graph:abc",
+                &mut cuts
+            )
+            .expect("a growing execution graph head is admissible"),
+            5
+        );
+        // A head that moved backwards is a truncated or replaced stream.
+        reader.revisions.insert("agentic-graph:abc".to_string(), 4);
+        let error = super::results::pin_result_source_with_reader(
+            &mut reader,
+            "agentic-graph:abc",
+            &mut cuts,
+        )
+        .expect_err("a backwards head must still be refused");
+        assert!(
+            error.contains("result metadata source moved backwards during resolution"),
+            "{error}"
+        );
+        assert_eq!(cuts.get("agentic-graph:abc"), Some(&5));
+    }
+
+    /// A2f-N2: a source that is not a shared aggregate stream still refuses a
+    /// moved head, with the original wording.
+    #[test]
+    fn a2f_a_non_tolerated_source_head_that_moved_is_still_refused() {
+        for source in [
+            "agentic-program:abc",
+            "goal:abc",
+            "execution-effect:abc",
+            "execution-agent-receipts:abc:node",
+        ] {
+            let mut reader = A2PinReader { revisions: std::collections::BTreeMap::new() };
+            let mut cuts = std::collections::BTreeMap::new();
+            reader.revisions.insert(source.to_string(), 4);
+            super::results::pin_result_source_with_reader(&mut reader, source, &mut cuts)
+                .expect("the first pin");
+            reader.revisions.insert(source.to_string(), 5);
+            let error = super::results::pin_result_source_with_reader(
+                &mut reader,
+                source,
+                &mut cuts,
+            )
+            .expect_err("a moved head on a non-tolerated source must be refused");
+            assert!(
+                error.contains("result metadata source changed during resolution"),
+                "{source}: {error}"
+            );
+            assert_eq!(cuts.get(source), Some(&4));
+        }
+    }
+
+    /// T1a-N1: a refused source pin produces the named rebuild ticket, and the
+    /// ticket's own reason is the sentence the pin has always produced. The
+    /// source and the two revisions below are the shape the 029 explicit-team
+    /// run died on: the receipts stream grew while one reviewer was resolving.
+    #[test]
+    fn t1a_a_refused_growth_produces_a_named_ticket_that_repins_at_the_fresh_head() {
+        let receipts =
+            "execution-agent-receipts:agentic-graph:one:agentic-graph:one:agent:1";
+        let review = "agentic-graph:one/agent:1";
+        let mut reader = A2PinReader { revisions: std::collections::BTreeMap::new() };
+        let mut cuts = std::collections::BTreeMap::new();
+        reader.revisions.insert(receipts.to_string(), 14);
+        assert_eq!(
+            super::results::pin_result_source_ticketed_with_reader(
+                &mut reader, review, 1, receipts, &mut cuts,
+            )
+            .expect("the first pin reads the head as its window"),
+            14
+        );
+        reader.revisions.insert(receipts.to_string(), 16);
+        let rejection = super::results::pin_result_source_ticketed_with_reader(
+            &mut reader, review, 1, receipts, &mut cuts,
+        )
+        .expect_err("growth on a receipts stream is still refused");
+        let ticket = rejection
+            .ticket()
+            .expect("a window refusal carries its ticket")
+            .clone();
+        assert_eq!(ticket.review_ref(), review);
+        assert_eq!(ticket.attempt(), 1);
+        assert_eq!(ticket.source(), receipts);
+        assert_eq!(ticket.pinned_cut(), 14, "the cut this review pinned");
+        assert_eq!(ticket.observed_head(), 16, "the head the store reported");
+        assert_eq!(ticket.movement(), super::ReviewSourceMovement::ForwardNotAccepted);
+        assert!(ticket.movement().rebuildable());
+        assert_eq!(
+            ticket.reason(),
+            format!(
+                "result metadata source changed during resolution; rebuild the review; source={receipts} expected=14 actual=16 phase=result_source_pin"
+            ),
+            "the ticket must not change the propagated wording"
+        );
+        assert_eq!(
+            super::ReviewRepinTicket::from_refusal(review, 1, &ticket.reason()).as_ref(),
+            Some(&ticket),
+            "the reason round-trips back into the same ticket"
+        );
+        assert_eq!(cuts[receipts], 14, "a refusal leaves the window where it was");
+        // The rebuild window comes from the store: the caller names only who it is.
+        assert_eq!(
+            super::results::repin_at_fresh_head_with_reader(
+                &mut reader, review, 1, &ticket, &mut cuts,
+            )
+            .expect("the rebuild opens at the fresh head"),
+            16
+        );
+        assert_eq!(cuts[receipts], 16);
+        assert_eq!(
+            super::results::pin_result_source_ticketed_with_reader(
+                &mut reader, review, 1, receipts, &mut cuts,
+            )
+            .expect("a settled window lets the rebuilt review resolve"),
+            16
+        );
+    }
+
+    /// T1a-N2: a rebuilt window that moves again is refused again on the same
+    /// lineage, and a rebuild refusal cannot be laundered into a fresh rebuild.
+    #[test]
+    fn t1a_a_rebuilt_window_that_moves_again_refuses_again_on_the_same_lineage() {
+        let source = "execution-effect:abc";
+        let review = "agentic-graph:two/agent:1";
+        let mut reader = A2PinReader { revisions: std::collections::BTreeMap::new() };
+        let mut cuts = std::collections::BTreeMap::new();
+        reader.revisions.insert(source.to_string(), 14);
+        super::results::pin_result_source_ticketed_with_reader(
+            &mut reader, review, 2, source, &mut cuts,
+        )
+        .expect("the first pin");
+        reader.revisions.insert(source.to_string(), 16);
+        let first_rejection = super::results::pin_result_source_ticketed_with_reader(
+            &mut reader, review, 2, source, &mut cuts,
+        )
+        .expect_err("the first growth refuses");
+        let first = first_rejection.ticket().expect("window refusal").clone();
+        assert_eq!(
+            super::results::repin_at_fresh_head_with_reader(
+                &mut reader, review, 2, &first, &mut cuts,
+            )
+            .expect("the rebuild opens"),
+            16
+        );
+        // The window the rebuild just opened is what moved: refused again.
+        reader.revisions.insert(source.to_string(), 18);
+        let second_rejection = super::results::pin_result_source_ticketed_with_reader(
+            &mut reader, review, 2, source, &mut cuts,
+        )
+        .expect_err("a second growth refuses again");
+        let second = second_rejection.ticket().expect("window refusal").clone();
+        assert_eq!(
+            second.lineage(),
+            first.lineage(),
+            "both refusals belong to one review attempt, which is what a bounded budget counts"
+        );
+        assert_eq!((second.pinned_cut(), second.observed_head()), (16, 18));
+        let rebuild_refusal = super::RepinRejection::Window { refused: first.clone(), pinned: 999 };
+        assert!(rebuild_refusal.reason().contains("movement=window-mismatch"));
+        assert!(
+            super::ReviewRepinTicket::from_refusal(review, 2, &rebuild_refusal.reason()).is_none(),
+            "a rebuild refusal is a budget answer, not a fresh rebuild request"
+        );
+    }
+
+    /// T1a-N3: a head that moved backwards keeps its original refusal and is not
+    /// a rebuildable window. Re-reading at "whatever the head is now" would
+    /// resolve the review against material nobody observed.
+    #[test]
+    fn t1a_a_backwards_head_is_refused_and_never_rebuildable() {
+        let source = "agentic-program:abc";
+        let review = "agentic-graph:three/agent:1";
+        let mut reader = A2PinReader { revisions: std::collections::BTreeMap::new() };
+        let mut cuts = std::collections::BTreeMap::new();
+        reader.revisions.insert(source.to_string(), 5);
+        super::results::pin_result_source_ticketed_with_reader(
+            &mut reader, review, 3, source, &mut cuts,
+        )
+        .expect("the first pin");
+        reader.revisions.insert(source.to_string(), 3);
+        let rejection = super::results::pin_result_source_ticketed_with_reader(
+            &mut reader, review, 3, source, &mut cuts,
+        )
+        .expect_err("a backwards head is refused");
+        let ticket = rejection.ticket().expect("window refusal").clone();
+        assert_eq!(ticket.movement(), super::ReviewSourceMovement::Backwards);
+        assert!(!ticket.movement().rebuildable());
+        assert_eq!(
+            ticket.reason(),
+            "result metadata source moved backwards during resolution; rebuild the review; source=agentic-program:abc expected=5 actual=3 phase=result_source_pin"
+        );
+        let refused = super::results::repin_at_fresh_head_with_reader(
+            &mut reader, review, 3, &ticket, &mut cuts,
+        )
+        .expect_err("a backwards head does not open a rebuild window");
+        assert_eq!(refused, super::RepinRejection::NotRebuildable(ticket.clone()));
+        assert_eq!(refused.reason(), ticket.reason(), "the refusal wording survives untouched");
+        assert_eq!(cuts[source], 5, "a refused rebuild leaves the window alone");
+    }
+
+    /// T1a-N4: the rebuild entry opens a window only for the review that was
+    /// refused, only at the window it was refused on, and never below the head
+    /// the refusal reported.
+    #[test]
+    fn t1a_the_rebuild_entry_refuses_a_foreign_review_a_stale_window_and_a_shrunken_head() {
+        let source = "execution-agent-receipts:agentic-graph:four:agent:1";
+        let review = "agentic-graph:four/agent:1";
+        let mut reader = A2PinReader { revisions: std::collections::BTreeMap::new() };
+        let mut cuts = std::collections::BTreeMap::new();
+        reader.revisions.insert(source.to_string(), 14);
+        super::results::pin_result_source_ticketed_with_reader(
+            &mut reader, review, 1, source, &mut cuts,
+        )
+        .expect("the first pin");
+        reader.revisions.insert(source.to_string(), 16);
+        let rejection = super::results::pin_result_source_ticketed_with_reader(
+            &mut reader, review, 1, source, &mut cuts,
+        )
+        .expect_err("the growth refuses");
+        let ticket = rejection.ticket().expect("window refusal").clone();
+        let foreign = super::results::repin_at_fresh_head_with_reader(
+            &mut reader, "agentic-graph:other/agent:1", 7, &ticket, &mut cuts,
+        )
+        .expect_err("another review cannot spend this refusal");
+        assert!(foreign.reason().contains("movement=identity-mismatch"), "{}", foreign.reason());
+        assert!(foreign.reason().contains("actual=agentic-graph:other/agent:1#7"));
+        assert_eq!(cuts[source], 14);
+        // A stale window: the entry this map pins is no longer the refused one.
+        cuts.insert(source.to_string(), 15);
+        let stale = super::results::repin_at_fresh_head_with_reader(
+            &mut reader, review, 1, &ticket, &mut cuts,
+        )
+        .expect_err("a moved window is refused");
+        assert!(stale.reason().contains("movement=window-mismatch"), "{}", stale.reason());
+        assert!(stale.reason().contains("actual=15"));
+        cuts.insert(source.to_string(), 14);
+        // The stream shrank below the head the refusal reported.
+        reader.revisions.insert(source.to_string(), 15);
+        let behind = super::results::repin_at_fresh_head_with_reader(
+            &mut reader, review, 1, &ticket, &mut cuts,
+        )
+        .expect_err("a truncated stream is not a rebuild window");
+        assert!(
+            behind.reason().contains("movement=head-behind-refused-head"),
+            "{}",
+            behind.reason()
+        );
+        assert!(behind.reason().contains("actual=15"));
+        assert_eq!(cuts[source], 14, "none of the three rewrites the window");
+    }
+
+    /// T1a-N5: an accepted pin produces no ticket, so a shared aggregate that
+    /// keeps growing never triggers a rebuild at all.
+    #[test]
+    fn t1a_an_accepted_pin_produces_no_ticket_and_a_shared_aggregate_never_needs_one() {
+        for source in [
+            "session:one",
+            "agentic-graph:abc",
+            "execution-lineage:abc",
+            "session-ingress-graph:abc",
+        ] {
+            let review = "agentic-graph:five/agent:1";
+            let mut reader = A2PinReader { revisions: std::collections::BTreeMap::new() };
+            let mut cuts = std::collections::BTreeMap::new();
+            reader.revisions.insert(source.to_string(), 4);
+            assert_eq!(
+                super::results::pin_result_source_ticketed_with_reader(
+                    &mut reader, review, 5, source, &mut cuts,
+                )
+                .expect("the first pin"),
+                4
+            );
+            reader.revisions.insert(source.to_string(), 5);
+            assert_eq!(
+                super::results::pin_result_source_ticketed_with_reader(
+                    &mut reader, review, 5, source, &mut cuts,
+                )
+                .expect("growth on a shared aggregate is another actor appending"),
+                5
+            );
+            assert_eq!(cuts[source], 5, "the pinned window moved with the aggregate");
+        }
+        assert!(super::ReviewRepinTicket::from_refusal("review", 1, "some other failure").is_none());
+    }
+
+    /// T1a-R1: the source shapes the field refusals actually used, replayed in
+    /// memory. Each one refuses, names its own window, and rebuilds at the head
+    /// the store reports - including the 028-era refusal, which is why the
+    /// rebuild is not read as a 029 regression.
+    #[test]
+    fn t1a_the_field_refusal_shapes_rebuild_from_their_own_windows() {
+        for (source, pinned, head) in [
+            (
+                "execution-agent-receipts:agentic-graph:33637f01:agentic-graph:33637f01:agent:1",
+                14,
+                16,
+            ),
+            (
+                "execution-agent-receipts:agentic-graph:8c0a6fd5:agentic-graph:8c0a6fd5:agent:1",
+                3,
+                6,
+            ),
+            ("execution-effect:read-key", 4, 5),
+            ("agentic-program:abc", 7, 8),
+        ] {
+            let review = "agentic-graph:replay/agent:1";
+            let mut reader = A2PinReader { revisions: std::collections::BTreeMap::new() };
+            let mut cuts = std::collections::BTreeMap::new();
+            reader.revisions.insert(source.to_string(), pinned);
+            super::results::pin_result_source_ticketed_with_reader(
+                &mut reader, review, 1, source, &mut cuts,
+            )
+            .expect("the first pin");
+            reader.revisions.insert(source.to_string(), head);
+            let rejection = super::results::pin_result_source_ticketed_with_reader(
+                &mut reader, review, 1, source, &mut cuts,
+            )
+            .expect_err("a moved head on these sources is refused");
+            let ticket = rejection.ticket().expect("window refusal").clone();
+            assert_eq!((ticket.pinned_cut(), ticket.observed_head()), (pinned, head), "{source}");
+            assert_eq!(
+                super::results::repin_at_fresh_head_with_reader(
+                    &mut reader, review, 1, &ticket, &mut cuts,
+                )
+                .expect("the rebuild opens at the store's head"),
+                head,
+                "{source}"
+            );
+            assert_eq!(cuts[source], head);
+        }
+    }
+
+    /// 030 T7 (e2 option B): the review's closing producer-metadata fence is
+    /// self-consistency inside the published cut. The cuts below are produced by
+    /// the real pinning and bounded paging path, not by hand.
+    #[test]
+    fn t7_the_producer_metadata_fence_settles_a_busy_session_and_still_refuses_drift() {
+        let store = crate::RuntimeEventStore::for_test();
+        let append = |store: &crate::RuntimeEventStore, stream: &str, scope| {
+            store
+                .append(crate::RuntimeEventInput {
+                    stream_id: stream.into(),
+                    scope,
+                    kind: "test.t7-append".into(),
+                    status: None,
+                    actor: None,
+                    refs: vec![],
+                    payload: serde_json::json!({}),
+                })
+                .unwrap();
+        };
+        let session = "session:t7-v3";
+        let mut cuts = std::collections::BTreeMap::new();
+        for _ in 0..3 {
+            append(&store, session, crate::RuntimeEventScope::Session);
+        }
+        assert_eq!(
+            super::results::result_source_events(&store, session, &mut cuts)
+                .expect("the real bounded read")
+                .len(),
+            3
+        );
+        let published = vec![crate::ExpectedStreamRevision {
+            stream_id: session.into(),
+            expected_revision: cuts[session],
+        }];
+        assert_eq!(published[0].expected_revision, 3);
+        // The Session keeps appending while the reviewer is still resolving. The
+        // fence used to refuse this with an unclassified sentence.
+        for _ in 0..2 {
+            append(&store, session, crate::RuntimeEventScope::Session);
+        }
+        super::verify_producer_metadata_cuts(&store, published.iter())
+            .expect("growth above the published cut cites nothing this review read");
+        assert_eq!(cuts[session], 3, "the fence does not chase the head");
+        assert_eq!(
+            published[0].expected_revision, 3,
+            "the published cut stays published"
+        );
+        // A judged source moving is the object under review moving: still refused,
+        // with the sentence unchanged.
+        let judged = "execution-effect:t7-v3-key";
+        let mut judged_cuts = std::collections::BTreeMap::new();
+        append(&store, judged, crate::RuntimeEventScope::ExecutionNode);
+        super::results::result_source_events(&store, judged, &mut judged_cuts).unwrap();
+        append(&store, judged, crate::RuntimeEventScope::ExecutionNode);
+        let drift = vec![crate::ExpectedStreamRevision {
+            stream_id: judged.into(),
+            expected_revision: judged_cuts[judged],
+        }];
+        assert_eq!(
+            super::verify_producer_metadata_cuts(&store, drift.iter())
+                .expect_err("a judged source that moved still refuses"),
+            "producer metadata changed during result resolution; retry current results"
+        );
+        // A published cut above the durable head is a fabricated window or a
+        // truncated stream, and refuses on the aggregate class too.
+        let beyond = vec![crate::ExpectedStreamRevision {
+            stream_id: session.into(),
+            expected_revision: 9_999,
+        }];
+        assert!(
+            super::verify_producer_metadata_cuts(&store, beyond.iter())
+                .expect_err("a cut above the head must refuse")
+                .contains("producer metadata changed during result resolution")
+        );
+    }
+
+    /// 030 T7 v4 (option 甲): the same fence on a quiet stream, on a published cut
+    /// that sits below the head, and on a published cut above the head.
+    ///
+    /// The middle case is the one this control first got backwards: a Session
+    /// stream published at cut 0 whose head has since advanced to 1 is the same
+    /// durable fact as "the aggregate grew above the published cut", which the
+    /// sibling busy-Session control asserts must be admitted. A published cut
+    /// above the durable head is the shape that cannot be a busy stream - a
+    /// fabricated window or a truncated log - and that one still refuses with the
+    /// untouched sentence. Nothing here re-pins: admitting growth must leave both
+    /// the published value and the pinned cut exactly where they were.
+    #[test]
+    fn t7_the_producer_metadata_fence_passes_by_equality_and_treats_a_lower_published_cut_as_growth() {
+        let store = crate::RuntimeEventStore::for_test();
+        let quiet = "session:t7-v3-quiet";
+        let mut cuts = std::collections::BTreeMap::new();
+        store
+            .append(crate::RuntimeEventInput {
+                stream_id: quiet.into(),
+                scope: crate::RuntimeEventScope::Session,
+                kind: "test.t7-append".into(),
+                status: None,
+                actor: None,
+                refs: vec![],
+                payload: serde_json::json!({}),
+            })
+            .unwrap();
+        super::results::result_source_events(&store, quiet, &mut cuts).unwrap();
+        let published = vec![crate::ExpectedStreamRevision {
+            stream_id: quiet.into(),
+            expected_revision: cuts[quiet],
+        }];
+        super::verify_producer_metadata_cuts(&store, published.iter())
+            .expect("an unchanged head satisfies the fence by equality");
+        assert_eq!(cuts[quiet], 1);
+        let below = vec![crate::ExpectedStreamRevision {
+            stream_id: quiet.into(),
+            expected_revision: 0,
+        }];
+        super::verify_producer_metadata_cuts(&store, below.iter())
+            .expect("a head above a published Session cut is growth, not a replaced stream");
+        assert_eq!(
+            below[0].expected_revision, 0,
+            "admitting growth never chases the head: the published value stays"
+        );
+        assert_eq!(cuts[quiet], 1, "admitting growth never re-pins");
+        let beyond = vec![crate::ExpectedStreamRevision {
+            stream_id: quiet.into(),
+            expected_revision: 9_999,
+        }];
+        assert_eq!(
+            super::verify_producer_metadata_cuts(&store, beyond.iter())
+                .expect_err("a published cut above the durable head cannot be a quiet stream"),
+            "producer metadata changed during result resolution; retry current results"
+        );
+    }
+
+    /// A2f-P2: the paging path reads the same predicate, so the graph streams
+    /// it pages are admissible there too. A delegated read reaches the
+    /// predicate in its run-id form, because the reviewer pins the
+    /// un-normalized ticket graph id while the store keys on the graph id.
+    #[test]
+    fn a2f_the_paging_path_reads_the_same_source_classes() {
+        for source in [
+            "agentic-graph:abc",
+            "run:agentic-graph:abc",
+            "session-ingress-graph:abc",
+            "run:session-ingress-graph:abc",
+            "session:abc",
+            "execution-lineage:abc",
+        ] {
+            assert!(
+                super::repin_accepts_moved_head(source, 4, 5),
+                "{source} is a shared aggregate stream"
+            );
+        }
+        // A head that did not grow is not a growth, and a source that is not a
+        // shared aggregate stream is the object under review moving.
+        assert!(!super::repin_accepts_moved_head("agentic-graph:abc", 5, 5));
+        assert!(!super::repin_accepts_moved_head("agentic-graph:abc", 5, 4));
+        for source in [
+            "agentic-program:abc",
+            "goal:abc",
+            "execution-effect:abc",
+            "execution-agent-receipts:abc:node",
+        ] {
+            assert!(
+                !super::repin_accepts_moved_head(source, 4, 5),
+                "{source} is not a shared aggregate stream"
+            );
+        }
+    }
+
+    /// G-d-N2: G-d does not widen which tools have to provide physical
+    /// material.
+    #[test]
+    fn g_d_the_physical_read_coverage_is_unchanged() {
+        assert!(counts_as_physical_read("read_ref"));
+        assert!(counts_as_physical_read("evidence_retrieve"));
+        assert!(!counts_as_physical_read("read"));
+        assert!(!counts_as_physical_read("read_file"));
+        assert!(!counts_as_physical_read("grep_search"));
+        assert!(!counts_as_physical_read("state_inspect"));
+    }
+
+    /// A read-acquisition seal, in the shape the product writes it.
+    fn a2_gd_seal() -> serde_json::Value {
+        let step: harness_contract::step::StepIdentity = serde_json::from_value(
+            serde_json::json!({
+                "step_id": "read-step",
+                "session_id": "read-session",
+                "turn_id": "read-turn",
+                "execution_id": "agentic-graph:read",
+                "actor_ref": "read-agent",
+                "run_ref": "read-run",
+                "attempt": 1,
+                "build_ref": "read-fixture",
+            }),
+        )
+        .expect("step identity");
+        let seal = crate::context_evidence::ReadAcquisitionSeal {
+            schema_version: 1,
+            primary_stream: "read-primary".into(),
+            primary_key: "read-key:read-receipt".into(),
+            index_stream: "execution-agent-receipts:agentic-graph:read:node:1".into(),
+            index_key: "agent-tool-receipt:read-key".into(),
+            session_id: "read-session".into(),
+            invocation_id: "read-call".into(),
+            tool_name: "read_file".into(),
+            graph_id: "agentic-graph:read".into(),
+            node_id: "node".into(),
+            attempt: 1,
+            step,
+            origin: serde_json::json!({
+                "origin_step_id": "read-step",
+                "call_id": "read-call",
+                "catalog_digest": "fixed",
+                "source": {"kind": "provider", "attempt_id": "read-attempt"},
+            }),
+            input_sha256: "read-input".into(),
+            body: crate::context_evidence::ReadBodySeal {
+                schema_version: 1,
+                source_ref: "workspace/read.txt".into(),
+                source_sha256: "sha256:read-source".into(),
+                source_bytes: 20,
+                output_sha256: "sha256:read-output".into(),
+                output_bytes: 4,
+                extent: crate::context_evidence::ReadExtent::FileLines {
+                    start_line: 2,
+                    line_count: 1,
+                    total_lines: 4,
+                    ends_with_newline: true,
+                    body_sha256: "sha256:read-output".into(),
+                    body_bytes: 4,
+                    source_omitted: true,
+                },
+            },
+        };
+        serde_json::to_value(seal).expect("seal value")
+    }
+
+    /// G-d-P1 and G-d-N1: a read carries a seal only when the seal's value is
+    /// one. The truncated receipt of the live run has the key with a json null
+    /// value, and that is no seal.
+    #[test]
+    fn g_d_a_read_carries_a_seal_only_when_its_value_is_one() {
+        let sealed = serde_json::json!({
+            "read_acquisition_v1": a2_gd_seal(),
+        });
+        assert!(read_carries_acquisition_seal(&sealed));
+        let null_value =
+            serde_json::json!({"read_acquisition_v1": serde_json::Value::Null});
+        assert!(!read_carries_acquisition_seal(&null_value));
+        let absent = serde_json::json!({"other": 1});
+        assert!(!read_carries_acquisition_seal(&absent));
+        let another_type = serde_json::json!({"read_acquisition_v1": "not a seal"});
+        assert!(!read_carries_acquisition_seal(&another_type));
+        let not_a_seal = serde_json::json!({"read_acquisition_v1": {"schema_version": 1}});
+        assert!(!read_carries_acquisition_seal(&not_a_seal));
+    }
+
+    /// G-d-N1: the auxiliary read refusal keeps its own wording. G-d widens
+    /// who has a material; it does not rewrite what a read without one says.
+    #[test]
+    fn g_d_the_auxiliary_read_refusal_text_is_unchanged() {
+        let source = include_str!("review_evidence.rs");
+        assert!(
+            source.contains(
+                "\"proof auxiliary read has no authenticated immutable or physical material\""
+            ),
+            "the auxiliary read refusal text must not change"
+        );
+    }
+
     #[test]
     fn a_refusal_lists_the_result_refs_runtime_currently_holds() {
         // V27-B1: a model that had just named three real receipts was told its
@@ -3436,6 +4547,10 @@ mod tests {
     /// generation 1 bound to `graph` / `agent:1` / `membership:1`.
     fn reviewed_task() -> crate::agentic::program::AgenticTaskProjection {
         let mut task = crate::agentic::program::AgenticTaskProjection {
+            obligations: Vec::new(),
+            rework_directives: Vec::new(),
+            unsettled_released_attempts: Vec::new(),
+            terminal_note: None,
             task_id: "task".to_string(),
             team_id: "team".to_string(),
             title: "long task".to_string(),
@@ -3461,6 +4576,11 @@ mod tests {
             failed_attempts: 0,
             review_generation: 0,
             failed_review_attempts: 0,
+            structural_execution_stalls: 0,
+            structural_review_stalls: 0,
+            reviews_applied: 0,
+            review_obligation: None,
+            reviews_accepted: 0,
             last_failure: None,
             replacement_task_refs: Vec::new(),
             supersede_evidence_refs: Vec::new(),
@@ -3480,7 +4600,7 @@ mod tests {
         task.active_attempts.insert(
             "graph".to_string(),
             crate::agentic::program::AgenticTaskAttemptProjection {
-                execution_id: "execution:1".to_string(),
+                execution_id: "graph".to_string(),
                 agent_id: "agent:1".to_string(),
                 membership_id: "membership:1".to_string(),
                 mode: harness_contract::agent_action::AgentAttemptMode::Review,
@@ -3503,6 +4623,7 @@ mod tests {
                 &task,
                 "graph",
                 2,
+                2,
                 "agent:1",
                 "membership:1",
                 &["artifact:a".to_string(), "artifact:z".to_string()],
@@ -3517,6 +4638,7 @@ mod tests {
             &task,
             "graph",
             2,
+            2, // independently authenticated physical ticket
             "agent:1",
             "membership:1",
             &["artifact:a".to_string(), "artifact:z".to_string()],
@@ -3548,6 +4670,7 @@ mod tests {
             &task,
             "graph",
             5,
+            2, // independently authenticated physical ticket
             "agent:1",
             "membership:1",
             &["artifact:a".to_string()],
@@ -3555,14 +4678,22 @@ mod tests {
         )
         .expect_err("generation 5 cannot review a Task at review generation 1");
         assert!(
-            stale_generation.contains("generation is stale"),
+            stale_generation.contains("physical node attempt is stale"),
             "the refusal must name the generation: {stale_generation}"
         );
+
+        let mut old_owner = task.clone();
+        old_owner.active_attempts.get_mut("graph").unwrap().generation = 0;
+        assert!(task_review_attempt_rejection(
+            &old_owner, "graph", 2, 2, "agent:1", "membership:1",
+            &["artifact:a".to_string()], None,
+        ).is_err(), "old business generation is not a physical attempt");
 
         let wrong_agent = task_review_attempt_rejection(
             &task,
             "graph",
             2,
+            2, // independently authenticated physical ticket
             "agent:9",
             "membership:1",
             &["artifact:a".to_string()],
@@ -3578,6 +4709,7 @@ mod tests {
             &task,
             "graph",
             2,
+            2, // independently authenticated physical ticket
             "agent:1",
             "membership:1",
             &["artifact:a".to_string()],
@@ -3933,6 +5065,10 @@ mod tests {
             program.tasks.insert(
                 task_id.to_string(),
                 crate::AgenticTaskProjection {
+                    obligations: Vec::new(),
+                    rework_directives: Vec::new(),
+                    unsettled_released_attempts: Vec::new(),
+                    terminal_note: None,
                     task_id: task_id.to_string(),
                     team_id: "team:1".to_string(),
                     title: "work".to_string(),
@@ -3958,6 +5094,11 @@ mod tests {
                     failed_attempts: 0,
                     review_generation: 1,
                     failed_review_attempts: 0,
+                    structural_execution_stalls: 0,
+                    structural_review_stalls: 0,
+                    reviews_applied: 0,
+                    review_obligation: None,
+                    reviews_accepted: 0,
                     last_failure: None,
                     replacement_task_refs: Vec::new(),
                     supersede_evidence_refs: Vec::new(),
@@ -4001,6 +5142,10 @@ mod tests {
         program.tasks.insert(
             "task:empty".to_string(),
             crate::AgenticTaskProjection {
+                obligations: Vec::new(),
+                rework_directives: Vec::new(),
+                unsettled_released_attempts: Vec::new(),
+                terminal_note: None,
                 claim_renewal_streak: 0,
                 task_id: "task:empty".to_string(),
                 team_id: "team:1".to_string(),
@@ -4026,6 +5171,11 @@ mod tests {
                 failed_attempts: 0,
                 review_generation: 1,
                 failed_review_attempts: 0,
+                structural_execution_stalls: 0,
+                structural_review_stalls: 0,
+                reviews_applied: 0,
+                review_obligation: None,
+                reviews_accepted: 0,
                 last_failure: None,
                 replacement_task_refs: Vec::new(),
                 supersede_evidence_refs: Vec::new(),
@@ -4205,4 +5355,113 @@ mod tests {
         }
     }
     include!("review_evidence/work_contract_tests.rs");
+}
+
+#[cfg(test)]
+pub(super) mod t1_frame_cleanup_tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+    use tracing::{Event, Metadata, Subscriber, span::{Attributes, Id, Record}};
+
+    #[derive(Clone, Default)]
+    pub(super) struct EventCapture(pub(super) Arc<Mutex<Vec<String>>>);
+    struct Fields(String);
+    impl tracing::field::Visit for Fields {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            self.0.push_str(&format!("{}={value:?};", field.name()));
+        }
+    }
+    impl Subscriber for EventCapture {
+        fn enabled(&self, _: &Metadata<'_>) -> bool { true }
+        fn new_span(&self, _: &Attributes<'_>) -> Id { Id::from_u64(1) }
+        fn record(&self, _: &Id, _: &Record<'_>) {}
+        fn record_follows_from(&self, _: &Id, _: &Id) {}
+        fn event(&self, event: &Event<'_>) {
+            let mut fields = Fields(String::new());
+            event.record(&mut fields);
+            self.0.lock().unwrap().push(fields.0);
+        }
+        fn enter(&self, _: &Id) {}
+        fn exit(&self, _: &Id) {}
+    }
+
+    #[test]
+    fn t1_cleanup_does_not_reverse_original_artifact_adoption() {
+        use crate::ArtifactMetadataRepository as _;
+        let temp = tempfile::tempdir().unwrap();
+        let repo = Arc::new(crate::EphemeralArtifactRepository::default());
+        let store = crate::ArtifactStore::new(temp.path(), repo.clone(), crate::ArtifactStoreConfig::default()).unwrap();
+        let origin = crate::PreparedArtifactOrigin::EventBody {
+            stream_id: "graph:t1".into(), idempotency_key: "original".into(), kind: "execution_graph.planned".into(),
+        };
+        let artifact = store.write_pre_pinned_blocking("session:t1", "original", b"body", &origin).unwrap();
+        let id = artifact.selector.strip_prefix("artifact://").unwrap();
+        assert_eq!(repo.record(id).unwrap().unwrap().record_class, crate::ArtifactRecordClass::PrivatePrepared);
+        let frame = ProcessInputFrame::without_process_verifier();
+        let owner = frame.artifact_owner.clone();
+        frame.retain_artifact(&store, &artifact).unwrap();
+        assert_eq!(repo.record(id).unwrap().unwrap().record_class, crate::ArtifactRecordClass::Live);
+        let captured = EventCapture::default();
+        let events = Arc::clone(&captured.0);
+        tracing::subscriber::with_default(captured, || drop(frame));
+        assert!(!repo.fixture_review_exact_pin(id, &owner));
+        assert!(repo.fixture_review_exact_pin(id, crate::ARTIFACT_PREPARED_PIN_OWNER));
+        assert_eq!(repo.record(id).unwrap().unwrap().record_class, crate::ArtifactRecordClass::Live,
+            "removing the review pin does not reverse adoption");
+        assert!(events.lock().unwrap().join("\n").contains("not_rolled_back"));
+    }
+
+    #[tokio::test]
+    async fn t1_frame_pin_failure_and_cleanup_report_exact_private_facts() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = Arc::new(crate::EphemeralArtifactRepository::default());
+        let store = crate::ArtifactStore::new(temp.path(), repo.clone(), crate::ArtifactStoreConfig::default()).unwrap();
+        let artifact = store.write_bytes(harness_contract::context::ArtifactWriteDescriptor {
+            media_type: "text/plain".into(), visibility_scope: "session:t1".into(),
+            expected_bytes: None, original_name: None,
+        }, b"original").await.unwrap();
+        let id = artifact.selector.strip_prefix("artifact://").unwrap();
+        let other = "another-original-owner";
+        store.pin(&artifact, other, crate::ARTIFACT_PERMANENT_PIN_UNTIL_MS).unwrap();
+        let captured = EventCapture::default();
+        let events = Arc::clone(&captured.0);
+        let selector_hash = format!("{:x}", Sha256::digest(artifact.selector.as_bytes()));
+
+        let frame = ProcessInputFrame::without_process_verifier();
+        let unknown_owner = frame.artifact_owner.clone();
+        repo.fixture_review_pin_response_loss();
+        tracing::subscriber::with_default(captured.clone(), || {
+            let error = frame.retain_artifact(&store, &artifact).unwrap_err();
+            assert!(error.contains("injected committed pin response loss"));
+            assert!(!frame.retains_exact_artifact(&artifact));
+            drop(frame);
+        });
+        assert!(repo.fixture_review_exact_pin(id, &unknown_owner), "a committed pin response loss must not be guessed away");
+        assert!(repo.fixture_review_exact_pin(id, other));
+        let unknown_hash = format!("{:x}", Sha256::digest(unknown_owner.as_bytes()));
+        let logs = events.lock().unwrap().join("\n");
+        assert!(logs.contains("error_unclassified") && logs.contains("not_attempted") && logs.contains("may_have_become_live"));
+        assert!(logs.contains(&selector_hash) && logs.contains(&unknown_hash));
+        assert!(!logs.contains(&artifact.selector) && !logs.contains(&unknown_owner) && !logs.contains("injected committed"));
+
+        let frame = ProcessInputFrame::without_process_verifier();
+        let failed_owner = frame.artifact_owner.clone();
+        frame.retain_artifact(&store, &artifact).unwrap();
+        repo.fixture_review_unpin_failure();
+        tracing::subscriber::with_default(captured.clone(), || drop(frame));
+        assert!(repo.fixture_review_exact_pin(id, &failed_owner), "failed unpin retains the original tuple");
+        assert!(repo.fixture_review_exact_pin(id, other));
+        let failed_hash = format!("{:x}", Sha256::digest(failed_owner.as_bytes()));
+        let logs = events.lock().unwrap().join("\n");
+        assert!(logs.contains("unpin_unconfirmed") && logs.contains("not_rolled_back") && logs.contains(&failed_hash));
+        assert!(!logs.contains(&failed_owner) && !logs.contains("injected unpin failure"));
+
+        let frame = ProcessInputFrame::without_process_verifier();
+        let released_owner = frame.artifact_owner.clone();
+        frame.retain_artifact(&store, &artifact).unwrap();
+        tracing::subscriber::with_default(captured, || drop(frame));
+        assert!(!repo.fixture_review_exact_pin(id, &released_owner));
+        assert!(repo.fixture_review_exact_pin(id, other), "cleanup must not remove another owner");
+        assert!(events.lock().unwrap().join("\n").contains("unpin_returned_ok"));
+    }
 }

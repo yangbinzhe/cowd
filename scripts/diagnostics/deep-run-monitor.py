@@ -346,9 +346,65 @@ def pairs3(rows):
             yield row[0], row[1], int(row[2])
 
 
+# 034-5(b): which events prove the run is alive.
+#
+# The allow-list omitted the two kinds a live-but-failing loop does emit: the
+# durable Outcome terminal it records every round, and the resource admission it
+# re-acquires to start the next round. An eight-round loop that wrote `failed`
+# eight times was therefore read as silence, and reported as "no events for 140
+# steps" while the run was demonstrably working. Background projection writes
+# stay excluded - they flow while the work is stalled and would mask real
+# silence in the other direction.
+SUBSTANTIVE_EVENT_KINDS = (
+    "model.item_completed",
+    "agentic.action_applied",
+    "tool.invocation.started",
+    "execution.effect.intent",
+    "runtime.outcome.recorded.v1",
+    "resource.admission.granted",
+)
+
+
 class Monitor:
     def __init__(self, url):
         self.url = url
+
+    def latest_outcome(self):
+        """The newest durable Outcome event, as status / gates / terminal_reason.
+
+        034-5(b): the monitor used to infer everything from step volumes and
+        then ask whether a completion request had ever appeared. The run itself
+        already records the business terminal durably, so read that first.
+        Newlines are flattened because a multi-line payload used to break the
+        row parsing of this very monitor.
+        """
+        rows = self.q(
+            "SELECT coalesce(status,''), "
+            "coalesce(payload->'terminal'->>'class',''), "
+            "coalesce(replace(replace(left(payload->'terminal'->>'reason',240), "
+            "chr(10),' '), chr(13),' '),''), "
+            "coalesce(payload->'verified'->>'verdict',''), "
+            "coalesce(payload->>'evidence_completeness',''), "
+            "coalesce(payload->'strategy_feedback'->>'verification_blocked',''), "
+            "coalesce(payload->'strategy_feedback'->>'context_pressure',''), "
+            "coalesce(payload->'quality'->>'kind','') "
+            "FROM runtime_events WHERE kind='runtime.outcome.recorded.v1' "
+            "ORDER BY created_at_ms DESC LIMIT 1")
+        if not rows or len(rows[0]) < 8:
+            return {}
+        status, terminal_class, reason, verdict, completeness, blocked, pressure, quality = rows[0]
+        return {
+            "status": status,
+            "terminal_class": terminal_class or status,
+            "terminal_reason": reason,
+            "verified_verdict": verdict,
+            "gates": {
+                "evidence_completeness": completeness,
+                "verification_blocked": blocked,
+                "context_pressure": pressure,
+                "quality": quality,
+            },
+        }
 
     def q(self, sql):
         return psql(self.url, sql)
@@ -359,6 +415,12 @@ class Monitor:
 
     def snapshot(self):
         s = {}
+        # 034-5(b): report the durable business terminal first.  Field names are
+        # the serialized contract in crates/harness-contract/src/outcome.rs:
+        # `status`, `payload->terminal{class,reason}`, `payload->verified.verdict`,
+        # `payload->evidence_completeness`, `payload->strategy_feedback{verification_blocked,
+        # context_pressure}`, `payload->quality.kind`.  Nothing here is invented.
+        s["outcome"] = self.latest_outcome()
         s["model_steps"] = self.scalar("SELECT count(*) FROM runtime_events WHERE kind='model.item_completed'")
         # Repeat ratio: how much of the tool work carried no new information. It is
         # a first-class projection rather than a post-mortem statistic because the
@@ -387,6 +449,18 @@ class Monitor:
         s["task_submits"] = self.scalar(
             "SELECT count(*) FROM runtime_events WHERE kind='agentic.action_applied' "
             "AND payload->'envelope'->'action'->>'kind'='task_submit'")
+        # 034-5(b): the three counts that decide whether the closure vocabulary
+        # exists at all.  A single-stream scenario never emits `agentic.*`, so its
+        # completion_requests is 0 by construction and can carry no signal.
+        s["outcome_records"] = self.scalar(
+            "SELECT count(*) FROM runtime_events WHERE kind='runtime.outcome.recorded.v1'")
+        s["outcome_terminal_records"] = self.scalar(
+            "SELECT count(*) FROM runtime_events "
+            "WHERE kind='runtime.outcome.recorded.v1' AND coalesce(status,'') <> 'succeeded'")
+        s["admissions_granted"] = self.scalar(
+            "SELECT count(*) FROM runtime_events WHERE kind='resource.admission.granted'")
+        s["agentic_events"] = self.scalar(
+            "SELECT count(*) FROM runtime_events WHERE kind LIKE 'agentic.%'")
         elapsed = self.q("SELECT (max(created_at_ms)-min(created_at_ms))/1000 FROM runtime_events")
         s["elapsed_s"] = int(elapsed[0][0]) if elapsed and elapsed[0][0] else 0
         # Silence is wall-clock now minus the last durable event: a stalled run
@@ -395,10 +469,9 @@ class Monitor:
         # Only substantive events count: background projection writes
         # (evolution signals, case indexes) keep flowing while the work is
         # stalled, which would mask the silence.
+        kinds = ",".join("'%s'" % kind for kind in SUBSTANTIVE_EVENT_KINDS)
         last = self.q(
-            "SELECT max(created_at_ms) FROM runtime_events "
-            "WHERE kind IN ('model.item_completed','agentic.action_applied',"
-            "'tool.invocation.started','execution.effect.intent')"
+            "SELECT max(created_at_ms) FROM runtime_events WHERE kind IN (%s)" % kinds
         )
         now_ms = int(time.time() * 1000)
         s["last_event_age_s"] = (
@@ -608,6 +681,41 @@ class Monitor:
         findings = []
         if snap["verdicts"] > 0:
             return {"state": "TERMINAL", "findings": ["verdict reached"]}
+        # 034-5(b): the durable terminal outranks any inferred symptom. Reading
+        # it first is what separates "the loop keeps failing" from "the run went
+        # quiet": eight rounds that each recorded a non-success Outcome are live
+        # work, and the reason for it is already stored next to the terminal.
+        # One record is a fact to report, not a fault to escalate; the repeat is
+        # the loop. The root cause names only the class, so the fingerprint stays
+        # stable while the evidence grows.
+        outcome = snap.get("outcome") or {}
+        terminal_class = outcome.get("terminal_class") or ""
+        if terminal_class and terminal_class != "succeeded" and int(
+            snap.get("outcome_terminal_records", 0) or 0
+        ) >= 2:
+            findings.append({
+                "root_cause": (
+                    "durable outcome terminal repeats as %s: every round records a non-success terminal"
+                    % terminal_class
+                ),
+                "evidence": [
+                    "outcome status=%s gates=%s terminal_reason=%s" % (
+                        outcome.get("status") or "(none)",
+                        outcome.get("gates") or {},
+                        outcome.get("terminal_reason") or "(none)",
+                    ),
+                    "%d non-success outcome records; latest verified_verdict=%s "
+                    "(absent means the business verdict is Unknown, not success)"
+                    % (
+                        int(snap.get("outcome_terminal_records", 0) or 0),
+                        outcome.get("verified_verdict") or "(absent)",
+                    ),
+                ],
+                "action": (
+                    "stop; read the durable status/gates/terminal_reason - do not wait for a "
+                    "completion request this scenario shape never emits"
+                ),
+            })
         advancing = snap["objective_reviews"] > 0 and (
             snap["completion_requests"] > snap["reopens"])
         if advancing:
@@ -630,14 +738,36 @@ class Monitor:
         # same file once is information gathering, not waste. Judging health by
         # volume reported a healthy run as spinning and trained the operator to
         # ignore the monitor. Only convergence toward the Objective counts.
-        stalled_long = (
-            snap.get("last_event_age_s", 0) > 600 and snap["completion_requests"] == 0
-        )
-        if stalled_long:
+        # 034-5(b): silence and "never asked for completion" are two different
+        # facts, and the old code asserted the second from the first even when
+        # the vocabulary for the question does not exist. A single-stream run
+        # carries no `agentic.*` event at all, so its completion_requests is 0
+        # by construction and says nothing; only where the closure vocabulary
+        # is present may the monitor ask whether completion was ever requested.
+        agentic_vocabulary = int(snap.get("agentic_events", 0) or 0) > 0
+        silent = snap.get("last_event_age_s", 0) > 600
+        if silent and agentic_vocabulary and snap["completion_requests"] == 0:
             findings.append({
                 "root_cause": "objective never requested: work phase never converges to a completion request",
                 "evidence": [f"{snap['model_steps']} steps, 0 completion requests, recent actions {inv.get('recent_actions')}"],
                 "action": "stop; inspect task authoring and rework pressure",
+            })
+        elif silent and not agentic_vocabulary:
+            # Say what was actually observed, and lead with the durable terminal
+            # the run already recorded instead of a closure counter it cannot
+            # ever raise.
+            outcome = snap.get("outcome") or {}
+            findings.append({
+                "root_cause": "no substantive event: the run stopped emitting",
+                "evidence": [
+                    "%ds since the last substantive event" % snap.get("last_event_age_s", 0),
+                    "outcome status=%s gates=%s terminal_reason=%s" % (
+                        outcome.get("status") or "(no outcome recorded)",
+                        outcome.get("gates") or {},
+                        outcome.get("terminal_reason") or "(none)",
+                    ),
+                ],
+                "action": "stop; read the durable outcome first, then the provider/queue state - this scenario shape has no completion request to wait for",
             })
         # An `artifact_commit` on `current_message_block:<i>` names a block of
         # the response being written right now, so its input is identical every

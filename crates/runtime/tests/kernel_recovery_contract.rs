@@ -21,8 +21,8 @@ fn a_shared_backend_commit_is_visible_even_when_the_reader_has_no_local_doorbell
     assert_eq!(reader.current_commit_cursor(), hint);
     assert_eq!(reader.durable_commit_cursor().unwrap(), event.commit_cursor);
     let recovered = reader.events_after_cursor(hint, 10).unwrap();
-    assert_eq!(recovered.len(), 1);
-    assert_eq!(recovered[0].events[0].event_id, event.event_id);
+    let [unique_recovered_24] = recovered.as_slice() else { panic!("expected the original recovered exactly once") };
+    assert_eq!(unique_recovered_24.events[0].event_id, event.event_id);
 }
 
 #[test]
@@ -37,5 +37,5 @@ fn reconstructing_a_reader_keeps_the_committed_boundary_without_reexecuting_the_
     drop(writer);
     let reader = RuntimeEventStore::from_backend(backend);
     assert_eq!(reader.durable_commit_cursor().unwrap(), event.commit_cursor);
-    assert_eq!(reader.list_stream("kernel:reconstructed-reader").unwrap().len(), 1);
+    assert!(matches!(reader.list_stream("kernel:reconstructed-reader").unwrap().as_slice(), [actual] if actual.event_id == event.event_id));
 }

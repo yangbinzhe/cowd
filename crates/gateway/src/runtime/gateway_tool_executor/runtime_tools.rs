@@ -1,3 +1,19 @@
+/// Keep the original owner's complete publication in the same-call transport
+/// even if its dedicated stop slot was unavailable, poisoned, or occupied.
+fn original_member_stop_error(
+    sink: &runtime::ToolProgressSink,
+    publication: runtime::tool_host::OriginalStopPublication,
+    message: &str,
+) -> ToolError {
+    let publication = std::sync::Arc::new(publication);
+    sink.record_original_stop_publication(std::sync::Arc::clone(&publication));
+    ToolError::unknown_with_agent_batch(
+        message,
+        runtime::PendingAgentBatch::new(
+            runtime::PendingAgentBatchValue::OriginalStopPublication(publication)),
+    )
+}
+
 /// Re-evaluate the root Agentic Program barrier in the same path as the mutation that
 /// may have settled it.
 ///
@@ -155,10 +171,19 @@ impl GatewayToolExecutor {
         tool_name: &str,
         value: &mut serde_json::Value,
     ) -> Vec<CoercedField> {
+        let lease = self.tool_host.pin_snapshot();
+        self.coerce_string_typed_structured_fields_with_lease(tool_name, value, &lease)
+    }
+
+    fn coerce_string_typed_structured_fields_with_lease(
+        &self,
+        tool_name: &str,
+        value: &mut serde_json::Value,
+        lease: &tools::ToolHostLease,
+    ) -> Vec<CoercedField> {
         let Some(object) = value.as_object_mut() else {
             return Vec::new();
         };
-        let lease = self.tool_host.pin_snapshot();
         let Some(definition) = lease
             .snapshot()
             .catalog
@@ -200,7 +225,37 @@ impl GatewayToolExecutor {
         }
         let mut repaired = Vec::new();
         for (field, schema) in &properties {
+            // The derived schema answers with a `$ref` into the definitions, so
+            // the node as written carries no type and no members. A repair that
+            // reads it as written never fires on the fields that need it.
+            let schema = harness_contract::tool_input_contract::resolve_schema_node(
+                &definition.input_schema,
+                schema,
+            );
             let expected = schema.get("type").and_then(serde_json::Value::as_str);
+            // A literal that differs from a legal member only in case is the
+            // same shape the contract closed the field to, spelled differently.
+            // The schema is the authority on the member, so put the spelling
+            // back instead of refusing the call for a letter.
+            if let Some(serde_json::Value::String(text)) = object.get(field) {
+                if let Some(legal) =
+                    harness_contract::tool_input_contract::normalize_schema_literal(
+                        schema,
+                        &serde_json::Value::String(text.clone()),
+                    )
+                {
+                    let original_len = text.chars().count();
+                    object.insert(field.clone(), legal);
+                    repaired.push(CoercedField {
+                        field: field.clone(),
+                        truncated: false,
+                        salvaged_items: 0,
+                        dropped_items: 0,
+                        original_len,
+                    });
+                    continue;
+                }
+            }
             // A number quoted as a string is the same one-shot corruption as a
             // container quoted as a string. The schema is the authority on what
             // the field wants, so coerce rather than making the model guess the
@@ -289,8 +344,41 @@ impl GatewayToolExecutor {
             .collect()
     }
 
+    /// The path the schema validator wrote into its refusal.
+    ///
+    /// The validator names the path it was at (`$.deliverable`), so the refusal
+    /// can show the legal form of that path instead of the whole call.
+    fn violated_path(error: &str) -> Option<&str> {
+        let head = error.split_once(':').map(|(head, _)| head.trim())?;
+        head.starts_with('$').then_some(head)
+    }
+
+    /// The field a violated path names.
+    ///
+    /// The path is written as `$.evidence_refs` or `$.entries[0].input`; the
+    /// field is its last named segment, so the sibling hint can name the
+    /// family the field belongs to.
+    fn violated_field(path: &str) -> Option<String> {
+        let last = path.rsplit('.').next()?;
+        let name: String = last
+            .chars()
+            .take_while(|character| character.is_alphanumeric() || *character == '_')
+            .collect();
+        (!name.is_empty()).then_some(name)
+    }
+
     fn input_contract_error(&self, tool_name: &str, error: impl std::fmt::Display) -> ToolError {
         let lease = self.tool_host.pin_snapshot();
+        self.input_contract_error_with_lease(tool_name, error, &lease, None)
+    }
+
+    fn input_contract_error_with_lease(
+        &self,
+        tool_name: &str,
+        error: impl std::fmt::Display,
+        lease: &tools::ToolHostLease,
+        schema_reason: Option<&str>,
+    ) -> ToolError {
         let definition = lease
             .snapshot()
             .catalog
@@ -322,18 +410,83 @@ impl GatewayToolExecutor {
         // same malformed frame again. codex and opencode both put a complete
         // literal example in the contract; this puts the same example in the
         // refusal, so the repair attempt has something to copy.
-        let message = match definition
-            .as_ref()
-            .and_then(|definition| {
-                harness_contract::tool_input_contract::input_example(&definition.input_schema)
-            }) {
-            Some(example) => format!(
-                "{error}. Send it shaped like this: {}",
-                serde_json::to_string(&example).unwrap_or_else(|_| example.to_string()
-                )
-            ),
+        //
+        // The shape shown is the shape of the field that was violated, not the
+        // shape of the whole call: a whole-call example never carries an
+        // optional or a chosen field, so it taught the model to send the same
+        // call again while naming the wrong thing. The whole call stays as
+        // background.
+        let error_text = error.to_string();
+        let violated_path = Self::violated_path(&error_text);
+        // The bounce is the model's one retry, so it says which legal name
+        // belongs where: a model that moved a name from a sibling tool is told
+        // the sibling's name and where it is legal.
+        let violated_field = violated_path.as_deref().and_then(Self::violated_field);
+        let sibling_hint = violated_field
+            .as_deref()
+            .and_then(harness_contract::reference_vocab::sibling_vocab_hint);
+        let message = match definition.as_ref() {
+            Some(definition) => {
+                let path_form = violated_path.as_deref().and_then(|path| {
+                    harness_contract::tool_input_contract::example_for_path(
+                        &definition.input_schema,
+                        path,
+                    )
+                });
+                match path_form {
+                    Some(form) => format!(
+                        "{error}. Send it shaped like this: {}",
+                        serde_json::to_string(&form).unwrap_or_else(|_| form.to_string())
+                    ),
+                    None => match harness_contract::tool_input_contract::input_example(
+                        &definition.input_schema,
+                    ) {
+                        Some(example) => {
+                            // A degraded example is not an instance; showing it
+                            // as one would hand the model something to copy that
+                            // the schema refuses.
+                            match harness_contract::tool_input_contract::degraded_example(
+                                &example,
+                            ) {
+                                Some(degraded) => format!(
+                                    "{error}. {}",
+                                    harness_contract::tool_input_contract::degraded_example_text(
+                                        &degraded
+                                    )
+                                ),
+                                None => format!(
+                                    "{error}. Send it shaped like this: {}",
+                                    serde_json::to_string(&example).unwrap_or_else(|_| {
+                                        example.to_string()
+                                    })
+                                ),
+                            }
+                        }
+                        None => error.to_string(),
+                    },
+                }
+            }
             None => error.to_string(),
         };
+        let message = match sibling_hint {
+            Some(hint) => format!("{message}. sibling_vocab_hint: {hint}"),
+            None => message,
+        };
+        let correction = schema_reason.and_then(|reason| {
+            definition.as_ref().and_then(|definition| {
+                harness_contract::tool_input_contract::input_shape_correction(
+                    tool_name, reason, &definition.input_schema,
+                )
+            })
+        });
+        let mut message = correction.map_or(message.clone(), |hint| format!("{message}. {hint}"));
+        if tool_name == "tool_orchestrate" && correction.is_some() {
+            let example = serde_json::json!({"steps":[{"id":"read","op":"call","tool":"read_file",
+                "input":{"path":"<workspace path>"}}],"return":"$read"});
+            if lease.validate_input(tool_name, &example).is_ok() {
+                message.push_str(&format!(". Schema-valid structural example (replace the path with a real workspace path): {example}"));
+            }
+        }
         ToolError::from_failure(
             harness_contract::tool::ToolExecutionFailure::input_contract(
                 tool_name,
@@ -541,7 +694,7 @@ impl GatewayToolExecutor {
         self.execute_runtime_tool_with_binding(
             tool_name,
             value,
-            RuntimeToolExecutionBinding {
+            RuntimeToolExecutionBinding { action_invocation: None,
                 tool_lease: None,
                 action_id: None,
                 session_id: self.runtime_session_id.as_deref(),
@@ -550,6 +703,7 @@ impl GatewayToolExecutor {
                 reality_context: None,
                 model_lease: self.runtime_model_lease.as_deref(),
                 parent_execution: None,
+                parent_execution_attempt: None,
                 execution_decision: None,
                 permission_ceiling: self.runtime_permission_ceiling,
             },
@@ -563,10 +717,11 @@ impl GatewayToolExecutor {
     /// so validation, authorization, the durable commit and the physical
     /// follow-up dispatch are exactly the path a direct call takes: the batch
     /// can never grant a permission a direct call would be denied.
-    async fn execute_agent_action_batch(
+    pub(super) async fn execute_agent_action_batch(
         &self,
         mut value: serde_json::Value,
         binding: RuntimeToolExecutionBinding<'_>,
+        original: &runtime::RuntimeToolExecutionRequest,
     ) -> Result<String, ToolError> {
         const MAX_ACTIONS: usize = 25;
         let actions = value
@@ -590,76 +745,145 @@ impl GatewayToolExecutor {
                 ToolError::new("agent_action_batch requires a durable Runtime invocation id")
             })?
             .to_string();
+        // Reuse an existing same-call terminal before considering any prefix
+        // for replay. Runtime still authenticates and closes the boundary.
+        original.tool_progress.reconcile_original_member_stop();
+        let publications = original.tool_progress.original_stop_publications();
+        if let [publication] = publications.as_slice() {
+            if let runtime::tool_host::OriginalStopPublication::Recorded(stop) = publication.as_ref() {
+                if matches!(stop.reason(), runtime::tool_host::OriginalBatchMemberStopReason::ConfirmedNoncommit(_)) {
+                    let boundary = runtime::PendingAgentBatch::original_terminal_boundary(
+                        original.tool_progress.clone(), std::sync::Arc::clone(publication), stop.coordinate().index(), actions.len(),
+                    );
+                    return match boundary {
+                        Ok(boundary) => Err(ToolError::original_terminal_batch(boundary)),
+                        Err(_) => Err(ToolError::unknown_with_agent_batch(
+                            "original member terminal boundary unresolved",
+                            runtime::PendingAgentBatch::new(runtime::PendingAgentBatchValue::OriginalStopPublication(
+                                std::sync::Arc::clone(publication))),
+                        )),
+                    };
+                }
+            }
+        }
         let mut results = Vec::with_capacity(actions.len());
         for (index, entry) in actions.iter().enumerate() {
-            let inner_tool = entry
-                .get("tool")
-                .and_then(serde_json::Value::as_str)
-                .ok_or_else(|| {
-                    // Three live frames omitted `tool` on their later entries and
-                    // wrote `"input": {...}, "input": {...}` instead. The refusal
-                    // named the index and nothing else, so the model had to guess
-                    // what the field wanted. The allowed values are already the
-                    // single source of truth the enum owns.
-                    ToolError::new(format!(
-                        "agent_action_batch action[{index}] needs a `tool` naming one of: {}",
-                        harness_contract::agent_action::AGENT_ACTION_TOOL_IDS.join(", ")
-                    ))
+            let member_result: Result<(String, String), ToolError> = async {
+                let owner = original.tool_progress.batch_policy_owner().map_err(|error| {
+                    ToolError::unknown(error)
+                })?.ok_or_else(|| {
+                    ToolError::unknown("batch original member policy owner missing")
                 })?;
-            if !is_agent_action_tool(inner_tool) {
-                return Err(ToolError::new(format!(
-                    "agent_action_batch dispatches Agent actions only; `{inner_tool}` is not one"
-                )));
-            }
-            let mut inner_input = entry
-                .get("input")
-                .cloned()
-                .unwrap_or_else(|| serde_json::json!({}));
-            // Every reference field in this action goes through the same
-            // normalization a direct call gets. Runtime spells a one-shot Task
-            // deliverable `artifact:<24 hex>` and repeats it in a completion
-            // gap; without this a batch that cites it is refused for a review
-            // whose reading the model already did.
-            if let Some(object) = inner_input.as_object_mut() {
-                for field in ["reference", "evidence_ref"] {
-                    if let Some(raw) = object.get(field).and_then(|v| v.as_str()) {
-                        let normalized = runtime::normalize_bare_evidence_ref(raw);
-                        if normalized != raw {
-                            object.insert(field.to_string(), serde_json::Value::String(normalized));
+                match owner.prepare_member_pregrant(original, index).await {
+                runtime::tool_host::AgentBatchMemberPregrant::Replay(member) => {
+                    entry.get("tool").and_then(serde_json::Value::as_str)
+                        .ok_or_else(|| ToolError::unknown("replayed original member tool unavailable"))?;
+                    // The original owner already committed this member. Keep that
+                    // certified outcome in the same-call sink: a rebuilt request
+                    // (new attempt) starts with an empty sink, and settlement
+                    // requires one owner outcome per member. Registration is
+                    // idempotent per index, so this never duplicates a member.
+                    original.tool_progress.record_original_member(index, std::sync::Arc::new(
+                        runtime::tool_host::OriginalMemberSubmitOutcome::Committed(member)));
+                    Err(ToolError::unknown("original member committed; Host delivery incomplete"))
+                }
+                runtime::tool_host::AgentBatchMemberPregrant::Terminal(publication) => {
+                    // Preserve the original terminal until the outer/node/physical owners close it.
+                    Err(ToolError::unknown_with_agent_batch(
+                        "original member terminal awaits original closure",
+                        runtime::PendingAgentBatch::new(
+                            runtime::PendingAgentBatchValue::OriginalStopPublication(publication)),
+                    ))
+                }
+                runtime::tool_host::AgentBatchMemberPregrant::Candidate(candidate) => {
+                    let mut candidate = Some(candidate);
+                    let result: Result<(String, String), ToolError> = async {
+                        let inner_tool = entry.get("tool").and_then(serde_json::Value::as_str)
+                            .ok_or_else(|| {
+                                ToolError::new(format!("agent_action_batch action[{index}] needs a tool"))
+                            })?;
+                        let prepared = candidate.as_ref().ok_or_else(|| {
+                            ToolError::unknown("original candidate missing")
+                        })?;
+                        if !is_agent_action_tool(inner_tool) || prepared.tool() != inner_tool || prepared.index() != index {
+                            return Err(ToolError::new("original member tool or index mismatch"));
                         }
+                        let inner_input = prepared.normalized_member_input().clone();
+                        let member_ceiling = prepared.member_permission_ceiling()
+                            .map_err(|error| {
+                                ToolError::unknown(error.to_string())
+                            })?;
+                        let action_id = format!("{parent_action_id}:{index}");
+                        let mut inner_binding = binding.for_batch_action(action_id.as_str());
+                        inner_binding.permission_ceiling = member_ceiling;
+                        let receipt = Box::pin(self.execute_runtime_tool_with_member(
+                            inner_tool, inner_input, inner_binding, Some(&mut candidate),
+                            Some((&original.tool_progress, index)),
+                        )).await?;
+                        Ok((inner_tool.to_string(), receipt))
+                    }.await;
+                    match (result, candidate) {
+                        (Err(error), Some(candidate)) => {
+                            let publication = candidate.stop_before_outcome_unknown(error.to_string());
+                            Err(original_member_stop_error(
+                                &original.tool_progress, publication,
+                                "original member stopped before a checked outcome",
+                            ))
+                        }
+                        (result, _) => result,
                     }
                 }
-                for field in ["evidence_refs", "result_refs", "artifact_refs"] {
-                    if let Some(array) = object.get_mut(field).and_then(|v| v.as_array_mut()) {
-                        for entry in array.iter_mut() {
-                            if let Some(raw) = entry.as_str() {
-                                let normalized = runtime::normalize_bare_evidence_ref(raw);
-                                if normalized != raw {
-                                    *entry = serde_json::Value::String(normalized);
-                                }
+                runtime::tool_host::AgentBatchMemberPregrant::Unknown { failure: _, stop } => {
+                    match stop {
+                        Some(publication) => Err(original_member_stop_error(
+                            &original.tool_progress, publication, "original member pregrant unresolved",
+                        )),
+                        None => Err(ToolError::unknown("original member pregrant unresolved without authenticated stop")),
+                    }
+                }
+                }
+            }.await;
+            match member_result {
+                Ok((tool, receipt)) => results.push(serde_json::json!({
+                    "tool": tool,
+                    "receipt": serde_json::from_str::<serde_json::Value>(&receipt)
+                        .unwrap_or(serde_json::Value::String(receipt)),
+                })),
+                Err(error) => {
+                    // The original owner carries this terminal separately from
+                    // delivery; never turn another failure into a noncommit.
+                    if let Some(runtime::PendingAgentBatchValue::OriginalStopPublication(publication)) =
+                        error.pending_agent_batch().map(|pending| pending.value())
+                    {
+                        if matches!(publication.as_ref(), runtime::tool_host::OriginalStopPublication::Recorded(stop)
+                            if matches!(stop.reason(), runtime::tool_host::OriginalBatchMemberStopReason::ConfirmedNoncommit(_)))
+                        {
+                            if let Ok(terminal) = runtime::PendingAgentBatch::original_terminal_boundary(
+                                original.tool_progress.clone(), std::sync::Arc::clone(publication), index, actions.len(),
+                            ) {
+                                return Err(ToolError::original_terminal_batch(terminal));
                             }
                         }
                     }
+                    let original_members = original.tool_progress.original_members();
+                    if !original_members.is_empty() || original.tool_progress.has_original_member_stop() {
+                        let prefix = runtime::PendingAgentBatch::new(
+                            runtime::PendingAgentBatchValue::RecordedSink(original.tool_progress.clone()),
+                        );
+                        let carrier = runtime::PendingAgentBatch::with_cause(
+                            prefix, error.pending_agent_batch().cloned(),
+                        );
+                        // Keep the member's own error in the outer message:
+                        // the generic wording alone hides the only
+                        // actionable fact the run can report.
+                        return Err(ToolError::unknown_with_agent_batch(
+                            &batch_member_error_message(&error.to_string()),
+                            carrier,
+                        ));
+                    }
+                    return Err(error);
                 }
             }
-            // Each action gets its own durable identity derived from this call,
-            // so retrying the whole batch is idempotent per action.
-            let action_id = format!("{parent_action_id}:{index}");
-            let inner_binding = RuntimeToolExecutionBinding {
-                action_id: Some(action_id.as_str()),
-                ..binding
-            };
-            let receipt = Box::pin(self.execute_runtime_tool_with_binding(
-                inner_tool,
-                inner_input,
-                inner_binding,
-            ))
-            .await?;
-            results.push(serde_json::json!({
-                "tool": inner_tool,
-                "receipt": serde_json::from_str::<serde_json::Value>(&receipt)
-                    .unwrap_or(serde_json::Value::String(receipt)),
-            }));
         }
         Ok(serde_json::to_string_pretty(&serde_json::json!({
             "type": "agent_action_batch",
@@ -672,21 +896,26 @@ impl GatewayToolExecutor {
     async fn execute_runtime_tool_with_binding(
         &self,
         tool_name: &str,
-        mut value: serde_json::Value,
+        value: serde_json::Value,
         binding: RuntimeToolExecutionBinding<'_>,
     ) -> Result<String, ToolError> {
+        self.execute_runtime_tool_with_member(tool_name, value, binding, None, None).await
+    }
+
+    async fn execute_runtime_tool_with_member(
+        &self, tool_name: &str, mut value: serde_json::Value,
+        binding: RuntimeToolExecutionBinding<'_>,
+        member: Option<&mut Option<runtime::step_snapshot::OriginalPreparedMemberCapability>>,
+        member_results: Option<(&runtime::ToolProgressSink, usize)>,
+    ) -> Result<String, ToolError> {
+        if member.is_some() && !is_agent_action_tool(tool_name) {
+            return Err(ToolError::new("member admission requires an Agent action"));
+        }
         let repaired_fields = if binding.tool_lease.is_some() { Vec::new() } else {
             self.coerce_string_typed_structured_fields(tool_name, &mut value)
         };
-        if !repaired_fields.is_empty() {
-            tracing::info!(
-                tool_name,
-                ?repaired_fields,
-                "coerced string-typed structured tool input fields at the schema boundary"
-            );
-        }
         if tool_name == "agent_action_batch" {
-            return self.execute_agent_action_batch(value, binding).await;
+            return Err(ToolError::unknown("unknown: original batch request/owner unavailable"));
         }
         if matches!(tool_name, "artifact_publish" | "artifact_materialize") {
             return self
@@ -694,10 +923,274 @@ impl GatewayToolExecutor {
                 .await;
         }
         if is_agent_action_tool(tool_name) {
+            return Box::pin(self.execute_agent_action_tool(tool_name, value, binding, member, member_results)).await;
+        }
+        if tool_name == "runtime_capabilities" {
+            tracing::debug!(
+                tool = %tool_name,
+                session = ?binding.session_id,
+                fallback_ceiling = ?binding.permission_ceiling,
+                "runtime control tool binding ceiling"
+            );
+        }
+        if matches!(tool_name, "lark_cli_read" | "lark_cli_write") {
+            let input: LarkCliToolRequest = serde_json::from_value(value)
+                .map_err(|error| self.input_contract_error(tool_name, error))?;
+            let workspace_root = self.tool_host.workspace_root();
+            let config = ConfigLoader::default_for(workspace_root)
+                .load()
+                .map_err(|error| {
+                    ToolError::new(format!("load active runtime configuration: {error}"))
+                })?;
+            let mode = if tool_name == "lark_cli_read" {
+                LarkCliToolMode::Read
+            } else {
+                LarkCliToolMode::Write
+            };
+            return execute_lark_cli_tool(config.gateway(), input, mode).map_err(ToolError::new);
+        }
+        if tool_name == "runtime_config_view" {
+            let input: RuntimeConfigViewRequest = serde_json::from_value(value)
+                .map_err(|error| self.input_contract_error(tool_name, error))?;
+            return self.execute_runtime_config_view(input);
+        }
+        if tool_name == "runtime_resource_capabilities" {
+            let input: RuntimeResourceCapabilitiesRequest = serde_json::from_value(value)
+                .map_err(|error| self.input_contract_error(tool_name, error))?;
+            return self.execute_runtime_resource_capabilities(input);
+        }
+        if tool_name == "get_context_remaining" {
+            let input: ContextRemainingRequest = serde_json::from_value(value)
+                .map_err(|error| self.input_contract_error(tool_name, error))?;
+            return self
+                .execute_get_context_remaining(input, binding.session_id)
+                .await;
+        }
+        if tool_name == "private_note" {
+            let input: runtime::working_context::PrivateNoteInput =
+                serde_json::from_value(value)
+                    .map_err(|error| self.input_contract_error(tool_name, error))?;
+            let context = binding.memory_context.ok_or_else(|| {
+                ToolError::new("private_note requires the exact Runtime Memory binding")
+            })?;
+            if binding.session_id != Some(context.session_id.as_str()) {
+                return Err(ToolError::new("private note Session binding mismatch"));
+            }
+            let services = self
+                .upgrade_runtime_services()
+                .ok_or_else(|| ToolError::new("private note Runtime unavailable"))?;
+            let output = services
+                .private_note_command(context, binding.action_id.unwrap_or(""), input)
+                .await
+                .map_err(ToolError::new)?;
+            return serde_json::to_string(&output)
+                .map_err(|error| ToolError::new(error.to_string()));
+        }
+        if tool_name == "working_context" {
+            let input: runtime::working_context::WorkingContextInput =
+                serde_json::from_value(value)
+                    .map_err(|error| self.input_contract_error(tool_name, error))?;
+            let context = binding.memory_context.ok_or_else(|| {
+                ToolError::new("working_context requires the exact Runtime Memory binding")
+            })?;
+            runtime::working_context::authorize_session_binding(
+                binding.session_id,
+                &context.session_id,
+            )
+            .map_err(ToolError::new)?;
+            let services = self
+                .upgrade_runtime_services()
+                .ok_or_else(|| ToolError::new("working context Runtime unavailable"))?;
+            // The artifact visibility scopes this call is authorized for: the
+            // authenticated Session, plus the execution this turn belongs to.
+            // An authorized tool call is not a license to read every artifact.
+            let mut visibility_scopes = vec![format!("session:{}", context.session_id)];
+            if let Some(decision) = binding.execution_decision {
+                if let Some(execution) = decision.execution_graph_ref.as_ref() {
+                    if !execution.trim().is_empty() {
+                        visibility_scopes.push(format!("execution:{}", execution));
+                    }
+                }
+            }
+            let output = services
+                .working_context_command(
+                    context,
+                    binding.action_id.unwrap_or(""),
+                    input,
+                    visibility_scopes,
+                )
+                .await
+                .map_err(ToolError::new)?;
+            return serde_json::to_string(&output)
+                .map_err(|error| ToolError::new(error.to_string()));
+        }
+        if tool_name == "context_retrieve" {
+            let input: ContextRetrieveRequest = serde_json::from_value(value)
+                .map_err(|error| self.input_contract_error(tool_name, error))?;
+            return self.execute_context_retrieve(input, binding).await;
+        }
+        if tool_name == "evidence_retrieve" {
+            let input: EvidenceRetrieveToolRequest = serde_json::from_value(value)
+                .map_err(|error| self.input_contract_error(tool_name, error))?;
+            return self
+                .execute_evidence_retrieve(input, binding.session_id, binding.authorized_scopes)
+                .await;
+        }
+        if is_unified_read_tool(tool_name) {
+            let input: UnifiedReadRequest = serde_json::from_value(value)
+                .map_err(|error| self.input_contract_error(tool_name, error))?;
+            return self.execute_unified_read(input, binding).await;
+        }
+        if tool_name == "runtime_capabilities" {
+            let input: RuntimeCapabilitiesRequest = serde_json::from_value(value)
+                .map_err(|error| self.input_contract_error(tool_name, error))?;
+            let leased_decision = self
+                .runtime_execution_decision
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+            let agent_catalog = self
+                .upgrade_runtime_services()
+                .and_then(|services| services.definition_registry().runnable_agent_catalog().ok());
+            return serde_json::to_string_pretty(
+                &runtime::runtime_capabilities_response_with_leased_decision_and_tools(
+                    &input.intent,
+                    input.surface.as_deref(),
+                    input.profile.as_deref(),
+                    input.detail.as_deref(),
+                    leased_decision.as_ref(),
+                    &self.available_tool_names(),
+                    agent_catalog.as_deref(),
+                ),
+            )
+            .map_err(|error| ToolError::new(error.to_string()));
+        }
+        if tool_name == "read_mcp_resource_tool" {
+            if let Some(uri) = value
+                .get("uri")
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+            {
+                if uri.starts_with("session://") || uri.starts_with("memory:") {
+                    return Err(ToolError::new(
+                        "Session and Memory evidence references are audit locators, not MCP resources. Use `context_retrieve` and its returned `read_request` or `next_request` to read authorized content.",
+                    ));
+                }
+            }
+        }
+        let service = binding.tool_lease.map(|lease| lease.snapshot().mcp.clone())
+            .unwrap_or_else(|| self.tool_host.pin_snapshot().snapshot().mcp.clone())
+            .ok_or_else(|| {
+                ToolError::new(format!(
+                    "runtime tool `{tool_name}` is unavailable without configured MCP servers"
+                ))
+            })?;
+        match tool_name {
+            "mcp_tool" => {
+                serde_json::from_value::<McpToolRequest>(value.clone())
+                    .map_err(|error| self.input_contract_error(tool_name, error))?;
+            }
+            "list_mcp_resources_tool" => {
+                serde_json::from_value::<ListMcpResourcesRequest>(value.clone())
+                    .map_err(|error| self.input_contract_error(tool_name, error))?;
+            }
+            "read_mcp_resource_tool" => {
+                serde_json::from_value::<ReadMcpResourceRequest>(value.clone())
+                    .map_err(|error| self.input_contract_error(tool_name, error))?;
+            }
+            _ => {}
+        }
+        let tool_name = tool_name.to_string();
+        runtime::ToolExecutionPlane::adapt_blocking(move || {
+            let output = match tool_name.as_str() {
+                "mcp_tool" => {
+                    let input: McpToolRequest = serde_json::from_value(value).map_err(|error| {
+                        ToolError::new(format!("invalid tool input JSON: {error}"))
+                    })?;
+                    let qualified_name = input
+                        .qualified_name
+                        .or(input.tool)
+                        .ok_or_else(|| ToolError::new("missing required field `qualifiedName`"))?;
+                    let (server, tool) = parse_qualified_mcp_name(&qualified_name)?;
+                    serde_json::to_value(
+                        service
+                            .call_tool(mcp::McpToolCallRequest {
+                                server,
+                                tool,
+                                input: input.arguments.unwrap_or_else(|| serde_json::json!({})),
+                            })
+                            .map_err(|error| ToolError::new(error.to_string()))?,
+                    )
+                }
+                "list_mcp_resources_tool" => {
+                    let input: ListMcpResourcesRequest =
+                        serde_json::from_value(value).map_err(|error| {
+                            ToolError::new(format!("invalid tool input JSON: {error}"))
+                        })?;
+                    serde_json::to_value(
+                        service
+                            .list_resources(input.server.as_deref())
+                            .map_err(|error| ToolError::new(error.to_string()))?,
+                    )
+                }
+                "read_mcp_resource_tool" => {
+                    let input: ReadMcpResourceRequest =
+                        serde_json::from_value(value).map_err(|error| {
+                            ToolError::new(format!("invalid tool input JSON: {error}"))
+                        })?;
+                    serde_json::to_value(
+                        service
+                            .read_resource(&input.server, &input.uri)
+                            .map_err(|error| ToolError::new(error.to_string()))?,
+                    )
+                }
+                _ => {
+                    let (server, tool) = parse_qualified_mcp_name(&tool_name)?;
+                    serde_json::to_value(
+                        service
+                            .call_tool(mcp::McpToolCallRequest {
+                                server,
+                                tool,
+                                input: value,
+                            })
+                            .map_err(|error| ToolError::new(error.to_string()))?,
+                    )
+                }
+            }
+            .map_err(|error| ToolError::new(error.to_string()))?;
+            serde_json::to_string_pretty(&output).map_err(|error| ToolError::new(error.to_string()))
+        })
+        .await
+        .map_err(|error| ToolError::new(error.to_string()))?
+    }
+
+    /// Whole-node view from execution-graph truth: identity, status, result,
+    /// evidence refs and the input/output edges around the node. Phase B of the
+    /// unified read design, so a collaborator can inspect one node in a single
+    /// read instead of stitching several tools together.
+    // Keep the action-specific state machine out of the general dispatch future.
+    async fn execute_agent_action_tool(
+        &self,
+        tool_name: &str,
+        mut value: serde_json::Value,
+        binding: RuntimeToolExecutionBinding<'_>,
+        mut member: Option<&mut Option<runtime::step_snapshot::OriginalPreparedMemberCapability>>,
+        member_results: Option<(&runtime::ToolProgressSink, usize)>,
+    ) -> Result<String, ToolError> {
+        // Keep the whole agent-action state machine off the caller's stack: the
+        // actor resolution, member submit and dispatch futures are large and were
+        // inlined into this frame. Boxing the body moves them to the heap; the
+        // ownership, fences and receipt semantics are unchanged.
+        Box::pin(async move {
+            let original_action_input = value.clone();
             let services = self.upgrade_runtime_services().ok_or_else(|| {
                 ToolError::new("Agent action requires the workspace RuntimeServices")
             })?;
-            let actor = match binding.parent_execution {
+            let original_root = binding.action_invocation.and_then(|capability| capability.root_physical_owner());
+            let root_parent = original_root.as_ref().map(|physical| harness_contract::execution_graph::ExecutionParentBinding {
+                execution_id: physical.graph_id.clone(), node_id: physical.node_id.clone(),
+            });
+            let actor = match root_parent.as_ref().or(binding.parent_execution) {
                 Some(parent) => {
                     let trusted_root = binding
                         .execution_decision
@@ -712,11 +1205,21 @@ impl GatewayToolExecutor {
                             .then(|| root_agent_action_actor(binding))
                         })
                         .transpose()
-                        .map_err(ToolError::new)?;
+                        .map_err(|error| {
+                            ToolError::new(error)
+                        })?;
                     services
-                        .resolve_agent_action_actor(parent, trusted_root)
+                        .resolve_agent_action_actor_for_attempt(
+                            parent,
+                            original_root.as_ref().map(|p| p.attempt).or(binding.parent_execution_attempt).ok_or_else(|| {
+                                ToolError::new("Agent actions require the original node attempt")
+                            })?,
+                            trusted_root,
+                        )
                         .await
-                        .map_err(ToolError::new)?
+                        .map_err(|error| {
+                            ToolError::new(error)
+                        })?
                 }
                 None => {
                     return Err(ToolError::new(
@@ -756,7 +1259,9 @@ impl GatewayToolExecutor {
                 }
             }
             let action = parse_agent_action(tool_name, value)
-                .map_err(|error| self.input_contract_error(tool_name, error))?;
+                .map_err(|error| {
+                    self.input_contract_error(tool_name, error)
+                })?;
             let resolved_content_ref = match &action {
                 harness_contract::agent_action::AgentAction::ArtifactCommit(input) => {
                     Some(input.content_ref.clone())
@@ -767,18 +1272,53 @@ impl GatewayToolExecutor {
                 action_id: binding
                     .action_id
                     .filter(|value| !value.trim().is_empty())
-                    .ok_or_else(|| ToolError::new(
-                        "Agent action requires a durable Runtime invocation id; payload hashes are not action identities",
-                    ))?
+                    .ok_or_else(|| {
+                        ToolError::new("Agent action requires a durable Runtime invocation id; payload hashes are not action identities")
+                    })?
                     .to_string(),
                 actor,
                 expected_revision,
                 action,
             };
-            let mut observation = services
-                .submit_agent_action(&envelope)
-                .await
-                .map_err(ToolError::new)?;
+            let mut observation = match member.as_deref_mut() {
+                Some(candidate) => {
+                    let (sink, index) = member_results.ok_or_else(|| {
+                        ToolError::unknown("original member result carrier unavailable")
+                    })?;
+                    let capability = candidate.take().ok_or_else(|| {
+                        ToolError::unknown("original member candidate unavailable")
+                    })?;
+                    match services.submit_agent_action_member(&envelope, capability).await {
+                        runtime::tool_host::PreparedMemberSubmitOutcome::Committed(committed) => {
+                            let observation = match committed.observation() {
+                                runtime::tool_host::OriginalMemberObservation::Available(observation) => Some(observation.clone()),
+                                runtime::tool_host::OriginalMemberObservation::Unavailable => None,
+                            };
+                            sink.record_original_member(index, std::sync::Arc::new(
+                                runtime::tool_host::OriginalMemberSubmitOutcome::Committed(committed)));
+                            observation.ok_or_else(|| ToolError::unknown("original member committed; observation unavailable"))?
+                        }
+                        runtime::tool_host::PreparedMemberSubmitOutcome::Stopped(publication) => {
+                            return Err(original_member_stop_error(
+                                sink, publication, "original member checked outcome unresolved",
+                            ));
+                        },
+                    }
+                },
+                None => {
+                    let capability = binding.action_invocation.ok_or_else(||
+                        single_call_capability_refusal(tool_name))?;
+                    services.submit_delegated_tool_action(capability, &envelope, tool_name, &original_action_input)
+                        .await.map_err(|error| match error {
+                            runtime::AgentActionServiceError::MemberUnknown(_) => ToolError::unknown(error.to_string()),
+                            other => ToolError::new(other.to_string()),
+                        })?
+                }
+            };
+            drop(original_action_input);
+            drop(member);
+            let _ = member_results;
+            Box::pin(async move {
             // `objective_complete_request` only commits the model-authored
             // request here. The durable Program projection lane is the sole
             // live reconciliation trigger: it asks ObjectiveSupervisor for a
@@ -930,232 +1470,10 @@ impl GatewayToolExecutor {
             }
             return serialize_agent_action_receipt(&observation, resolved_content_ref.as_deref())
                 .map_err(|error| ToolError::new(error.to_string()));
-        }
-        if tool_name == "runtime_capabilities" {
-            tracing::debug!(
-                tool = %tool_name,
-                session = ?binding.session_id,
-                fallback_ceiling = ?binding.permission_ceiling,
-                "runtime control tool binding ceiling"
-            );
-        }
-        if matches!(tool_name, "lark_cli_read" | "lark_cli_write") {
-            let input: LarkCliToolRequest = serde_json::from_value(value)
-                .map_err(|error| self.input_contract_error(tool_name, error))?;
-            let workspace_root = self.tool_host.workspace_root();
-            let config = ConfigLoader::default_for(workspace_root)
-                .load()
-                .map_err(|error| {
-                    ToolError::new(format!("load active runtime configuration: {error}"))
-                })?;
-            let mode = if tool_name == "lark_cli_read" {
-                LarkCliToolMode::Read
-            } else {
-                LarkCliToolMode::Write
-            };
-            return execute_lark_cli_tool(config.gateway(), input, mode).map_err(ToolError::new);
-        }
-        if tool_name == "runtime_config_view" {
-            let input: RuntimeConfigViewRequest = serde_json::from_value(value)
-                .map_err(|error| self.input_contract_error(tool_name, error))?;
-            return self.execute_runtime_config_view(input);
-        }
-        if tool_name == "runtime_resource_capabilities" {
-            let input: RuntimeResourceCapabilitiesRequest = serde_json::from_value(value)
-                .map_err(|error| self.input_contract_error(tool_name, error))?;
-            return self.execute_runtime_resource_capabilities(input);
-        }
-        if tool_name == "get_context_remaining" {
-            let input: ContextRemainingRequest = serde_json::from_value(value)
-                .map_err(|error| self.input_contract_error(tool_name, error))?;
-            return self
-                .execute_get_context_remaining(input, binding.session_id)
-                .await;
-        }
-        if tool_name == "private_note" {
-            let input: runtime::working_context::PrivateNoteInput =
-                serde_json::from_value(value)
-                    .map_err(|error| self.input_contract_error(tool_name, error))?;
-            let context = binding.memory_context.ok_or_else(|| {
-                ToolError::new("private_note requires the exact Runtime Memory binding")
-            })?;
-            if binding.session_id != Some(context.session_id.as_str()) {
-                return Err(ToolError::new("private note Session binding mismatch"));
-            }
-            let services = self
-                .upgrade_runtime_services()
-                .ok_or_else(|| ToolError::new("private note Runtime unavailable"))?;
-            let output = services
-                .private_note_command(context, binding.action_id.unwrap_or(""), input)
-                .await
-                .map_err(ToolError::new)?;
-            return serde_json::to_string(&output)
-                .map_err(|error| ToolError::new(error.to_string()));
-        }
-        if tool_name == "working_context" {
-            let input: runtime::working_context::WorkingContextInput =
-                serde_json::from_value(value)
-                    .map_err(|error| self.input_contract_error(tool_name, error))?;
-            let context = binding.memory_context.ok_or_else(|| {
-                ToolError::new("working_context requires the exact Runtime Memory binding")
-            })?;
-            if binding.session_id != Some(context.session_id.as_str()) {
-                return Err(ToolError::new("working context Session binding mismatch"));
-            }
-            let services = self
-                .upgrade_runtime_services()
-                .ok_or_else(|| ToolError::new("working context Runtime unavailable"))?;
-            let output = services
-                .working_context_command(context, binding.action_id.unwrap_or(""), input)
-                .await
-                .map_err(ToolError::new)?;
-            return serde_json::to_string(&output)
-                .map_err(|error| ToolError::new(error.to_string()));
-        }
-        if tool_name == "context_retrieve" {
-            let input: ContextRetrieveRequest = serde_json::from_value(value)
-                .map_err(|error| self.input_contract_error(tool_name, error))?;
-            return self.execute_context_retrieve(input, binding).await;
-        }
-        if tool_name == "evidence_retrieve" {
-            let input: EvidenceRetrieveToolRequest = serde_json::from_value(value)
-                .map_err(|error| self.input_contract_error(tool_name, error))?;
-            return self
-                .execute_evidence_retrieve(input, binding.session_id, binding.authorized_scopes)
-                .await;
-        }
-        if is_unified_read_tool(tool_name) {
-            let input: UnifiedReadRequest = serde_json::from_value(value)
-                .map_err(|error| self.input_contract_error(tool_name, error))?;
-            return self.execute_unified_read(input, binding).await;
-        }
-        if tool_name == "runtime_capabilities" {
-            let input: RuntimeCapabilitiesRequest = serde_json::from_value(value)
-                .map_err(|error| self.input_contract_error(tool_name, error))?;
-            let leased_decision = self
-                .runtime_execution_decision
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .clone();
-            let agent_catalog = self
-                .upgrade_runtime_services()
-                .and_then(|services| services.definition_registry().runnable_agent_catalog().ok());
-            return serde_json::to_string_pretty(
-                &runtime::runtime_capabilities_response_with_leased_decision_and_tools(
-                    &input.intent,
-                    input.surface.as_deref(),
-                    input.profile.as_deref(),
-                    input.detail.as_deref(),
-                    leased_decision.as_ref(),
-                    &self.available_tool_names(),
-                    agent_catalog.as_deref(),
-                ),
-            )
-            .map_err(|error| ToolError::new(error.to_string()));
-        }
-        if tool_name == "read_mcp_resource_tool" {
-            if let Some(uri) = value
-                .get("uri")
-                .and_then(serde_json::Value::as_str)
-                .map(str::trim)
-            {
-                if uri.starts_with("session://") || uri.starts_with("memory:") {
-                    return Err(ToolError::new(
-                        "Session and Memory evidence references are audit locators, not MCP resources. Use `context_retrieve` and its returned `read_request` or `next_request` to read authorized content.",
-                    ));
-                }
-            }
-        }
-        let service = binding.tool_lease.map(|lease| lease.snapshot().mcp.clone())
-            .unwrap_or_else(|| self.tool_host.pin_snapshot().snapshot().mcp.clone())
-            .ok_or_else(|| {
-                ToolError::new(format!(
-                    "runtime tool `{tool_name}` is unavailable without configured MCP servers"
-                ))
-            })?;
-        match tool_name {
-            "mcp_tool" => {
-                serde_json::from_value::<McpToolRequest>(value.clone())
-                    .map_err(|error| self.input_contract_error(tool_name, error))?;
-            }
-            "list_mcp_resources_tool" => {
-                serde_json::from_value::<ListMcpResourcesRequest>(value.clone())
-                    .map_err(|error| self.input_contract_error(tool_name, error))?;
-            }
-            "read_mcp_resource_tool" => {
-                serde_json::from_value::<ReadMcpResourceRequest>(value.clone())
-                    .map_err(|error| self.input_contract_error(tool_name, error))?;
-            }
-            _ => {}
-        }
-        let tool_name = tool_name.to_string();
-        runtime::ToolExecutionPlane::adapt_blocking(move || {
-            let output = match tool_name.as_str() {
-                "mcp_tool" => {
-                    let input: McpToolRequest = serde_json::from_value(value).map_err(|error| {
-                        ToolError::new(format!("invalid tool input JSON: {error}"))
-                    })?;
-                    let qualified_name = input
-                        .qualified_name
-                        .or(input.tool)
-                        .ok_or_else(|| ToolError::new("missing required field `qualifiedName`"))?;
-                    let (server, tool) = parse_qualified_mcp_name(&qualified_name)?;
-                    serde_json::to_value(
-                        service
-                            .call_tool(mcp::McpToolCallRequest {
-                                server,
-                                tool,
-                                input: input.arguments.unwrap_or_else(|| serde_json::json!({})),
-                            })
-                            .map_err(|error| ToolError::new(error.to_string()))?,
-                    )
-                }
-                "list_mcp_resources_tool" => {
-                    let input: ListMcpResourcesRequest =
-                        serde_json::from_value(value).map_err(|error| {
-                            ToolError::new(format!("invalid tool input JSON: {error}"))
-                        })?;
-                    serde_json::to_value(
-                        service
-                            .list_resources(input.server.as_deref())
-                            .map_err(|error| ToolError::new(error.to_string()))?,
-                    )
-                }
-                "read_mcp_resource_tool" => {
-                    let input: ReadMcpResourceRequest =
-                        serde_json::from_value(value).map_err(|error| {
-                            ToolError::new(format!("invalid tool input JSON: {error}"))
-                        })?;
-                    serde_json::to_value(
-                        service
-                            .read_resource(&input.server, &input.uri)
-                            .map_err(|error| ToolError::new(error.to_string()))?,
-                    )
-                }
-                _ => {
-                    let (server, tool) = parse_qualified_mcp_name(&tool_name)?;
-                    serde_json::to_value(
-                        service
-                            .call_tool(mcp::McpToolCallRequest {
-                                server,
-                                tool,
-                                input: value,
-                            })
-                            .map_err(|error| ToolError::new(error.to_string()))?,
-                    )
-                }
-            }
-            .map_err(|error| ToolError::new(error.to_string()))?;
-            serde_json::to_string_pretty(&output).map_err(|error| ToolError::new(error.to_string()))
-        })
-        .await
-        .map_err(|error| ToolError::new(error.to_string()))?
+            }).await
+        }).await
     }
 
-    /// Whole-node view from execution-graph truth: identity, status, result,
-    /// evidence refs and the input/output edges around the node. Phase B of the
-    /// unified read design, so a collaborator can inspect one node in a single
-    /// read instead of stitching several tools together.
     async fn read_graph_node(&self, graph_id: &str, node_id: &str) -> Result<String, ToolError> {
         let services = self.upgrade_runtime_services().ok_or_else(|| {
             ToolError::new("`read_ref` node:// requires the workspace RuntimeServices")
@@ -1317,8 +1635,25 @@ impl GatewayToolExecutor {
             }))
             .map_err(|error| ToolError::new(error.to_string()))?);
         }
-        let (delegate, mut delegated) =
-            unified_read_delegation(&input.reference).map_err(ToolError::new)?;
+        let (delegate, mut delegated) = match input.program_directory_inspect_input().map_err(|error| ToolError::new(error.to_string()))? {
+            Some(derived) => ("state_inspect", derived),
+            None => unified_read_delegation(&input.reference, input.cursor.as_deref()).map_err(ToolError::new)?,
+        };
+        // A delegated Agent action needs the original owner's action
+        // capability for this same call. Without it the delegated action
+        // cannot be authorized, and the old opaque "original single-call
+        // capability unavailable" Unknown blocked the whole node. Name what
+        // is actually missing instead.
+        if is_agent_action_tool(delegate) && binding.action_invocation.is_none() {
+            // The call is refused before it runs: the delegated reader is an
+            // Agent action and this call carries no original action
+            // capability, so nothing was executed. The refusal is reported
+            // as such, and the runtime settles the call against it.
+            return Err(ToolError::refused_before_effect(format!(
+                "`read_ref` cannot serve the reference `{}` in this call: the delegated reader `{delegate}` is an Agent action and this call carries no original action capability; call `{delegate}` directly with the same target",
+                input.reference
+            )));
+        }
         if let Some(limit) = input.limit {
             if delegate != "state_inspect" {
                 delegated["limit"] = serde_json::json!(limit);
@@ -1326,7 +1661,7 @@ impl GatewayToolExecutor {
         }
         if let Some(cursor) = input.cursor {
             match delegate {
-                "state_inspect" => delegated["page_cursor"] = serde_json::json!(cursor),
+                "state_inspect" => {},
                 "context_retrieve" => delegated["content_cursor"] = serde_json::json!(cursor),
                 _ => delegated["cursor"] = serde_json::json!(cursor),
             }
@@ -1948,6 +2283,25 @@ impl GatewayToolExecutor {
 /// tool: a stale `read` here sends every read into the MCP catch-all, which
 /// rejects it with "invalid MCP tool name `read_ref`" - one live run lost a
 /// read this way (L5 trace, line 393).
+/// The refusal a single Agent-action call gets when it carries no original
+/// owner's action capability.
+///
+/// This is an authorization fact about the call, not a routing fact: the call
+/// may not act for the original owner, so the refusal names what is missing
+/// and what the caller can do about it - replay the action under the original
+/// owner, have that owner authorize it, or issue it on a non-delegated path.
+/// It deliberately does not reuse the `read_ref` delegation refusal's
+/// "call X directly" remedy, which belongs to a routing problem and would
+/// point at the wrong next step here. The error stays an Unknown: no
+/// capability is granted, nothing is dispatched and nothing is re-queued.
+pub(crate) fn single_call_capability_refusal(tool_name: &str) -> ToolError {
+    ToolError::unknown(format!(
+        "`{tool_name}` is an Agent action and this call carries no original owner's action \
+         capability: replay the action under the original owner, have that owner authorize it, \
+         or use a non-delegated path"
+    ))
+}
+
 fn is_unified_read_tool(tool_name: &str) -> bool {
     tool_name == "read_ref"
 }
@@ -1966,7 +2320,7 @@ fn is_unified_read_tool(tool_name: &str) -> bool {
 /// spelling instead: an unambiguous scheme prefix with the wrong separator is a
 /// mistake worth naming, while a legacy bare id (no colon at all) still routes
 /// through the Program directory as before.
-fn unified_read_delegation(reference: &str) -> Result<(&'static str, serde_json::Value), String> {
+fn unified_read_delegation(reference: &str, cursor: Option<&str>) -> Result<(&'static str, serde_json::Value), String> {
     use harness_contract::refs::Address;
     let address = Address::parse(reference).map_err(|error| error.to_string())?;
     if let Address::Bare(bare) = &address {
@@ -1980,6 +2334,9 @@ fn unified_read_delegation(reference: &str) -> Result<(&'static str, serde_json:
                 ));
             }
         }
+    }
+    if let Some(input) = address.program_directory_inspect_input(cursor) {
+        return Ok(("state_inspect", input));
     }
     let delegation = match address {
         Address::Tool(id) => (
@@ -2006,16 +2363,11 @@ fn unified_read_delegation(reference: &str) -> Result<(&'static str, serde_json:
             "context_retrieve",
             serde_json::json!({ "source": "matrix", "entry_ref": id }),
         ),
-        Address::Program(id)
-        | Address::Task(id)
-        | Address::Team(id)
-        | Address::Agent(id)
-        | Address::Topic(id)
-        | Address::Issue(id)
-        | Address::Criterion(id)
-        | Address::Obligation(id)
-        | Address::Review(id)
-        | Address::Bare(id) => ("state_inspect", serde_json::json!({ "entry_ref": id })),
+        Address::Program(_) | Address::Task(_) | Address::Team(_) | Address::Agent(_)
+        | Address::Topic(_) | Address::Issue(_) | Address::Criterion(_)
+        | Address::Obligation(_) | Address::Review(_) | Address::Bare(_) => {
+            return Err("reference is not a Program-directory target".into());
+        }
         Address::File(_) | Address::Dir(_) | Address::Node { .. } => {
             return Err(
                 "`read` resolves Runtime references (program/task/team/agent/topic/issue/criterion/obligation/review/tool/artifact/session/fact/matrix/memory). Use read_file, glob_search, or grep_search for file:// and dir:// content."
@@ -2032,35 +2384,38 @@ mod unified_read_tests {
 
     #[test]
     fn routes_each_scheme_to_its_authorized_reader() {
-        let (reader, value) = unified_read_delegation("task://task:abc").expect("task routes");
+        let (reader, value) = unified_read_delegation("task://task:abc", None).expect("task routes");
         assert_eq!(reader, "state_inspect");
         assert_eq!(value["entry_ref"], "task:abc");
+        let (reader, value) = unified_read_delegation("task://task:abc", Some("next")).expect("task routes");
+        assert_eq!(reader, "state_inspect");
+        assert_eq!(value, serde_json::json!({"entry_ref":"task:abc", "page_cursor":"next"}));
 
         let (reader, value) =
-            unified_read_delegation("tool://tool-raw-call_00_x-abc").expect("tool routes");
+            unified_read_delegation("tool://tool-raw-call_00_x-abc", None).expect("tool routes");
         assert_eq!(reader, "evidence_retrieve");
         assert_eq!(value["evidence_ref"], "tool://tool-raw-call_00_x-abc");
 
         let (reader, _) =
-            unified_read_delegation("artifact://sha256:deadbeef").expect("artifact routes");
+            unified_read_delegation("artifact://sha256:deadbeef", None).expect("artifact routes");
         assert_eq!(reader, "evidence_retrieve");
 
-        let (reader, value) = unified_read_delegation("session://sess:1").expect("session routes");
+        let (reader, value) = unified_read_delegation("session://sess:1", None).expect("session routes");
         assert_eq!(reader, "context_retrieve");
         assert_eq!(value["source"], "session_history");
 
         // A legacy bare id still resolves through the Program directory.
-        let (reader, value) = unified_read_delegation("task:abc").expect("bare routes");
+        let (reader, value) = unified_read_delegation("task:abc", None).expect("bare routes");
         assert_eq!(reader, "state_inspect");
         assert_eq!(value["entry_ref"], "task:abc");
     }
 
     #[test]
     fn file_and_dir_content_redirect_to_the_workspace_tools() {
-        assert!(unified_read_delegation("file://src/main.rs").is_err());
-        assert!(unified_read_delegation("dir://crates").is_err());
-        assert!(unified_read_delegation("node://g/n").is_err());
-        assert!(unified_read_delegation("weird://x").is_err());
+        assert!(unified_read_delegation("file://src/main.rs", None).is_err());
+        assert!(unified_read_delegation("dir://crates", None).is_err());
+        assert!(unified_read_delegation("node://g/n", None).is_err());
+        assert!(unified_read_delegation("weird://x", None).is_err());
     }
 
     /// Runtime spells a one-shot Task deliverable `artifact:<24 hex>` and
@@ -2086,7 +2441,7 @@ mod unified_read_tests {
             ("matrix:7", "matrix", "7"),
             ("memory:9", "memory", "9"),
         ] {
-            let error = unified_read_delegation(wrong)
+            let error = unified_read_delegation(wrong, None)
                 .expect_err("a durable scheme without `://` must not read silently");
             assert!(
                 error.contains(&format!("{scheme}://{id}")),
@@ -2101,13 +2456,13 @@ mod unified_read_tests {
     #[test]
     fn a_legacy_bare_id_still_routes_to_the_program_directory() {
         let (reader, value) =
-            unified_read_delegation("1890cf27e957ec7b95501c38").expect("bare routes");
+            unified_read_delegation("1890cf27e957ec7b95501c38", None).expect("bare routes");
         assert_eq!(reader, "state_inspect");
         assert_eq!(value["entry_ref"], "1890cf27e957ec7b95501c38");
 
         // A program-scoped key is not a durable evidence scheme either.
         let (reader, value) =
-            unified_read_delegation("task:1890cf27e957ec7b95501c38").expect("task key routes");
+            unified_read_delegation("task:1890cf27e957ec7b95501c38", None).expect("task key routes");
         assert_eq!(reader, "state_inspect");
         assert_eq!(value["entry_ref"], "task:1890cf27e957ec7b95501c38");
     }
@@ -2119,5 +2474,101 @@ mod unified_read_tests {
     fn the_read_guard_matches_the_exposed_tool_name() {
         assert!(is_unified_read_tool("read_ref"));
         assert!(!is_unified_read_tool("read"));
+    }
+}
+
+/// The outer message of a failed batch member: the generic wording plus the
+/// member's own error, so a run reports the cause instead of the wrapper.
+/// The member's error text is carried verbatim; nothing here interprets it.
+pub(crate) fn batch_member_error_message(detail: &str) -> String {
+    format!("original batch has committed or unresolved members: {detail}")
+}
+
+#[cfg(test)]
+mod batch_member_error_tests {
+    use super::batch_member_error_message;
+
+    /// The outer message must carry the member's own error: a run that only
+    /// reports the wrapper hides the cause of the refusal.
+    #[test]
+    fn the_outer_message_carries_the_member_error() {
+        let message = batch_member_error_message(
+            "original_effect_admission_missing tool_use_id=call-1 effect_key=key-1",
+        );
+        assert!(
+            message.contains("original batch has committed or unresolved members"),
+            "{message}"
+        );
+        assert!(
+            message.contains("original_effect_admission_missing")
+                && message.contains("tool_use_id=call-1"),
+            "the member's own error must survive: {message}"
+        );
+    }
+
+    /// A member error with no typed failure renders as its bare message, and
+    /// the outer wrapper must still carry it. This is the shape the admission
+    /// refusals take today.
+    #[test]
+    fn a_member_error_without_a_failure_keeps_its_message() {
+        let member = runtime::ToolError::unknown(
+            "original_effect_admission_missing tool_use_id=call-1 effect_key=key-1 attempt=2",
+        );
+        let message = batch_member_error_message(&member.to_string());
+        assert!(message.contains("original_effect_admission_missing"), "{message}");
+        assert!(message.contains("tool_use_id=call-1"), "{message}");
+        assert!(message.contains("attempt=2"), "{message}");
+    }
+
+    /// A member error carrying a typed failure renders through `Display` as
+    /// the failure document, not as the bare message. The member's own text
+    /// still has to survive the wrapper, otherwise a change to `Display`
+    /// would silently drop the only actionable fact the run can report.
+    #[test]
+    fn a_member_error_with_a_failure_keeps_its_message() {
+        let member = runtime::ToolError::from_failure(
+            harness_contract::tool::ToolExecutionFailure::input_contract(
+                "task_publish",
+                "original_effect_admission_missing tool_use_id=call-2 effect_key=key-2",
+                None,
+                Vec::new(),
+            ),
+        );
+        let message = batch_member_error_message(&member.to_string());
+        assert!(message.contains("original batch has committed or unresolved members"), "{message}");
+        assert!(
+            message.contains("original_effect_admission_missing")
+                && message.contains("tool_use_id=call-2"),
+            "the member's own error must survive the failure document: {message}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod single_call_refusal_tests {
+    use super::single_call_capability_refusal;
+
+    /// The refusal must be diagnosable and its remedy must be the right one:
+    /// it names the Agent action, says the original owner's action capability
+    /// is missing, offers the next steps that actually apply to an
+    /// authorization fact, and does not borrow the routing remedy of the
+    /// `read_ref` delegation refusal.
+    #[test]
+    fn single_call_capability_refusal_names_what_is_missing_and_the_next_step() {
+        let refusal = single_call_capability_refusal("task_review").to_string();
+        assert!(refusal.contains("task_review"), "{refusal}");
+        assert!(
+            refusal.contains("original owner's action capability"),
+            "{refusal}"
+        );
+        assert!(
+            refusal.contains("replay the action under the original owner"),
+            "{refusal}"
+        );
+        assert!(refusal.contains("non-delegated path"), "{refusal}");
+        assert!(
+            !refusal.contains("directly"),
+            "the routing remedy of the read_ref refusal must not be copied here: {refusal}"
+        );
     }
 }

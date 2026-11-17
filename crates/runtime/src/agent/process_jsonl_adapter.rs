@@ -5074,6 +5074,7 @@ time.sleep(300)
                 error: None,
                 evidence_ref: format!("fixture-read:{}", request.tool_use_id),
                 observed_evidence: vec![],
+                pending_agent_batch: None,
             }
         }
         fn delegated_tool_effect_descriptor(
@@ -5206,6 +5207,7 @@ time.sleep(300)
         packet.allowed_tools = vec!["read_file".into()];
         packet.resource_scopes = vec!["read:.".into()];
         let root = AgentActorBinding {
+            original_execution: None,
             objective_id: "topic-process-objective".into(),
             program_id: "topic-process-program".into(),
             session_id: packet.session_id().into(),
@@ -5477,6 +5479,7 @@ time.sleep(300)
                         content_ref: material.selector,
                     },
                 },
+                vec![format!("session:{}", context.session_id)],
             )
             .await
             .unwrap();
@@ -5606,20 +5609,33 @@ else:
         let process_packet = packet.clone();
         let process_workspace = workspace.clone();
         let process_bridge = Arc::clone(&bridge);
-        let worker_task = tokio::task::spawn_blocking(move || {
-            execute_child(
+        // The V2 exchange parks its reader inside `runtime_handle.block_on`, which a
+        // current-thread test runtime cannot drive while this deadline is pending. A
+        // `spawn_blocking` worker keeps the uncancelable task in the runtime's blocking
+        // pool, so the expired deadline unwinds into `Runtime::drop` and blocks there
+        // forever. Handing the worker to a thread the runtime does not own keeps the
+        // failure reportable: an overrun is a red, never a hang.
+        let (worker_tx, worker_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let outcome = execute_child(
                 &process_registry,
                 &process_workspace,
                 &spec,
                 &process_packet,
                 Some(process_bridge),
                 runtime_handle,
-            )
+            );
+            let _ = worker_tx.send(outcome);
         });
-        let received = tokio::time::timeout(Duration::from_secs(30), worker_task)
-            .await
-            .expect("bounded process fixture")
-            .unwrap();
+        let received = match worker_rx.recv_timeout(Duration::from_secs(30)) {
+            Ok(outcome) => outcome,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                panic!("bounded process fixture: Elapsed(())")
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                panic!("bounded process fixture: worker thread panicked")
+            }
+        };
         if content_case == Some("commit") {
             let artifact: harness_contract::context::ArtifactRef =
                 serde_json::from_str(&received.unwrap().outcome).unwrap();

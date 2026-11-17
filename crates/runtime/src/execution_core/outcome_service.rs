@@ -365,7 +365,16 @@ fn ensure_same_outcome(
 ) -> Result<(), String> {
     let existing = serde_json::from_value::<ExecutionOutcome>(existing_payload.clone())
         .map_err(|error| format!("existing Outcome payload is invalid: {error}"))?;
-    if &existing != expected {
+    // The verified business conclusion is an additive field.  An older Outcome
+    // event carries none, and such an event is never rewritten: a replay that
+    // carries the new conclusion must not conflict with the durable fact that
+    // is already there.  A recorded conclusion, however, is authoritative: a
+    // different conclusion for the same identity is a real conflict.
+    let mut expected = expected.clone();
+    if existing.verified.is_none() {
+        expected.verified = None;
+    }
+    if &existing != &expected {
         return Err(format!(
             "outcome idempotency conflict for execution {} generation {}",
             expected.identity.execution_id, expected.identity.terminal_generation
@@ -590,6 +599,7 @@ mod tests {
             strategy_feedback: Default::default(),
             evidence_refs: Vec::new(),
             evidence_completeness: EvidenceCompleteness::None,
+            verified: None,
             schema_revision: OUTCOME_SCHEMA_REVISION,
         }
     }
@@ -636,6 +646,74 @@ mod tests {
         assert!(outcomes.iter().all(|outcome| {
             outcome.runtime.runtime_revision == build.semver && outcome.runtime.build == build
         }));
+    }
+
+    #[test]
+    fn s6_nc_d_verified_conclusion_is_idempotent_and_legacy_events_are_not_rewritten() {
+        let store = Arc::new(RuntimeEventStore::for_test());
+        let service = OutcomeService::new(Arc::clone(&store));
+        let mut original = outcome(ExecutionCandidateKind::Direct);
+        original.verified = Some(harness_contract::outcome::VerifiedBusinessOutcome {
+            verdict: harness_contract::outcome::VerifiedBusinessVerdict::Satisfied,
+            reason: "completed".to_string(),
+            basis: Vec::new(),
+        });
+        let first = service.record_terminal(&original).unwrap();
+        assert!(!first.duplicate);
+        // The same terminal with the same verified conclusion is one durable
+        // fact, not a second one.
+        let replay = service.record_terminal(&original).unwrap();
+        assert!(replay.duplicate);
+        assert_eq!(replay.commit_cursor, first.commit_cursor);
+        let events = store
+            .all_events(100)
+            .unwrap()
+            .into_iter()
+            .filter(|event| event.kind == OUTCOME_EVENT_KIND)
+            .collect::<Vec<_>>();
+        assert_eq!(events.len(), 1);
+        // A different verified conclusion for the same identity is a real
+        // conflict: the durable business fact cannot change.
+        let mut conflicting = original.clone();
+        conflicting.verified = Some(harness_contract::outcome::VerifiedBusinessOutcome {
+            verdict: harness_contract::outcome::VerifiedBusinessVerdict::Unsatisfied,
+            reason: "completed".to_string(),
+            basis: Vec::new(),
+        });
+        assert!(
+            service
+                .record_terminal(&conflicting)
+                .expect_err("a changed verified conclusion must fail")
+                .contains("idempotency conflict")
+        );
+    }
+
+    #[test]
+    fn s6_legacy_outcome_without_a_verified_conclusion_is_never_rewritten() {
+        let store = Arc::new(RuntimeEventStore::for_test());
+        let service = OutcomeService::new(Arc::clone(&store));
+        let legacy = outcome(ExecutionCandidateKind::Direct);
+        service.record_terminal(&legacy).unwrap();
+        // A replay that carries the additive verified conclusion does not
+        // rewrite the durable legacy event and does not fail.
+        let mut replay = legacy.clone();
+        replay.verified = Some(harness_contract::outcome::VerifiedBusinessOutcome {
+            verdict: harness_contract::outcome::VerifiedBusinessVerdict::Satisfied,
+            reason: "completed".to_string(),
+            basis: Vec::new(),
+        });
+        let receipt = service.record_terminal(&replay).unwrap();
+        assert!(receipt.duplicate);
+        let events = store
+            .all_events(100)
+            .unwrap()
+            .into_iter()
+            .filter(|event| event.kind == OUTCOME_EVENT_KIND)
+            .collect::<Vec<_>>();
+        assert_eq!(events.len(), 1);
+        let stored: ExecutionOutcome =
+            serde_json::from_value(events[0].payload.clone()).expect("Outcome");
+        assert!(stored.verified.is_none());
     }
 
     #[test]

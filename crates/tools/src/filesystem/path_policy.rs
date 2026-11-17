@@ -111,12 +111,44 @@ impl WorkspacePathPolicy {
     }
 
     fn is_protected(&self, path: &Path) -> bool {
+        if path
+            .strip_prefix(&self.workspace_root)
+            .is_ok_and(is_bounded_evaluation_output_path)
+        {
+            return false;
+        }
         self.protected_paths.iter().any(|protected| {
             path == protected
                 || path.starts_with(protected)
                 || canonical_or_lexical(protected) == path
         })
     }
+}
+
+fn is_bounded_evaluation_output_path(relative: &Path) -> bool {
+    let mut components = relative.components();
+    let Some(Component::Normal(first)) = components.next() else {
+        return false;
+    };
+    if first != ".cowd" {
+        return false;
+    }
+    let Some(Component::Normal(second)) = components.next() else {
+        return false;
+    };
+    if second != "evaluation" {
+        return false;
+    }
+    let Some(Component::Normal(hash)) = components.next() else {
+        return false;
+    };
+    let hash = hash.to_str().unwrap_or_default();
+    if hash.len() != 64 || !hash.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return false;
+    }
+    components.all(|component| {
+        matches!(component, Component::Normal(part) if part != ".cowd")
+    })
 }
 
 fn denied(message: &str) -> io::Error {
@@ -239,6 +271,13 @@ mod tests {
 
         assert!(policy.resolve(".cowd/runtime.sqlite").is_err());
         assert!(policy.resolve(".cowd/auth-broker/token").is_err());
+        let evaluation = format!(".cowd/evaluation/{}", "a".repeat(64));
+        fs::create_dir_all(root.join(&evaluation)).expect("evaluation output");
+        fs::write(root.join(&evaluation).join("proof.txt"), "proof").expect("proof");
+        assert!(policy
+            .resolve(&format!("{evaluation}/proof.txt"))
+            .is_ok());
+        assert!(policy.resolve(".cowd/evaluation/short/proof.txt").is_err());
     }
 
     #[test]

@@ -409,10 +409,8 @@ fn loads_and_merges_claude_code_config_files_by_precedence() {
         .expect("config should load");
 
     assert_eq!(COWD_SETTINGS_SCHEMA_NAME, "SettingsSchema");
-    assert_eq!(loaded.loaded_entries().len(), 3);
-    assert_eq!(loaded.loaded_entries()[0].source, ConfigSource::User);
-    assert!(loaded.loaded_entries()[1].source == ConfigSource::Project);
-    assert!(loaded.loaded_entries()[2].source == ConfigSource::Local);
+    let sources: Vec<_> = loaded.loaded_entries().iter().map(|entry| entry.source).collect();
+    assert_eq!(sources, [ConfigSource::User, ConfigSource::Project, ConfigSource::Local]);
     assert_eq!(
         loaded.get("model"),
         Some(&JsonValue::String("opus".to_string()))
@@ -701,12 +699,13 @@ fn parses_provider_fallbacks_array_format() {
 
     // then
     let chain = loaded.fallbacks();
-    assert!(!chain.is_empty());
-    assert_eq!(chain.len(), 4);
-    assert!(chain.contains(&"deepseek-v4-flash".to_string()));
-    assert!(chain.contains(&"qwen3.6-plus".to_string()));
-    assert!(chain.contains(&"step-3.5-flash".to_string()));
-    assert!(chain.contains(&"claude-haiku-4-6".to_string()));
+    let mut sorted_chain = chain.to_vec();
+    sorted_chain.sort();
+    assert_eq!(
+        sorted_chain,
+        ["claude-haiku-4-6", "deepseek-v4-flash", "qwen3.6-plus", "step-3.5-flash"]
+            .map(str::to_owned)
+    );
     assert!(!chain.contains(&"nonexistent".to_string()));
 
     fs::remove_dir_all(root).expect("cleanup temp dir");
@@ -730,7 +729,6 @@ fn provider_fallbacks_default_is_empty_when_unset() {
     // then
     let chain = loaded.fallbacks();
     assert!(chain.is_empty());
-    assert_eq!(chain.len(), 0);
 
     fs::remove_dir_all(root).expect("cleanup temp dir");
 }
@@ -1185,9 +1183,9 @@ fn empty_settings_file_loads_defaults() {
         .expect("empty settings should still load");
 
     // then
-    assert_eq!(loaded.loaded_entries().len(), 1);
+    assert!(matches!(loaded.loaded_entries(), [entry] if entry.source == ConfigSource::User && entry.path == home.join("config.yaml") && entry.exists));
     assert_eq!(loaded.permission_mode(), None);
-    assert_eq!(loaded.plugins().enabled_plugins().len(), 0);
+    assert!(loaded.plugins().enabled_plugins().is_empty());
 
     fs::remove_dir_all(root).expect("cleanup temp dir");
 }
@@ -1776,13 +1774,16 @@ agent_executor_commands:
         .load()
         .expect("trusted manifest");
     let commands = loaded.agent_executor_commands();
-    assert_eq!(commands.len(), 1);
-    assert_eq!(commands[0].command_ref, "local-worker");
+    assert!(matches!(commands, [command] if command.command_ref == "local-worker"));
     assert_eq!(commands[0].executable, ".cowd/workers/jsonl-worker");
     assert_eq!(
         commands[0].sandbox_profile,
         super::AgentExecutorSandboxProfile::IsolatedReadOnly
     );
+    assert!(commands[0]
+        .manifest_digest
+        .chars()
+        .all(|character| character.is_ascii_hexdigit()));
     assert_eq!(commands[0].manifest_digest.len(), 64);
     assert_eq!(
         commands[0].environment_refs.get("LANG").map(String::as_str),
@@ -2063,6 +2064,16 @@ fn parses_session_history_chunk_and_request_cache_limits() {
 
     let invalid = JsonValue::parse(r#"{"session_history":{"request_cache_entries":0}}"#).unwrap();
     assert!(parse_optional_session_history_config(&invalid).is_err());
+}
+
+#[test]
+fn parses_gateway_runtime_thread_capacity_from_config() {
+    let root = JsonValue::parse(r#"{"gateway":{"capacity":{"runtime_workers":3,"runtime_stack_bytes":4194304}}}"#).unwrap();
+    let gateway = parse_optional_gateway_config(&root).unwrap();
+    assert_eq!(gateway.capacity.runtime_workers, Some(3));
+    assert_eq!(gateway.capacity.runtime_stack_bytes, Some(4 * 1024 * 1024));
+    let defaults = parse_optional_gateway_config(&JsonValue::parse(r#"{"gateway":{}}"#).unwrap()).unwrap();
+    assert_eq!(defaults.capacity.runtime_stack_bytes, None);
 }
 
 #[test]
@@ -2410,4 +2421,15 @@ fn network_domain_env_wins_over_config_file() {
     drop(allow);
     drop(block);
     let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn provider_reasoning_effort_is_optional_and_rejects_unknown_values() {
+    let root = crate::json::JsonValue::parse(r#"{"providers":{"step":{"base_url":"https://example.invalid/v1","api_key":"test","models":["step-5-preview"],"reasoning_effort":"high"}}}"#).unwrap();
+    let configured = super::parse_optional_providers_config(&root).unwrap();
+    assert_eq!(configured.providers["step"].reasoning_effort.as_deref(), Some("high"));
+    let missing = crate::json::JsonValue::parse(r#"{"providers":{"step":{"base_url":"https://example.invalid/v1","api_key":"test","models":["step-5-preview"]}}}"#).unwrap();
+    assert_eq!(super::parse_optional_providers_config(&missing).unwrap().providers["step"].reasoning_effort, None);
+    let invalid = crate::json::JsonValue::parse(r#"{"providers":{"step":{"base_url":"https://example.invalid/v1","api_key":"test","models":["step-5-preview"],"reasoning_effort":"unknown"}}}"#).unwrap();
+    assert!(super::parse_optional_providers_config(&invalid).is_err());
 }

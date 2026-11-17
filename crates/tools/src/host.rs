@@ -153,6 +153,8 @@ impl ToolHost {
         ToolHostLease {
             local_network_trace: None,
             orchestrated_read_trace: None,
+            read_location: None,
+            grep_batch_index: None,
             workspace_id: self.workspace_id.clone(),
             workspace_root: self.workspace_root.clone(),
             path_policy,
@@ -219,6 +221,8 @@ fn bounded_workspace_directory(root: &Path) -> Option<Arc<std::fs::File>> {
 pub struct ToolHostLease {
     local_network_trace: Option<Arc<std::sync::Mutex<local_network::LocalNetworkTrace>>>,
     orchestrated_read_trace: Option<Arc<std::sync::Mutex<OrchestratedReadTrace>>>,
+    read_location: Option<(usize, String, usize)>,
+    grep_batch_index: Option<usize>,
     workspace_id: String,
     workspace_root: PathBuf,
     path_policy: Arc<WorkspacePathPolicy>,
@@ -236,6 +240,8 @@ pub struct ToolHostLease {
 /// proof of commit or delivery to a model.
 #[derive(Clone, PartialEq)]
 pub struct OrchestratedRead {
+    grep_windows: Option<Vec<crate::file_ops::GrepReadWindow>>,
+    grep_batch_index: Option<usize>,
     ordinal: usize,
     step_index: usize,
     step_id: String,
@@ -256,6 +262,8 @@ impl std::fmt::Debug for OrchestratedRead {
 }
 
 impl OrchestratedRead {
+    pub fn grep_windows(&self) -> Option<&[crate::file_ops::GrepReadWindow]> { self.grep_windows.as_deref() }
+    pub fn grep_batch_index(&self) -> Option<usize> { self.grep_batch_index }
     pub fn ordinal(&self) -> usize {
         self.ordinal
     }
@@ -286,15 +294,87 @@ impl OrchestratedRead {
     }
 }
 
+/// Actual successful searches captured by the same private child execution owner.
+/// This is only a novelty candidate, not a file-read or authorization receipt.
+#[derive(Clone, PartialEq)]
+pub struct OrchestratedSearch {
+    step_index: usize,
+    step_id: String,
+    position: usize,
+    parent_request_id: String,
+    parent_descriptor_hash: String,
+    parent_authorization: ToolExecutionAuthorization,
+    effect: ToolEffectDescriptor,
+    tool_name: String,
+    input_sha256: String,
+    output_sha256: String,
+    base_path: String,
+}
+impl std::fmt::Debug for OrchestratedSearch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OrchestratedSearch").field("step_index", &self.step_index)
+            .field("position", &self.position).finish_non_exhaustive()
+    }
+}
+impl OrchestratedSearch {
+    pub fn step_index(&self) -> usize { self.step_index }
+    pub fn step_id(&self) -> &str { &self.step_id }
+    pub fn position(&self) -> usize { self.position }
+    pub fn parent_request_id(&self) -> &str { &self.parent_request_id }
+    pub fn parent_descriptor_hash(&self) -> &str { &self.parent_descriptor_hash }
+    pub fn parent_authorization(&self) -> &ToolExecutionAuthorization { &self.parent_authorization }
+    pub fn effect(&self) -> &ToolEffectDescriptor { &self.effect }
+    pub fn tool_name(&self) -> &str { &self.tool_name }
+    pub fn input_sha256(&self) -> &str { &self.input_sha256 }
+    pub fn output_sha256(&self) -> &str { &self.output_sha256 }
+    pub fn base_path(&self) -> &str { &self.base_path }
+}
+#[derive(Clone, Debug, PartialEq)]
+pub struct OrchestratedChildren {
+    pub reads: Option<Vec<OrchestratedRead>>,
+    pub searches: Option<Vec<OrchestratedSearch>>,
+}
+
+/// Verify an internal grep batch member against its original admitted call.
+/// This does not grant a new Tool scope; each File scope must already belong
+/// to the parent descriptor. The caller still checks the original lease.
+#[must_use]
+pub fn original_grep_batch_member_scopes(
+    parent_input: &Value, parent: &ToolEffectDescriptor, index: usize,
+    child_input: &Value, child: &ToolEffectDescriptor,
+) -> bool {
+    use harness_contract::policy::{PermissionOperation, PermissionResource};
+    use harness_contract::tool::ToolEffectKind;
+    if parent.tool_id != "grep_search" || child.tool_id != "grep_search"
+        || parent.effect_kind != ToolEffectKind::Read || child.effect_kind != ToolEffectKind::Read
+        || parent.uses_network || parent.spawns_process || parent.mutates_packages || parent.mutates_system
+        || child.uses_network || child.spawns_process || child.mutates_packages || child.mutates_system
+        || parent_input.get("searches").and_then(Value::as_array).and_then(|items| items.get(index)) != Some(child_input)
+    { return false; }
+    let parent_tool = parent.scopes.iter().filter(|s| s.resource == PermissionResource::Tool && s.operation == PermissionOperation::Read).count();
+    let child_tool = child.scopes.iter().filter(|s| s.resource == PermissionResource::Tool && s.operation == PermissionOperation::Read).count();
+    parent_tool == 1 && child_tool == 1
+        && parent.scopes.iter().all(|s| (s.resource == PermissionResource::Tool || s.resource == PermissionResource::File) && s.operation == PermissionOperation::Read)
+        && child.scopes.iter().all(|s| s.operation == PermissionOperation::Read
+            && ((s.resource == PermissionResource::Tool
+                && s.target == crate::tool_orchestrator::resource_target(child_input))
+                || (s.resource == PermissionResource::File && parent.scopes.contains(s))))
+        && child.scopes.iter().any(|s| s.resource == PermissionResource::File)
+}
+
 #[derive(Default)]
 struct OrchestratedReadTrace {
     reads: Vec<OrchestratedRead>,
+    searches: Vec<OrchestratedSearch>,
+    search_bytes: usize,
+    search_overflow: bool,
     bytes: usize,
     overflow: bool,
     parent_request_id: String,
     parent_descriptor_hash: String,
     parent_authorization: Option<ToolExecutionAuthorization>,
     authorized_scopes: Vec<harness_contract::policy::PermissionScope>,
+    original_grep_batch: Option<(Value, ToolEffectDescriptor)>,
 }
 
 impl std::fmt::Debug for ToolHostLease {
@@ -312,6 +392,32 @@ impl std::fmt::Debug for ToolHostLease {
 #[path = "local_network.rs"]
 mod local_network;
 
+/// Re-exported so the gateway router and the joined executor read the same
+/// acceptance set instead of each deriving its own.
+pub use local_network::joined_local_network_tool;
+
+/// Why one child effect of an orchestrated program could not be resolved.
+///
+/// `InvalidInput` means the child's own input violates its contract: the call
+/// would be refused, and the effects the sibling steps declared are still
+/// true. `Unprovable` means the effect itself cannot be proven, so the program
+/// may touch anything and no exact scope may be claimed.
+#[derive(Debug, Clone)]
+struct ChildEffectFailure {
+    reason: String,
+    unprovable: bool,
+}
+
+impl ChildEffectFailure {
+    fn unprovable(reason: String) -> Self {
+        Self { reason, unprovable: true }
+    }
+
+    fn invalid_input(reason: String) -> Self {
+        Self { reason, unprovable: false }
+    }
+}
+
 impl ToolHostLease {
     /// Execute under the original parent authorization while retaining actual
     /// successful child reads in a private, per-invocation trace. A caller must
@@ -321,27 +427,87 @@ impl ToolHostLease {
         &self,
         authorization: &ToolExecutionAuthorization,
         input: &Value,
-    ) -> Result<(String, Option<Vec<OrchestratedRead>>), ToolHostError> {
-        if self.orchestrated_read_trace.is_some() {
-            return Err(ToolHostError::Execution("nested read trace owner".into()));
+    ) -> Result<(String, OrchestratedChildren), ToolHostError> {
+        self.execute_with_read_trace(authorization, "tool_orchestrate", input)
+    }
+
+    pub fn execute_with_read_trace(
+        &self, authorization: &ToolExecutionAuthorization, tool: &str, input: &Value,
+    ) -> Result<(String, OrchestratedChildren), ToolHostError> {
+        if self.orchestrated_read_trace.is_some() || !matches!(tool, "tool_orchestrate" | "grep_search") {
+            return Err(ToolHostError::Execution("invalid read trace owner".into()));
         }
-        let (canonical, value) =
-            self.authorize_and_canonicalize(authorization, "tool_orchestrate", input)?;
+        let (canonical, value) = self.authorize_and_canonicalize(authorization, tool, input)?;
         let mut lease = self.for_authorized_read_cache(authorization)?;
+        let original_grep_batch = (canonical == "grep_search" && value.get("searches").and_then(Value::as_array).is_some())
+            .then(|| (value.clone(), self.describe_effect(&canonical, &value)));
         let trace = Arc::new(std::sync::Mutex::new(OrchestratedReadTrace {
             authorized_scopes: authorization.authorization_lease.scopes.clone(),
             parent_request_id: authorization.request_id.clone(),
             parent_descriptor_hash: authorization.descriptor_hash.clone(),
             parent_authorization: Some(authorization.clone()),
+            original_grep_batch,
             ..OrchestratedReadTrace::default()
         }));
         lease.orchestrated_read_trace = Some(Arc::clone(&trace));
         let output = lease.dispatch_sync(&canonical, value)?;
-        let mut trace = trace
-            .lock()
-            .map_err(|_| ToolHostError::Execution("read trace poisoned".into()))?;
+        let Ok(mut trace) = trace.lock() else {
+            return Ok((output, OrchestratedChildren { reads: None, searches: None }));
+        };
         let reads = (!trace.overflow).then(|| std::mem::take(&mut trace.reads));
-        Ok((output, reads))
+        let searches = (!trace.search_overflow).then(|| std::mem::take(&mut trace.searches));
+        Ok((output, OrchestratedChildren { reads, searches }))
+    }
+
+    pub(crate) fn discard_orchestrated_searches(&self) {
+        if let Some(trace) = &self.orchestrated_read_trace {
+            if let Ok(mut trace) = trace.lock() { trace.search_overflow = true; trace.searches.clear(); }
+        }
+    }
+
+    pub(crate) fn record_orchestrated_search(
+        &self, step_index: usize, step_id: &str, position: usize, tool: &str, input: &Value, output: &str,
+    ) -> Result<(), String> {
+        let Some(trace) = &self.orchestrated_read_trace else { return Ok(()); };
+        let Ok(result) = serde_json::from_str::<Value>(output) else { self.discard_orchestrated_searches(); return Ok(()); };
+        let Some(base_path) = result.get("basePath").and_then(Value::as_str) else { self.discard_orchestrated_searches(); return Ok(()); };
+        if result.get("scanComplete").and_then(Value::as_bool) != Some(true)
+            || result.get("truncated").and_then(Value::as_bool) != Some(false)
+            || result.get("numFiles").and_then(Value::as_u64).is_none()
+            || result.get("omissions").and_then(Value::as_array).is_some_and(|items| !items.is_empty())
+            || result.get("continuationCursor").is_some_and(|v| !v.is_null())
+            || result.get("next_request").is_some_and(|v| !v.is_null()) { self.discard_orchestrated_searches(); return Ok(()); }
+        if tool != "grep_search" { return Ok(()); }
+        if tool == "grep_search" && result.get("omissions").and_then(Value::as_array).is_none() { self.discard_orchestrated_searches(); return Ok(()); }
+        let path = std::path::Path::new(base_path);
+        let relative = path.is_absolute().then(|| path.strip_prefix(self.path_policy.workspace_root()).ok()).flatten()
+            .filter(|path| path.components().all(|part| matches!(part, std::path::Component::Normal(_))))
+            .and_then(std::path::Path::to_str)
+            .filter(|path| !path.contains('\u{fffd}'));
+        let Some(base_path) = relative.map(|path| if path.is_empty() { "." } else { path }) else {
+            self.discard_orchestrated_searches();
+            return Ok(());
+        };
+        let effect = self.describe_effect(tool, input);
+        use sha2::{Digest, Sha256};
+        let input_sha256 = format!("{:x}", Sha256::digest(serde_json::to_vec(input).map_err(|error| error.to_string())?));
+        let output_sha256 = format!("{:x}", Sha256::digest(output.as_bytes()));
+        let mut trace = trace.lock().map_err(|_| "search trace poisoned")?;
+        if effect.scopes.is_empty() || !effect.scopes.iter().all(|scope| trace.authorized_scopes.contains(scope)) {
+            trace.search_overflow = true; trace.searches.clear(); return Ok(());
+        }
+        let bytes = base_path.len().saturating_add(step_id.len());
+        if trace.searches.len() >= 400 || trace.search_bytes.saturating_add(bytes) > 1024 * 1024 {
+            trace.search_overflow = true; trace.searches.clear(); return Ok(());
+        }
+        if trace.search_overflow { return Ok(()); }
+        trace.search_bytes += bytes;
+        let parent_request_id = trace.parent_request_id.clone();
+        let parent_descriptor_hash = trace.parent_descriptor_hash.clone();
+        let parent_authorization = trace.parent_authorization.clone().ok_or("search trace parent authorization missing")?;
+        trace.searches.push(OrchestratedSearch { step_index, step_id: step_id.into(), position,
+            parent_request_id, parent_descriptor_hash, parent_authorization, effect, tool_name: tool.into(), input_sha256, output_sha256, base_path: base_path.into() });
+        Ok(())
     }
 
     pub(crate) fn record_orchestrated_read(
@@ -363,6 +529,8 @@ impl ToolHostLease {
                 .iter()
                 .all(|scope| trace.authorized_scopes.contains(scope))
         {
+            trace.overflow = true;
+            trace.reads.clear();
             return Ok(());
         }
         let bytes = serde_json::to_vec(input)
@@ -383,6 +551,8 @@ impl ToolHostLease {
         let parent_descriptor_hash = trace.parent_descriptor_hash.clone();
         let parent_authorization = trace.parent_authorization.clone().ok_or("read trace parent authorization missing")?;
         trace.reads.push(OrchestratedRead {
+            grep_windows: None,
+            grep_batch_index: None,
             ordinal,
             step_index,
             step_id: step_id.into(),
@@ -395,6 +565,74 @@ impl ToolHostLease {
             effect,
         });
         Ok(())
+    }
+
+    pub(crate) fn with_read_location(&self, step: usize, id: &str, position: usize) -> Self {
+        let mut lease = self.clone(); lease.read_location = Some((step, id.into(), position)); lease
+    }
+    pub(crate) fn with_grep_batch_index(&self, index: usize) -> Self {
+        let mut lease = self.clone(); lease.grep_batch_index = Some(index); lease
+    }
+    pub(crate) fn grep_bounded_root(&self) -> Option<&std::fs::File> { self.bounded_root.as_deref() }
+    pub(crate) fn captures_reads(&self) -> bool { self.orchestrated_read_trace.is_some() }
+    pub(crate) fn record_grep_windows(&self, input: &Value, output: &str,
+        windows: Option<Vec<crate::file_ops::GrepReadWindow>>) -> Result<(), String> {
+        let Some(trace) = &self.orchestrated_read_trace else { return Ok(()); };
+        let mut trace = trace.lock().map_err(|_| "read trace poisoned")?;
+        let effect = self.describe_effect("grep_search", input);
+        let original_batch_member = self.grep_batch_index.zip(trace.original_grep_batch.as_ref())
+            .is_some_and(|(index, (parent_input, parent))| {
+                parent.descriptor_hash == trace.parent_descriptor_hash
+                    && parent.scopes.iter().all(|scope| trace.authorized_scopes.contains(scope))
+                    && original_grep_batch_member_scopes(parent_input, parent, index, input, &effect)
+            });
+        if effect.scopes.is_empty() || (!original_batch_member
+            && !effect.scopes.iter().all(|scope| trace.authorized_scopes.contains(scope))) {
+            trace.overflow = true;
+            trace.reads.clear();
+            return Ok(());
+        }
+        let Some(windows) = windows else {
+            trace.overflow = true; trace.reads.clear(); return Ok(());
+        };
+        if windows.is_empty() {
+            // A complete non-content result contributes no body candidate, not a no-read fact.
+            let known_non_content = trace.parent_authorization.as_ref().is_some_and(|auth|
+                !auth.request_id.is_empty() && auth.descriptor_hash == trace.parent_descriptor_hash)
+                && input.get("output_mode").and_then(Value::as_str)
+                .filter(|mode| matches!(*mode, "count" | "files_with_matches"))
+                .is_some_and(|mode| {
+                    serde_json::from_str::<Value>(output).ok().is_some_and(|result| {
+                        result.get("mode").and_then(Value::as_str) == Some(mode)
+                            && result.get("content").is_some_and(Value::is_null)
+                            && result.get("scanComplete").and_then(Value::as_bool) == Some(true)
+                            && result.get("truncated").and_then(Value::as_bool) == Some(false)
+                            && result.get("omissions").and_then(Value::as_array).is_some_and(Vec::is_empty)
+                            && result.get("continuationCursor").is_none_or(Value::is_null)
+                            && result.get("next_request").is_none_or(Value::is_null)
+                            && input.get("cursor").is_none_or(Value::is_null)
+                            && input.get("offset").is_none_or(|v| v.is_null() || v.as_u64() == Some(0))
+                    })
+                });
+            if !known_non_content { trace.overflow = true; trace.reads.clear(); }
+            return Ok(());
+        }
+        let bytes = output.len().saturating_add(serde_json::to_vec(input).map_err(|e| e.to_string())?.len())
+            .saturating_add(windows.iter().map(|w| w.body.len() + w.presentation.len() + w.path.len() + w.relative_path.len() + w.directory_ancestry.as_ref().map_or(0, |(path, root, directory)| path.len() + root.len() + directory.len())).sum::<usize>());
+        if trace.reads.len() >= 400 || trace.bytes.saturating_add(bytes) > 4 * 1024 * 1024 {
+            trace.overflow = true; trace.reads.clear(); return Ok(());
+        }
+        if trace.overflow { return Ok(()); }
+        trace.bytes += bytes;
+        let (step_index, step_id, position) = self.read_location.clone().unwrap_or((0, String::new(), 0));
+        let child = OrchestratedRead {
+            ordinal: trace.reads.len() + 1, step_index, step_id, position,
+            parent_request_id: trace.parent_request_id.clone(), parent_descriptor_hash: trace.parent_descriptor_hash.clone(),
+            parent_authorization: trace.parent_authorization.clone().ok_or("grep parent missing")?,
+            input: input.clone(), output: output.into(), effect,
+            grep_windows: Some(windows), grep_batch_index: self.grep_batch_index,
+        };
+        trace.reads.push(child); Ok(())
     }
 
     pub(crate) fn read_cache_authority_digest(&self) -> Option<&str> {
@@ -570,10 +808,18 @@ impl ToolHostLease {
         }
         if canonical_id == "tool_orchestrate" {
             let preflight = crate::executor::orchestrate::effect_preflight(input);
-            let effects = preflight
-                .as_ref()
-                .map_err(Clone::clone)
-                .and_then(|calls| self.orchestration_child_effects(calls));
+            // A child whose effect cannot be proven must not erase the effects
+            // the program already declared. Dropping every child on the first
+            // failure described a program that also writes as if it declared
+            // nothing, which is narrower than what the program may do. The
+            // resolved children are kept, the unresolved ones are reported as
+            // unresolved, and the composite stays conservative because an
+            // unresolved composite is unknown/Secret with the widest
+            // permission - so the decision still fails closed.
+            let (children, child_indices, unresolved) = match preflight.as_ref() {
+                Ok(calls) => self.orchestration_child_effects_partial(calls),
+                Err(_) => (Vec::new(), Vec::new(), true),
+            };
             let floor = preflight
                 .as_ref()
                 .map(|calls| {
@@ -588,15 +834,14 @@ impl ToolHostLease {
                     })
                 })
                 .unwrap_or(ToolPermissionMode::DangerFullAccess);
-            let unresolved = effects.is_err();
-            let children = effects.unwrap_or_default();
             let mut fingerprints = preflight
                 .as_ref()
                 .ok()
                 .into_iter()
                 .flatten()
-                .zip(&children)
-                .map(|(call, child)| {
+                .zip(child_indices.iter())
+                .map(|(call, index)| {
+                    let child = &children[*index];
                     format!(
                         "{}:{}:{}:{}",
                         call.step_id,
@@ -627,42 +872,126 @@ impl ToolHostLease {
         calls
             .iter()
             .map(|call| {
-                if !crate::executor::is_allowed_orchestration_tool(&call.tool)
-                    || !self.snapshot.catalog.contains(&call.tool)
-                {
-                    return Err(format!(
-                        "tool_orchestrate cannot dispatch pinned child `{}`",
-                        call.tool
-                    ));
-                }
-                let resolver = self.snapshot.catalog.effect_resolver(&call.tool);
-                let permission = self
-                    .snapshot
-                    .catalog
-                    .required_permission(&call.tool)
-                    .ok_or_else(|| format!("missing pinned permission for `{}`", call.tool))?;
-                let effect = if call.references.is_empty() {
-                    self.describe_effect_resolution(&call.tool, &call.input)
-                } else {
-                    crate::tool_orchestrator::resolve_orchestration_child_effect_resolution(
-                        &resolver,
-                        &call.tool,
-                        &call.input,
-                        permission,
-                        &call.references,
-                    )?
-                };
-                if effect.descriptor.effect_kind == harness_contract::tool::ToolEffectKind::Unknown
-                {
-                    return Err(format!(
-                        "tool_orchestrate cannot prove complete effects for `{}` at {} ({})",
-                        call.tool, call.step_id, call.operation
-                    ));
-                }
-                Ok(effect)
+                self.orchestration_child_effect(call)
+                    .map_err(|failure| failure.reason)
             })
             .collect()
     }
+
+    /// Resolve the child effects that can be proven and report whether any
+    /// child could not be resolved, together with the index of each resolved
+    /// child so a fingerprint still pairs a step with its own effect.
+    pub(crate) fn orchestration_child_effects_partial(
+        &self,
+        calls: &[crate::executor::orchestrate::PreflightCall],
+    ) -> (Vec<ToolEffectResolution>, Vec<usize>, bool) {
+        let mut children = Vec::new();
+        let mut indices = Vec::new();
+        let mut unresolved = false;
+        for (index, call) in calls.iter().enumerate() {
+            match self.orchestration_child_effect(call) {
+                Ok(effect) => {
+                    children.push(effect);
+                    indices.push(index);
+                }
+                Err(failure) if failure.unprovable => {
+                    // The effect of this child cannot be proven, so the
+                    // program may touch anything: no exact scope may be
+                    // claimed and every child is dropped.
+                    return (Vec::new(), Vec::new(), true);
+                }
+                Err(_) => unresolved = true,
+            }
+        }
+        (children, indices, unresolved)
+    }
+
+    /// Whether this child's own declared file scope is invalid rather than
+    /// merely unproven.
+    ///
+    /// A bounded compute declares the exact files it may read through
+    /// `input_files`. A compute step that does not declare them violates that
+    /// contract, and the call is refused at execution; the effects the sibling
+    /// steps declared are still true, so they stay in the description. Any
+    /// other effect that cannot be proven leaves the whole program
+    /// unprovable, and then no exact scope may be claimed at all.
+    fn child_declares_an_invalid_file_scope(
+        &self,
+        call: &crate::executor::orchestrate::PreflightCall,
+    ) -> bool {
+        if call.tool == "execute_code" {
+            return crate::sandbox_exec::bounded_compute_input_files(&call.input).is_err();
+        }
+        crate::executor::orchestrate::original_static_file_scopes(&call.tool, &call.input).is_err()
+    }
+
+    fn orchestration_child_effect(
+        &self,
+        call: &crate::executor::orchestrate::PreflightCall,
+    ) -> Result<ToolEffectResolution, ChildEffectFailure> {
+        {
+            if !crate::executor::is_allowed_orchestration_tool(&call.tool)
+                || !self.snapshot.catalog.contains(&call.tool)
+            {
+                return Err(ChildEffectFailure::unprovable(format!(
+                    "tool_orchestrate cannot dispatch pinned child `{}`",
+                    call.tool
+                )));
+            }
+            let resolver = self.snapshot.catalog.effect_resolver(&call.tool);
+            let permission = self
+                .snapshot
+                .catalog
+                .required_permission(&call.tool)
+                .ok_or_else(|| {
+                    ChildEffectFailure::unprovable(format!(
+                        "missing pinned permission for `{}`",
+                        call.tool
+                    ))
+                })?;
+            let effect = if call.references.is_empty() {
+                self.describe_effect_resolution(&call.tool, &call.input)
+            } else {
+                crate::tool_orchestrator::resolve_orchestration_child_effect_resolution(
+                    &resolver,
+                    &call.tool,
+                    &call.input,
+                    permission,
+                    &call.references,
+                )
+                .map_err(|reason| {
+                    if self.child_declares_an_invalid_file_scope(call) {
+                        ChildEffectFailure::invalid_input(reason)
+                    } else {
+                        ChildEffectFailure::unprovable(reason)
+                    }
+                })?
+            };
+            if effect.descriptor.effect_kind == harness_contract::tool::ToolEffectKind::Unknown
+            {
+                // Two different failures must not be described the same way.
+                // A child whose OWN input violates its contract (a compute
+                // step without a declared file set, for example) is an invalid
+                // call: the program is refused at execution, and the effects
+                // the sibling steps declared are still true, so they stay in
+                // the description. A child whose effect simply cannot be
+                // proven (a dynamic input) leaves the whole program
+                // unprovable, and then no exact scope may be claimed at all.
+                let invalid_input = self.child_declares_an_invalid_file_scope(call);
+                let reason = format!(
+                    "tool_orchestrate cannot prove complete effects for `{}` at {} ({})",
+                    call.tool, call.step_id, call.operation
+                );
+                return Err(if invalid_input {
+                    ChildEffectFailure::invalid_input(reason)
+                } else {
+                    ChildEffectFailure::unprovable(reason)
+                });
+            }
+            Ok(effect)
+        }
+    }
+
 
     /// Validate model-supplied input against the exact Tool definition pinned
     /// by this request. This boundary runs before policy negotiation so an
@@ -1110,6 +1439,33 @@ pub enum ToolHostError {
     McpUnavailable,
     #[error("tool execution failed: {0}")]
     Execution(String),
+    /// A joined local network call failed after the host took it.
+    ///
+    /// The fact carries the per-operation facts the host observed. It is
+    /// evidence, never authority: the call still fails, and the facts never
+    /// turn a failure into a success. The wording is the original failure
+    /// reason, so the failure reads exactly as it did before.
+    #[error("{reason}")]
+    LocalNetworkFailed {
+        reason: String,
+        fact: harness_contract::context::LocalNetworkFact,
+    },
+}
+
+impl ToolHostError {
+    /// The local network fact a failed joined call produced, when the failure
+    /// carries one.
+    ///
+    /// A caller that reports observations reads the fact here and puts it in
+    /// the same observed-evidence slot a successful call uses. A failure with
+    /// no fact stays a failure with no observation.
+    #[must_use]
+    pub fn local_network_fact(&self) -> Option<harness_contract::context::LocalNetworkFact> {
+        match self {
+            Self::LocalNetworkFailed { fact, .. } => Some(fact.clone()),
+            _ => None,
+        }
+    }
 }
 
 fn validate_schema_value(
@@ -1641,6 +1997,215 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn grep_batch_capture_uses_original_parent_and_exact_member() {
+        let root = std::env::temp_dir().join(format!("cowd-grep-batch-parent-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("a.txt"), "hit original\n").unwrap();
+        let lease = test_host("batch-parent", &root).pin_snapshot();
+        let child_input = json!({"pattern":"hit","glob":"a.txt"});
+        let input = json!({"path":root.to_str().unwrap(),"searches":[child_input]});
+        let parent = lease.describe_effect("grep_search", &input);
+        let auth = authorization(&parent, None);
+        let (_, captured) = lease.execute_with_read_trace(&auth, "grep_search", &input).unwrap();
+        let reads = captured.reads.unwrap();
+        assert_eq!(reads.len(), 1);
+        let child = &reads[0];
+        assert_eq!(child.grep_batch_index(), Some(0));
+        assert!(original_grep_batch_member_scopes(&input, &parent, 0, child.input(), child.effect()));
+        assert!(!original_grep_batch_member_scopes(&input, &parent, 1, child.input(), child.effect()));
+        assert!(!original_grep_batch_member_scopes(&json!({"searches":[{"pattern":"foreign"}]}), &parent, 0, child.input(), child.effect()));
+        let mut foreign = child.effect().clone();
+        let file = foreign.scopes.iter_mut().find(|scope| scope.resource == harness_contract::policy::PermissionResource::File).unwrap();
+        file.target = Some("../outside".into());
+        assert!(!original_grep_batch_member_scopes(&input, &parent, 0, child.input(), &foreign));
+        let explicit = json!({"searches":[{"path":"a.txt","pattern":"hit"}]});
+        let explicit_parent = lease.describe_effect("grep_search", &explicit);
+        let explicit_auth = authorization(&explicit_parent, None);
+        let (_, captured) = lease.execute_with_read_trace(&explicit_auth, "grep_search", &explicit).unwrap();
+        let explicit_reads = captured.reads.unwrap();
+        assert_eq!(explicit_reads.len(), 1);
+        let explicit_child = &explicit_reads[0];
+        assert!(original_grep_batch_member_scopes(&explicit, &explicit_parent, 0, explicit_child.input(), explicit_child.effect()));
+        let mut forged_tool = explicit_child.effect().clone();
+        let tool_scope = forged_tool.scopes.iter_mut().find(|scope| scope.resource == harness_contract::policy::PermissionResource::Tool).unwrap();
+        tool_scope.target = Some("foreign".into());
+        assert!(!original_grep_batch_member_scopes(&explicit, &explicit_parent, 0, explicit_child.input(), &forged_tool));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn grep_mixed_batch_keeps_content_only_for_complete_non_content_siblings() {
+        let root = std::env::temp_dir().join(format!("cowd-grep-mixed-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("a.txt"), "hit one\nmiss\nhit two\n").unwrap();
+        let lease = test_host("batch-mixed", &root).pin_snapshot();
+        let content = json!({"pattern":"hit","glob":"a.txt"});
+        let count = json!({"pattern":"hit","glob":"a.txt","output_mode":"count"});
+        let files = json!({"pattern":"hit","glob":"a.txt","output_mode":"files_with_matches"});
+        let input = json!({"path":root.to_str().unwrap(),"searches":[content, count, files]});
+        let parent = lease.describe_effect("grep_search", &input);
+        let auth = authorization(&parent, None);
+        let (_, captured) = lease.execute_with_read_trace(&auth, "grep_search", &input).unwrap();
+        let reads = captured.reads.unwrap();
+        assert_eq!(reads.len(), 1);
+        assert_eq!(reads[0].grep_batch_index(), Some(0));
+        assert_eq!(reads[0].grep_windows().unwrap().len(), 2);
+        let truncated = json!({"path":root.to_str().unwrap(),"searches":[
+            {"pattern":"hit","glob":"a.txt"},
+            {"pattern":"hit","glob":"a.txt","output_mode":"count","head_limit":1}
+        ]});
+        let auth = authorization(&lease.describe_effect("grep_search", &truncated), None);
+        let (_, captured) = lease.execute_with_read_trace(&auth, "grep_search", &truncated).unwrap();
+        assert!(captured.reads.is_none());
+        // Feed the original member through the same owner with an inconsistent result.
+        let trace = Arc::new(std::sync::Mutex::new(OrchestratedReadTrace {
+            authorized_scopes: auth.authorization_lease.scopes.clone(),
+            parent_descriptor_hash: auth.descriptor_hash.clone(),
+            parent_authorization: Some(auth.clone()),
+            original_grep_batch: Some((truncated.clone(), lease.describe_effect("grep_search", &truncated))),
+            ..OrchestratedReadTrace::default()
+        }));
+        let mut child = lease.with_grep_batch_index(1);
+        child.orchestrated_read_trace = Some(trace.clone());
+        let fake = json!({"mode":"files_with_matches","content":null,"scanComplete":true,
+            "truncated":false,"omissions":[]});
+        child.record_grep_windows(&truncated["searches"][1], &fake.to_string(), Some(vec![])).unwrap();
+        assert!(trace.lock().unwrap().overflow);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn grep_samecall_private_windows_are_original_and_contiguous() {
+        let root = std::env::temp_dir().join(format!("cowd-grep-windows-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        let source = "hit one\r\nmissing\r\nhit two\r\n";
+        std::fs::write(root.as_path().join("a.txt"), source).unwrap();
+        let lease = test_host("grep-windows", root.as_path()).pin_snapshot();
+        let input = json!({"pattern":"hit","path":"a.txt"});
+        let auth = authorization(&lease.describe_effect("grep_search", &input), None);
+        let (output, children) = lease.execute_with_read_trace(&auth, "grep_search", &input).unwrap();
+        let reads = children.reads.unwrap();
+        assert_eq!(reads.len(), 1);
+        let windows = reads[0].grep_windows().unwrap();
+        assert_eq!(windows.len(), 2);
+        assert_eq!((windows[0].start_line(), windows[1].start_line()), (1,3));
+        assert_eq!(windows[0].body(), "hit one");
+        assert_eq!(windows[0].source_bytes(), source.len() as u64);
+        use sha2::{Digest, Sha256};
+        assert_eq!(windows[0].source_sha256(), format!("sha256:{:x}",Sha256::digest(source.as_bytes())));
+        std::fs::write(root.as_path().join("a.txt"), "new bytes").unwrap();
+        assert_eq!(windows[1].body(), "hit two");
+        assert!(!output.contains("physical_identity"));
+        assert!(!output.contains("source_sha256"));
+        for extra in [json!({"output_mode":"count"}), json!({"output_mode":"files_with_matches"}), json!({"head_limit":1})] {
+            std::fs::write(root.as_path().join("a.txt"), source).unwrap();
+            let mut input = input.clone(); input.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+            let auth = authorization(&lease.describe_effect("grep_search", &input), None);
+            let (output, children) = lease.execute_with_read_trace(&auth, "grep_search", &input).unwrap();
+            let result: serde_json::Value = serde_json::from_str(&output).unwrap();
+            if let Some(mode) = extra.get("output_mode").and_then(serde_json::Value::as_str) {
+                // The result is known to contain counts or filenames, not file-body windows.
+                assert_eq!(result["mode"], mode);
+                assert_eq!(result["scanComplete"], true);
+                assert_eq!(result["truncated"], false);
+                assert!(result["content"].is_null());
+                assert_eq!(result["numFiles"], 1);
+                if mode == "count" { assert_eq!(result["numMatches"], 2); }
+                // The complete output has no presented file-body windows;
+                // this says nothing about whether the tool read files internally.
+                assert!(children.reads.as_ref().is_some_and(Vec::is_empty));
+            } else {
+                // A limited content page cannot certify that its windows are complete.
+                assert_eq!(result["mode"], "content");
+                assert_eq!(result["scanComplete"], false);
+                assert_eq!(result["truncated"], true);
+                assert!(!result["next_request"].is_null());
+                assert!(children.reads.is_none());
+            }
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn grep_samecall_private_trace_failure_keeps_business_result() {
+        let root = std::env::temp_dir().join(format!("cowd-grep-trace-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("a.txt"), "hit original\n").unwrap();
+        let lease = test_host("grep-trace", &root).pin_snapshot();
+        let input = json!({"pattern":"hit","path":"a.txt"});
+        let auth = authorization(&lease.describe_effect("grep_search", &input), None);
+        let original = lease.execute(&auth, "grep_search", &input).unwrap();
+        for poison in [false, true] {
+            let trace = Arc::new(std::sync::Mutex::new(OrchestratedReadTrace {
+                authorized_scopes: auth.authorization_lease.scopes.clone(),
+                ..OrchestratedReadTrace::default()
+            }));
+            if poison {
+                let worker = trace.clone();
+                assert!(std::thread::spawn(move || {
+                    let _guard = worker.lock().unwrap();
+                    panic!("private trace unavailable");
+                }).join().is_err());
+            }
+            let mut unavailable = lease.clone();
+            unavailable.orchestrated_read_trace = Some(trace.clone());
+            assert_eq!(unavailable.execute(&auth, "grep_search", &input).unwrap(), original);
+            if !poison { assert!(trace.lock().unwrap().reads.is_empty()); }
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn grep_samecall_non_utf8_keeps_original_output_and_only_known_sibling_evidence() {
+        use std::os::unix::ffi::OsStringExt;
+        let root = std::env::temp_dir().join(format!("cowd-grep-path-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        let bad_name = std::ffi::OsString::from_vec(b"bad-\xff.txt".to_vec());
+        std::fs::write(root.join(bad_name), "hit invalid name\n").unwrap();
+        std::fs::write(root.join("valid.txt"), "hit valid name\n").unwrap();
+        let lease = test_host("grep-path", &root).pin_snapshot();
+        let input = json!({"pattern":"hit","path":"."});
+        let auth = authorization(&lease.describe_effect("grep_search", &input), None);
+        let original = lease.execute(&auth, "grep_search", &input).unwrap();
+        let (output, children) = lease.execute_with_read_trace(&auth, "grep_search", &input).unwrap();
+        assert_eq!(output, original);
+        assert!(output.contains("hit invalid name"));
+        let reads = children.reads.unwrap();
+        assert_eq!(reads.len(), 1);
+        let windows = reads[0].grep_windows().unwrap();
+        assert_eq!(windows.len(), 1);
+        assert_eq!(windows[0].relative_path(), "valid.txt");
+        assert_eq!(windows[0].directory_ancestry().unwrap().0, ".");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn grep_samecall_replaced_lease_root_keeps_output_without_ancestry() {
+        let root = std::env::temp_dir().join(format!("cowd-grep-root-{}", uuid::Uuid::new_v4()));
+        let old = root.with_extension("old");
+        std::fs::create_dir(&root).unwrap();
+        let lease = test_host("grep-root", &root).pin_snapshot();
+        std::fs::rename(&root, &old).unwrap();
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("a.txt"), "hit replacement\n").unwrap();
+        let input = json!({"pattern":"hit","path":"."});
+        let auth = authorization(&lease.describe_effect("grep_search", &input), None);
+        let original = lease.execute(&auth, "grep_search", &input).unwrap();
+        let (output, children) = lease.execute_with_read_trace(&auth, "grep_search", &input).unwrap();
+        assert_eq!(output, original);
+        assert!(output.contains("hit replacement"));
+        for read in children.reads.unwrap() {
+            for window in read.grep_windows().unwrap() { assert!(window.directory_ancestry().is_none()); }
+        }
+        std::fs::remove_dir_all(root).unwrap();
+        std::fs::remove_dir_all(old).unwrap();
+    }
+
     #[test]
     fn orchestrated_trace_records_actual_successes_under_parent_grant() {
         let root = std::env::temp_dir().join(format!("cowd-child-read-{}", uuid::Uuid::new_v4()));
@@ -1658,7 +2223,7 @@ mod tests {
         let (output, reads) = lease
             .execute_with_orchestrated_read_trace(&auth, &input)
             .unwrap();
-        let reads = reads.unwrap();
+        let reads = reads.reads.unwrap();
         assert_eq!(reads.len(), 2);
         assert_eq!(
             reads
@@ -1693,7 +2258,132 @@ mod tests {
         let (_, next) = lease
             .execute_with_orchestrated_read_trace(&auth, &input)
             .unwrap();
-        assert_eq!(next.unwrap().len(), 2, "traces are invocation-local");
+        assert_eq!(next.reads.unwrap().len(), 2, "traces are invocation-local");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    // R4-034-fixture-fix: the compute step needs the real hardened sandbox
+    // launcher binary. The workspace-relative default only exists when that
+    // binary was built into the workspace target, so resolve the built binary
+    // from the test target directory when the configured path is absent.
+    // This only supplies the launcher binary; no oracle or expectation moves.
+    fn resolve_sandbox_launcher_binary() {
+        let configured = std::env::var("COWD_SANDBOX_LAUNCHER_BINARY").unwrap_or_default();
+        if !configured.trim().is_empty() && std::path::Path::new(&configured).is_file() {
+            return;
+        }
+        let mut candidates: Vec<std::path::PathBuf> = Vec::new();
+        if let Ok(executable) = std::env::current_exe() {
+            if let Some(debug_dir) = executable.parent().and_then(std::path::Path::parent) {
+                candidates.push(debug_dir.join("cowd"));
+            }
+        }
+        if let Ok(manifest_dir) = std::env::var("CARGO_MANIFEST_DIR") {
+            let manifest = std::path::PathBuf::from(manifest_dir);
+            if let Some(workspace) = manifest.parent().and_then(std::path::Path::parent) {
+                candidates.push(workspace.join("target").join("debug").join("cowd"));
+            }
+        }
+        for candidate in candidates {
+            if candidate.is_file() {
+                std::env::set_var("COWD_SANDBOX_LAUNCHER_BINARY", candidate);
+                return;
+            }
+        }
+    }
+
+    #[test]
+    fn orchestrated_search_trace_only_records_actual_success_under_parent_grant() {
+        resolve_sandbox_launcher_binary();
+        let root = std::env::temp_dir().join(format!("cowd-child-search-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("a.rs"), "pub mod alpha;\n").unwrap();
+        std::fs::create_dir_all(root.join("docs")).unwrap();
+        std::fs::create_dir_all(root.join("crates/example")).unwrap();
+        std::fs::write(root.join("docs/a.txt"), "alpha\n").unwrap();
+        std::fs::write(root.join("crates/example/a.txt"), "alpha\n").unwrap();
+        let lease = test_host("child-search", &root).pin_snapshot();
+        let input = json!({"steps":[{"id":"find","op":"batch","on_error":"collect","calls":[
+            {"tool":"grep_search","input":{"path":".","pattern":"alpha"},"as":"ok"},
+            {"tool":"grep_search","input":{"path":".","pattern":"not-present"},"as":"zero"}
+        ]}]});
+        let auth = authorization(&lease.describe_effect("tool_orchestrate", &input), None);
+        let (_, children) = lease.execute_with_orchestrated_read_trace(&auth, &input).unwrap();
+        let searches = children.searches.unwrap();
+        assert_eq!(searches.len(), 2);
+        assert_eq!(searches.iter().map(|child| child.position()).collect::<std::collections::BTreeSet<_>>(), [0, 1].into_iter().collect());
+        let child = searches.iter().find(|child| child.position() == 0).unwrap();
+        assert_eq!((child.step_index(), child.step_id(), child.position()), (0, "find", 0));
+        assert_eq!(child.tool_name(), "grep_search");
+        assert_eq!(child.base_path(), ".");
+        assert_eq!(child.parent_authorization(), &auth);
+        assert_eq!(child.effect().tool_id, "grep_search");
+        assert_eq!(child.input_sha256().len(), 64);
+        assert_eq!(child.output_sha256().len(), 64);
+        // R4-034-fixture-fix: correct the read-trace oracle for a zero-hit content member.
+        // The zero-hit content-mode member contributes no certifiable body window, so the
+        // private read trace is poisoned and only the search trace survives. Provenance:
+        // commit 4a02fa5e and the sibling oracle at crates/tools/src/host.rs:2119-2126.
+        assert!(children.reads.is_none(), "content-mode zero hit cannot certify read candidates");
+        let zoned = json!({"steps":[{"id":"zones","op":"batch","calls":[
+            {"tool":"grep_search","input":{"path":"docs","pattern":"alpha"}},
+            {"tool":"grep_search","input":{"path":"crates/example","pattern":"alpha"}}
+        ]}]});
+        let zoned_auth = authorization(&lease.describe_effect("tool_orchestrate", &zoned), None);
+        let (_, zoned_children) = lease.execute_with_orchestrated_read_trace(&zoned_auth, &zoned).unwrap();
+        let paths = zoned_children.searches.unwrap().into_iter().map(|search| search.base_path().to_owned())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(paths, ["docs".to_string(), "crates/example".to_string()].into_iter().collect());
+        // An invalid producer path must poison the existing per-call trace even if a later path is valid.
+        let mut traced = lease.clone();
+        let trace = Arc::new(std::sync::Mutex::new(OrchestratedReadTrace {
+            authorized_scopes: zoned_auth.authorization_lease.scopes.clone(),
+            parent_request_id: zoned_auth.request_id.clone(),
+            parent_descriptor_hash: zoned_auth.descriptor_hash.clone(),
+            parent_authorization: Some(zoned_auth.clone()),
+            ..OrchestratedReadTrace::default()
+        }));
+        traced.orchestrated_read_trace = Some(trace.clone());
+        let grep_input = json!({"path":"docs","pattern":"alpha"});
+        let output = |path: &str| json!({"basePath":path,"scanComplete":true,"truncated":false,
+            "numFiles":0,"omissions":[]}).to_string();
+        traced.record_orchestrated_search(0, "zones", 0, "grep_search", &grep_input,
+            &output("/outside-workspace")).unwrap();
+        let valid_path = root.join("docs");
+        traced.record_orchestrated_search(0, "zones", 1, "grep_search", &grep_input,
+            &output(valid_path.to_str().unwrap())).unwrap();
+        let guard = trace.lock().unwrap();
+        assert!(guard.search_overflow && guard.searches.is_empty());
+        drop(guard);
+        let traversal = Arc::new(std::sync::Mutex::new(OrchestratedReadTrace::default()));
+        traced.orchestrated_read_trace = Some(traversal.clone());
+        traced.record_orchestrated_search(0, "zones", 0, "grep_search", &grep_input,
+            &output(root.join("../outside-workspace").to_str().unwrap())).unwrap();
+        assert!(traversal.lock().unwrap().search_overflow);
+        let lossy = Arc::new(std::sync::Mutex::new(OrchestratedReadTrace::default()));
+        traced.orchestrated_read_trace = Some(lossy.clone());
+        traced.record_orchestrated_search(0, "zones", 0, "grep_search", &grep_input,
+            &output(root.join("bad\u{fffd}path").to_str().unwrap())).unwrap();
+        assert!(lossy.lock().unwrap().search_overflow);
+        let mut mixed = input.clone();
+        mixed["steps"][0]["calls"].as_array_mut().unwrap().push(json!({"tool":"read_file","input":{"path":"a.rs"},"as":"read"}));
+        let mixed_auth = authorization(&lease.describe_effect("tool_orchestrate", &mixed), None);
+        let (_, mixed_children) = lease.execute_with_orchestrated_read_trace(&mixed_auth, &mixed).unwrap();
+        assert!(mixed_children.searches.is_none(), "mixed child kinds cannot claim complete search-only coverage");
+        // R4-034-fixture-fix: a zero-hit content member poisons the mixed read trace too.
+        assert!(mixed_children.reads.is_none(), "zero-hit content member poisons the mixed read trace");
+        let mut partial = input.clone();
+        partial["steps"][0]["calls"].as_array_mut().unwrap().push(json!({"tool":"grep_search","input":{"path":"missing","pattern":"alpha"},"as":"missing"}));
+        let auth = authorization(&lease.describe_effect("tool_orchestrate", &partial), None);
+        let (_, unknown) = lease.execute_with_orchestrated_read_trace(&auth, &partial).unwrap();
+        assert!(unknown.searches.is_none(), "a collected failure cannot prove complete search coverage");
+        let compute = json!({"steps":[
+            {"id":"find","op":"call","tool":"grep_search","input":{"path":".","pattern":"alpha"}},
+            {"id":"compute","op":"compute","language":"python","code":"print(1)","input":null}
+        ]});
+        let compute_auth = authorization(&lease.describe_effect("tool_orchestrate", &compute), None);
+        let (_, computed) = lease.execute_with_orchestrated_read_trace(&compute_auth, &compute).unwrap();
+        assert!(computed.searches.is_none(), "an executed compute is outside search-only coverage");
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -1711,7 +2401,7 @@ mod tests {
         let (_, reads) = lease
             .execute_with_orchestrated_read_trace(&auth, &input)
             .unwrap();
-        let reads = reads.unwrap();
+        let reads = reads.reads.unwrap();
         assert_eq!(reads.len(), 2);
         assert_eq!(
             reads
@@ -1721,6 +2411,23 @@ mod tests {
             [(0, 0), (1, 0)]
         );
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn orchestrated_unprovable_read_poisons_trace() {
+        let root = std::env::temp_dir();
+        let mut lease = test_host("trace-unprovable", &root).pin_snapshot();
+        let trace = Arc::new(std::sync::Mutex::new(OrchestratedReadTrace::default()));
+        lease.orchestrated_read_trace = Some(Arc::clone(&trace));
+        lease.record_orchestrated_read(0, "read", 0, &json!({"path":"a.txt"}), "body").unwrap();
+        assert!(trace.lock().unwrap().overflow);
+        assert!(trace.lock().unwrap().reads.is_empty());
+
+        let trace = Arc::new(std::sync::Mutex::new(OrchestratedReadTrace::default()));
+        lease.orchestrated_read_trace = Some(Arc::clone(&trace));
+        lease.record_grep_windows(&json!({"path":"."}), "{}", None).unwrap();
+        assert!(trace.lock().unwrap().overflow);
+        assert!(trace.lock().unwrap().reads.is_empty());
     }
 
     #[test]
@@ -2567,7 +3274,12 @@ mod tests {
             let program =
                 json!({"steps":[{"id":"discover","op":"call","tool":tool,"input":dynamic}]});
             let dynamic_effect = lease.describe_effect("tool_orchestrate", &program);
-            for effect in [&static_effect, &dynamic_effect] {
+            // R4-034-fixture-fix: split static/dynamic target oracles; a literal call defaults to ".".
+            // A literal call normalizes its missing path to the workspace root; a `$prior.*`
+            // reference keeps the whole-workspace envelope with no literal target. Provenance:
+            // crates/tools/src/execution/executor.rs:1233-1237 and this test's own demand
+            // assertion below, which expects the literal scope key ".".
+            for (effect, expected_target) in [(&static_effect, Some(".")), (&dynamic_effect, None)] {
                 let files = effect
                     .scopes
                     .iter()
@@ -2575,7 +3287,8 @@ mod tests {
                     .collect::<Vec<_>>();
                 assert_eq!(files.len(), 1);
                 assert_eq!(files[0].operation, PermissionOperation::Read);
-                assert_eq!(files[0].target, None);
+                // R4-034-fixture-fix: compare each effect with its own expected target.
+                assert_eq!(files[0].target.as_deref(), expected_target);
                 assert!(!effect.uses_network && !effect.spawns_process);
                 assert!(effect
                     .scopes
@@ -2779,12 +3492,12 @@ mod tests {
             .scopes
             .iter()
             .any(|scope| scope.target.as_deref() == Some("https://skipped.invalid")));
-        assert!(effect
+        assert!(!effect
             .scopes
             .iter()
             .any(|scope| scope.resource == PermissionResource::Shell
                 && scope.operation == PermissionOperation::Execute));
-        assert!(effect
+        assert!(!effect
             .scopes
             .iter()
             .any(|scope| scope.resource == PermissionResource::File

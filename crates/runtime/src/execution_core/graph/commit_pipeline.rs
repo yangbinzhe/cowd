@@ -125,7 +125,12 @@ pub(super) fn validate_executor_domain_events(
 ) -> Result<(), ExecutionCommitError> {
     if domain_events
         .iter()
-        .any(|event| event.event.kind.starts_with("execution.effect."))
+        .any(|event| event.event.kind.starts_with("execution.effect.")
+            || event.event.kind == "execution_node.agent_batch_member"
+            || event.event.kind == "execution_node.agent_batch_prefix"
+            || event.event.kind == "execution_node.agent_batch_manifest"
+            || event.event.kind == "execution_node.agent_batch_pending"
+            || event.event.kind == "execution_node.transitioned")
     {
         return Err(ExecutionCommitError::InvalidCommand(
             "executor domain input cannot author reserved execution effect facts".into(),
@@ -182,6 +187,16 @@ mod reserved_node_effect_452_tests {
     }
 
     #[test]
+    fn executor_domain_cannot_forge_no_dispatch_on_a_node_transition() {
+        let mut forged = domain("execution_node.transitioned", "execution_commit_service", RuntimeEventScope::ExecutionNode);
+        assert!(matches!(validate_executor_domain_events(&[forged.clone()]),
+            Err(ExecutionCommitError::InvalidCommand(_))));
+        forged.event.payload = json!({"no_dispatch":{"durable_result_sha256":"sha256:forged"}});
+        assert!(matches!(validate_executor_domain_events(&[forged]),
+            Err(ExecutionCommitError::InvalidCommand(_))));
+    }
+
+    #[test]
     fn r1_452_reserved_guard_preserves_ordinary_domains_and_scope_rejection() {
         let ordinary = domain("goal.test.ordinary", "test-owner", RuntimeEventScope::Goal);
         assert!(validate_executor_domain_events(&[ordinary.clone()]).is_ok());
@@ -213,7 +228,7 @@ mod reserved_node_effect_452_tests {
     }
 }
 
-pub(super) fn graph_identity_refs(graph: &ExecutionGraph) -> Vec<RuntimeEventRef> {
+pub(in crate::execution_core::graph) fn graph_identity_refs(graph: &ExecutionGraph) -> Vec<RuntimeEventRef> {
     let mut refs = vec![RuntimeEventRef {
         kind: "execution_graph".to_string(),
         id: graph.id.clone(),
@@ -393,6 +408,7 @@ pub(super) fn root_index_receipt_event(
                 "effect_kind":effect_kind,
                 "effect_scope":request.authorization.as_ref().map(|authorization| &authorization.scope),
                 "authorized_scopes":request.authorized_scopes,
+                "outcome_truncated":tool_effect_outcome_requires_truncation(outcome),
                 "outcome":bounded_tool_effect_outcome(outcome),
             }),
         },
@@ -437,6 +453,7 @@ pub(super) fn delegated_agent_receipt_event(
                 "effect_kind": effect_kind,
                 "effect_scope": request.authorization.as_ref().map(|authorization| &authorization.scope),
                 "authorized_scopes": request.authorized_scopes,
+                "outcome_truncated": tool_effect_outcome_requires_truncation(outcome),
                 "outcome": bounded_tool_effect_outcome(outcome),
             }),
         },
@@ -445,7 +462,7 @@ pub(super) fn delegated_agent_receipt_event(
     })
 }
 
-pub(super) fn bounded_tool_effect_outcome(
+pub(crate) fn bounded_tool_effect_outcome(
     outcome: &crate::RuntimeToolExecutionOutcome,
 ) -> crate::RuntimeToolExecutionOutcome {
     let mut bounded = outcome.clone();
@@ -468,7 +485,7 @@ pub(super) fn bounded_tool_effect_outcome(
     bounded
 }
 
-pub(super) fn tool_effect_outcome_requires_truncation(
+pub(crate) fn tool_effect_outcome_requires_truncation(
     outcome: &crate::RuntimeToolExecutionOutcome,
 ) -> bool {
     outcome
@@ -561,6 +578,23 @@ fn receipt_identity_digest<T: serde::Serialize>(
 pub(crate) fn receipt_replay_contract(
     request: &crate::RuntimeToolExecutionRequest,
 ) -> Result<serde_json::Value, ExecutionCommitError> {
+    if request.step_binding.is_none() {
+        let hook = request.tool_progress.original_governed_hook()
+            .map_err(ExecutionCommitError::InvalidCommand)?
+            .ok_or_else(|| ExecutionCommitError::InvalidCommand("original unbound call owner missing".into()))?;
+        let facts = hook.nonstep_receipt_facts(request).map_err(ExecutionCommitError::InvalidCommand)?;
+        return Ok(json!({
+            "original_unbound_call_digest": receipt_identity_digest(b"tool-effect-original-unbound-v1\0", &facts)?,
+            "session_id":hook.original_session_id(), "parent_execution":hook.original_parent(),
+            "parent_execution_attempt":hook.original_attempt(),
+            "plan_id":hook.original_plan_id(), "plan_revision":hook.original_plan_revision(),
+            "call_id":request.tool_use_id, "tool_name":request.tool_name,
+            "authorization_digest":receipt_identity_digest(b"tool-effect-authorization-v1\0", &hook.original_authorization())?,
+            "payload_digest":canonical_tool_payload(&request.input)?,
+            "policy_revision":request.policy_revision, "authorized_scopes":request.authorized_scopes,
+            "sandbox_posture":request.sandbox_posture, "observation_wave_sequence":request.observation_wave_sequence,
+        }));
+    }
     let (Some(binding), Some(invocation)) = (&request.step_binding, &request.compiled_invocation)
     else {
         return Ok(serde_json::Value::Null);
@@ -629,7 +663,7 @@ fn canonical_tool_value(input: &serde_json::Value) -> Result<String, ExecutionCo
         .map_err(|error| ExecutionCommitError::InvalidCommand(error.to_string()))
 }
 
-fn canonical_tool_payload(input: &str) -> Result<String, ExecutionCommitError> {
+pub(crate) fn canonical_tool_payload(input: &str) -> Result<String, ExecutionCommitError> {
     let value = harness_contract::step::parse_strict_json(input)
         .map_err(|error| ExecutionCommitError::InvalidCommand(error.to_string()))?;
     canonical_tool_value(&value)
@@ -917,7 +951,7 @@ pub(super) fn status_name(status: ExecutionNodeStatus) -> &'static str {
     }
 }
 
-pub(super) fn graph_status(graph: &ExecutionGraph) -> Option<&'static str> {
+pub(in crate::execution_core::graph) fn graph_status(graph: &ExecutionGraph) -> Option<&'static str> {
     let statuses = graph.node_statuses.values().copied().collect::<Vec<_>>();
     if statuses.is_empty() {
         return Some("planned");

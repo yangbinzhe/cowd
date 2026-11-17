@@ -29,6 +29,20 @@ type DeadlineWakeFuture = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
 type DeadlineWake = Arc<dyn Fn(String) -> DeadlineWakeFuture + Send + Sync + 'static>;
 const APPROVAL_REFRESH_COMMIT_PAGE: usize = 256;
 
+/// Current owner projection for one proof-bound approval, with its commit cut.
+/// The caller must retain the cut in the original checked transaction.
+pub(crate) struct ProofApprovalControl {
+    source: crate::ExpectedStreamRevision,
+    request: GlobalApprovalRequest,
+    grants: Vec<ApprovalGrant>,
+}
+
+impl ProofApprovalControl {
+    pub(crate) fn source(&self) -> &crate::ExpectedStreamRevision { &self.source }
+    pub(crate) fn request(&self) -> &GlobalApprovalRequest { &self.request }
+    pub(crate) fn grants(&self) -> &[ApprovalGrant] { &self.grants }
+}
+
 /// Policy actors that represent a session's explicit YOLO/trust-all approval
 /// authority. Only these exact identities may commit a Global approval
 /// without a human actor; every other policy/typed/timeout actor stays
@@ -72,6 +86,33 @@ pub struct ApprovalQueue {
     /// when nothing has changed.
     last_refresh_commit: Mutex<u64>,
     event_store: Arc<RuntimeEventStore>,
+}
+
+/// Original once-grant owner facts staged for a member transaction.
+/// The fields are private: preparing does not consume or change the grant.
+pub(crate) struct PreparedMemberApproval {
+    owner: std::sync::Weak<ApprovalQueue>,
+    member: crate::authorization_negotiator::RetainedMemberBinding,
+    owner_store: std::sync::Weak<RuntimeEventStore>,
+    grant: ApprovalGrant,
+    source: crate::ExpectedStreamRevision,
+    event: Option<RuntimeTransactionEventInput>,
+    deadline_ms: Option<u64>,
+}
+
+impl PreparedMemberApproval {
+    pub(crate) fn owner_guard(&self, store: &Arc<RuntimeEventStore>) -> Result<Arc<ApprovalQueue>, String> {
+        let owner = self.owner.upgrade().ok_or("original approval owner unavailable")?;
+        if !Arc::ptr_eq(&owner.event_store, store) || !std::ptr::eq(Arc::as_ptr(store), self.owner_store.as_ptr()) {
+            return Err("original approval store changed".into());
+        }
+        Ok(owner)
+    }
+    pub(crate) fn grant(&self) -> &ApprovalGrant { &self.grant }
+    pub(crate) fn member(&self) -> &crate::authorization_negotiator::RetainedMemberBinding { &self.member }
+    pub(crate) fn source(&self) -> &crate::ExpectedStreamRevision { &self.source }
+    pub(crate) fn event(&self) -> Option<&RuntimeTransactionEventInput> { self.event.as_ref() }
+    pub(crate) fn deadline_ms(&self) -> Option<u64> { self.deadline_ms }
 }
 
 impl std::fmt::Debug for ApprovalQueue {
@@ -1034,6 +1075,333 @@ impl ApprovalQueue {
         ))
     }
 
+    /// Reuse the Approval owner reducer at one current cut, limited to the
+    /// approval already authenticated as relevant to this proof. A consumed
+    /// once grant and an explicitly revoked grant remain distinct facts.
+    pub(crate) fn capture_proof_control(
+        &self, session_id: &str, approval_id: &str,
+    ) -> Result<ProofApprovalControl, String> {
+        Self::capture_proof_control_from_store(&self.event_store, session_id, approval_id)
+    }
+
+    pub(crate) fn capture_proof_control_from_store(
+        store: &RuntimeEventStore, session_id: &str, approval_id: &str,
+    ) -> Result<ProofApprovalControl, String> {
+        let stream = format!("approval:{approval_id}");
+        let revision = store.stream_revision(&stream).map_err(|error| error.to_string())?;
+        let control = Self::project_proof_at_cut(store, session_id, approval_id, revision)?;
+        if store.stream_revision(&stream).map_err(|error| error.to_string())? != revision {
+            return Err("approval control changed during owner projection".into());
+        }
+        Ok(control)
+    }
+
+    /// Check the original call's exact approval against the current owner
+    /// projection. The authenticated context is supplied by the call owner;
+    /// callers must fence the returned source in their original transaction.
+    pub(crate) fn capture_current_same_call_approval(
+        store: &RuntimeEventStore,
+        session_id: &str,
+        approval_id: &str,
+        grant_id: &str,
+        context: &ApprovalContext,
+        risk: harness_contract::core::TaskRisk,
+    ) -> Result<(crate::ExpectedStreamRevision, Option<u64>), String> {
+        if grant_id.is_empty() || context.session_id.as_deref() != Some(session_id) {
+            return Err("current approval is not bound to this Session and call".into());
+        }
+        let control = Self::capture_proof_control_from_store(store, session_id, approval_id)?;
+        let mut matches = control.grants.iter().filter(|grant| grant.grant_id == grant_id);
+        let grant = matches.next().ok_or("same-call approval grant missing")?;
+        if matches.next().is_some() || !grant_matches(grant, context, risk) {
+            return Err("same-call approval grant is unavailable or does not match current control".into());
+        }
+        Ok((control.source, grant.expires_at_ms))
+    }
+
+    /// Authenticate the Process owner's original exact-once grant at the
+    /// proof cut. Current revocation and current authorization are separate.
+    /// `before_cursor` comes from the independently authenticated assessment.
+    pub(crate) fn original_exact_once_grant_at_cut(
+        store: &RuntimeEventStore,
+        session_id: &str,
+        approval_id: &str,
+        grant_id: &str,
+        proof_revision: u64,
+        before_cursor: u64,
+        context: &ApprovalContext,
+        risk: harness_contract::core::TaskRisk,
+    ) -> Result<(ApprovalGrant, crate::ExpectedStreamRevision), String> {
+        if proof_revision == 0 || before_cursor == 0 || grant_id.is_empty()
+            || context.session_id.as_deref() != Some(session_id) {
+            return Err("original approval call or cut missing".into());
+        }
+        let stream_id = format!("approval:{approval_id}");
+        if store.stream_revision(&stream_id).map_err(|error| error.to_string())? < proof_revision {
+            return Err("original approval cut exceeds owner history".into());
+        }
+        let mut after = 0;
+        let mut original_consume = None;
+        let mut pages = 0usize;
+        let mut count = 0usize;
+        let mut bytes = 0usize;
+        let budget = crate::SourceCheckBudget::default();
+        while after < proof_revision {
+            pages += 1;
+            if pages > budget.max_pages { return Err("original approval page budget exceeded".into()); }
+            let events = store.list_stream_after(&stream_id, after, proof_revision, 64, 4 * 1024 * 1024)?;
+            if events.is_empty() { return Err("original approval history incomplete".into()); }
+            for event in events {
+                count += 1;
+                bytes = bytes.saturating_add(serde_json::to_vec(&event).map_err(|error| error.to_string())?.len());
+                if count > budget.max_events || bytes > budget.max_bytes || event.stream_id != stream_id
+                    || event.sequence != after + 1 || event.sequence > proof_revision {
+                    return Err("original approval history invalid or over budget".into());
+                }
+                after = event.sequence;
+                if event.commit_cursor == 0 || event.commit_cursor >= before_cursor { continue; }
+                let receipt = store.original_transaction_receipt(&event.transaction_id)
+                    .map_err(|error| error.to_string())?
+                    .ok_or("original approval event receipt missing")?;
+                if receipt.transaction_id != event.transaction_id || receipt.commit_cursor != event.commit_cursor
+                    || receipt.event_ids.get(event.transaction_index as usize) != Some(&event.event_id)
+                    || !receipt.stream_revisions.iter().any(|source| source.stream_id == stream_id
+                        && source.expected_revision < event.sequence && source.committed_revision >= event.sequence) {
+                    return Err("original approval event receipt differs".into());
+                }
+                if event.kind == "approval.grant_consumed"
+                    && event.payload["grant_id"].as_str() == Some(grant_id) {
+                    let source = receipt.stream_revisions.first().ok_or("approval consume source missing")?;
+                    if event.scope != RuntimeEventScope::Approval || event.schema_version != 1
+                        || event.status.as_deref() != Some("expired")
+                        || event.actor.as_deref() != Some("approval_coordinator")
+                        || event.transaction_id != format!("approval-grant-consume:{grant_id}")
+                        || event.transaction_index != 0 || receipt.event_ids.as_slice() != [event.event_id.clone()]
+                        || receipt.stream_revisions.len() != 1 || source.stream_id != stream_id
+                        || source.expected_revision.checked_add(1) != Some(event.sequence)
+                        || source.committed_revision != event.sequence
+                        || event.refs != vec![RuntimeEventRef { kind: "approval_grant".into(), id: grant_id.into() }]
+                        || event.payload["consumed_at_ms"].as_u64().is_none()
+                    { return Err("original exact-once approval consume differs".into()); }
+                    if original_consume.replace(event).is_some() {
+                        return Err("original approval consume is ambiguous".into());
+                    }
+                }
+            }
+        }
+        let consume = original_consume.ok_or("original exact-once approval consume missing")?;
+        let before = consume.sequence.checked_sub(1).filter(|revision| *revision > 0)
+            .ok_or("original approval issued source missing")?;
+        let original = Self::project_proof_at_cut(store, session_id, approval_id, before)?;
+        let mut matching = original.grants.iter().filter(|grant| grant.grant_id == grant_id);
+        let grant = matching.next().ok_or("original approval grant missing")?;
+        let consumed_at = consume.payload["consumed_at_ms"].as_u64().ok_or("original approval consume time missing")?;
+        if matching.next().is_some() || grant.scope != ApprovalGrantScope::Once
+            || grant.issued_by.kind != ApprovalDecisionActorKind::Human
+            || context.session_id.is_none() || grant.session_id != context.session_id
+            || grant.turn_id != context.turn_id || grant.task_id != context.task_id
+            || context.invocation_id.is_none() || !grant_matches_at(grant, context, risk, consumed_at) {
+            return Err("original exact-once grant does not match this call".into());
+        }
+        Ok((grant.clone(), crate::ExpectedStreamRevision { stream_id, expected_revision: proof_revision }))
+    }
+
+    /// Reuse the proof owner's private original member facts. The proof owner
+    /// must authenticate the original Step, actor and same-call context before
+    /// it can construct these borrowed facts; no public receipt is authority.
+    pub(crate) fn original_exact_once_grant_from_authenticated_member(
+        store: &Arc<RuntimeEventStore>,
+        facts: &crate::agentic::review_evidence::AuthenticatedMemberApprovalEvidence,
+        approval_id: &str, grant_id: &str,
+    ) -> Result<(ApprovalGrant, crate::ExpectedStreamRevision), String> {
+        if !facts.belongs_to(store) {
+            return Err("member approval original store differs".into());
+        }
+        let action = facts.action(); let index = facts.index();
+        let receipt = facts.transaction(); let consume = facts.consume();
+        let assessment = facts.assessment(); let effect_receipt = facts.effect_receipt();
+        let context = facts.context(); let risk = facts.risk();
+        let stream = format!("approval:{approval_id}");
+        if context.session_id.is_none() || context.invocation_id.is_none()
+            || context.invocation_id.as_deref() != index.payload["member_identity"].as_str()
+            || index.kind != "agentic.batch_member.index" || index.scope != RuntimeEventScope::ExecutionNode
+            || action.kind != "agentic.action_applied" || action.scope != RuntimeEventScope::Program
+            || receipt.transaction_id != action.transaction_id || receipt.commit_cursor == 0
+            || action.commit_cursor != receipt.commit_cursor || index.commit_cursor != receipt.commit_cursor
+            || consume.commit_cursor != receipt.commit_cursor || assessment.commit_cursor != receipt.commit_cursor
+            || index.transaction_id != receipt.transaction_id || consume.transaction_id != receipt.transaction_id
+            || assessment.transaction_id != receipt.transaction_id
+            || receipt.event_ids.get(action.transaction_index as usize) != Some(&action.event_id)
+            || receipt.event_ids.get(index.transaction_index as usize) != Some(&index.event_id)
+            || receipt.event_ids.get(consume.transaction_index as usize) != Some(&consume.event_id)
+            || receipt.event_ids.get(assessment.transaction_index as usize) != Some(&assessment.event_id)
+            || consume.transaction_index >= assessment.transaction_index
+            || effect_receipt.commit_cursor <= receipt.commit_cursor {
+            return Err("member approval transaction identity or order differs".into());
+        }
+        if consume.stream_id != stream || consume.scope != RuntimeEventScope::Approval
+            || consume.kind != "approval.grant_consumed" || consume.schema_version != 1
+            || consume.status.as_deref() != Some("expired") || consume.actor.as_deref() != Some("approval_coordinator")
+            || consume.refs != vec![RuntimeEventRef { kind: "approval_grant".into(), id: grant_id.into() }]
+            || consume.payload["grant_id"].as_str() != Some(grant_id)
+            || assessment.kind != "authorization.capability_assessed" || assessment.scope != RuntimeEventScope::Tool
+            || assessment.stream_id != format!("session:{}", context.session_id.as_deref().unwrap_or_default()) {
+            return Err("member approval original events differ".into());
+        }
+        for event in [action, index, consume, assessment] {
+            if !receipt.stream_revisions.iter().any(|source| source.stream_id == event.stream_id
+                && source.expected_revision < event.sequence && source.committed_revision >= event.sequence) {
+                return Err("member approval original source revision differs".into());
+            }
+        }
+        let refs = index.payload["authority_events"].as_array().ok_or("member authority coordinates missing")?;
+        for event in [consume, assessment] {
+            let count = refs.iter().filter(|entry| {
+                entry["stream_id"].as_str() == Some(event.stream_id.as_str())
+                    && entry["kind"].as_str() == Some(event.kind.as_str())
+                    && entry["idempotency_key"].as_str() == event.idempotency_key.as_deref()
+                    && entry["transaction_index"].as_u64() == Some(u64::from(event.transaction_index))
+            }).count();
+            if count != 1 { return Err("member authority event coordinate is missing or ambiguous".into()); }
+        }
+        let mut approval_sources = receipt.stream_revisions.iter().filter(|source| source.stream_id == stream);
+        let committed_source = approval_sources.next().ok_or("member approval committed source missing")?;
+        if approval_sources.next().is_some() || committed_source.expected_revision == 0
+            || committed_source.expected_revision >= consume.sequence
+            || committed_source.committed_revision < consume.sequence
+            || store.stream_revision(&stream).map_err(|e| e.to_string())? < committed_source.committed_revision {
+            return Err("member approval historical cut or committed source differs".into());
+        }
+        let before = consume.sequence.checked_sub(1).filter(|value| *value > 0).ok_or("member grant issuer missing")?;
+        let original = Self::project_proof_at_cut(store, context.session_id.as_deref().unwrap_or_default(), approval_id, committed_source.expected_revision)?;
+        let before_consume = Self::project_proof_at_cut(store, context.session_id.as_deref().unwrap_or_default(), approval_id, before)?;
+        let mut grants = original.grants.iter().filter(|grant| grant.grant_id == grant_id);
+        let grant = grants.next().ok_or("member original grant missing")?;
+        let mut before_grants = before_consume.grants.iter().filter(|candidate| candidate.grant_id == grant_id);
+        let before_grant = before_grants.next().ok_or("member grant missing immediately before consume")?;
+        if before_grants.next().is_some() || before_grant != grant {
+            return Err("member approval grant changed after historical proof cut".into());
+        }
+        let consumed_at = consume.payload["consumed_at_ms"].as_u64().ok_or("member consume time missing")?;
+        if grants.next().is_some() || grant.scope != ApprovalGrantScope::Once
+            || !matches!(grant.issued_by.kind, ApprovalDecisionActorKind::Human | ApprovalDecisionActorKind::Policy)
+            || !grant_matches_at(grant, context, risk, consumed_at)
+            || serde_json::to_value(grant).map_err(|e| e.to_string())? != assessment.payload["_original_approval_grant"] {
+            return Err("member original grant does not match authenticated context".into());
+        }
+        let mut after = 0; let mut matches = 0usize; let budget = crate::SourceCheckBudget::default();
+        let mut pages = 0usize; let mut count = 0usize; let mut bytes = 0usize;
+        while after < committed_source.committed_revision {
+            pages = pages.saturating_add(1);
+            if pages > budget.max_pages { return Err("member approval proof page budget exceeded".into()); }
+            let page = store.list_stream_after(&stream, after, committed_source.committed_revision, 64, 4 * 1024 * 1024)?;
+            if page.is_empty() { return Err("member approval proof history incomplete".into()); }
+            for event in page {
+                count = count.saturating_add(1);
+                bytes = bytes.saturating_add(serde_json::to_vec(&event).map_err(|e| e.to_string())?.len());
+                if count > budget.max_events || bytes > budget.max_bytes || event.sequence != after + 1
+                    || event.sequence > committed_source.committed_revision || event.stream_id != stream {
+                    return Err("member approval proof sequence differs".into());
+                }
+                after = event.sequence;
+                if event.kind == "approval.grant_consumed" && event.payload["grant_id"].as_str() == Some(grant_id) {
+                    matches += 1;
+                    if event.event_id != consume.event_id { return Err("member approval has a different consume".into()); }
+                }
+            }
+        }
+        if matches != 1 { return Err("member approval consume is missing or ambiguous".into()); }
+        Ok((grant.clone(), crate::ExpectedStreamRevision { stream_id: stream, expected_revision: committed_source.expected_revision }))
+    }
+
+    /// Reconstruct the original decision at the proof's authenticated cut.
+    /// The current control and its CAS source must be captured separately.
+    pub(crate) fn decision_result_at_cut(
+        store: &RuntimeEventStore, session_id: &str, approval_id: &str, revision: u64,
+    ) -> Result<(GlobalApprovalRequest, crate::ExpectedStreamRevision), String> {
+        let control = Self::project_proof_at_cut(store, session_id, approval_id, revision)?;
+        Ok((control.request, control.source))
+    }
+
+    fn project_proof_at_cut(
+        store: &RuntimeEventStore, session_id: &str, approval_id: &str, revision: u64,
+    ) -> Result<ProofApprovalControl, String> {
+        if revision == 0 || approval_id.trim().is_empty() {
+            return Err("approval proof cut is missing".into());
+        }
+        let source = crate::ExpectedStreamRevision {
+            stream_id: format!("approval:{approval_id}"), expected_revision: revision,
+        };
+        if store.stream_revision(&source.stream_id).map_err(|error| error.to_string())? < revision {
+            return Err("approval proof cut is beyond owner history".into());
+        }
+        let mut requests = BTreeMap::new();
+        let mut grants = BTreeMap::new();
+        let mut after = 0;
+        let mut previous_cursor = 0;
+        while after < source.expected_revision {
+            let page = store.list_stream_after(
+                &source.stream_id, after, source.expected_revision, 64, 4 * 1024 * 1024,
+            )?;
+            if page.is_empty() { return Err("approval control history is incomplete".into()); }
+            for event in page {
+                if event.stream_id != source.stream_id || event.sequence != after + 1
+                    || event.sequence > source.expected_revision || event.commit_cursor == 0
+                    || event.commit_cursor < previous_cursor || event.scope != RuntimeEventScope::Approval
+                { return Err("approval control history envelope is invalid".into()); }
+                after = event.sequence;
+                previous_cursor = event.commit_cursor;
+                match event.kind.as_str() {
+                    "approval.submitted" => {
+                        let request: GlobalApprovalRequest = serde_json::from_value(event.payload["request"].clone())
+                            .map_err(|error| format!("approval control request malformed: {error}"))?;
+                        if request.approval_id != approval_id || requests.contains_key(approval_id) {
+                            return Err("approval control original request is foreign or ambiguous".into());
+                        }
+                    }
+                    "approval.decided" | "approval.decided.application" | "approval.timed_out"
+                    | "approval.cancelled" | "approval.superseded" => {
+                        if !requests.contains_key(approval_id) || !matches!(event.status.as_deref(),
+                            Some("approved" | "denied" | "skipped" | "timed_out" | "cancelled" | "superseded")) {
+                            return Err("approval control decision has no original request or status".into());
+                        }
+                    }
+                    "approval.grant_issued" => {
+                        let grant: ApprovalGrant = serde_json::from_value(event.payload["grant"].clone())
+                            .map_err(|error| format!("approval control grant malformed: {error}"))?;
+                        if grant.approval_id != approval_id || grant.grant_id.is_empty() || grants.contains_key(&grant.grant_id)
+                            || event.status.as_deref() != Some("active") || event.actor.as_deref() != Some(grant.issued_by.actor_id.as_str()) {
+                            return Err("approval control grant is foreign or ambiguous".into());
+                        }
+                    }
+                    "approval.grant_revoked" | "approval.grant_consumed" => {
+                        let grant_id = event.payload["grant_id"].as_str().filter(|id| !id.is_empty())
+                            .ok_or("approval control transition has no grant identity")?;
+                        let status = if event.kind == "approval.grant_revoked" { "revoked" } else { "expired" };
+                        if !grants.contains_key(grant_id) || event.status.as_deref() != Some(status)
+                            || event.actor.as_deref().is_none_or(str::is_empty)
+                            || (event.kind == "approval.grant_consumed" && event.actor.as_deref() != Some("approval_coordinator"))
+                            || event.refs != vec![RuntimeEventRef { kind: "approval_grant".into(), id: grant_id.into() }]
+                        { return Err("approval control transition has no original grant or owner".into()); }
+                    }
+                    _ => return Err("approval control contains an unsupported owner event".into()),
+                }
+                apply_approval_event(&mut requests, &mut grants, &event);
+            }
+        }
+        let request = requests.remove(approval_id).ok_or("approval control original request missing")?;
+        if request.source.session_id.as_deref() != Some(session_id)
+            || request.context.session_id.as_deref() != Some(session_id)
+        { return Err("external decision is outside the authenticated Session".into()); }
+        let decision = request.decision.as_ref().ok_or("external decision is pending or unavailable")?;
+        if !matches!(request.status, ApprovalStatus::Approved | ApprovalStatus::Denied)
+            || !matches!(decision.actor.kind, ApprovalDecisionActorKind::Human | ApprovalDecisionActorKind::Policy)
+            || decision.actor.actor_id.trim().is_empty()
+            || (request.status == ApprovalStatus::Approved) != decision.approved
+        { return Err("external result requires a Human or Policy decision at the proof cut".into()); }
+        Ok(ProofApprovalControl { source, request, grants: grants.into_values().collect() })
+    }
+
     #[must_use]
     pub fn pending(&self) -> Vec<GlobalApprovalRequest> {
         self.requests
@@ -1153,18 +1521,149 @@ impl ApprovalQueue {
         context: &ApprovalContext,
         risk: harness_contract::core::TaskRisk,
     ) -> Result<(), String> {
-        self.consume_once_grant_inner(grant_id, Some((context, risk)))
+        self.consume_once_grant_inner(grant_id, Some((context, risk)), true).map(|_| ())
     }
 
     pub fn consume_once_grant(&self, grant_id: &str) -> Result<(), String> {
-        self.consume_once_grant_inner(grant_id, None)
+        self.consume_once_grant_inner(grant_id, None, false).map(|_| ())
+    }
+
+    /// A policy owner may release a one-shot authorization only to the
+    /// caller that wins the durable consume, including across queue instances.
+    pub(crate) fn consume_once_grant_exclusive(&self, grant_id: &str) -> Result<crate::DurableRuntimeEvent, String> {
+        self.consume_once_grant_inner(grant_id, None, true)?
+            .ok_or_else(|| "once grant consume has no original event".to_string())
+    }
+
+    /// Prepare the original once consumption without mutating the hot projection
+    /// or appending an event. The checked transaction must CAS `source`.
+    pub(crate) fn prepare_member_approval(
+        self: &Arc<Self>, grant_id: &str, context: &ApprovalContext,
+        risk: harness_contract::core::TaskRisk, member: &crate::authorization_negotiator::PreparedMemberBinding,
+    ) -> Result<PreparedMemberApproval, String> {
+        if !std::ptr::eq(self.event_store.as_ref(), member.store().as_ref()) { return Err("approval and Process owner store differ".into()); }
+        if context.invocation_id.as_deref() != Some(member.prepared().identity.as_str())
+            || context.capability != member.prepared().tool { return Err("approval and original member differ".into()); }
+        let grants = self.grants.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let grant = grants.get(grant_id).ok_or("approval grant unavailable")?.clone();
+        if !grant_matches(&grant, context, risk)
+            || (grant.scope == ApprovalGrantScope::Once && !member_once_grant_matches(&grant, context, risk)) {
+            return Err("member approval context is no longer active".into());
+        }
+        let stream_id = format!("approval:{}", grant.approval_id);
+        let revision = self.event_store.stream_revision(&stream_id).map_err(|e| e.to_string())?;
+        let events = self.event_store.list_stream(&stream_id)?;
+        let mut requests = BTreeMap::new();
+        let mut durable = BTreeMap::new();
+        let mut expected_sequence = 1u64;
+        for event in events {
+            let receipt = self.event_store.original_transaction_receipt(&event.transaction_id)
+                .map_err(|e| e.to_string())?.ok_or("approval transaction receipt missing")?;
+            if event.stream_id != stream_id || event.sequence != expected_sequence
+                || event.scope != RuntimeEventScope::Approval || event.commit_cursor == 0
+                || receipt.transaction_id != event.transaction_id || receipt.commit_cursor != event.commit_cursor
+                || receipt.event_ids.get(event.transaction_index as usize) != Some(&event.event_id)
+                || !receipt.stream_revisions.iter().any(|source| source.stream_id == stream_id
+                    && source.expected_revision < event.sequence && source.committed_revision >= event.sequence)
+            { return Err("approval original event or receipt differs".into()); }
+            expected_sequence = expected_sequence.saturating_add(1);
+            apply_approval_event(&mut requests, &mut durable, &event);
+        }
+        if expected_sequence != revision.saturating_add(1) { return Err("approval source history incomplete".into()); }
+        let durable_grant = durable.get(grant_id).ok_or("durable approval grant unavailable")?;
+        if !grant_matches(durable_grant, context, risk)
+            || (durable_grant.scope == ApprovalGrantScope::Once && !member_once_grant_matches(durable_grant, context, risk))
+            || serde_json::to_value(durable_grant).map_err(|e| e.to_string())?
+                != serde_json::to_value(&grant).map_err(|e| e.to_string())?
+            || self.event_store.stream_revision(&stream_id).map_err(|e| e.to_string())? != revision
+        { return Err("approval source changed or grant differs".into()); }
+        let consumed_at_ms = now_ms();
+        let event = (grant.scope == ApprovalGrantScope::Once).then(|| RuntimeTransactionEventInput {
+            event: RuntimeEventInput {
+                stream_id: stream_id.clone(), scope: RuntimeEventScope::Approval,
+                kind: "approval.grant_consumed".into(), status: Some("expired".into()),
+                actor: Some("approval_coordinator".into()),
+                refs: vec![RuntimeEventRef { kind: "approval_grant".into(), id: grant_id.into() }],
+                payload: serde_json::json!({"schema_version": 2, "grant_id": grant_id, "consumed_at_ms": consumed_at_ms}),
+            },
+            idempotency_key: Some(format!("approval-grant-consume:{grant_id}")),
+            schema_version: 1,
+        });
+        Ok(PreparedMemberApproval { owner: Arc::downgrade(self), member: member.retained(), owner_store: Arc::downgrade(&self.event_store),
+            deadline_ms: grant.expires_at_ms, grant,
+            source: crate::ExpectedStreamRevision { stream_id, expected_revision: revision }, event })
+    }
+
+    /// Hold the original once-grant owner during the synchronous checked
+    /// transaction. `commit` is supplied only by the original action owner.
+    /// An error leaves this owner unchanged, including an unknown outcome.
+    pub(crate) fn commit_prepared_member_approval(
+        &self, prepared: &PreparedMemberApproval,
+        member_guard: &crate::authorization_negotiator::PreparedMemberBinding,
+        commit: impl FnOnce(&PreparedMemberApproval) -> Result<(Arc<crate::OriginalCommittedMember>, bool), crate::AgentActionServiceError>,
+    ) -> Result<(Arc<crate::OriginalCommittedMember>, bool), crate::AgentActionServiceError> {
+        if !std::ptr::eq(self, prepared.owner.as_ptr()) || !std::ptr::eq(Arc::as_ptr(&self.event_store), prepared.owner_store.as_ptr())
+            || !prepared.member.matches(member_guard) {
+
+            return Err(crate::AgentActionServiceError::Corrupt("approval owner changed".into()));
+        }
+        let mut grants = self.grants.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let current = grants.get(&prepared.grant.grant_id).ok_or_else(|| {
+
+            crate::AgentActionServiceError::Corrupt("approval grant no longer active".into())
+        })?;
+        if serde_json::to_value(current).map_err(|e| {
+
+                crate::AgentActionServiceError::Corrupt(e.to_string())
+            })?
+            != serde_json::to_value(&prepared.grant).map_err(|e| {
+
+                crate::AgentActionServiceError::Corrupt(e.to_string())
+            })?
+            || prepared.deadline_ms.is_some_and(|deadline| now_ms() >= deadline) {
+
+            return Err(crate::AgentActionServiceError::Corrupt("approval grant changed or expired".into()));
+        }
+
+        let result = commit(prepared).map_err(|error| {
+
+            error
+        })?;
+
+        if result.1 && prepared.event.is_some() { grants.remove(&prepared.grant.grant_id); }
+        Ok(result)
+    }
+
+    /// Recovery of an already-committed original member. The caller has
+    /// authenticated its original transaction before entering this owner.
+    pub(crate) fn apply_recovered_member_approval(
+        &self, prepared: &PreparedMemberApproval,
+        member_guard: &crate::authorization_negotiator::PreparedMemberBinding,
+        apply_lease: impl FnOnce() -> Result<(), String>,
+    ) -> Result<(), String> {
+        if !std::ptr::eq(self, prepared.owner.as_ptr()) || !std::ptr::eq(Arc::as_ptr(&self.event_store), prepared.owner_store.as_ptr())
+            || !prepared.member.matches(member_guard) {
+            return Err("recovered approval owner changed".into());
+        }
+        if prepared.event.is_none() { return apply_lease(); }
+        let mut grants = self.grants.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(current) = grants.get(&prepared.grant.grant_id) {
+            if serde_json::to_value(current).map_err(|e| e.to_string())?
+                != serde_json::to_value(&prepared.grant).map_err(|e| e.to_string())? {
+                return Err("recovered approval hot projection changed".into());
+            }
+        }
+        apply_lease()?;
+        if prepared.event.is_some() { grants.remove(&prepared.grant.grant_id); }
+        Ok(())
     }
 
     fn consume_once_grant_inner(
         &self,
         grant_id: &str,
         expected: Option<(&ApprovalContext, harness_contract::core::TaskRisk)>,
-    ) -> Result<(), String> {
+        exclusive: bool,
+    ) -> Result<Option<crate::DurableRuntimeEvent>, String> {
         let mut grants = self
             .grants
             .lock()
@@ -1175,15 +1674,20 @@ impl ApprovalQueue {
         if expected.is_none()
             && (grant.scope != ApprovalGrantScope::Once || grant.status != ApprovalGrantStatus::Active)
         {
-            return Ok(());
+            return if exclusive { Err("once approval grant is no longer active".into()) } else { Ok(None) };
         }
         let stream_id = format!("approval:{}", grant.approval_id);
         let revision = self
             .event_store
             .stream_revision(&stream_id)
             .map_err(|error| error.to_string())?;
-        if let Some((context, risk)) = expected {
-            if !exact_once_grant_matches(grant, context, risk) {
+        if exclusive {
+            if let Some((context, risk)) = expected {
+                if !exact_once_grant_matches(grant, context, risk) {
+                    return Err("exact once approval context is no longer active".into());
+                }
+            }
+            if grant.scope != ApprovalGrantScope::Once || grant.status != ApprovalGrantStatus::Active {
                 return Err("exact once approval context is no longer active".into());
             }
             let events = self.event_store.list_stream(&stream_id)?;
@@ -1194,8 +1698,11 @@ impl ApprovalQueue {
             }
             let durable_grant = durable_grants.get(grant_id)
                 .ok_or_else(|| "exact once approval has no durable grant".to_string())?;
-            if !exact_once_grant_matches(durable_grant, context, risk) {
-                return Err("exact once approval is durably inactive or mismatched".into());
+            if durable_grant.scope != ApprovalGrantScope::Once
+                || durable_grant.status != ApprovalGrantStatus::Active
+                || expected.is_some_and(|(context, risk)| !exact_once_grant_matches(durable_grant, context, risk))
+            {
+                return Err("once approval is durably inactive or mismatched".into());
             }
         }
         let consumed_at_ms = now_ms();
@@ -1206,7 +1713,7 @@ impl ApprovalQueue {
                 format!("approval-grant-consume:{grant_id}"),
                 vec![
                     RuntimeEventInput {
-                        stream_id,
+                        stream_id: stream_id.clone(),
                         scope: RuntimeEventScope::Approval,
                         kind: "approval.grant_consumed".to_string(),
                         status: Some("expired".to_string()),
@@ -1225,13 +1732,25 @@ impl ApprovalQueue {
                 ],
             )
             .map_err(|error| error.to_string())?;
-        if expected.is_some() {
+        if exclusive {
             require_exclusive_once_receipt(receipt.duplicate)?;
         }
+        let original = if exclusive {
+            if receipt.event_ids.len() != 1 { return Err("once consume receipt event count mismatch".into()); }
+            let events = self.event_store.list_stream(&stream_id)?;
+            let mut matching = events.into_iter().filter(|event| event.event_id == receipt.event_ids[0]);
+            let event = matching.next().ok_or("once consume original event unavailable")?;
+            if matching.next().is_some() || event.stream_id != stream_id
+                || event.kind != "approval.grant_consumed" || event.scope != RuntimeEventScope::Approval
+                || event.payload.get("grant_id").and_then(serde_json::Value::as_str) != Some(grant_id)
+                || event.transaction_id != receipt.transaction_id || event.commit_cursor != receipt.commit_cursor
+            { return Err("once consume original event/receipt mismatch".into()); }
+            Some(event)
+        } else { None };
         grant.status = ApprovalGrantStatus::Expired;
         grant.expires_at_ms = Some(consumed_at_ms);
         grants.remove(grant_id);
-        Ok(())
+        Ok(original)
     }
 
     pub fn revoke_grant(
@@ -1674,6 +2193,18 @@ fn require_exclusive_once_receipt(duplicate: bool) -> Result<(), String> {
     Ok(())
 }
 
+/// Original member approvals can be issued by either the human or the
+/// policy router; both are authenticated by their original durable owner.
+fn member_once_grant_matches(
+    grant: &ApprovalGrant, context: &ApprovalContext, risk: harness_contract::core::TaskRisk,
+) -> bool {
+    grant.scope == ApprovalGrantScope::Once
+        && matches!(grant.issued_by.kind, ApprovalDecisionActorKind::Human | ApprovalDecisionActorKind::Policy)
+        && context.session_id.is_some() && grant.session_id == context.session_id
+        && grant.turn_id == context.turn_id && grant.task_id == context.task_id
+        && context.invocation_id.is_some() && grant_matches(grant, context, risk)
+}
+
 fn exact_once_grant_matches(
     grant: &ApprovalGrant,
     context: &ApprovalContext,
@@ -1694,6 +2225,15 @@ fn grant_matches(
     context: &ApprovalContext,
     risk: harness_contract::core::TaskRisk,
 ) -> bool {
+    grant_matches_at(grant, context, risk, now_ms())
+}
+
+fn grant_matches_at(
+    grant: &ApprovalGrant,
+    context: &ApprovalContext,
+    risk: harness_contract::core::TaskRisk,
+    observed_at_ms: u64,
+) -> bool {
     if grant.status != ApprovalGrantStatus::Active
         || grant.principal_id != context.principal_id
         || grant.profile_id != context.profile_id
@@ -1706,7 +2246,7 @@ fn grant_matches(
     }
     if grant
         .expires_at_ms
-        .is_some_and(|expires_at_ms| expires_at_ms <= now_ms())
+        .is_some_and(|expires_at_ms| expires_at_ms <= observed_at_ms)
     {
         return false;
     }
@@ -2276,7 +2816,11 @@ mod tests {
         }
         assert!(queue.matching_exact_once_grant(&context, TaskRisk::High).is_none());
         let restarted = ApprovalQueue::new(queue.event_store.clone());
+        let original = queue.decision_result_snapshot("session-approval", &pending.approval_id).unwrap();
         queue.consume_exact_once_grant(&grant.grant_id, &context, TaskRisk::Low).unwrap();
+        assert_eq!(ApprovalQueue::decision_result_at_cut(&queue.event_store, "session-approval", &pending.approval_id, original.1.expected_revision).unwrap(), original);
+        assert!(ApprovalQueue::decision_result_at_cut(&queue.event_store, "foreign-session", &pending.approval_id, original.1.expected_revision).is_err());
+        assert!(ApprovalQueue::decision_result_at_cut(&queue.event_store, "session-approval", &pending.approval_id, 0).is_err());
         assert!(queue.consume_exact_once_grant(&grant.grant_id, &context, TaskRisk::Low).is_err());
         assert!(restarted.consume_exact_once_grant(&grant.grant_id, &context, TaskRisk::Low).is_err());
         assert!(queue.matching_exact_once_grant(&context, TaskRisk::Low).is_none());
@@ -2293,7 +2837,14 @@ mod tests {
         let grant = queue.matching_exact_once_grant(&context, TaskRisk::Low).unwrap();
         let restarted = ApprovalQueue::new(queue.event_store.clone());
         assert!(restarted.matching_exact_once_grant(&context, TaskRisk::Low).is_some());
+        let before = queue.capture_proof_control("session-approval", &pending.approval_id).unwrap();
+        assert_eq!(before.request().approval_id, pending.approval_id);
+        assert!(before.grants().iter().any(|item| item.grant_id == grant.grant_id && item.status == ApprovalGrantStatus::Active));
+        assert!(queue.capture_proof_control("foreign-session", &pending.approval_id).is_err());
         queue.revoke_grant(&human, &grant.grant_id, "revoked before physical dispatch").unwrap();
+        let after = queue.capture_proof_control("session-approval", &pending.approval_id).unwrap();
+        assert!(after.source().expected_revision > before.source().expected_revision);
+        assert!(after.grants().iter().any(|item| item.grant_id == grant.grant_id && item.status == ApprovalGrantStatus::Revoked));
         assert!(restarted.consume_exact_once_grant(&grant.grant_id, &context, TaskRisk::Low).is_err());
         assert!(!queue.event_store.list_stream(&format!("approval:{}", pending.approval_id))
             .unwrap().iter().any(|event| event.kind == "approval.grant_consumed"));

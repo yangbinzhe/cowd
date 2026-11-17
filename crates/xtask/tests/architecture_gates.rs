@@ -90,8 +90,7 @@ fn no_matches_gate_rejects_search_errors_and_actual_matches() {
 
 #[test]
 fn architecture_gates_stay_green_under_cargo_test() {
-    // Covers inventory, source-size, structural-limits, duplicate-authority
-    // and duplicate-capability in one pass.
+    // Covers inventory, duplicate-authority and duplicate-capability.
     run_gate(
         "xtask architecture audit",
         env!("CARGO_BIN_EXE_xtask"),

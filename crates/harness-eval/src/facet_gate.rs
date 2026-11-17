@@ -579,15 +579,20 @@ mod tests {
     /// The arm-E failure, fixed: a correct answer with durable receipts passes.
     #[test]
     fn a_correct_answer_with_durable_receipts_passes() {
-        let verdict = evaluate_facet(&acceptance(), &outcome());
+        let contract = acceptance();
+        let verdict = evaluate_facet(&contract, &outcome());
         assert!(
             verdict.passed,
             "a facet that produced its evidence must pass: {}",
             verdict.report()
         );
-        // answer_present + 2 read receipts + 1 answer_contains, and no
-        // unresolved requirement because this facet allows it.
-        assert_eq!(verdict.requirements.len(), 4);
+        let expected: std::collections::BTreeSet<_> = std::iter::once("answer_present".to_string())
+            .chain(contract.required_read_paths.iter().map(|path| format!("read_receipt:{path}")))
+            .chain(contract.answer_contains.iter().map(|needle| format!("answer_contains:{needle}")))
+            .collect();
+        let mut observed = std::collections::BTreeSet::new();
+        assert!(verdict.requirements.iter().all(|item| item.passed && observed.insert(item.requirement.clone())));
+        assert_eq!(observed, expected);
     }
 
     /// A claim without a receipt is not evidence. This is the distinction the

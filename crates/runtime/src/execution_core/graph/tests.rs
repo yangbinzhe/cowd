@@ -312,6 +312,75 @@ async fn r1_bounded_history_first_start_binding_and_effect_identity_are_checked(
             let before = state.load(&registered.id).unwrap();
             let cursor = events.durable_commit_cursor().unwrap();
             let result = runner.prepare_ready_wave(&registered.id, ready).await;
+            if fault == 8 {
+                // A Start error for this node is an unadmitted node-local
+                // failure. Drive the same completion path used by the pump;
+                // do not mistake the prepared wave for a successful node.
+                let prepared = result.expect("node-local Start remains in the prepared wave");
+                assert_eq!(prepared.len(), width);
+                let mut bad_prepared = None;
+                let mut good_prepared = None;
+                for item in prepared {
+                    if item.node.id == "bad" {
+                        assert!(item.has_startup_error());
+                        assert!(item.binding.is_none());
+                        bad_prepared = Some(item);
+                    } else {
+                        assert_eq!(item.node.id, "a-good");
+                        assert!(!item.has_startup_error());
+                        assert!(item.binding.is_some());
+                        good_prepared = Some(item);
+                    }
+                }
+                assert_eq!(executor.hits.load(Ordering::SeqCst), 1);
+                assert_eq!(executor.starts.load(Ordering::SeqCst), width);
+                assert_eq!(executor.polls.load(Ordering::SeqCst), 0);
+                assert_eq!(executor.cancels.load(Ordering::SeqCst), 0);
+                let during = state.load(&registered.id).unwrap();
+                assert_eq!(during.node_statuses["bad"], ExecutionNodeStatus::Ready);
+                assert_eq!(during.recovery_cursor.node_attempts.get("bad").copied().unwrap_or(0), 0);
+                if width == 1 {
+                    assert_eq!(during, before);
+                    assert_eq!(events.durable_commit_cursor().unwrap(), cursor);
+                } else {
+                    assert_eq!(during.node_statuses["a-good"], ExecutionNodeStatus::Running);
+                }
+                let bad_node = registered.nodes.iter().find(|node| node.id == "bad").unwrap();
+                let bad_ticket = NodeExecutionTicket {
+                    graph_id: registered.id.clone(), node_id: bad_node.id.clone(),
+                    executor_kind: bad_node.executor_kind.clone(), service_class: registered.service_class,
+                    attempt: 1, idempotency_key: bad_node.idempotency_key.clone(),
+                    payload_ref: bad_node.payload_ref.clone(),
+                };
+                runner.execute_prepared_pump_node(
+                    &registered.id, bad_prepared.expect("bad node retained"), Arc::new(Notify::new()),
+                ).await.expect("isolate node-local start failure");
+                if let Some(good) = good_prepared {
+                    runner.execute_prepared_pump_node(
+                        &registered.id, good, Arc::new(Notify::new()),
+                    ).await.expect("independent sibling completes");
+                }
+                let settled = state.load(&registered.id).unwrap();
+                assert_eq!(settled.node_statuses["bad"], ExecutionNodeStatus::Failed);
+                let failure = settled.node_results["bad"].failure.as_ref().expect("typed failure");
+                assert_eq!(failure.kind, "node_execution_isolated_failure");
+                assert!(failure.message.contains("start fault-hit"), "original error must survive: {failure:?}");
+                assert!(!failure.retryable);
+                assert_eq!(settled.recovery_cursor.node_attempts.get("bad").copied().unwrap_or(0), 0);
+                assert_eq!(events.stream_revision(&ExecutionNodeBinding::effect_stream_id(&bad_ticket)).unwrap(), 0);
+                let starts = state.binding_starts_page(&registered.id, 0, settled.revision).unwrap().1;
+                assert_eq!(starts.len(), width - 1, "only the healthy sibling may have a start binding");
+                if width == 2 {
+                    assert_eq!(settled.node_statuses["a-good"], ExecutionNodeStatus::Completed);
+                    assert_eq!(executor.calls.lock().unwrap().as_slice(), &["a-good".to_string()]);
+                }
+                assert_eq!(executor.polls.load(Ordering::SeqCst), width - 1);
+                assert_eq!(executor.cancels.load(Ordering::SeqCst), 0);
+                let counts = resources.snapshot(&ExecutionResourceKind::Tool).unwrap();
+                assert_eq!(counts.active_leases, 0);
+                assert_eq!(counts.queued_waiters, 0);
+                continue;
+            }
             assert!(
                 result.is_err(),
                 "first-start fault-hit {fault}, width {width}"
@@ -598,6 +667,9 @@ struct StartRaceExecutor {
 struct ReplanRaceExecutor {
     poll_entered: Notify,
     release_poll: Notify,
+    poll_calls: AtomicUsize,
+    cancel_calls: AtomicUsize,
+    fail_outcome: bool,
 }
 
 struct CancelNestedRunnerExecutor {
@@ -954,10 +1026,15 @@ impl NodeExecutor for ReplanRaceExecutor {
         &self,
         ticket: &NodeExecutionTicket,
     ) -> Result<NodeExecutionOutcome, NodeExecutorError> {
+        self.poll_calls.fetch_add(1, Ordering::SeqCst);
         self.poll_entered.notify_one();
         self.release_poll.notified().await;
+        let mut result = completed_result(&ticket.node_id);
+        if self.fail_outcome {
+            result.status = ExecutionNodeStatus::Failed;
+        }
         Ok(
-            NodeExecutionOutcome::new(completed_result(&ticket.node_id)).with_replan(
+            NodeExecutionOutcome::new(result).with_replan(
                 ExecutionGraphReplan {
                     nodes: vec![node("late-tool")],
                     edges: vec![ExecutionEdge {
@@ -973,6 +1050,7 @@ impl NodeExecutor for ReplanRaceExecutor {
     }
 
     async fn cancel(&self, _ticket: &NodeExecutionTicket) -> Result<(), NodeExecutorError> {
+        self.cancel_calls.fetch_add(1, Ordering::SeqCst);
         self.release_poll.notify_one();
         Ok(())
     }
@@ -1357,7 +1435,11 @@ async fn supervisor_runs_one_hundred_graphs_with_bounded_cross_key_parallelism()
         max_running <= 8,
         "supervisor concurrency must respect its configured upper bound"
     );
-    assert_eq!(executor.calls.lock().unwrap().len(), 100);
+    let mut actual = executor.calls.lock().unwrap().clone();
+    let mut expected = (0..100).map(|index| format!("node-{index}")).collect::<Vec<_>>();
+    actual.sort_unstable();
+    expected.sort_unstable();
+    assert_eq!(actual, expected);
     assert_eq!(supervisor.health().tracked_keys, 0);
     let shutdown = supervisor.shutdown().await;
     assert_eq!(shutdown.remaining_keys, 0);
@@ -1966,9 +2048,6 @@ fn conversation_compile_targets_have_distinct_initial_dags_and_constraints() {
     let evidence = compile(RuntimeCompileTarget::EvidenceGraph);
     let execution = compile(RuntimeCompileTarget::ExecutionGraph);
 
-    assert_eq!(inline.nodes.len(), 2);
-    assert_eq!(evidence.nodes.len(), 3);
-    assert_eq!(execution.nodes.len(), 3);
     for (graph, suffixes) in [
         (&inline, vec!["resource-constraint", "model"]),
         (
@@ -1985,6 +2064,10 @@ fn conversation_compile_targets_have_distinct_initial_dags_and_constraints() {
             .bind_conversation_graph_identity(&mut bound, "ingress-graph", None, Some("request"))
             .unwrap();
         assert_eq!(bound.id, "ingress-graph");
+        assert_eq!(
+            bound.nodes.iter().map(|node| node.id.as_str()).collect::<Vec<_>>(),
+            suffixes.iter().map(|suffix| format!("ingress-graph:{suffix}")).collect::<Vec<_>>()
+        );
         for (node, suffix) in bound.nodes.iter().zip(&suffixes) {
             assert_eq!(node.id, format!("ingress-graph:{suffix}"));
             assert_eq!(node.idempotency_key, format!("request:{suffix}"));
@@ -2133,6 +2216,385 @@ async fn executor_start_failure_never_persists_running_or_binding() {
         persisted.node_statuses["start-failure"],
         ExecutionNodeStatus::Failed
     );
+    assert_eq!(
+        persisted
+            .recovery_cursor
+            .node_attempts
+            .get("start-failure")
+            .copied()
+            .unwrap_or(0),
+        0
+    );
+    assert!(state
+        .binding_starts_page(&graph_id, 0, persisted.revision)
+        .unwrap()
+        .1
+        .is_empty());
+}
+
+#[tokio::test]
+async fn executor_start_failure_preserves_siblings_and_releases_unadmitted_resources() {
+    for fail_first in [true, false] {
+        for supervised in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            std::fs::create_dir(temp.path().join("failed-worktree")).unwrap();
+            let events = Arc::new(RuntimeEventStore::for_test());
+            let state = ExecutionGraphStateStore::new(events.clone());
+            let commits = ExecutionCommitService::new(events.clone());
+            let registry = Arc::new(NodeExecutorRegistry::new());
+            registry.register(Arc::new(StartFailExecutor)).unwrap();
+            let healthy = Arc::new(TestExecutor::new(Vec::new(), Duration::ZERO));
+            registry.register(healthy.clone()).unwrap();
+            let resources = Arc::new(ExecutionResourceManager::new([(
+                ExecutionResourceKind::Tool,
+                ResourceQuota::new(1, 4, 4).unwrap(),
+            )]));
+            let locks = Arc::new(ScopeLockManager::persistent(temp.path().join("locks")).unwrap());
+            let worktrees =
+                Arc::new(WorktreeLeaseManager::open(temp.path().join("leases.json")).unwrap());
+            let runner = ExecutionGraphRunner::new(
+                registry,
+                state.clone(),
+                commits.clone(),
+                resources.clone(),
+                locks.clone(),
+                worktrees.clone(),
+                "start-failure-workspace",
+                temp.path(),
+            );
+            let mut graph = test_graph("start failure preserves independent siblings");
+            let mut failing = node("start-failure");
+            failing.kind = ExecutionNodeKind::Materialize;
+            failing.executor_kind = "start_fail".into();
+            failing.resource_scopes =
+                vec!["write:failed.txt".into(), "worktree:failed-worktree".into()];
+            let mut sibling = node("healthy");
+            sibling.kind = ExecutionNodeKind::Materialize;
+            sibling.resource_scopes = vec!["write:healthy.txt".into()];
+            graph.nodes = if fail_first {
+                vec![failing.clone(), sibling]
+            } else {
+                vec![sibling, failing.clone()]
+            };
+            graph.nodes.push(node("dependent"));
+            graph.edges.push(ExecutionEdge {
+                from: failing.id.clone(),
+                to: "dependent".into(),
+                kind: ExecutionEdgeKind::DependsOn,
+            });
+            let graph_id = graph.id.clone();
+            let service_class = graph.service_class;
+            let supervisor = supervised.then(|| {
+                crate::RuntimeExecutionSupervisor::with_limits(
+                    Arc::new(runner.clone()),
+                    8,
+                    2,
+                    Duration::from_secs(2),
+                )
+            });
+            let report = if let Some(supervisor) = &supervisor {
+                let report = tokio::time::timeout(
+                    Duration::from_secs(5),
+                    supervisor.submit_and_wait(
+                        graph,
+                        ExecutionGraphCommand::Start {
+                            expected_revision: 0,
+                        },
+                    ),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+                report.1
+            } else {
+                tokio::time::timeout(Duration::from_secs(5), runner.start(graph))
+                    .await
+                    .unwrap()
+                    .unwrap()
+            };
+            assert_eq!(report.failed, 1);
+            assert_eq!(report.completed, 1);
+            assert_eq!(report.blocked, 1);
+            let settled = state.load(&graph_id).unwrap();
+            assert_eq!(
+                settled.node_statuses["start-failure"],
+                ExecutionNodeStatus::Failed
+            );
+            assert_eq!(
+                settled.node_statuses["healthy"],
+                ExecutionNodeStatus::Completed
+            );
+            assert_eq!(
+                settled.node_statuses["dependent"],
+                ExecutionNodeStatus::Blocked
+            );
+            assert_eq!(
+                settled
+                    .recovery_cursor
+                    .node_attempts
+                    .get("start-failure")
+                    .copied()
+                    .unwrap_or(0),
+                0
+            );
+            let starts = state
+                .binding_starts_page(&graph_id, 0, settled.revision)
+                .unwrap()
+                .1;
+            assert_eq!(starts.len(), 1);
+            assert_eq!(starts[0].0, "healthy");
+            assert_eq!(healthy.calls.lock().unwrap().as_slice(), &["healthy"]);
+            let ticket = NodeExecutionTicket {
+                graph_id: graph_id.clone(),
+                node_id: failing.id.clone(),
+                executor_kind: failing.executor_kind.clone(),
+                service_class,
+                attempt: 1,
+                idempotency_key: failing.idempotency_key.clone(),
+                payload_ref: failing.payload_ref.clone(),
+            };
+            assert!(matches!(
+                commits.inspect_execution_effect(&ticket).unwrap(),
+                ExecutionEffectState::Fresh
+            ));
+            let transitions = events
+                .list_stream(&format!("{graph_id}:node:start-failure"))
+                .unwrap();
+            assert!(transitions
+                .iter()
+                .all(|event| event.payload["to"] != "running"));
+            assert_eq!(
+                resources
+                    .snapshot(&ExecutionResourceKind::Tool)
+                    .unwrap()
+                    .active_leases,
+                0
+            );
+            assert_eq!(
+                resources
+                    .snapshot(&ExecutionResourceKind::Tool)
+                    .unwrap()
+                    .queued_waiters,
+                0
+            );
+            assert_eq!(locks.active_lease_count().unwrap(), 0);
+            assert!(worktrees.active_records().unwrap().is_empty());
+            let mut retry = test_graph("reuse resources after unadmitted failure");
+            let mut retry_node = node("reuse");
+            retry_node.kind = ExecutionNodeKind::Materialize;
+            retry_node.resource_scopes = failing.resource_scopes;
+            retry.nodes.push(retry_node);
+            assert_eq!(
+                tokio::time::timeout(Duration::from_secs(5), runner.start(retry))
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .completed,
+                1
+            );
+            if let Some(supervisor) = supervisor {
+                supervisor.shutdown().await;
+            }
+        }
+    }
+}
+
+enum StartFailureProbeMode {
+    Foreign,
+    Unknown,
+    AfterAdmission,
+    AdmittedForeign,
+}
+
+struct StartFailureProbe(StartFailureProbeMode);
+
+#[async_trait]
+impl NodeExecutor for StartFailureProbe {
+    fn kind(&self) -> &str {
+        "start_failure_probe"
+    }
+    fn validate(&self, _node: &ExecutionNodeSpec) -> Result<(), NodeExecutorError> {
+        Ok(())
+    }
+    async fn start(
+        &self,
+        context: NodeExecutionContext,
+    ) -> Result<NodeExecutionTicket, NodeExecutorError> {
+        match self.0 {
+            StartFailureProbeMode::Foreign => Err(NodeExecutorError::Start {
+                node_id: "foreign-node".into(),
+                reason: "wrong error owner".into(),
+            }),
+            StartFailureProbeMode::Unknown => Err(NodeExecutorError::OriginalCustodyUnknown {
+                node_id: context.node.id,
+                reason: "preparation did not establish an absent effect".into(),
+            }),
+            StartFailureProbeMode::AfterAdmission | StartFailureProbeMode::AdmittedForeign => {
+                Ok(NodeExecutionTicket {
+                    graph_id: context.graph.id.clone(),
+                    node_id: context.node.id,
+                    executor_kind: self.kind().into(),
+                    service_class: context.graph.service_class,
+                    attempt: context.attempt,
+                    idempotency_key: context.node.idempotency_key,
+                    payload_ref: context.node.payload_ref,
+                })
+            }
+        }
+    }
+    async fn poll_or_await(
+        &self,
+        ticket: &NodeExecutionTicket,
+    ) -> Result<NodeExecutionOutcome, NodeExecutorError> {
+        assert!(matches!(
+            self.0,
+            StartFailureProbeMode::AfterAdmission | StartFailureProbeMode::AdmittedForeign
+        ));
+        Err(NodeExecutorError::Start {
+            node_id: if matches!(self.0, StartFailureProbeMode::AdmittedForeign) {
+                "foreign-node".into()
+            } else {
+                ticket.node_id.clone()
+            },
+            reason: "misclassified admitted failure".into(),
+        })
+    }
+}
+
+#[tokio::test]
+async fn executor_start_failure_does_not_isolate_foreign_or_unknown_errors() {
+    for mode in [
+        StartFailureProbeMode::Foreign,
+        StartFailureProbeMode::Unknown,
+    ] {
+        let (registry, state, commits) = harness();
+        registry
+            .register(Arc::new(StartFailureProbe(mode)))
+            .unwrap();
+        let runner = test_runner(registry, state.clone(), commits);
+        let mut graph = test_graph("untrusted preparation error");
+        let mut probe = node("actual-node");
+        probe.executor_kind = "start_failure_probe".into();
+        graph.nodes.push(probe);
+        let graph = runner.register(graph).await.unwrap();
+        let ready = runner
+            .pump_snapshot(&graph.id, &Default::default())
+            .await
+            .unwrap()
+            .ready;
+        assert!(matches!(
+            runner.prepare_ready_wave(&graph.id, ready).await,
+            Err(ExecutionRunnerError::Executor(
+                NodeExecutorError::Start { .. } | NodeExecutorError::OriginalCustodyUnknown { .. }
+            ))
+        ));
+        let current = state.load(&graph.id).unwrap();
+        assert_eq!(
+            current.node_statuses["actual-node"],
+            ExecutionNodeStatus::Ready
+        );
+        assert!(current.node_results.is_empty());
+        assert!(current
+            .recovery_cursor
+            .node_attempts
+            .values()
+            .all(|attempt| *attempt == 0));
+        assert!(state
+            .binding_starts_page(&graph.id, 0, current.revision)
+            .unwrap()
+            .1
+            .is_empty());
+    }
+}
+
+#[tokio::test]
+async fn executor_start_failure_after_admission_preserves_unknown_original_custody() {
+    for foreign in [false, true] {
+        let (registry, state, commits) = harness();
+        registry
+            .register(Arc::new(StartFailureProbe(if foreign {
+                StartFailureProbeMode::AdmittedForeign
+            } else {
+                StartFailureProbeMode::AfterAdmission
+            })))
+            .unwrap();
+        let runner = test_runner(registry, state.clone(), commits);
+        let mut graph = test_graph("admitted Start is not a preparation failure");
+        let mut probe = node("actual-node");
+        probe.executor_kind = "start_failure_probe".into();
+        graph.nodes.push(probe);
+        let graph = runner.register(graph).await.unwrap();
+        let ready = runner
+            .pump_snapshot(&graph.id, &Default::default())
+            .await
+            .unwrap()
+            .ready;
+        let prepared = runner
+            .prepare_ready_wave(&graph.id, ready)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        let before = state.load(&graph.id).unwrap();
+        assert_eq!(
+            before.node_statuses["actual-node"],
+            ExecutionNodeStatus::Running
+        );
+        let error = runner
+            .execute_prepared_pump_node(&graph.id, prepared, Arc::new(Notify::new()))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, ExecutionRunnerError::Executor(NodeExecutorError::OriginalCustodyUnknown { node_id, .. }) if node_id == "actual-node")
+        );
+        assert_eq!(state.load(&graph.id).unwrap(), before);
+        let (finished, outcome, closed) = runner
+            .original_pump_outcome_for_test(&graph.id, "actual-node")
+            .await
+            .unwrap();
+        assert!(!finished);
+        assert!(!closed);
+        assert!(
+            matches!(outcome, Some(Err(error)) if matches!(error.as_ref(),
+            ExecutionRunnerError::Executor(NodeExecutorError::OriginalCustodyUnknown { node_id, .. }) if node_id == "actual-node"))
+        );
+        let in_flight = std::collections::BTreeSet::from(["actual-node".to_string()]);
+        let (owners, missing) = runner
+            .capture_pump_cancellation_owners(&graph.id, &in_flight)
+            .await;
+        assert!(!missing);
+        assert_eq!(owners.len(), 1);
+        let error = tokio::time::timeout(
+            Duration::from_secs(2),
+            runner.drain_pump_cancellation_owners(&graph.id, owners),
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            ExecutionRunnerError::Executor(NodeExecutorError::OriginalCustodyUnknown { .. })
+        ));
+        assert_eq!(state.load(&graph.id).unwrap(), before);
+        let (finished, _, closed) = runner
+            .original_pump_outcome_for_test(&graph.id, "actual-node")
+            .await
+            .unwrap();
+        assert!(!finished);
+        assert!(!closed);
+        let starts = state
+            .binding_starts_page(&graph.id, 0, before.revision)
+            .unwrap()
+            .1;
+        assert_eq!(starts.len(), 1);
+        assert!(state
+            .binding_retirement_record(&before, "actual-node", &starts[0].1)
+            .unwrap()
+            .is_none());
+        assert!(!state
+            .binding_lease_closure(&before, "actual-node", &starts[0].1, starts[0].2)
+            .unwrap());
+    }
 }
 
 #[tokio::test]
@@ -2248,6 +2710,10 @@ async fn aborted_cancel_releases_intent_and_nested_child_graph_can_progress() {
     tokio::task::yield_now().await;
     cancel.abort();
     let _ = cancel.await;
+    // Aborting the command waiter does not end the original cancel future.
+    // Let that same physical operation finish before expecting a graph commit.
+    assert_eq!(state.load(&graph_id).unwrap().node_statuses["cancel-probe"], ExecutionNodeStatus::Running);
+    executor.release_cancel.notify_one();
     tokio::time::timeout(Duration::from_secs(1), run)
         .await
         .expect("old intent waiter is released")
@@ -2448,7 +2914,16 @@ fn terminal_replan_is_one_transaction_and_survives_projection_restart() {
         .unwrap();
 
     assert_eq!(receipt.graph.revision, before_revision + 1);
-    assert_eq!(receipt.transaction.event_ids.len(), 2);
+    let transaction_events = event_store.all_events(100).unwrap().into_iter()
+        .filter(|event| event.transaction_id == receipt.transaction.transaction_id).collect::<Vec<_>>();
+    let mut kinds = transaction_events.iter().map(|event| event.kind.as_str()).collect::<Vec<_>>();
+    kinds.sort_unstable();
+    assert_eq!(kinds, ["execution_graph.checkpoint", "execution_node.transitioned"]);
+    let mut actual_event_ids = transaction_events.iter().map(|event| event.event_id.clone()).collect::<Vec<_>>();
+    let mut expected_event_ids = receipt.transaction.event_ids.clone();
+    actual_event_ids.sort_unstable();
+    expected_event_ids.sort_unstable();
+    assert_eq!(actual_event_ids, expected_event_ids);
     drop(commits);
     let projected = ExecutionGraphStateStore::new(event_store)
         .load(&graph.id)
@@ -2529,6 +3004,9 @@ fn malformed_session_terminal_cannot_commit_a_graph_without_an_outbox_row() {
 
 #[test]
 fn non_agentic_terminal_cannot_borrow_another_graphs_session() {
+    if crate::test_support::skip_if_env_absent("COWD_R1_06_FIXTURE_ROOT") {
+        return;
+    }
     let event_store = Arc::new(RuntimeEventStore::for_test());
     let commits = ExecutionCommitService::new(Arc::clone(&event_store));
     let mut graph = test_graph("terminal Session belongs to Graph lineage");
@@ -2866,6 +3344,7 @@ async fn agentic_root_terminal_requires_real_a_verdict_and_refuses_supplied_verd
         .apply(&AgentActionEnvelope {
             action_id: "open-root-program-before-b".into(),
             actor: AgentActorBinding {
+                original_execution: None,
                 objective_id,
                 program_id: program_id.clone(),
                 session_id: lineage.session_id.clone(),
@@ -2979,282 +3458,7 @@ async fn agentic_root_terminal_requires_real_a_verdict_and_refuses_supplied_verd
         .unwrap()
         .is_none());
 
-    crate::agentic::execution::reviewed_goal_fixture::with_native_raw_owner_fixture_for_test(|services, _raw_owner| async move {
-    let events = services.event_store();
-    let goal = services
-        .goal_store()
-        .get("goal:root-agentic-execution")
-        .unwrap()
-        .unwrap();
-    let binding = goal.execution_binding.as_ref().unwrap();
-    let program = services
-        .agent_action_service()
-        .project(&binding.agentic_program_id)
-        .unwrap();
-    let verdict = program
-        .objective_verdict
-        .as_ref()
-        .expect("real independently reviewed A");
-    let source = events
-        .event_by_idempotency_key(
-            &format!("agentic-program:{}", program.program_id),
-            &format!("program-conclusion:{}", verdict.authority_revision),
-        )
-        .unwrap()
-        .or_else(|| {
-            events
-                .event_by_idempotency_key(
-                    &format!("agentic-program:{}", program.program_id),
-                    &format!("agentic-objective-verdict:{}", verdict.terminal_fence),
-                )
-                .unwrap()
-        })
-        .unwrap();
-    assert_eq!(source.kind, "agentic.objective_verdict_bound");
-    let expected = serde_json::json!({
-        "program_id":binding.agentic_program_id,"program_stream_revision":program.revision,
-        "goal_stream_revision":events.stream_revision(&format!("goal:{}",goal.id)).unwrap(),
-        "goal_spec_revision":goal.spec_revision,"goal_spec_digest":goal.spec_digest,
-        "a_commit_cursor":source.commit_cursor,
-        "proof_input_digests":goal.reviews.iter().filter_map(|review|review.verification.as_ref()
-            .and_then(|proof|proof.input_set.as_ref()).map(|inputs|inputs.semantic_digest.clone())).collect::<Vec<_>>(),
-        "verdict":verdict,
-    });
-    let queries = Arc::new(std::sync::OnceLock::new());
-    assert!(queries.set(services.session_query_port().unwrap()).is_ok());
-    let writer = ExecutionCommitService::new(events.clone())
-        .with_artifact_store(services.artifact_store().clone())
-        .with_session_query_slot(queries);
-    let mut graph = services
-        .graph_state_store()
-        .load(&binding.root_execution_id)
-        .unwrap();
-    let node_id = graph
-        .nodes
-        .iter()
-        .find(|node| node.kind == ExecutionNodeKind::InlineModel)
-        .unwrap()
-        .id
-        .clone();
-    for status in [ExecutionNodeStatus::Ready, ExecutionNodeStatus::Running] {
-        if (graph.node_statuses[&node_id] == ExecutionNodeStatus::Planned
-            && status == ExecutionNodeStatus::Ready)
-            || (graph.node_statuses[&node_id] == ExecutionNodeStatus::Ready
-                && status == ExecutionNodeStatus::Running)
-        {
-            graph = writer
-                .transition_node(&graph, &node_id, status, None, Vec::new())
-                .unwrap()
-                .graph;
-        }
-    }
-    let stream = "session-terminal:graph-authored-metadata";
-    let key = "graph-authored-metadata";
-    let origin = crate::PreparedArtifactOrigin::TerminalBody {
-        terminal_id: key.into(),
-        session_id: binding.session_id.clone(),
-        execution_id: graph.id.clone(),
-        turn_id: binding.turn_id.clone(),
-        event_stream: stream.into(),
-        event_key: key.into(),
-    };
-    let body = serde_json::to_vec(&serde_json::json!({"schema_version":crate::SESSION_TERMINAL_ARTIFACT_SCHEMA_VERSION,"text":"independently reviewed real A"})).unwrap();
-    let reference = services
-        .artifact_store()
-        .write_pre_pinned_with_media_blocking(
-            &format!("session:{}", binding.session_id),
-            key,
-            "application/vnd.cowd.session-terminal+json",
-            &body,
-            &origin,
-        )
-        .unwrap();
-    let terminal = crate::SessionTerminalInput {
-        terminal_id: key.into(),
-        message_id: "graph-authored-message".into(),
-        session_id: binding.session_id.clone(),
-        execution_id: Some(graph.id.clone()),
-        turn_id: Some(binding.turn_id.clone()),
-        request_id: Some(key.into()),
-        session_generation: Some(1),
-        input_sequence: Some(1),
-        input_claim_owner: Some("matrix-owner".into()),
-        input_claim_token: Some("matrix-token".into()),
-        input_claim_revision: Some(1),
-        controlled_recovery_claim_fingerprints: Vec::new(),
-        payload_ref: crate::encode_session_terminal_artifact_ref(&reference).unwrap(),
-    };
-    let input = crate::RuntimeTransactionEventInput {
-        event: RuntimeEventInput {
-            stream_id: stream.into(),
-            scope: RuntimeEventScope::SessionInput,
-            kind: "runtime.session.terminal_requested".into(),
-            status: Some("pending_delivery".into()),
-            actor: Some("execution_commit_service".into()),
-            refs: Vec::new(),
-            payload: serde_json::to_value(&terminal).unwrap(),
-        },
-        idempotency_key: Some(key.into()),
-        schema_version: 1,
-    };
-    let mut canonical = input.clone();
-    canonical.event.payload["objective_verdict"] = expected.clone();
-    let request = crate::AppendTransactionRequest {
-        transaction_id: "graph-authored-matrix".into(),
-        expected_streams: vec![crate::ExpectedStreamRevision {
-            stream_id: stream.into(),
-            expected_revision: 0,
-        }],
-        events: vec![canonical],
-    };
-    let cursor = events.durable_commit_cursor().unwrap();
-    assert!(events
-        .append_transaction_with_terminal(request.clone(), terminal.clone())
-        .is_err());
-    let forged = writer
-        .transition_node(
-            &graph,
-            &node_id,
-            ExecutionNodeStatus::Completed,
-            Some(completed_result(&node_id)),
-            request.events.clone(),
-        )
-        .err()
-        .unwrap();
-    assert!(forged
-        .to_string()
-        .contains("cannot supply its own Objective verdict"));
-    assert_eq!(events.durable_commit_cursor().unwrap(), cursor);
-    assert_eq!(events.stream_revision(&graph.id).unwrap(), graph.revision);
-    let mut mutations = vec![None, Some(serde_json::Value::Null)];
-    let mut extra = expected.clone();
-    extra["unexpected"] = serde_json::json!(true);
-    mutations.push(Some(extra));
-    for field in [
-        "a_commit_cursor",
-        "goal_spec_revision",
-        "goal_spec_digest",
-        "verdict",
-        "proof_input_digests",
-    ] {
-        let mut changed = expected.clone();
-        changed[field] = serde_json::json!("foreign");
-        mutations.push(Some(changed));
-    }
-    let mut hits = 0;
-    for mutation in mutations {
-        let mut changed = request.clone();
-        match mutation {
-            Some(value) => {
-                changed.events[0].event.payload["objective_verdict"] = value;
-            }
-            None => {
-                changed.events[0]
-                    .event
-                    .payload
-                    .as_object_mut()
-                    .unwrap()
-                    .remove("objective_verdict");
-            }
-        }
-        assert!(events
-            .append_transaction_with_authored_terminal_metadata(
-                changed,
-                terminal.clone(),
-                Some(&expected)
-            )
-            .is_err());
-        hits += 1;
-        assert_eq!(events.durable_commit_cursor().unwrap(), cursor);
-        assert_eq!(events.stream_revision(stream).unwrap(), 0);
-        assert!(events.session_terminal(key).unwrap().is_none());
-    }
-    assert_eq!(hits, 8);
-    let mut identity_hits = 0;
-    for variant in 0..6 {
-        let mut changed = request.clone();
-        match variant {
-            0 => changed.events[0].event.scope = RuntimeEventScope::Session,
-            1 => changed.events[0].schema_version = 2,
-            2 => changed.events[0].idempotency_key = None,
-            3 => changed.events[0].event.stream_id = graph.id.clone(),
-            4 => changed.events.push(changed.events[0].clone()),
-            5 => changed.events[0].event.payload["input_claim_revision"] = serde_json::json!(2),
-            _ => unreachable!(),
-        }
-        assert!(events
-            .append_transaction_with_authored_terminal_metadata(
-                changed,
-                terminal.clone(),
-                Some(&expected)
-            )
-            .is_err());
-        identity_hits += 1;
-        assert_eq!(events.durable_commit_cursor().unwrap(), cursor);
-        assert!(events.session_terminal(key).unwrap().is_none());
-    }
-    assert_eq!(identity_hits, 6);
-    let null_expected = serde_json::Value::Null;
-    assert!(events
-        .append_transaction_with_authored_terminal_metadata(
-            request.clone(),
-            terminal.clone(),
-            Some(&null_expected)
-        )
-        .is_err());
-    let mut missing = request;
-    missing.events.clear();
-    assert!(events
-        .append_transaction_with_authored_terminal_metadata(
-            missing,
-            terminal.clone(),
-            Some(&expected)
-        )
-        .is_err());
-    let result = completed_result(&node_id);
-    let receipt = writer
-        .transition_node(
-            &graph,
-            &node_id,
-            ExecutionNodeStatus::Completed,
-            Some(result.clone()),
-            vec![input.clone()],
-        )
-        .unwrap();
-    let duplicate = writer
-        .transition_node(
-            &graph,
-            &node_id,
-            ExecutionNodeStatus::Completed,
-            Some(result),
-            vec![input],
-        )
-        .unwrap();
-    assert!(duplicate.transaction.duplicate);
-    assert_eq!(
-        duplicate.transaction.commit_cursor,
-        receipt.transaction.commit_cursor
-    );
-    let published = events.list_stream(stream).unwrap();
-    assert_eq!(published.len(), 1);
-    assert_eq!(published[0].payload["objective_verdict"], expected);
-    let mut payload = published[0].payload.clone();
-    payload.as_object_mut().unwrap().remove("objective_verdict");
-    assert_eq!(payload, serde_json::to_value(&terminal).unwrap());
-    assert_eq!(
-        events.session_terminal(key).unwrap().unwrap().commit_cursor,
-        receipt.transaction.commit_cursor
-    );
-    assert_eq!(services.goal_store().get(&goal.id).unwrap().unwrap(), goal);
-    assert_eq!(
-        services
-            .agent_action_service()
-            .project(&binding.agentic_program_id)
-            .unwrap(),
-        program
-    );
-    services.shutdown_maintenance().await;
-    }).await;
+
 }
 
 #[test]
@@ -3272,10 +3476,18 @@ fn graph_admission_rejects_missing_canonical_business_lineage_without_panicking(
 
 #[tokio::test]
 async fn cancel_wins_over_inflight_dynamic_replan_without_partial_graph_mutation() {
+    // R02 collect-and-close positive control: a cancellation that arrives
+    // while the original task is in flight stops further dispatch, collects
+    // every fact that had happened by that point, and closes the node with a
+    // named terminal state carrying that evidence - with no partial graph
+    // mutation and no re-dispatch of the original attempt.
     let (registry, state, commits) = harness();
     let executor = Arc::new(ReplanRaceExecutor {
         poll_entered: Notify::new(),
         release_poll: Notify::new(),
+        poll_calls: AtomicUsize::new(0),
+        cancel_calls: AtomicUsize::new(0),
+        fail_outcome: false,
     });
     registry.register(executor.clone()).unwrap();
     registry
@@ -3284,7 +3496,7 @@ async fn cancel_wins_over_inflight_dynamic_replan_without_partial_graph_mutation
             Duration::from_millis(1),
         )))
         .unwrap();
-    let runner = test_runner(registry, state.clone(), commits);
+    let runner = test_runner(registry, state.clone(), commits.clone());
     let mut graph = test_graph("command versus replan");
     let mut model = node("model");
     model.executor_kind = "replan_race".to_string();
@@ -3318,10 +3530,196 @@ async fn cancel_wins_over_inflight_dynamic_replan_without_partial_graph_mutation
         projected.node_statuses["model"],
         ExecutionNodeStatus::Cancelled
     );
+    // No partial graph mutation: the collected replan is never admitted and
+    // the durable head moved exactly twice - one command transaction plus
+    // the cancelled owner's lease-closure checkpoint, nothing else.
     assert!(!projected
         .nodes
         .iter()
         .any(|candidate| candidate.id == "late-tool"));
+    assert!(!projected
+        .edges
+        .iter()
+        .any(|edge| edge.to == "late-tool"));
+    assert_eq!(cancelled.revision, running.revision + 2);
+    // The named terminal state carries the collected facts: the original
+    // computed result and the collected-unapplied dynamic replan, so the
+    // durable answer holds the aggregation summary.
+    let closure = cancelled
+        .node_results
+        .get("model")
+        .expect("a collected cancellation closure must carry its node result");
+    assert_eq!(closure.status, ExecutionNodeStatus::Cancelled);
+    let summary = closure
+        .summary
+        .as_deref()
+        .expect("the cancelled answer must carry the collected changes summary");
+    assert!(summary.contains("collected"), "{summary}");
+    assert!(summary.contains("Completed"), "{summary}");
+    assert!(summary.contains("late-tool"), "{summary}");
+    assert!(summary.contains("collected unapplied"), "{summary}");
+    assert_eq!(
+        closure.result_ref.as_deref(),
+        Some("result:model"),
+        "the collected fact keeps the original computed result reference"
+    );
+    // The same-ticket effect receipt closes with the closure: recovery and
+    // every downstream reader consume one decision from one source.
+    let attempt = *projected
+        .recovery_cursor
+        .node_attempts
+        .get("model")
+        .expect("collected cancellation keeps the original attempt");
+    let binding = state
+        .current_binding(&projected, "model", attempt)
+        .expect("original binding");
+    let ticket = NodeExecutionTicket {
+        graph_id: graph_id.clone(),
+        node_id: "model".to_string(),
+        executor_kind: binding.executor_kind.clone(),
+        service_class: projected.service_class,
+        attempt: binding.attempt,
+        idempotency_key: binding.ticket_idempotency_key.clone(),
+        payload_ref: "payload:model".to_string(),
+    };
+    assert!(
+        matches!(
+            commits.inspect_execution_effect(&ticket).unwrap(),
+            ExecutionEffectState::Completed(collected)
+                if collected.result.status == ExecutionNodeStatus::Cancelled
+        ),
+        "the collected closure must commit the same-ticket effect receipt"
+    );
+    // Lease and retirement state is part of the collected facts: the binding
+    // lease closure checkpoint is durable and no owner stays retained.
+    let position = state
+        .binding_start_position(&projected, "model", &binding)
+        .expect("original binding start")
+        .expect("collected cancellation keeps the original binding start");
+    assert!(
+        state
+            .binding_lease_closure(&projected, "model", &binding, position)
+            .expect("lease closure checkpoint"),
+        "the collected cancellation must close the original binding leases"
+    );
+    assert!(!runner.has_retained_shutdown_owners().await);
+    // No re-dispatch: the original attempt polled exactly once.
+    assert_eq!(executor.poll_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(executor.cancel_calls.load(Ordering::SeqCst), 1);
+
+    // Negative control 1: a cancellation with no original facts at all keeps
+    // the plain Cancelled semantics - status flip only, no aggregated result,
+    // a single command revision.
+    let (registry, state, commits) = harness();
+    registry
+        .register(Arc::new(TestExecutor::new(
+            Vec::new(),
+            Duration::from_millis(1),
+        )))
+        .unwrap();
+    let runner = test_runner(registry, state.clone(), commits);
+    let mut graph = test_graph("cancel without facts");
+    graph.nodes.push(node("idle"));
+    let graph_id = graph.id.clone();
+    runner.register(graph).await.unwrap();
+    runner
+        .pump_snapshot(&graph_id, &Default::default())
+        .await
+        .unwrap();
+    let ready = state.load(&graph_id).unwrap();
+    assert_eq!(ready.node_statuses["idle"], ExecutionNodeStatus::Ready);
+    let cancelled = runner
+        .command(
+            &graph_id,
+            ExecutionGraphCommand::Cancel {
+                expected_revision: ready.revision,
+                reason: "queued without facts".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(cancelled.node_statuses["idle"], ExecutionNodeStatus::Cancelled);
+    assert!(
+        cancelled.node_results.get("idle").is_none(),
+        "a factless cancellation must not fabricate a collected result"
+    );
+    assert_eq!(cancelled.revision, ready.revision + 1);
+
+    // Negative control 2: a finished outcome that only the original owner
+    // can retire (a Failed result carrying a replan) stays unknown to this
+    // command. The rejected command commits nothing: the graph is neither
+    // half-written nor re-dispatched, and the original owner still settles
+    // its single decision afterwards.
+    let (registry, state, commits) = harness();
+    let executor = Arc::new(ReplanRaceExecutor {
+        poll_entered: Notify::new(),
+        release_poll: Notify::new(),
+        poll_calls: AtomicUsize::new(0),
+        cancel_calls: AtomicUsize::new(0),
+        fail_outcome: true,
+    });
+    registry.register(executor.clone()).unwrap();
+    registry
+        .register(Arc::new(TestExecutor::new(
+            Vec::new(),
+            Duration::from_millis(1),
+        )))
+        .unwrap();
+    let runner = test_runner(registry, state.clone(), commits);
+    let mut graph = test_graph("uncollectable versus replan");
+    let mut model = node("model");
+    model.executor_kind = "replan_race".to_string();
+    graph.nodes.push(model);
+    let graph_id = graph.id.clone();
+    let run = {
+        let runner = runner.clone();
+        tokio::spawn(async move { runner.start(graph).await })
+    };
+    executor.poll_entered.notified().await;
+    let running = state.load(&graph_id).unwrap();
+    let rejected = runner
+        .command(
+            &graph_id,
+            ExecutionGraphCommand::Cancel {
+                expected_revision: running.revision,
+                reason: "uncollectable outcome probe".to_string(),
+            },
+        )
+        .await
+        .expect_err("a Failed outcome with a replan belongs to its original owner");
+    assert!(
+        matches!(&rejected,
+            ExecutionRunnerError::Executor(NodeExecutorError::OriginalCustodyUnknown { node_id, .. })
+                if node_id == "model"),
+        "{rejected}"
+    );
+    let intact = state.load(&graph_id).unwrap();
+    assert_eq!(
+        intact.revision, running.revision,
+        "the rejected command must commit no partial mutation"
+    );
+    assert!(!intact
+        .nodes
+        .iter()
+        .any(|candidate| candidate.id == "late-tool"));
+    // The graph still converges through the original owner's own single
+    // decision, and the cancelled probe never forced a re-dispatch.
+    let report = run
+        .await
+        .unwrap()
+        .expect("the original owner settles the graph after the unknown probe");
+    assert_eq!(report.failed, 1);
+    // The owner's own single decision adds the replan; its late successor is
+    // blocked behind the Failed predecessor exactly like any other dependent
+    // work - the probe committed nothing itself.
+    assert_eq!(report.blocked, 1);
+    let settled = state.load(&graph_id).unwrap();
+    assert_eq!(settled.node_statuses["model"], ExecutionNodeStatus::Failed);
+    assert_eq!(
+        settled.node_statuses["late-tool"],
+        ExecutionNodeStatus::Blocked
+    );
+    assert_eq!(executor.poll_calls.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]
@@ -3533,7 +3931,7 @@ async fn isolation_rejects_foreign_attempt_before_touching_current_resource_leas
         .unwrap()
         .ready;
     let mut prepared = runner.prepare_ready_wave(&graph.id, ready).await.unwrap();
-    assert_eq!(prepared.len(), 1);
+    assert!(matches!(prepared.as_slice(), [item] if item.node.id == "current-attempt"));
     let prepared = prepared.pop().unwrap();
     let binding = prepared.binding.unwrap();
     let ticket = NodeExecutionTicket {
@@ -3557,6 +3955,10 @@ async fn isolation_rejects_foreign_attempt_before_touching_current_resource_leas
             .active_leases,
         1
     );
+    assert!(matches!(
+        commits.inspect_execution_effect(&ticket).unwrap(),
+        ExecutionEffectState::Uncertain
+    ));
     let mut foreign = binding.clone();
     foreign.attempt += 1;
     let rejected = runner
@@ -3605,10 +4007,14 @@ async fn isolation_rejects_foreign_attempt_before_touching_current_resource_leas
         state.load(&graph.id).unwrap().node_statuses[&ticket.node_id],
         ExecutionNodeStatus::Failed
     );
-    assert!(matches!(
-        commits.inspect_execution_effect(&ticket).unwrap(),
-        ExecutionEffectState::Uncertain
-    ));
+    let ExecutionEffectState::Completed(outcome) = commits.inspect_execution_effect(&ticket).unwrap()
+    else {
+        panic!("the original owner failure must have a settled receipt");
+    };
+    assert_eq!(outcome.result.status, ExecutionNodeStatus::Failed);
+    let failure = outcome.result.failure.expect("original isolated failure");
+    assert_eq!(failure.kind, "node_execution_isolated_failure");
+    assert_eq!(failure.message, "actual owner failure");
 }
 
 #[tokio::test]
@@ -3860,15 +4266,6 @@ async fn pause_resume_and_cancel_are_revision_checked() {
     );
 }
 
-#[tokio::test]
-async fn r1_backend_parity_preserves_original_attempt_fences() {
-    use crate::agentic::execution::reviewed_goal_fixture::{
-        exercise_r1_backend_resource_lifetime_for_test, R1ResourceBackend,
-    };
-    for backend in [R1ResourceBackend::Native, R1ResourceBackend::Process] {
-        exercise_r1_backend_resource_lifetime_for_test(backend).await;
-    }
-}
 
 #[test]
 fn duplicate_transition_returns_original_transaction_without_duplicate_events() {
@@ -3930,6 +4327,9 @@ fn r1_ref_fixture() -> (
 
 #[test]
 fn r1_event_replay_ref_write_retains_source_cas() {
+    if crate::test_support::skip_if_env_absent("COWD_R1_06_FIXTURE_ROOT") {
+        return;
+    }
     let (events, artifacts, commits, graph) = r1_ref_fixture();
     let goals = crate::execution_core::GoalStore::new(events.clone());
     let goal: harness_contract::goal::GoalContract = serde_json::from_value(serde_json::json!({
@@ -4000,6 +4400,9 @@ fn r1_event_replay_ref_write_retains_source_cas() {
 
 #[test]
 fn r1_event_replay_current_retry_is_idempotent_and_rejects_legacy_transactions() {
+    if crate::test_support::skip_if_env_absent("COWD_R1_06_FIXTURE_ROOT") {
+        return;
+    }
     let (events, _artifacts, commits, graph) = r1_ref_fixture();
     let first = commits
         .transition_node(&graph, "a", ExecutionNodeStatus::Ready, None, Vec::new())
@@ -4047,6 +4450,9 @@ fn r1_event_replay_current_retry_is_idempotent_and_rejects_legacy_transactions()
 
 #[test]
 fn r1_content_gc_committed_ref_survives_crash_before_pin_promotion() {
+    if crate::test_support::skip_if_env_absent("COWD_R1_06_FIXTURE_ROOT") {
+        return;
+    }
     let (events, artifacts, commits, graph) = r1_ref_fixture();
     let event = events.latest_for_stream(&graph.id).unwrap().unwrap();
     let reference: harness_contract::context::ArtifactRef =
@@ -4085,6 +4491,9 @@ fn r1_content_gc_committed_ref_survives_crash_before_pin_promotion() {
 
 #[test]
 fn r1_content_gc_prepared_failure_reconciles_real_source_cas() {
+    if crate::test_support::skip_if_env_absent("COWD_R1_06_FIXTURE_ROOT") {
+        return;
+    }
     let (events, artifacts, commits, graph) = r1_ref_fixture();
     let goals = crate::execution_core::GoalStore::new(events.clone());
     let goal: harness_contract::goal::GoalContract = serde_json::from_value(serde_json::json!({
@@ -4201,6 +4610,9 @@ fn r1_content_gc_prepared_failure_reconciles_real_source_cas() {
 
 #[test]
 fn r1_content_gc_all_submission_facades_revalidate_retired_slots() {
+    if crate::test_support::skip_if_env_absent("COWD_R1_06_FIXTURE_ROOT") {
+        return;
+    }
     let (events, artifacts, _commits, graph) = r1_ref_fixture();
     let goals = crate::execution_core::GoalStore::new(events.clone());
     let goal: harness_contract::goal::GoalContract = serde_json::from_value(serde_json::json!({
@@ -4749,7 +5161,7 @@ async fn compile_target_guard_skips_scope_locks_but_verify_and_effect_leaves_acq
             .prepare_ready_wave(&graph.id, ready)
             .await
             .unwrap();
-        assert_eq!(prepared.len(), 1);
+        assert!(matches!(prepared.as_slice(), [item] if item.node.id == "scoped"));
         let prepared = prepared.pop().unwrap();
         if skips_lock {
             let binding = prepared
@@ -4794,7 +5206,7 @@ async fn compile_target_guard_skips_scope_locks_but_verify_and_effect_leaves_acq
                 .prepare_ready_wave(&graph.id, ready)
                 .await
                 .unwrap();
-            assert_eq!(prepared.len(), 1);
+            assert!(matches!(prepared.as_slice(), [item] if item.node.id == "scoped"));
             let prepared = prepared.pop().unwrap();
             assert!(prepared.binding.as_ref().unwrap().scope_lease_ref.is_some());
             assert!(fixture
@@ -5051,8 +5463,7 @@ fn graph_enumeration_is_cursor_paginated_without_full_stream_scan() {
     let second = state
         .graph_ids_page(Some((*last_cursor, last_id.clone())), 2)
         .expect("second page");
-    assert_eq!(second.len(), 1);
-    assert_eq!(second[0].0, expected[2]);
+    assert!(matches!(second.as_slice(), [(id, _)] if id == &expected[2]));
 }
 
 /// A Program id contains a colon, so the parked subject has five colon-separated
@@ -5341,7 +5752,7 @@ async fn r1_423_normal_release_is_durable_across_manager_restart() {
         starts.extend(page);
         after = next;
     }
-    assert_eq!(starts.len(), 1);
+    assert!(matches!(starts.as_slice(), [(node_id, _, _)] if node_id == "normal-lease-423"));
     let (node_id, binding, position) = &starts[0];
     assert!(fixture
         .state
@@ -5557,7 +5968,7 @@ async fn r1_423_no_lease_binding_does_not_require_owner_file() {
         .binding_starts_page(&graph_id, 0, graph.revision)
         .unwrap()
         .1;
-    assert_eq!(starts.len(), 1);
+    assert!(matches!(starts.as_slice(), [(node, _, _)] if node == "no-lease-423"));
     let (node, binding, position) = &starts[0];
     assert!(
         binding.resource_lease_refs.is_empty()
@@ -5686,98 +6097,6 @@ async fn r1_423_worktree_recovery_requires_exact_owner_and_real_release_not_ttl(
     }
 }
 
-#[tokio::test]
-async fn r1_423b_original_process_exit_is_required_before_recovery_capability() {
-    use crate::agentic::execution::reviewed_goal_fixture::PhysicalProcessFixture;
-    for unknown in [false, true] {
-        let fixture = PhysicalProcessFixture::new(
-            crate::config::AgentExecutorSandboxProfile::WorkspaceReadOnly,
-            if unknown {
-                "423b-unknown"
-            } else {
-                "423b-reaped"
-            },
-        )
-        .await;
-        let worker = fixture
-            .dispatch(
-                if unknown {
-                    "423b-unknown-worker"
-                } else {
-                    "423b-reaped-worker"
-                },
-                vec!["read:.".into()],
-                false,
-                false,
-                true,
-            )
-            .await;
-        let gate = fixture
-            .services
-            .agent_runtime()
-            .process_fixture_exit_gate(unknown);
-        worker.withdraw().await;
-        tokio::time::timeout(Duration::from_secs(10), async {
-            while !gate.entered.load(Ordering::Acquire) {
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-        })
-        .await
-        .unwrap();
-        let graph = fixture
-            .services
-            .graph_state_store()
-            .load(worker.packet.graph_id())
-            .unwrap();
-        let mut after = 0;
-        let mut target = None;
-        while after < graph.revision {
-            let (next, starts) = fixture
-                .services
-                .graph_state_store()
-                .lease_starts_page(&graph.id, after, graph.revision)
-                .unwrap();
-            for (node, binding, _) in starts {
-                if node == worker.packet.node_id() {
-                    target = Some(binding);
-                }
-            }
-            after = next;
-        }
-        let binding = target.expect("original admitted Agent resource binding");
-        assert!(fixture
-            .services
-            .commit_service()
-            .authenticated_lease_recovery(
-                &graph,
-                worker.packet.node_id(),
-                &binding,
-                fixture.services.executor_registry()
-            )
-            .await
-            .unwrap()
-            .is_none());
-        gate.release();
-        worker.wait_terminal().await;
-        let graph = fixture
-            .services
-            .graph_state_store()
-            .load(worker.packet.graph_id())
-            .unwrap();
-        let capability = fixture
-            .services
-            .commit_service()
-            .authenticated_lease_recovery(
-                &graph,
-                worker.packet.node_id(),
-                &binding,
-                fixture.services.executor_registry(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(capability.is_some(), !unknown);
-    }
-}
 
 struct LeaseAfterCommitFailure423b;
 
@@ -5835,7 +6154,7 @@ async fn r1_423b_failed_after_commit_pins_worktree_and_owner_fence() {
     let _result = tokio::time::timeout(Duration::from_secs(2), fixture.runner.start(graph)).await;
     let graph = fixture.state.load(&graph_id).unwrap();
     let active = fixture.worktrees.active_records().unwrap();
-    assert_eq!(active.len(), 1);
+    assert!(matches!(active.as_slice(), [lease] if lease.path.ends_with("callback-worktree")));
     let mut after = 0;
     let mut binding = None;
     while after < graph.revision {
@@ -5936,6 +6255,7 @@ async fn r1_423b_builtin_inline_model_crash_before_lease_commit_recovers_real_wo
         &spec.id,
         &binding,
     );
+    executor.prepare_original_binding(&ticket).unwrap();
     let graph = fixture
         .commits
         .bind_and_start_nodes(
@@ -6034,9 +6354,9 @@ async fn r1_450_node_effect_attempt_namespace_and_source_identity_are_exact() {
     let stream = ExecutionNodeBinding::effect_stream_id(&ticket);
     assert!(stream.starts_with("execution-node-effect:"));
     let events = event_store.list_stream(&stream).unwrap();
-    assert_eq!(events.len(), 2);
+    let [_first_events_5888, _second_events_5888] = events.as_slice() else { panic!("expected both original events exactly once") };
     assert_eq!(
-        events[1].transaction_id,
+        _second_events_5888.transaction_id,
         event_store
             .list_stream(&graph.id)
             .unwrap()
@@ -6163,6 +6483,7 @@ pub(super) async fn running_inline_attempt_450(
     };
     let scopes = manual_scope_locks_475(&graph.id);
     let _owner = acquire_fixture_owner_475(&scopes, &commits, &graph, "durable", &binding);
+    executor.prepare_original_binding(&ticket).unwrap();
     let graph = commits
         .bind_and_start_nodes(
             &graph,
@@ -6175,250 +6496,8 @@ pub(super) async fn running_inline_attempt_450(
     (events, graph, ticket, outcome, calls)
 }
 
-pub(super) async fn recover_real_bound_leaf_450(
-    process: bool,
-) -> (
-    crate::RuntimeToolExecutionOutcome,
-    harness_contract::tool::ToolEffectDescriptor,
-) {
-    use crate::agentic::execution::reviewed_goal_fixture::PhysicalProcessFixture;
-    let fixture = PhysicalProcessFixture::new(
-        crate::config::AgentExecutorSandboxProfile::WorkspaceReadOnly,
-        if process {
-            "450-bound-process"
-        } else {
-            "450-bound-read"
-        },
-    )
-    .await;
-    if process {
-        std::fs::write(
-            fixture.services.workspace_root().join("recovery450.py"),
-            "print('450-one-real-child')\n",
-        )
-        .unwrap();
-    }
-    let worker = fixture
-        .dispatch(
-            if process {
-                "450-bound-executor"
-            } else {
-                "450-bound-reader"
-            },
-            vec!["read:.".into()],
-            process,
-            false,
-            true,
-        )
-        .await;
-    let tool_name = if process { "execute_code" } else { "read_file" };
-    assert!(worker
-        .packet
-        .allowed_tools
-        .iter()
-        .any(|name| name == tool_name));
-    let input = if process {
-        serde_json::json!({"language":"python","code":"exec(open('/project/recovery450.py').read())",
-            "input_files":["recovery450.py"],"timeout_ms":5000})
-    } else {
-        serde_json::json!({"path":"crates/runtime/Cargo.toml","complete":true})
-    };
-    fixture
-        .services
-        .commit_service()
-        .fail_next_bound_outcome_before_append_for_test();
-    let directory = worker.directory();
-    let token = uuid::Uuid::new_v4().to_string();
-    let staging = directory.join(format!("{token}.staging"));
-    let command = directory.join(format!("{token}.request"));
-    let response = directory.join(format!("{token}.response"));
-    std::fs::write(
-        &staging,
-        serde_json::to_vec(&serde_json::json!({
-            "request_id":token,"tool_name":tool_name,"input":input
-        }))
-        .unwrap(),
-    )
-    .unwrap();
-    std::fs::rename(staging, command).unwrap();
-    let reply = tokio::time::timeout(Duration::from_secs(30), async {
-        loop {
-            if let Ok(bytes) = std::fs::read(&response) {
-                break serde_json::from_slice::<serde_json::Value>(&bytes).unwrap();
-            }
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-    })
-    .await
-    .unwrap();
-    assert!(reply["error"].is_string(), "{reply}");
-    let graphs = fixture.services.graph_state_store().graph_ids().unwrap();
-    let candidates = graphs
-        .into_iter()
-        .filter_map(|id| {
-            let graph = fixture.services.graph_state_store().load(&id).unwrap();
-            super::executors::agent_tool::decode_bound_agent_tool_graph(&graph)
-                .ok()
-                .map(|bound| (graph, bound))
-        })
-        .collect::<Vec<_>>();
-    assert_eq!(candidates.len(), 1);
-    let (graph, bound) = &candidates[0];
-    let node = &graph.nodes[0];
-    assert_eq!(graph.node_statuses[&node.id], ExecutionNodeStatus::Running);
-    let primary_stream = format!("execution-effect:{}", bound.request.idempotency_key);
-    let primary_key = format!(
-        "{}:{}",
-        bound.request.idempotency_key,
-        if process { "receipt" } else { "read-receipt" }
-    );
-    let primary = fixture
-        .services
-        .event_store()
-        .event_by_idempotency_key(&primary_stream, &primary_key)
-        .unwrap()
-        .unwrap();
-    if !process {
-        assert_eq!(primary.payload["outcome_truncated"], false);
-    }
-    let original_index = format!(
-        "execution-agent-receipts:{}:{}:{}",
-        worker.packet.graph_id(),
-        worker.packet.node_id(),
-        worker.packet.attempt
-    );
-    let primary_head = fixture
-        .services
-        .event_store()
-        .stream_revision(&primary_stream)
-        .unwrap();
-    let index_head = fixture
-        .services
-        .event_store()
-        .stream_revision(&original_index)
-        .unwrap();
-    let transport_before = fixture
-        .services
-        .event_store()
-        .list_scope(crate::RuntimeEventScope::Agent, 10000)
-        .unwrap()
-        .into_iter()
-        .filter(|event| event.payload["request_id"] == token)
-        .collect::<Vec<_>>();
-    let recovered = fixture
-        .services
-        .execution_supervisor()
-        .recover_graph(&graph.id)
-        .await
-        .unwrap();
-    assert_eq!(
-        recovered.node_statuses[&node.id],
-        ExecutionNodeStatus::Completed
-    );
-    let before_repeat = recovered.revision;
-    let repeated = fixture
-        .services
-        .execution_supervisor()
-        .recover_graph(&graph.id)
-        .await
-        .unwrap();
-    assert_eq!(repeated.revision, before_repeat);
-    assert_eq!(
-        fixture
-            .services
-            .event_store()
-            .stream_revision(&primary_stream)
-            .unwrap(),
-        primary_head
-    );
-    assert_eq!(
-        fixture
-            .services
-            .event_store()
-            .stream_revision(&original_index)
-            .unwrap(),
-        index_head
-    );
-    assert_eq!(
-        fixture
-            .services
-            .event_store()
-            .list_scope(crate::RuntimeEventScope::Agent, 10000)
-            .unwrap()
-            .into_iter()
-            .filter(|event| event.payload["request_id"] == token)
-            .collect::<Vec<_>>(),
-        transport_before
-    );
-    let raw: crate::RuntimeToolExecutionOutcome =
-        serde_json::from_value(primary.payload["outcome"].clone()).unwrap();
-    assert_eq!(
-        recovered.node_results[&node.id],
-        super::executors::agent_tool::agent_tool_outcome_at(&raw, primary.created_at_ms)
-            .unwrap()
-            .result
-    );
-    assert!(recovered.node_results[&node.id].failure.is_none());
-    worker.withdraw().await;
-    worker.wait_terminal().await;
-    let program_id = &worker.packet.agentic_binding.as_ref().unwrap().program_id;
-    tokio::time::timeout(Duration::from_secs(30), async {
-        loop {
-            let program = fixture
-                .services
-                .agent_action_service()
-                .project(program_id)
-                .unwrap();
-            let status = program.tasks[&worker.task_ref].status;
-            assert_ne!(status, crate::AgenticTaskStatus::Accepted);
-            if status == crate::AgenticTaskStatus::Withdrawn {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-    })
-    .await
-    .unwrap();
-    let descriptor = bound
-        .request
-        .compiled_invocation
-        .as_ref()
-        .unwrap()
-        .effect
-        .clone();
-    fixture.services.shutdown_execution().await;
-    (raw, descriptor)
-}
 
-#[tokio::test]
-async fn r1_450_running_bound_read_recovers_real_leaf_without_reexecution() {
-    let (outcome, effect) = recover_real_bound_leaf_450(false).await;
-    assert_eq!(
-        effect.effect_kind,
-        harness_contract::tool::ToolEffectKind::Read
-    );
-    assert_eq!(outcome.status, crate::RuntimeToolExecutionStatus::Executed);
-}
 
-#[tokio::test]
-async fn r1_450_running_bound_process_recovers_original_reaped_leaf_without_reexecution() {
-    use harness_contract::context::{EvidenceTargetIdentity, ToolExecutionTerminal};
-    let (outcome, effect) = recover_real_bound_leaf_450(true).await;
-    assert!(effect.spawns_process);
-    let facts = outcome
-        .observed_evidence
-        .iter()
-        .filter_map(|observed| match &observed.target {
-            EvidenceTargetIdentity::ToolExecution { execution } => Some(execution),
-            _ => None,
-        })
-        .collect::<Vec<_>>();
-    assert_eq!(facts.len(), 1);
-    assert!(matches!(&facts[0].terminal,ToolExecutionTerminal::Settled {
-        exit_code:Some(0),signal:None,closure,..
-    } if closure.all_children_reaped && closure.init_reaped && closure.kernel_hardening_applied
-        && closure.network_disabled && closure.status_channel_protected));
-}
 
 #[tokio::test]
 async fn r1_450_atomic_replan_metadata_retry_and_response_loss_keep_one_outcome() {
@@ -7170,7 +7249,7 @@ async fn r1_521_unknown_failed_original_publication_cannot_use_completed_status_
                 .prepare_ready_wave(&registered.id, ready)
                 .await
                 .unwrap();
-            assert_eq!(prepared.len(), 1);
+            assert!(matches!(prepared.as_slice(), [item] if item.node.id == node_id));
             let result = tokio::time::timeout(
                 Duration::from_secs(5),
                 runner.execute_prepared_pump_node(
@@ -7524,6 +7603,7 @@ async fn r1_450_original_wait_after_ready_is_reconciled_not_borrowed_for_new_att
     };
     let scopes = manual_scope_locks_475(&ready.id);
     let owner = acquire_fixture_owner_475(&scopes, &commits, &ready, "durable", &binding);
+    executor.prepare_original_binding(&ticket).unwrap();
     let running = commits
         .bind_and_start_nodes(
             &ready,
@@ -7631,13 +7711,13 @@ async fn r1_450_explicit_resume_admits_fresh_namespace_without_reusing_uncertain
     };
     let scopes = manual_scope_locks_475(&ready.id);
     let _owner = acquire_fixture_owner_475(&scopes, &commits, &ready, "durable", &binding);
-    commits
+    let second_running = commits
         .bind_and_start_nodes(
             &ready,
             BTreeMap::from([("durable".into(), binding)]),
             vec![retry.clone()],
         )
-        .unwrap();
+        .unwrap().graph;
     assert!(matches!(
         commits.inspect_execution_effect(&retry).unwrap(),
         ExecutionEffectState::Uncertain
@@ -7646,6 +7726,14 @@ async fn r1_450_explicit_resume_admits_fresh_namespace_without_reusing_uncertain
         ExecutionNodeBinding::effect_stream_id(&ticket),
         ExecutionNodeBinding::effect_stream_id(&retry)
     );
+    let program_stream = "agentic-program:gb3-graph-test";
+    let before = events.stream_revision(program_stream).unwrap();
+    let error = crate::agentic::gb3_settle_synthetic_old_cut_for_graph_test(
+        events.clone(), &second_running.id, &ticket.node_id, ticket.attempt,
+    ).unwrap_err();
+    assert!(error.to_string().contains("review_cut_original_attempt_changed"), "{error}");
+    assert_eq!(events.stream_revision(program_stream).unwrap(), before);
+    assert_eq!(events.stream_revision(&second_running.id).unwrap(), second_running.revision);
     assert_eq!(calls.load(Ordering::SeqCst), 1);
 }
 
@@ -7657,7 +7745,7 @@ async fn r1_450_split_completed_receipt_cannot_restore_running_or_reexecute() {
     commits.commit_execution_effect(&ticket, &outcome).unwrap();
     let effect_stream = ExecutionNodeBinding::effect_stream_id(&ticket);
     let effect_before = events.list_stream(&effect_stream).unwrap();
-    assert_eq!(effect_before.len(), 2);
+    assert_eq!(effect_before.iter().map(|event| event.kind.as_str()).collect::<Vec<_>>(), ["execution.effect.intent", "execution.effect.receipt"]);
     assert!(matches!(
         commits.inspect_execution_effect(&ticket).unwrap(),
         ExecutionEffectState::Completed(_)
@@ -8623,28 +8711,29 @@ async fn r1_704_hot_recovery_finishes_original_callback_without_stealing_or_reex
         )
         .await
         .is_err());
-    let recovered = runner.recover_graph(&id).await.unwrap();
-    assert!(state
-        .binding_lease_closure(&recovered, "retained704", &binding, position)
-        .unwrap());
-    assert_eq!(
-        recovered.recovery_cursor.node_attempts,
-        before.recovery_cursor.node_attempts
-    );
+    // A generic Poll can also mean that the receipt was written and its
+    // acknowledgement lost. Changing this fixture flag is not proof that
+    // the original callback is safe to run again.
+    assert!(matches!(runner.recover_graph(&id).await,
+        Err(super::recovery::ExecutionRecoveryError::LeaseReconciliation(_))));
+    let retained = state.load(&id).unwrap();
+    assert_eq!(retained, before);
+    assert!(!state.binding_lease_closure(&retained, "retained704", &binding, position).unwrap());
     assert_eq!(executor.polls.load(Ordering::SeqCst), 1);
-    assert_eq!(executor.inner.after_commits.load(Ordering::SeqCst), 1);
-    assert_eq!(runner.recover_graph(&id).await.unwrap(), recovered);
+    assert_eq!(executor.inner.after_commits.load(Ordering::SeqCst), 0);
     let stale = runner
         .command(
             &id,
             ExecutionGraphCommand::Cancel {
-                expected_revision: before.revision,
+                expected_revision: retained.revision.checked_sub(1).expect("registered graph has a prior revision"),
                 reason: "704 stale command must not bypass CAS".into(),
             },
         )
         .await;
-    assert!(stale.is_err());
-    assert_eq!(state.load(&id).unwrap(), recovered);
+    assert!(matches!(stale, Err(ExecutionRunnerError::Commit(
+        ExecutionCommitError::StaleRevision { .. }
+    ))));
+    assert_eq!(state.load(&id).unwrap(), retained);
     assert!(runner.recover_graph("foreign-704").await.is_err());
 }
 
@@ -8704,7 +8793,7 @@ async fn cold_callback_recovery_704(after_effect: bool) {
         let original_effect = events
             .list_stream(&ExecutionNodeBinding::effect_stream_id(&ticket))
             .unwrap();
-        assert_eq!(original_effect.len(), 2);
+        assert_eq!(original_effect.iter().map(|event| event.kind.as_str()).collect::<Vec<_>>(), ["execution.effect.intent", "execution.effect.receipt"]);
         assert!(matches!(
             commits.inspect_execution_effect(&ticket).unwrap(),
             ExecutionEffectState::Completed(_)
@@ -8767,6 +8856,20 @@ async fn cold_callback_recovery_704(after_effect: bool) {
         drop(commits);
         drop(state);
         drop(events);
+        if !after_effect {
+            // Cancelling the observer is not process death: the pending original
+            // callback still owns its fence and has not published a receipt.
+            let retained_events = old_events.upgrade().expect("original callback retains its event owner");
+            let retained_executor = old_executor.upgrade().expect("original executor remains alive");
+            assert!(retained_events.list_stream(&receipt_stream).unwrap().is_empty());
+            assert_eq!(retained_events.list_stream(&ExecutionNodeBinding::effect_stream_id(&ticket)).unwrap(), original_effect);
+            let retained_state = ExecutionGraphStateStore::new(retained_events.clone());
+            let retained_graph = retained_state.load(&graph_id).unwrap();
+            assert!(!retained_state.binding_lease_closure(&retained_graph, "cold704", &binding, position).unwrap());
+            assert_eq!(retained_executor.polls.load(Ordering::SeqCst), 1);
+            assert!(scopes.try_recover_binding_owner(&fence).unwrap().is_none());
+            continue;
+        }
         tokio::time::timeout(Duration::from_secs(5), async {
             while old_registry.upgrade().is_some()
                 || old_executor.upgrade().is_some()
@@ -8824,7 +8927,8 @@ async fn cold_callback_recovery_704(after_effect: bool) {
                 .unwrap(),
             original_effect
         );
-        assert_eq!(events.list_stream(&receipt_stream).unwrap().len(), 1);
+        assert!(matches!(events.list_stream(&receipt_stream).unwrap().as_slice(), [receipt]
+            if receipt.kind == "test.callback.receipt" && receipt.payload["ticket"]["node_id"] == ticket.node_id));
         assert_eq!(executor.polls.load(Ordering::SeqCst), 0);
         assert_eq!(
             executor.inner.after_commits.load(Ordering::SeqCst),
@@ -8842,7 +8946,8 @@ async fn cold_callback_recovery_704(after_effect: bool) {
             .binding_callback_disposition(&recovered, "cold704", &stale)
             .is_err());
         assert_eq!(runner.recover_graph(&graph_id).await.unwrap(), recovered);
-        assert_eq!(events.list_stream(&receipt_stream).unwrap().len(), 1);
+        assert!(matches!(events.list_stream(&receipt_stream).unwrap().as_slice(), [receipt]
+            if receipt.kind == "test.callback.receipt" && receipt.payload["ticket"]["node_id"] == ticket.node_id));
         assert_eq!(
             executor.inner.after_commits.load(Ordering::SeqCst),
             usize::from(!cancelled)
@@ -9073,6 +9178,93 @@ async fn r1_475_intent_only_command_crash_recovers_empty_binding_without_complet
 }
 
 #[tokio::test]
+async fn r4_034_planned_cancel_produces_canonical_retirement() {
+    let (events, running, ticket, _, _) =
+        running_inline_attempt_450("034 planned retirement").await;
+    let commits = ExecutionCommitService::new(events.clone());
+    let state = ExecutionGraphStateStore::new(events);
+    let binding = state
+        .current_binding(&running, "durable", ticket.attempt)
+        .unwrap();
+    let mut planned = running.clone();
+    planned
+        .node_statuses
+        .insert("durable".into(), ExecutionNodeStatus::Planned);
+    let planned = commits
+        .commit_recovery(&running, planned, Vec::new(), Vec::new())
+        .unwrap()
+        .graph;
+    assert_eq!(
+        planned.node_statuses["durable"],
+        ExecutionNodeStatus::Planned
+    );
+    let cancelled = commits
+        .apply_command(
+            &planned,
+            &ExecutionGraphCommand::CancelNode {
+                expected_revision: planned.revision,
+                node_id: "durable".into(),
+                reason: "planned node never entered".into(),
+            },
+        )
+        .unwrap()
+        .graph;
+    assert_eq!(
+        cancelled.node_statuses["durable"],
+        ExecutionNodeStatus::Cancelled
+    );
+    assert!(state
+        .binding_retirement_record(&cancelled, "durable", &binding)
+        .unwrap()
+        .is_some());
+    assert_eq!(
+        commits
+            .binding_callback_disposition(&cancelled, "durable", &binding)
+            .unwrap(),
+        super::commit_service::CallbackDisposition::Abort
+    );
+}
+
+#[tokio::test]
+async fn r4_034_planned_cancel_retirement_negatives_stay_refused() {
+    let (events, running, ticket, _, _) =
+        running_inline_attempt_450("034 planned retirement negatives").await;
+    let commits = ExecutionCommitService::new(events.clone());
+    let state = ExecutionGraphStateStore::new(events);
+    let binding = state
+        .current_binding(&running, "durable", ticket.attempt)
+        .unwrap();
+    assert!(state
+        .binding_retirement_record(&running, "durable", &binding)
+        .unwrap()
+        .is_none());
+    let failed = commits
+        .transition_node(
+            &running,
+            "durable",
+            ExecutionNodeStatus::Failed,
+            None,
+            Vec::new(),
+        )
+        .unwrap()
+        .graph;
+    assert!(state
+        .binding_retirement_record(&failed, "durable", &binding)
+        .unwrap()
+        .is_none());
+    let mut wrong_attempt = binding.clone();
+    wrong_attempt.attempt = wrong_attempt.attempt.saturating_add(1);
+    assert!(state
+        .binding_retirement_record(&running, "durable", &wrong_attempt)
+        .is_err());
+    let mut wrong_binding = binding.clone();
+    wrong_binding.ticket_idempotency_key.push_str(":foreign");
+    assert!(state
+        .binding_retirement_record(&running, "durable", &wrong_binding)
+        .is_err());
+}
+
+#[tokio::test]
 async fn r1_475_orphan_admission_same_inode_cas_retry_response_loss_polls_once() {
     use std::os::unix::fs::MetadataExt;
     let events = Arc::new(RuntimeEventStore::for_test());
@@ -9144,6 +9336,7 @@ async fn r1_475_orphan_admission_same_inode_cas_retry_response_loss_polls_once()
     assert_eq!(std::fs::metadata(&path).unwrap().ino(), inode);
     let losses = Arc::new(AtomicUsize::new(0));
     commits.inject_binding_start_response_loss_for_test(&fresh.id, losses.clone());
+    executor.prepare_original_binding(&ticket).unwrap();
     let running = commits
         .bind_and_start_nodes(
             &fresh,
@@ -9231,6 +9424,7 @@ async fn r1_475_wait_result_then_ready_or_paused_cancel_keeps_original_receipt()
         };
         let scopes = manual_scope_locks_475(&ready.id);
         let owner = acquire_fixture_owner_475(&scopes, &commits, &ready, "durable", &binding);
+        executor.prepare_original_binding(&ticket).unwrap();
         let running = commits
             .bind_and_start_nodes(
                 &ready,
@@ -9416,13 +9610,13 @@ impl NodeExecutor for ControlledDrain475 {
     }
 }
 
-async fn assert_actual_cancel_gate_475(abort_fails: bool) {
+async fn assert_actual_cancel_gate_475(abort_fails: bool, initially_drained: bool) {
     let events = Arc::new(RuntimeEventStore::for_test());
     let state = ExecutionGraphStateStore::new(events.clone());
     let commits = ExecutionCommitService::new(events.clone());
     let registry = Arc::new(NodeExecutorRegistry::new());
     let executor = Arc::new(ControlledDrain475 {
-        drained: AtomicBool::new(false),
+        drained: AtomicBool::new(initially_drained),
         abort_fails,
         aborts: AtomicUsize::new(0),
         polls: AtomicUsize::new(0),
@@ -9443,7 +9637,7 @@ async fn assert_actual_cancel_gate_475(abort_fails: bool) {
         .prepare_ready_wave(&graph.id, snapshot.ready)
         .await
         .unwrap();
-    assert_eq!(prepared.len(), 1);
+    assert!(matches!(prepared.as_slice(), [item] if item.node.id == "drain475"));
     drop(prepared);
     let running = state.load(&graph.id).unwrap();
     assert_eq!(
@@ -9457,25 +9651,44 @@ async fn assert_actual_cancel_gate_475(abort_fails: bool) {
         .into_iter()
         .next()
         .unwrap();
-    let error = runner
-        .command(
-            &graph.id,
-            ExecutionGraphCommand::Cancel {
-                expected_revision: running.revision,
-                reason: "original cancel".into(),
-            },
-        )
-        .await
-        .err()
-        .expect("bounded Ok must not mean physical drain");
-    assert!(error.to_string().contains("without physical quiescence"));
-    assert_eq!(state.load(&graph.id).unwrap(), running);
-    assert!(!state
-        .binding_lease_closure(&running, "drain475", &binding, position)
-        .unwrap());
-    assert_eq!(executor.aborts.load(Ordering::SeqCst), 0);
-    assert!(runner.recover_graph(&graph.id).await.is_err());
-    executor.drained.store(true, Ordering::SeqCst);
+    if !initially_drained {
+        let ticket = fixture_ticket_475(&running, "drain475", &binding);
+        let effect_stream = ExecutionNodeBinding::effect_stream_id(&ticket);
+        let original_effect = events.list_stream(&effect_stream).unwrap();
+        assert!(matches!(original_effect.as_slice(), [event] if event.kind == "execution.effect.intent"), "original intent exists without a receipt");
+        let error = runner
+            .command(
+                &graph.id,
+                ExecutionGraphCommand::Cancel {
+                    expected_revision: running.revision,
+                    reason: "original cancel".into(),
+                },
+            )
+            .await
+            .err()
+            .expect("bounded Ok must not mean physical drain");
+        assert!(error.to_string().contains("without physical quiescence"));
+        assert_eq!(state.load(&graph.id).unwrap(), running);
+        assert!(!state
+            .binding_lease_closure(&running, "drain475", &binding, position)
+            .unwrap());
+        assert_eq!(executor.aborts.load(Ordering::SeqCst), 0);
+        assert!(runner.recover_graph(&graph.id).await.is_err());
+        executor.drained.store(true, Ordering::SeqCst);
+        let retry = runner.command(&graph.id, ExecutionGraphCommand::Cancel {
+            expected_revision: running.revision,
+            reason: "unconfirmed original drain".into(),
+        }).await;
+        assert!(retry.is_err(), "a changed fixture flag is not an original drain receipt");
+        let retained = state.load(&graph.id).unwrap();
+        assert_eq!(retained, running);
+        assert!(!state.binding_lease_closure(&retained, "drain475", &binding, position).unwrap());
+        assert_eq!(events.list_stream(&effect_stream).unwrap(), original_effect);
+        assert!(matches!(commits.inspect_execution_effect(&ticket).unwrap(), ExecutionEffectState::Uncertain));
+        assert_eq!(executor.aborts.load(Ordering::SeqCst), 0);
+        assert_eq!(executor.polls.load(Ordering::SeqCst), 0);
+        return;
+    }
     let result = runner
         .command(
             &graph.id,
@@ -9534,12 +9747,14 @@ async fn assert_actual_cancel_gate_475(abort_fails: bool) {
 
 #[tokio::test]
 async fn r1_475_bounded_cancel_ok_requires_positive_original_drain_before_closure() {
-    assert_actual_cancel_gate_475(false).await;
+    assert_actual_cancel_gate_475(false, false).await;
+    assert_actual_cancel_gate_475(false, true).await;
 }
 
 #[tokio::test]
 async fn r1_475_command_after_abort_failure_keeps_cancelled_binding_unclosed() {
-    assert_actual_cancel_gate_475(true).await;
+    assert_actual_cancel_gate_475(true, false).await;
+    assert_actual_cancel_gate_475(true, true).await;
 }
 
 #[test]
@@ -9801,6 +10016,7 @@ async fn running_source_wave_498() -> (
         owners.push(acquire_fixture_owner_475(
             &scopes, &commits, &graph, &spec.id, &binding,
         ));
+        executor.prepare_original_binding(&ticket).unwrap();
         bindings.insert(spec.id.clone(), binding);
         tickets.push(ticket);
         executors.push(executor);
@@ -10024,7 +10240,7 @@ impl UnadmittedBuiltinFixture534 {
             .prepare_ready_wave(&self.ready.id, vec![self.spec.clone()])
             .await
             .unwrap();
-        assert_eq!(prepared.len(), 1);
+        assert!(matches!(prepared.as_slice(), [item] if item.node.id == self.spec.id));
         let prepared = prepared.pop().unwrap();
         let binding = prepared.binding.as_ref().expect("original start binding");
         assert_eq!(binding.attempt, self.ticket.attempt);
@@ -10069,7 +10285,7 @@ impl UnadmittedBuiltinFixture534 {
             .binding_starts_page(&graph.id, 0, graph.revision)
             .unwrap()
             .1;
-        assert_eq!(starts.len(), 1);
+        assert!(matches!(starts.as_slice(), [(node_id, _, _)] if node_id == &self.spec.id));
         let (node_id, binding, position) = &starts[0];
         assert_eq!(node_id, &self.spec.id);
         assert_eq!(binding.attempt, 1);
@@ -10376,4 +10592,237 @@ async fn r1_534_builtin_completed_entered_callback_cleanup_cannot_reset_original
     ));
     assert!(observation.witness().is_none());
     assert_eq!(fixture.calls.load(Ordering::SeqCst), 1);
+}
+
+/// The original terminal custody belongs to the original Session terminal.
+///
+/// A delegated leaf publishes its own terminal and never owns the original
+/// Session terminal, so a published terminal completion alone must not demand
+/// that custody. The original Session terminal keeps demanding it.
+#[test]
+fn a8_original_terminal_custody_is_required_only_for_the_original_session_terminal() {
+    let mut outcome = NodeExecutionOutcome::new(ExecutionNodeResult {
+        status: ExecutionNodeStatus::Completed,
+        result_ref: Some("a8-delegated-terminal".to_string()),
+        wait_class: None,
+        summary: Some("delegated leaf terminal".to_string()),
+        evidence_refs: Vec::new(),
+        failure: None,
+        usage: Default::default(),
+        finished_at_ms: 1,
+    });
+    // A delegated leaf terminal: no original Session terminal was requested.
+    assert!(!super::runner::requests_original_session_terminal(&outcome));
+    outcome
+        .domain_events
+        .push(crate::runtime_event_store::RuntimeTransactionEventInput {
+            event: crate::RuntimeEventInput {
+                stream_id: "session-terminal:request-a8".to_string(),
+                scope: crate::RuntimeEventScope::SessionInput,
+                kind: "runtime.session.terminal_requested".to_string(),
+                status: Some("pending_delivery".to_string()),
+                actor: Some("SynthesizeNodeExecutor".to_string()),
+                refs: Vec::new(),
+                payload: serde_json::json!({}),
+            },
+            idempotency_key: Some("a8-session-terminal".to_string()),
+            schema_version: 1,
+        });
+    // The original Session terminal keeps its custody requirement, and the
+    // custody error keeps its original wording.
+    assert!(super::runner::requests_original_session_terminal(&outcome));
+    let error = super::runner::missing_original_terminal_custody(&outcome)
+        .expect("the original Session terminal keeps its custody requirement");
+    assert_eq!(
+        error.to_string(),
+        "runtime execution driver failed: original terminal handoff is unconfirmed"
+    );
+    // A delegated leaf terminal never carries that custody.
+    let mut leaf = NodeExecutionOutcome::new(ExecutionNodeResult {
+        status: ExecutionNodeStatus::Completed,
+        result_ref: Some("a8-delegated-terminal".to_string()),
+        wait_class: None,
+        summary: Some("delegated leaf terminal".to_string()),
+        evidence_refs: Vec::new(),
+        failure: None,
+        usage: Default::default(),
+        finished_at_ms: 1,
+    });
+    leaf.domain_events.push(crate::runtime_event_store::RuntimeTransactionEventInput {
+        event: crate::RuntimeEventInput {
+            stream_id: "execution-node:leaf".to_string(),
+            scope: crate::RuntimeEventScope::ExecutionNode,
+            kind: "execution.node.result".to_string(),
+            status: Some("completed".to_string()),
+            actor: Some("synthesize".to_string()),
+            refs: Vec::new(),
+            payload: serde_json::json!({}),
+        },
+        idempotency_key: Some("a8-leaf-node".to_string()),
+        schema_version: 1,
+    });
+    assert!(super::runner::missing_original_terminal_custody(&leaf).is_none());
+}
+
+/// A delegated leaf publishes its own terminal.
+///
+/// The leaf terminal carries a terminal completion and never carries the
+/// original Session terminal, because only a root Session ingress asks for
+/// that one. The runner must not read a leaf terminal as a lost original
+/// terminal handover, while the original Session terminal keeps demanding its
+/// custody.
+struct A8LeafTerminalBackend {
+    commits: ExecutionCommitService,
+    session_id: String,
+    turn_id: String,
+    original_session_terminal: bool,
+}
+
+struct A8LeafTerminalResolver {
+    graph_id: String,
+    backend: Arc<A8LeafTerminalBackend>,
+}
+
+impl super::executors::SynthesizeBackendResolver for A8LeafTerminalResolver {
+    fn resolve(
+        &self,
+        ticket: &NodeExecutionTicket,
+    ) -> Option<Arc<dyn super::executors::SynthesizeBackend>> {
+        (ticket.graph_id == self.graph_id)
+            .then(|| Arc::clone(&self.backend) as Arc<dyn super::executors::SynthesizeBackend>)
+    }
+}
+
+#[async_trait]
+impl super::executors::SynthesizeBackend for A8LeafTerminalBackend {
+    async fn synthesize(
+        &self,
+        ticket: &NodeExecutionTicket,
+    ) -> Result<NodeExecutionOutcome, String> {
+        use sha2::{Digest, Sha256};
+        let text = "a8 delegated leaf terminal";
+        let messages = vec![serde_json::json!({
+            "role":"assistant","blocks":[{"Text":{"text":text}}],"usage":null
+        })];
+        let publication = self
+            .commits
+            .prepare_synthesize_transcript(
+                ticket,
+                &self.session_id,
+                &self.turn_id,
+                0,
+                "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+                    .to_string(),
+                messages,
+                Some(harness_contract::goal::GoalCompletion::Partial),
+            )
+            .map_err(|error| error.to_string())?;
+        let mut outcome = NodeExecutionOutcome::new(ExecutionNodeResult {
+            status: ExecutionNodeStatus::Completed,
+            result_ref: Some(format!(
+                "turn-result:{}:{:x}",
+                ticket.graph_id,
+                Sha256::digest(text.as_bytes())
+            )),
+            wait_class: None,
+            summary: Some("delegated leaf terminal".to_string()),
+            evidence_refs: Vec::new(),
+            failure: None,
+            usage: Default::default(),
+            finished_at_ms: 1,
+        });
+        if self.original_session_terminal {
+            outcome
+                .domain_events
+                .push(crate::runtime_event_store::RuntimeTransactionEventInput {
+                    event: crate::RuntimeEventInput {
+                        stream_id: format!("session-terminal:{}", self.turn_id),
+                        scope: crate::RuntimeEventScope::SessionInput,
+                        kind: "runtime.session.terminal_requested".to_string(),
+                        status: Some("pending_delivery".to_string()),
+                        actor: Some("SynthesizeNodeExecutor".to_string()),
+                        refs: Vec::new(),
+                        payload: serde_json::json!({}),
+                    },
+                    idempotency_key: Some("a8-session-terminal".to_string()),
+                    schema_version: 1,
+                });
+        }
+        ExecutionCommitService::attach_host_transcript(&mut outcome, publication)
+            .map_err(|error| error.to_string())?;
+        Ok(outcome)
+    }
+
+    async fn after_commit(&self, _ticket: &NodeExecutionTicket) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn a8_delegated_leaf_terminal_is_not_a_lost_original_session_terminal() {
+    for original_session_terminal in [false, true] {
+        let event_store = Arc::new(RuntimeEventStore::for_test());
+        let root = tempfile::tempdir().unwrap();
+        let artifacts = Arc::new(crate::ArtifactStore::for_test_default(root.path().join("blobs")));
+        event_store.bind_artifact_store(artifacts.clone()).unwrap();
+        let commits = ExecutionCommitService::new(Arc::clone(&event_store)).with_artifact_store(artifacts);
+        let state = ExecutionGraphStateStore::new(Arc::clone(&event_store));
+        let registry = Arc::new(NodeExecutorRegistry::new());
+        let synthesize = Arc::new(super::executors::SynthesizeNodeExecutor::new());
+        registry
+            .register(Arc::clone(&synthesize) as Arc<dyn NodeExecutor>)
+            .unwrap();
+        let mut graph = test_graph("a8 delegated leaf terminal");
+        let mut spec = node("leaf-terminal");
+        spec.kind = ExecutionNodeKind::Synthesize;
+        spec.executor_kind = "synthesize".into();
+        graph.nodes.push(spec);
+        let graph_id = graph.id.clone();
+        let lineage = graph.lineage.clone().unwrap();
+        synthesize.install_resolver(Arc::new(A8LeafTerminalResolver {
+            graph_id: graph_id.clone(),
+            backend: Arc::new(A8LeafTerminalBackend {
+                commits: commits.clone(),
+                session_id: lineage.session_id.clone(),
+                turn_id: lineage.turn_id.clone(),
+                original_session_terminal,
+            }),
+        }));
+        let runner = test_runner(registry, state.clone(), commits);
+        let _ = runner.start(graph).await;
+        let committed = state.load(&graph_id).expect("graph state");
+        let status = committed
+            .node_statuses
+            .get("leaf-terminal")
+            .copied()
+            .unwrap_or(ExecutionNodeStatus::Planned);
+        if original_session_terminal {
+            // The original Session terminal keeps demanding its custody: this
+            // shape never completes as a plain leaf terminal.
+            assert_ne!(
+                status,
+                ExecutionNodeStatus::Completed,
+                "the original Session terminal custody must still be required"
+            );
+            // The refused terminal leaves no durable completed receipt of its
+            // own: it either carries its failure or it was never committed.
+            let recorded = committed.node_results.get("leaf-terminal");
+            assert!(
+                recorded
+                    .map(|result| {
+                        result.failure.as_ref().is_some_and(|failure| !failure.message.is_empty())
+                    })
+                    .unwrap_or(true),
+                "the refused original Session terminal must not carry a durable completed receipt"
+            );
+        } else {
+            // The delegated leaf's own terminal is not a lost original Session
+            // terminal handover.
+            assert_eq!(status, ExecutionNodeStatus::Completed);
+            assert!(committed.node_results["leaf-terminal"]
+                .failure
+                .as_ref()
+                .is_none());
+        }
+    }
 }

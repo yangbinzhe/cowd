@@ -146,7 +146,10 @@ pub fn resolve_registered_tool_effect_resolution(
             stricter_permission(properties.required_permission, catalog_permission);
     }
 
-    let assessment = effect_assessment(&properties, input);
+    let mut assessment = effect_assessment(&properties, input);
+    if data_only_compute(resolver, tool_id, input, &properties) {
+        assessment.novelty = EffectNovelty::Routine;
+    }
     finalize_effect(resolver, tool_id, input, properties, assessment, &[])
 }
 
@@ -263,6 +266,10 @@ pub(crate) fn resolve_orchestration_child_effect_resolution(
             catalog_permission,
         ));
     }
+    let compute_data_only = catalog_permission == ToolPermissionMode::ReadOnly
+        && data_only_compute(
+            resolver, tool_id, input, &resolve_effect_properties(resolver, tool_id, input),
+        );
     let data_only =
         references
             .iter()
@@ -282,6 +289,7 @@ pub(crate) fn resolve_orchestration_child_effect_resolution(
                 ("read_file", Some("offset" | "limit" | "complete")) => true,
                 ("checkpoint", Some("label")) | ("background", Some("tail")) => true,
                 ("bash" | "powershell", Some("description")) => true,
+                ("execute_code", Some("input")) if compute_data_only => true,
                 _ => false,
             });
     let mut properties = if data_only {
@@ -312,7 +320,14 @@ pub(crate) fn resolve_orchestration_child_effect_resolution(
                 });
                 properties
             }
-            ("execute_code", "builtin.sandboxed_command") => resolve_effect_properties(resolver, tool_id, &Value::Null),
+            // The compute child's own declared file set is part of its
+            // contract, so it is resolved from the child's real input. A null
+            // input hid that declaration, which made the child unprovable
+            // and dropped every sibling effect with it - planning then
+            // described less than what the program may do.
+            ("execute_code", "builtin.sandboxed_command") => {
+                resolve_effect_properties(resolver, tool_id, input)
+            }
             _ => return Err(format!("tool_orchestrate cannot prove a bounded effect envelope for `{tool_id}` reference paths {references:?}")),
         }
     };
@@ -320,7 +335,33 @@ pub(crate) fn resolve_orchestration_child_effect_resolution(
         stricter_permission(properties.required_permission, catalog_permission);
     properties.idempotency = ToolIdempotency::Unknown;
     let mut assessment = effect_assessment(&properties, input);
-    assessment.data_sensitivity = DataClassification::Secret;
+    if compute_data_only {
+        assessment.novelty = EffectNovelty::Routine;
+    }
+    // A dynamic reference can hide a sensitive target or override an explicit
+    // classification. Only references confined to known non-sensitive data
+    // fields of a proven read-only effect retain the normal classification.
+    let sensitivity_dynamic = references.iter().any(|path| {
+        matches!(path.first().map(String::as_str), Some("contains_secrets" | "data_classification"))
+    });
+    // A bounded read-only compute child keeps the normal classification: it
+    // observes exactly its declared files inside the read-only sandbox. The
+    // sensitive-target rules in `data_classification` still apply unchanged,
+    // so a `.env` or credentials input stays Secret.
+    let bounded_child = is_bounded_read_only_compute(
+        properties.effect_kind,
+        properties.required_permission,
+        properties.uses_network,
+        properties.spawns_process,
+        properties.mutates_packages,
+        properties.mutates_system,
+        &properties.scopes,
+        false,
+    );
+    if !data_only || sensitivity_dynamic || !(is_read_only_research_effect(&properties) || bounded_child)
+    {
+        assessment.data_sensitivity = DataClassification::Secret;
+    }
     if !data_only {
         assessment.novelty = EffectNovelty::NewTarget;
         assessment.blast_radius = EffectBlastRadius::Workspace;
@@ -484,19 +525,11 @@ fn join_ranked<Ranked: Copy + PartialEq>(left: Ranked, right: Ranked, order: &[R
 }
 
 fn effect_assessment(properties: &EffectProperties, input: &Value) -> EffectAssessment {
-    let internal_control = properties.effect_kind == ToolEffectKind::Write
-        && properties.idempotency == ToolIdempotency::IdempotentWithKey
-        && properties.required_permission == ToolPermissionMode::ReadOnly
-        && properties.approval_class == ToolApprovalClass::None
-        && !properties.scopes.is_empty()
-        && properties.scopes.iter().all(|scope| {
-            scope.resource == PermissionResource::Tool
-                && scope.operation == PermissionOperation::Control
-        })
-        && !properties.uses_network
-        && !properties.spawns_process
-        && !properties.mutates_packages
-        && !properties.mutates_system;
+    let internal_control = harness_contract::tool::is_internal_control_effect(
+        properties.effect_kind, properties.idempotency, properties.required_permission,
+        properties.approval_class, &properties.scopes, properties.uses_network,
+        properties.spawns_process, properties.mutates_packages, properties.mutates_system,
+    );
     let externality = if internal_control {
         EffectExternality::Internal
     } else if properties.mutates_system
@@ -563,6 +596,106 @@ fn effect_assessment(properties: &EffectProperties, input: &Value) -> EffectAsse
 /// tool and made a read-only session unable to enumerate the very corpus the
 /// scenario declares. Sensitivity is a property of what an effect does, not of
 /// whether its scope happens to name a target.
+/// Whether this effect is a **bounded read-only compute**.
+///
+/// A read-only ceiling does not forbid a process: it forbids *unbounded*
+/// authority. This predicate is the single contract statement for the narrow
+/// case the product actually supports - a real child process that
+///
+///   * declares its own effect as read-only,
+///   * uses no network, mutates no package and no system state,
+///   * may observe exactly the declared file scopes (each one an explicit,
+///     non-root target) and nothing else,
+///   * carries no Shell scope (an arbitrary command line is not bounded), and
+///   * is executed inside the kernel-enforced, network-off, read-only sandbox.
+///
+/// Anything outside that envelope - an unbounded file scope, the workspace
+/// root, a Shell scope, a write or control scope, network access - is NOT a
+/// bounded read-only compute and keeps the conservative Secret classification
+/// and the permission it implies.
+fn is_bounded_read_only_compute(
+    effect_kind: ToolEffectKind,
+    required_permission: ToolPermissionMode,
+    uses_network: bool,
+    spawns_process: bool,
+    mutates_packages: bool,
+    mutates_system: bool,
+    scopes: &[PermissionScope],
+    composite: bool,
+) -> bool {
+    if effect_kind != ToolEffectKind::Process
+        || !spawns_process
+        || uses_network
+        || mutates_packages
+        || mutates_system
+        || required_permission != ToolPermissionMode::ReadOnly
+    {
+        return false;
+    }
+    scopes.iter().all(|scope| match scope.resource {
+        PermissionResource::File => {
+            scope.operation == PermissionOperation::Read
+                && scope
+                    .target
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|target| !target.is_empty())
+                    .is_some_and(|target| composite || target != ".")
+        }
+        // The invocation itself is what the lease authorizes; it grants no
+        // authority over any file, network or command line by itself.
+        PermissionResource::Tool => scope.operation == PermissionOperation::Call
+            || (composite && scope.operation == PermissionOperation::Read),
+        // A process that may run an arbitrary command line is not bounded, and
+        // neither is a tool that writes or controls the workspace.
+        PermissionResource::Shell => false,
+        PermissionResource::Network => false,
+        _ => false,
+    })
+}
+
+/// The public contract form of [`is_bounded_read_only_compute`], evaluated on
+/// the resolved effect descriptor. Runtime owns the permission decision, so the
+/// predicate lives with the tool contract it describes.
+pub fn effect_is_bounded_read_only_compute(
+    descriptor: &harness_contract::tool::ToolEffectDescriptor,
+) -> bool {
+    is_bounded_read_only_compute(
+        descriptor.effect_kind,
+        descriptor.required_permission,
+        descriptor.uses_network,
+        descriptor.spawns_process,
+        descriptor.mutates_packages,
+        descriptor.mutates_system,
+        &descriptor.scopes,
+        descriptor.tool_id == "tool_orchestrate",
+    )
+}
+
+fn data_only_compute(
+    resolver: &ToolEffectResolverSpec,
+    tool_id: &str,
+    input: &Value,
+    properties: &EffectProperties,
+) -> bool {
+    tool_id == "execute_code"
+        && resolver.resolver_id == "builtin.sandboxed_command"
+        && input.get("input_files").and_then(Value::as_array).is_some_and(Vec::is_empty)
+        && input.get("dangerouslyDisableSandbox").is_none_or(|v| v == false)
+        && input.get("isolateNetwork").is_none_or(|v| v == true)
+        && input.get("workspaceAccess").is_none_or(|v| v == "read-only")
+        && is_bounded_read_only_compute(
+            properties.effect_kind,
+            properties.required_permission,
+            properties.uses_network,
+            properties.spawns_process,
+            properties.mutates_packages,
+            properties.mutates_system,
+            &properties.scopes,
+            false,
+        )
+}
+
 fn is_read_only_research_effect(properties: &EffectProperties) -> bool {
     properties.required_permission == ToolPermissionMode::ReadOnly
         && !properties.uses_network
@@ -760,7 +893,17 @@ fn resolve_base_effect_properties(
             // `effect_kind` and `spawns_process`.
             effect_kind: ToolEffectKind::Process,
             idempotency: ToolIdempotency::Unknown,
-            scopes: Vec::new(),
+            // The tool invocation itself is the capability the lease
+            // authorizes; the file scopes the process may observe are added
+            // from the request's declared  (and only from there).
+            // An empty scope set would mean "no invocation at all", which is
+            // not what this tool is, and it would leave the descriptor
+            // without any scope to certify.
+            scopes: vec![scope(
+                PermissionResource::Tool,
+                PermissionOperation::Call,
+                None,
+            )],
             required_permission: ToolPermissionMode::ReadOnly,
             approval_class: ToolApprovalClass::Policy,
             uses_network: false,
@@ -1318,7 +1461,7 @@ fn scope(
     }
 }
 
-fn resource_target(input: &Value) -> Option<String> {
+pub(crate) fn resource_target(input: &Value) -> Option<String> {
     ["path", "url", "server", "uri", "target"]
         .into_iter()
         .find_map(|key| input.get(key).and_then(Value::as_str).map(str::to_string))
@@ -1420,6 +1563,47 @@ fn contains_sequence(command: &str, sequences: &[&str]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fix2_compute_composite_classification_and_boundaries() {
+        let host = crate::ToolHost::builtin("fix2", &std::env::current_dir().unwrap());
+        let lease = host.pin_snapshot();
+        let program = |read: Value, compute_input: Value| json!({"steps":[
+            {"id":"r","op":"call","tool":"read_file","input":read},
+            {"id":"c","op":"compute","language":"python","code":"print(_input)","input":compute_input}
+        ]});
+        for data in [json!([1, 2]), json!({"value":"$r"})] {
+            let effect = lease.describe_effect("tool_orchestrate", &program(json!({"path":"src/a"}), data));
+            assert!(effect_is_bounded_read_only_compute(&effect), "{effect:?}");
+            assert_eq!(effect.assessment.novelty, EffectNovelty::Routine);
+            assert_eq!(effect.assessment.data_sensitivity, DataClassification::Internal);
+        }
+        let secret = lease.describe_effect("tool_orchestrate", &program(json!({"path":".env"}), json!("$r")));
+        assert_eq!(secret.assessment.data_sensitivity, DataClassification::Secret);
+        let dynamic_path = lease.describe_effect("tool_orchestrate", &program(json!({"path":"$previous.path"}), json!("$r")));
+        assert!(!effect_is_bounded_read_only_compute(&dynamic_path));
+        assert_eq!(dynamic_path.assessment.data_sensitivity, DataClassification::Secret);
+        let write = lease.describe_effect("tool_orchestrate", &json!({"steps":[
+            {"id":"w","op":"call","tool":"edit","input":{"action":"write","path":"out","content":"x"}},
+            {"id":"c","op":"compute","language":"python","code":"print(1)","input":1}
+        ]}));
+        assert_eq!(write.required_permission, ToolPermissionMode::WorkspaceWrite);
+        assert!(!effect_is_bounded_read_only_compute(&write));
+
+        let resolver = crate::builtin_effect_resolver_spec("execute_code");
+        for input in [
+            json!({"input":"$r","input_files":["src/a"]}),
+            json!({"input":"$r","input_files":[],"workspaceAccess":"write"}),
+            json!({"input":"$r","input_files":[],"isolateNetwork":false}),
+            json!({"input":"$r","input_files":[],"dangerouslyDisableSandbox":true}),
+            json!({"input_files":["$r.path"]}),
+        ] {
+            let path = if input.get("input").is_some() { "input" } else { "input_files" };
+            let effect = resolve_orchestration_child_effect_resolution(&resolver, "execute_code", &input, ToolPermissionMode::ReadOnly, &[vec![path.into()]]).unwrap().descriptor;
+            assert_eq!(effect.assessment.data_sensitivity, DataClassification::Secret, "{input}");
+            assert_ne!(effect.assessment.novelty, EffectNovelty::Routine, "{input}");
+        }
+    }
     use serde_json::json;
 
     fn assert_complete_purposes(resolution: &ToolEffectResolution) {
@@ -1986,17 +2170,57 @@ mod tests {
             (
                 "glob_search",
                 json!({"path":"src","pattern":"nested/*.rs"}),
+                vec![Some(".")],
+            ),
+            (
+                "glob_search",
+                json!({"path":"crates","pattern":"*/src/*.rs"}),
+                vec![Some(".")],
+            ),
+            (
+                "glob_search",
+                json!({"path":"crates/runtime","pattern":"**/*.rs"}),
+                vec![Some(".")],
+            ),
+            (
+                "glob_search",
+                json!({"patterns":[{"path":"src","pattern":"**/*.rs"},{"path":"tests","pattern":"nested/*.rs"}]}),
+                vec![Some(".")],
+            ),
+            (
+                "glob_search",
+                json!({"path":"src","pattern":"{..,nested}/*.rs"}),
                 vec![None],
             ),
             (
                 "glob_search",
                 json!({"path":" ","pattern":"*.rs"}),
-                vec![None],
+                vec![Some(".")],
+            ),
+            (
+                "glob_search",
+                json!({"pattern":"crates"}),
+                vec![Some(".")],
+            ),
+            (
+                "glob_search",
+                json!({"patterns":[{"pattern":"*.rs"},{"path":null,"pattern":"**/*.rs"},{"path":"","pattern":"*.rs"},{"path":42,"pattern":"*.rs"}]}),
+                vec![Some("."), None],
             ),
             (
                 "grep_search",
                 json!({"path":"src","pattern":"needle"}),
                 vec![Some("src")],
+            ),
+            (
+                "grep_search",
+                json!({"pattern":"needle"}),
+                vec![Some(".")],
+            ),
+            (
+                "grep_search",
+                json!({"searches":[{"pattern":"a"},{"path":null,"pattern":"b"},{"path":" ","pattern":"c"},{"path":42,"pattern":"d"}]}),
+                vec![Some("."), None],
             ),
             (
                 "grep_search",
@@ -2018,7 +2242,9 @@ mod tests {
                 json!({"roots":["src","tests"],"path":"decoy"}),
                 vec![Some("src"), Some("tests")],
             ),
-            ("workspace_snapshot", json!({"path":"decoy"}), vec![None]),
+            ("workspace_snapshot", json!({"path":"decoy"}), vec![Some(".")]),
+            ("workspace_snapshot", json!({"roots":null}), vec![Some(".")]),
+            ("workspace_snapshot", json!({"roots":"bad"}), vec![None]),
             (
                 "vision_analyze",
                 json!({"image_path":"image.png","path":"decoy"}),
@@ -2716,7 +2942,8 @@ mod tests {
             "execute_code",
             &json!({
                 "language": "python",
-                "code": "print(sum(range(10)))"
+                "code": "print(sum(range(10)))",
+                "input_files": ["crates/tools/src/lib.rs"]
             }),
             ToolPermissionMode::ReadOnly,
         );

@@ -4,11 +4,6 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
-use harness_contract::execution_graph::{
-    ExecutionGraph, ExecutionNodeKind, ExecutionNodeSpec, ExecutionNodeStatus,
-};
-
-use crate::execution_core::graph::ExecutionGraphEvent;
 use crate::runtime_event_store::{
     AppendTransactionRequest, ExpectedStreamRevision, RuntimeEventInput, RuntimeEventScope,
     RuntimeEventStore, RuntimeEventStoreError, RuntimeTransactionEventInput,
@@ -44,6 +39,12 @@ pub enum LegacyExecutionImportError {
     Validation(String),
     #[error(transparent)]
     EventStore(#[from] RuntimeEventStoreError),
+    #[error("legacy import failed: {import_error}; recovery marker persistence failed: {source}")]
+    RecoveryMarkerPersistence {
+        import_error: Box<LegacyExecutionImportError>,
+        #[source]
+        source: RuntimeEventStoreError,
+    },
 }
 
 pub struct LegacyExecutionImporter {
@@ -73,22 +74,16 @@ impl LegacyExecutionImporter {
         manifest_path: impl AsRef<Path>,
     ) -> Result<LegacyExecutionImportReceipt, LegacyExecutionImportError> {
         let manifest_path = manifest_path.as_ref();
-        let result = self.import_manifest_inner(manifest_path);
-        if let Err(error) = &result {
-            self.mark_recovery_required(manifest_path, &error.to_string());
-        }
-        result
+        self.import_manifest_inner(manifest_path)
+            .map_err(|error| self.record_recovery_error(manifest_path, error))
     }
 
     pub fn import_clean_shutdown(
         &self,
         receipt: &UpgradeCleanShutdownReceipt,
     ) -> Result<LegacyExecutionImportReceipt, LegacyExecutionImportError> {
-        let result = self.import_clean_shutdown_inner(receipt);
-        if let Err(error) = &result {
-            self.mark_recovery_required(&receipt.manifest_path, &error.to_string());
-        }
-        result
+        self.import_clean_shutdown_inner(receipt)
+            .map_err(|error| self.record_recovery_error(&receipt.manifest_path, error))
     }
 
     pub fn import_receipt_file(
@@ -106,10 +101,7 @@ impl LegacyExecutionImporter {
                 serde_json::from_slice(&fs::read(receipt_path)?)?;
             self.import_clean_shutdown_inner(&receipt)
         })();
-        if let Err(error) = &result {
-            self.mark_recovery_required(receipt_path, &error.to_string());
-        }
-        result
+        result.map_err(|error| self.record_recovery_error(receipt_path, error))
     }
 
     pub fn mutation_allowed(&self) -> Result<bool, LegacyExecutionImportError> {
@@ -138,6 +130,25 @@ impl LegacyExecutionImporter {
             &self.workspace_id,
             &self.workspace_root,
         )?;
+
+        let active = inventory
+            .carriers
+            .iter()
+            .filter(|carrier| carrier.status.is_active())
+            .collect::<Vec<_>>();
+        // A legacy selector and snapshot hash do not authenticate a live
+        // Session, Agent attempt, or physical owner. Only an explicit
+        // disposition can settle these carriers; never manufacture a Graph.
+        // Validate before replay so an old import marker cannot revive that
+        // retired capability.
+        let dispositions = active
+            .iter()
+            .map(|carrier| {
+                let disposition = disposition_for(&inventory.dispositions, carrier)?;
+                validate_disposition(disposition)?;
+                Ok(disposition)
+            })
+            .collect::<Result<Vec<_>, LegacyExecutionImportError>>()?;
 
         if let Some(marker) = self
             .event_store
@@ -171,66 +182,41 @@ impl LegacyExecutionImporter {
             });
         }
 
-        let active = inventory
-            .carriers
-            .iter()
-            .filter(|carrier| carrier.status.is_active())
-            .collect::<Vec<_>>();
         let pre_hash = carrier_identity_hash(active.iter().copied())?;
         let stream_id = upgrade_stream_id(&self.workspace_id);
         let expected_revision = self.event_store.stream_revision(&stream_id)?;
         let transaction_id = format!("legacy-execution-import:{}", inventory.content_hash);
-        let mut imported_count = 0;
+        let imported_count = 0;
         let mut disposition_count = 0;
         let mut handled = Vec::with_capacity(active.len());
-        let mut imported_graph_ids = Vec::new();
+        let imported_graph_ids: Vec<String> = Vec::new();
         let mut events = Vec::with_capacity(active.len() + 1);
-        let mut expected_streams = vec![ExpectedStreamRevision {
+        let expected_streams = vec![ExpectedStreamRevision {
             stream_id: stream_id.clone(),
             expected_revision,
         }];
 
-        for carrier in &active {
-            let disposition = disposition_for(&inventory.dispositions, carrier);
-            if let Some(disposition) = disposition {
-                validate_disposition(disposition)?;
-                disposition_count += 1;
-                events.push(transaction_event(
-                    &stream_id,
-                    RuntimeEventScope::Recovery,
-                    "legacy_execution_disposition_recorded",
-                    format!(
-                        "legacy-disposition:{}:{}",
-                        carrier.carrier_kind, carrier.carrier_id
-                    ),
-                    serde_json::json!({
-                        "carrier_identity": {
-                            "carrier_kind": carrier.carrier_kind,
-                            "carrier_id": carrier.carrier_id,
-                            "revision": carrier.revision,
-                            "state_hash": carrier.state_hash,
-                        },
-                        "disposition": disposition,
-                        "manifest_hash": inventory.content_hash,
-                    }),
-                ));
-            } else {
-                imported_count += 1;
-                let graph = materialize_graph(carrier, &inventory.content_hash);
-                let graph_id = graph.id.clone();
-                imported_graph_ids.push(graph_id.clone());
-                expected_streams.push(ExpectedStreamRevision {
-                    stream_id: graph_id.clone(),
-                    expected_revision: 0,
-                });
-                events.push(transaction_event(
-                    &graph_id,
-                    RuntimeEventScope::ExecutionGraph,
-                    "execution_graph.planned",
-                    format!("legacy-graph:{graph_id}"),
-                    serde_json::to_value(ExecutionGraphEvent::Planned { graph })?,
-                ));
-            }
+        for (carrier, disposition) in active.iter().zip(dispositions) {
+            disposition_count += 1;
+            events.push(transaction_event(
+                &stream_id,
+                RuntimeEventScope::Recovery,
+                "legacy_execution_disposition_recorded",
+                format!(
+                    "legacy-disposition:{}:{}",
+                    carrier.carrier_kind, carrier.carrier_id
+                ),
+                serde_json::json!({
+                    "carrier_identity": {
+                        "carrier_kind": carrier.carrier_kind,
+                        "carrier_id": carrier.carrier_id,
+                        "revision": carrier.revision,
+                        "state_hash": carrier.state_hash,
+                    },
+                    "disposition": disposition,
+                    "manifest_hash": inventory.content_hash,
+                }),
+            ));
             handled.push(*carrier);
         }
 
@@ -309,14 +295,29 @@ impl LegacyExecutionImporter {
         source_importer.import_manifest_inner(&receipt.manifest_path)
     }
 
-    fn mark_recovery_required(&self, manifest_path: &Path, reason: &str) {
+    fn record_recovery_error(
+        &self,
+        manifest_path: &Path,
+        error: LegacyExecutionImportError,
+    ) -> LegacyExecutionImportError {
+        match self.mark_recovery_required(manifest_path, &error.to_string()) {
+            Ok(()) => error,
+            Err(source) => LegacyExecutionImportError::RecoveryMarkerPersistence {
+                import_error: Box::new(error),
+                source,
+            },
+        }
+    }
+
+    fn mark_recovery_required(
+        &self,
+        manifest_path: &Path,
+        reason: &str,
+    ) -> Result<(), RuntimeEventStoreError> {
         let stream_id = upgrade_stream_id(&self.workspace_id);
-        let Ok(expected_revision) = self.event_store.stream_revision(&stream_id) else {
-            return;
-        };
+        let expected_revision = self.event_store.stream_revision(&stream_id)?;
         let reason_hash = stable_hash(reason.as_bytes());
-        let _ = self
-            .event_store
+        self.event_store
             .append_transaction(AppendTransactionRequest {
                 transaction_id: format!("upgrade-recovery-required:{reason_hash}"),
                 expected_streams: vec![ExpectedStreamRevision {
@@ -334,47 +335,9 @@ impl LegacyExecutionImporter {
                         "reason": reason,
                     }),
                 )],
-            });
+            })?;
+        Ok(())
     }
-}
-
-fn materialize_graph(carrier: &UpgradeCarrierRecord, manifest_hash: &str) -> ExecutionGraph {
-    let identity = format!(
-        "{}:{}:{}:{}",
-        carrier.carrier_kind, carrier.carrier_id, carrier.revision, carrier.state_hash
-    );
-    let identity_hash = stable_hash(identity.as_bytes());
-    let mut graph = ExecutionGraph::new(format!(
-        "Imported legacy {} {}",
-        carrier.carrier_kind, carrier.carrier_id
-    ));
-    graph.id = format!("legacy-execution-graph-{identity_hash}");
-    graph.revision = 1;
-    let mut node = ExecutionNodeSpec::new(
-        ExecutionNodeKind::AgentTask,
-        "legacy_execution",
-        carrier
-            .state_ref
-            .clone()
-            .unwrap_or_else(|| format!("legacy-state:{manifest_hash}:{}", carrier.carrier_id)),
-    );
-    node.id = format!("legacy-execution-node-{identity_hash}");
-    node.idempotency_key = format!("legacy-execution:{identity_hash}");
-    graph.node_statuses.insert(
-        node.id.clone(),
-        match carrier.status {
-            super::UpgradeCarrierStatus::Ready => ExecutionNodeStatus::Ready,
-            super::UpgradeCarrierStatus::Running => ExecutionNodeStatus::Running,
-            super::UpgradeCarrierStatus::Waiting => ExecutionNodeStatus::WaitingExternal,
-            super::UpgradeCarrierStatus::Paused => ExecutionNodeStatus::Paused,
-            super::UpgradeCarrierStatus::Completed => ExecutionNodeStatus::Completed,
-            super::UpgradeCarrierStatus::Failed => ExecutionNodeStatus::Failed,
-            super::UpgradeCarrierStatus::Cancelled => ExecutionNodeStatus::Cancelled,
-            super::UpgradeCarrierStatus::Blocked => ExecutionNodeStatus::Blocked,
-        },
-    );
-    graph.nodes.push(node);
-    graph
 }
 
 fn validate_disposition(
@@ -472,11 +435,14 @@ fn carrier_identity_hash<'a>(
 fn disposition_for<'a>(
     dispositions: &'a [UpgradeDispositionReceipt],
     carrier: &UpgradeCarrierRecord,
-) -> Option<&'a UpgradeDispositionReceipt> {
+) -> Result<&'a UpgradeDispositionReceipt, LegacyExecutionImportError> {
     dispositions.iter().find(|disposition| {
         disposition.carrier_kind == carrier.carrier_kind
             && disposition.carrier_id == carrier.carrier_id
-    })
+    }).ok_or_else(|| validation(&format!(
+        "active legacy carrier {}:{} requires an explicit cancel or drain disposition; original execution identity is unavailable",
+        carrier.carrier_kind, carrier.carrier_id,
+    )))
 }
 
 fn transaction_event(
@@ -547,7 +513,7 @@ mod tests {
     }
 
     #[test]
-    fn imports_active_carriers_and_marker_in_one_idempotent_transaction() {
+    fn active_carriers_require_disposition_without_creating_execution_graphs() {
         let temp = tempfile::tempdir().unwrap();
         let manifest = temp.path().join("clean-shutdown.json");
         let inventory = inventory(temp.path());
@@ -556,26 +522,24 @@ mod tests {
         let importer =
             LegacyExecutionImporter::new(Arc::clone(&store), "workspace", temp.path(), "0.9.472");
 
-        let first = importer.import_manifest(&manifest).unwrap();
-        let second = importer.import_manifest(&manifest).unwrap();
-
-        assert!(!first.duplicate);
-        assert!(second.duplicate);
-        assert_eq!(first.pre_hash, first.post_hash);
-        assert_eq!(first.imported_count, 1);
+        let original = fs::read(&manifest).unwrap();
+        for _ in 0..2 {
+            let error = importer.import_manifest(&manifest).unwrap_err();
+            assert!(error
+                .to_string()
+                .contains("explicit cancel or drain disposition"));
+        }
         let events = store.list_stream("upgrade:workspace").unwrap();
         assert_eq!(events.len(), 1);
-        assert_eq!(events[0].kind, LEGACY_EXECUTION_IMPORTED);
-        let graph_id = materialize_graph(&inventory.carriers[0], &inventory.content_hash).id;
-        let graph = crate::execution_core::graph::ExecutionGraphStateStore::new(Arc::clone(&store))
-            .load(&graph_id)
-            .unwrap();
-        assert_eq!(graph.id, graph_id);
-        assert_eq!(
-            graph.node_statuses.values().next(),
-            Some(&ExecutionNodeStatus::Running)
+        assert_eq!(events[0].kind, UPGRADE_RECOVERY_REQUIRED);
+        assert!(
+            crate::execution_core::graph::ExecutionGraphStateStore::new(Arc::clone(&store))
+                .graph_ids()
+                .unwrap()
+                .is_empty()
         );
-        assert!(importer.mutation_allowed().unwrap());
+        assert!(!importer.mutation_allowed().unwrap());
+        assert_eq!(fs::read(&manifest).unwrap(), original);
     }
 
     #[test]
@@ -602,9 +566,224 @@ mod tests {
 
         assert_eq!(receipt.imported_count, 0);
         assert_eq!(receipt.disposition_count, 1);
+        assert_eq!(receipt.active_carrier_count, 1);
+        assert_eq!(receipt.pre_hash, receipt.post_hash);
         let events = store.list_stream("upgrade:workspace").unwrap();
+        assert_eq!(events.len(), 2);
         assert_eq!(events[0].kind, "legacy_execution_disposition_recorded");
         assert_eq!(events[1].kind, LEGACY_EXECUTION_IMPORTED);
+        assert_eq!(events[0].transaction_id, events[1].transaction_id);
+        assert_eq!(events[0].commit_cursor, events[1].commit_cursor);
+        let replay = importer.import_manifest(&manifest).unwrap();
+        assert!(replay.duplicate);
+        assert_eq!(replay.transaction_id, receipt.transaction_id);
+        assert_eq!(replay.pre_hash, receipt.pre_hash);
+        assert_eq!(replay.post_hash, receipt.post_hash);
+        assert_eq!(store.list_stream("upgrade:workspace").unwrap(), events);
+        assert!(importer.mutation_allowed().unwrap());
+
+        assert!(importer
+            .import_receipt_file(temp.path().join("missing-later-receipt.json"))
+            .is_err());
+        let blocked = store.list_stream("upgrade:workspace").unwrap();
+        assert_eq!(blocked.last().unwrap().kind, UPGRADE_RECOVERY_REQUIRED);
+        assert!(importer.import_manifest(&manifest).unwrap().duplicate);
+        assert!(!importer.mutation_allowed().unwrap());
+        assert_eq!(store.list_stream("upgrade:workspace").unwrap(), blocked);
+    }
+
+    #[test]
+    fn an_undisposed_carrier_prevents_partial_disposition_publication() {
+        let temp = tempfile::tempdir().unwrap();
+        let manifest = temp.path().join("clean-shutdown.json");
+        let mut inventory = inventory(temp.path());
+        inventory.dispositions.push(UpgradeDispositionReceipt {
+            carrier_kind: "active_turn".into(),
+            carrier_id: "turn-1".into(),
+            action: "cancel".into(),
+            actor: "operator".into(),
+            reason: "upgrade".into(),
+            result_refs: vec!["cancellation:turn-1".into()],
+            created_at_ms: 43,
+        });
+        let mut undisposed = inventory.carriers[0].clone();
+        undisposed.carrier_id = "turn-2".into();
+        inventory.carriers.push(undisposed);
+        inventory.active_count = 2;
+        inventory.carrier_count = 2;
+        inventory.content_hash = inventory_content_hash(&inventory).unwrap();
+        let original = serde_json::to_vec_pretty(&inventory).unwrap();
+        fs::write(&manifest, &original).unwrap();
+        let store = Arc::new(RuntimeEventStore::for_test());
+        let importer =
+            LegacyExecutionImporter::new(store.clone(), "workspace", temp.path(), "0.9.472");
+
+        assert!(importer.import_manifest(&manifest).is_err());
+        let events = store.list_stream("upgrade:workspace").unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].kind, UPGRADE_RECOVERY_REQUIRED);
+        assert!(!importer.mutation_allowed().unwrap());
+        assert!(
+            crate::execution_core::graph::ExecutionGraphStateStore::new(store)
+                .graph_ids()
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(fs::read(&manifest).unwrap(), original);
+    }
+
+    #[test]
+    fn drain_disposition_retries_atomically_after_a_failed_import_append() {
+        let temp = tempfile::tempdir().unwrap();
+        let manifest = temp.path().join("clean-shutdown.json");
+        let mut inventory = inventory(temp.path());
+        inventory.dispositions.push(UpgradeDispositionReceipt {
+            carrier_kind: "active_turn".into(),
+            carrier_id: "turn-1".into(),
+            action: "drain".into(),
+            actor: "operator".into(),
+            reason: "upgrade after physical drain".into(),
+            result_refs: vec!["drain:turn-1".into()],
+            created_at_ms: 43,
+        });
+        inventory.content_hash = inventory_content_hash(&inventory).unwrap();
+        fs::write(&manifest, serde_json::to_vec_pretty(&inventory).unwrap()).unwrap();
+        let store = Arc::new(RuntimeEventStore::for_test());
+        let importer =
+            LegacyExecutionImporter::new(store.clone(), "workspace", temp.path(), "0.9.472");
+        let transaction = format!("legacy-execution-import:{}", inventory.content_hash);
+        store.inject_append_fault_once(transaction.clone(), false);
+
+        assert!(importer.import_manifest(&manifest).is_err());
+        assert!(!store.append_fault_is_pending(&transaction));
+        let failed = store.list_stream("upgrade:workspace").unwrap();
+        assert_eq!(failed.len(), 1);
+        assert_eq!(failed[0].kind, UPGRADE_RECOVERY_REQUIRED);
+        assert!(!importer.mutation_allowed().unwrap());
+
+        let recovered = importer.import_manifest(&manifest).unwrap();
+        assert_eq!(recovered.imported_count, 0);
+        assert_eq!(recovered.disposition_count, 1);
+        assert_eq!(recovered.pre_hash, recovered.post_hash);
+        let events = store.list_stream("upgrade:workspace").unwrap();
+        assert_eq!(events.len(), 3);
+        assert_eq!(events[1].kind, "legacy_execution_disposition_recorded");
+        assert_eq!(events[2].kind, LEGACY_EXECUTION_IMPORTED);
+        assert_eq!(events[1].transaction_id, events[2].transaction_id);
+        assert_eq!(events[1].commit_cursor, events[2].commit_cursor);
+        assert_eq!(events[1].payload["disposition"]["action"], "drain");
+        assert!(importer.mutation_allowed().unwrap());
+        assert!(importer.import_manifest(&manifest).unwrap().duplicate);
+        assert_eq!(store.list_stream("upgrade:workspace").unwrap(), events);
+        assert!(
+            crate::execution_core::graph::ExecutionGraphStateStore::new(store)
+                .graph_ids()
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn recovery_marker_write_failures_are_reported_by_every_import_entry() {
+        for entry in 0..3 {
+            for after_commit in [false, true] {
+                let temp = tempfile::tempdir().unwrap();
+                let missing = temp.path().join("missing.json");
+                let store = Arc::new(RuntimeEventStore::for_test());
+                let importer = LegacyExecutionImporter::new(
+                    store.clone(),
+                    "workspace",
+                    temp.path(),
+                    "0.9.472",
+                );
+                let original = LegacyExecutionImportError::MissingManifest(missing.clone());
+                let transaction = format!(
+                    "upgrade-recovery-required:{}",
+                    stable_hash(original.to_string().as_bytes()),
+                );
+                store.inject_append_fault_once(transaction.clone(), after_commit);
+                let error = match entry {
+                    0 => importer.import_manifest(&missing),
+                    1 => importer.import_receipt_file(&missing),
+                    _ => importer.import_clean_shutdown(&UpgradeCleanShutdownReceipt {
+                        schema_version: 1,
+                        source_binary_version: "0.9.472".into(),
+                        workspace_id: "workspace".into(),
+                        manifest_path: missing.clone(),
+                        manifest_hash: "missing".into(),
+                        active_count: 1,
+                        clean_shutdown_at_ms: 43,
+                    }),
+                }
+                .unwrap_err();
+                assert!(error
+                    .to_string()
+                    .contains("recovery marker persistence failed"));
+                assert!(error.to_string().contains(&original.to_string()));
+                assert!(error
+                    .to_string()
+                    .contains("injected transaction reply failure"));
+                assert!(std::error::Error::source(&error)
+                    .unwrap()
+                    .to_string()
+                    .contains("injected transaction reply failure"));
+                assert!(!store.append_fault_is_pending(&transaction));
+                assert_eq!(
+                    store.list_stream("upgrade:workspace").unwrap().len(),
+                    usize::from(after_commit)
+                );
+                assert_eq!(importer.mutation_allowed().unwrap(), !after_commit);
+            }
+        }
+    }
+
+    #[test]
+    fn an_old_import_marker_cannot_restore_undisposed_carriers() {
+        let temp = tempfile::tempdir().unwrap();
+        let manifest = temp.path().join("clean-shutdown.json");
+        let inventory = inventory(temp.path());
+        fs::write(&manifest, serde_json::to_vec_pretty(&inventory).unwrap()).unwrap();
+        let store = Arc::new(RuntimeEventStore::for_test());
+        let original = store
+            .append_transaction(AppendTransactionRequest {
+                transaction_id: format!("legacy-execution-import:{}", inventory.content_hash),
+                expected_streams: vec![ExpectedStreamRevision {
+                    stream_id: "upgrade:workspace".into(),
+                    expected_revision: 0,
+                }],
+                events: vec![transaction_event(
+                    "upgrade:workspace",
+                    RuntimeEventScope::Recovery,
+                    LEGACY_EXECUTION_IMPORTED,
+                    format!("legacy-marker:{}", inventory.content_hash),
+                    serde_json::json!({"manifest_hash":inventory.content_hash,"imported_count":1,
+                    "imported_graph_ids":["legacy-unverified-graph"]}),
+                )],
+            })
+            .unwrap();
+        let importer =
+            LegacyExecutionImporter::new(store.clone(), "workspace", temp.path(), "0.9.472");
+
+        assert!(importer
+            .import_manifest(&manifest)
+            .unwrap_err()
+            .to_string()
+            .contains("explicit cancel or drain disposition"));
+        let events = store.list_stream("upgrade:workspace").unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].transaction_id, original.transaction_id);
+        assert_eq!(
+            events[0].payload["imported_graph_ids"][0],
+            "legacy-unverified-graph"
+        );
+        assert_eq!(events[1].kind, UPGRADE_RECOVERY_REQUIRED);
+        assert!(!importer.mutation_allowed().unwrap());
+        assert!(
+            crate::execution_core::graph::ExecutionGraphStateStore::new(store)
+                .graph_ids()
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]

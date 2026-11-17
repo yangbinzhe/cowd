@@ -27,7 +27,8 @@ async fn own865_checkpoint_metadata_does_not_fetch_body_and_tracks_row_replaceme
     assert!(metadata.compact_body.is_none());
     assert_eq!(repository.body_query_count.load(std::sync::atomic::Ordering::Relaxed), before);
     let body = repository.object(&artifact.sha256).unwrap().unwrap();
-    assert_eq!(body.compact_body.unwrap().len(), 242788);
+    let compact_body = body.compact_body.unwrap();
+    assert_eq!(compact_body.len(), metadata.bytes as usize);
     assert_eq!(repository.body_query_count.load(std::sync::atomic::Ordering::Relaxed), before + 1);
     let executor = fixture.reconnect();
     let mut connection = executor.checkout_critical().unwrap();
@@ -708,6 +709,7 @@ fn r1_content_gc_prepared_inventory_resumes_after_retained_prefix() {
     }
     let high = repository.prepared_high_water().unwrap().unwrap();
     let page = repository.prepared_page(None, &high, 100).unwrap();
+    assert_eq!(page.candidates.iter().map(|candidate| candidate.record.sha256.clone()).collect::<std::collections::BTreeSet<_>>().len(), 100);
     assert_eq!(page.candidates.len(), 100);
     assert!(!page.complete);
     let view = events.quiesced_content_roots();
@@ -1057,7 +1059,7 @@ fn r1_content_gc_postgres_graph_goal_business_source_cas_and_reopen() {
 
 #[test]
 fn runtime_event_clean_baseline_has_current_fences_and_discovery_index() {
-    assert_eq!(RUNTIME_EVENT_MIGRATIONS.len(), 1);
+    assert_eq!(RUNTIME_EVENT_MIGRATIONS.iter().map(|migration| migration.id).collect::<Vec<_>>(), vec!["runtime_event.current-baseline"]);
     assert_eq!(
         RUNTIME_EVENT_MIGRATIONS[0].id,
         "runtime_event.current-baseline"
@@ -1248,7 +1250,7 @@ fn r1_bounded_history_mission_metadata_precedes_payload_and_limits_driver_bytes(
                 1024 * 1024,
             )
             .unwrap();
-        assert_eq!(old_lines.len(), 1);
+        assert_eq!(old_lines.iter().map(|event| event.event_id.as_str()).collect::<Vec<_>>(), vec![old.event_id.as_str()]);
         assert_eq!(old_lines[0].event_id, old.event_id);
         assert!(store
             .recent_event_lines("mission:empty", &[], 0, 50, 1024 * 1024)
@@ -1309,7 +1311,8 @@ fn r1_bounded_history_mission_metadata_precedes_payload_and_limits_driver_bytes(
             let batches = store
                 .events_after_cursor(receipt.commit_cursor - 1, 1)
                 .unwrap();
-            assert_eq!(batches.len(), 1);
+            let expected_transaction = format!("recent-cohort-{first}");
+            assert_eq!(batches.iter().map(|batch| batch.transaction_id.as_str()).collect::<Vec<_>>(), vec![expected_transaction.as_str()]);
             for event in &batches[0].events {
                 if !event
                     .refs
@@ -1526,11 +1529,11 @@ fn r1_bounded_history_backend_enforces_bytes_before_hydration() {
     let first = store
         .list_stream_after("metadata-budget", 0, head, 100, 1024 * 1024)
         .unwrap();
-    assert_eq!(first.len(), 1);
+    assert_eq!(first.iter().map(|event| event.sequence).collect::<Vec<_>>(), vec![1]);
     let second = store
         .list_stream_after("metadata-budget", first[0].sequence, head, 100, 1024 * 1024)
         .unwrap();
-    assert_eq!(second.len(), 1);
+    assert_eq!(second.iter().map(|event| event.sequence).collect::<Vec<_>>(), vec![2]);
     assert_eq!(second[0].sequence, 2);
     fixture
         .reconnect()
@@ -1627,20 +1630,20 @@ fn r1_bounded_history_backend_enforces_bytes_before_hydration() {
     let error = store.position_page(RuntimeEventScope::Session, stream, None, position, through, 100, target_bytes - 1).unwrap_err();
     assert!(error.contains(&target.event_id));
     let exact = store.list_stream_after(stream, small.sequence, head, 100, target_bytes).unwrap();
-    assert_eq!(exact.len(), 1);
+    assert_eq!(exact.iter().map(|event| event.event_id.as_str()).collect::<Vec<_>>(), vec![target.event_id.as_str()]);
     assert_eq!(exact[0].event_id, target.event_id);
     let exact_position = store.position_page(RuntimeEventScope::Session, stream, None, position, through, 100, target_bytes).unwrap();
-    assert_eq!(exact_position.len(), 1);
+    assert_eq!(exact_position.iter().map(|event| event.event_id.as_str()).collect::<Vec<_>>(), vec![target.event_id.as_str()]);
     assert_eq!(exact_position[0].event_id, target.event_id);
     let short = store.list_stream_after(stream, 0, head, 100, small_bytes).unwrap();
     assert_eq!(short.iter().map(|event| event.event_id.as_str()).collect::<Vec<_>>(), vec![small.event_id.as_str()]);
     let resumed = store.list_stream_after(stream, short[0].sequence, head, 100, target_bytes).unwrap();
     assert_eq!(resumed.iter().map(|event| event.event_id.as_str()).collect::<Vec<_>>(), vec![target.event_id.as_str()]);
     let short_position = store.position_page(RuntimeEventScope::Session, stream, None, None, through, 100, small_bytes).unwrap();
-    assert_eq!(short_position.len(), 1);
+    assert_eq!(short_position.iter().map(|event| event.event_id.as_str()).collect::<Vec<_>>(), vec![small.event_id.as_str()]);
     assert_eq!(short_position[0].event_id, small.event_id);
     let resumed_position = store.position_page(RuntimeEventScope::Session, stream, None, Some((short_position[0].commit_cursor, short_position[0].transaction_index)), through, 100, target_bytes).unwrap();
-    assert_eq!(resumed_position.len(), 1);
+    assert_eq!(resumed_position.iter().map(|event| event.event_id.as_str()).collect::<Vec<_>>(), vec![target.event_id.as_str()]);
     assert_eq!(resumed_position[0].event_id, target.event_id);
     assert!(store.position_page(RuntimeEventScope::Session, "foreign-session", None, None, through, 100, target_bytes).unwrap().is_empty());
     let mut oversized = input("r662-absolute-budget", RuntimeEventScope::Session, "budget.absolute");
@@ -1884,7 +1887,13 @@ fn r1_clean_schema_initialization_is_atomic_and_rejects_old_catalog() {
         (ARTIFACT_DOMAIN, ARTIFACT_MIGRATIONS, "artifact_objects"),
         (TASK_DOMAIN, TASK_MIGRATIONS, "runtime_tasks"),
     ] {
-        assert_eq!(specs.len(), 1);
+        let expected_migration = match table {
+            "runtime_events" => "runtime_event.current-baseline",
+            "artifact_objects" => "runtime_artifact.current-baseline",
+            "runtime_tasks" => "runtime_task.current-baseline",
+            _ => unreachable!(),
+        };
+        assert_eq!(specs.iter().map(|migration| migration.id).collect::<Vec<_>>(), vec![expected_migration]);
         let fixture = PostgresTestScope::new();
         let executor = fixture.reconnect();
         executor.checkout_critical().unwrap().batch_execute(&format!("CREATE TABLE {table}(sentinel TEXT NOT NULL); INSERT INTO {table} VALUES('never rewrite old data')")).unwrap();
@@ -2258,7 +2267,8 @@ fn postgres_sequence_pages_freeze_the_head_during_independent_concurrent_appends
         .map(|event| event.event_id.clone())
         .collect::<std::collections::BTreeSet<_>>();
     assert_eq!(read_ids, written_ids);
-    assert_eq!(read_ids.len(), 64);
+    assert_eq!(written_ids.len(), 64);
+    assert_eq!(read_ids.len(), written_ids.len());
     let reopened = PostgresRuntimeEventStore::new(fixture.reconnect())
         .unwrap()
         .into_runtime_event_store();
@@ -2338,7 +2348,7 @@ fn postgres_runtime_event_store_preserves_fences_outbox_restart_and_runtime_comp
     let prefix_events = store
         .replay_scope_stream_prefix(RuntimeEventScope::Evolution, "evolution:signal:")
         .expect("prefix replay must be independent of database collation");
-    assert_eq!(prefix_events.len(), 1);
+    assert_eq!(prefix_events.iter().map(|event| event.stream_id.as_str()).collect::<Vec<_>>(), vec!["evolution:signal:prefix-contract"]);
     assert_eq!(
         prefix_events[0].stream_id,
         "evolution:signal:prefix-contract"
@@ -2494,7 +2504,7 @@ fn postgres_runtime_event_store_preserves_fences_outbox_restart_and_runtime_comp
         .map(|worker| worker.join().expect("worker thread").expect("claim"))
         .collect::<Vec<_>>();
     let claimed = claims.into_iter().flatten().collect::<Vec<_>>();
-    assert_eq!(claimed.len(), 1);
+    assert_eq!(claimed.iter().map(|claim| claim.request_id.as_deref()).collect::<Vec<_>>(), vec![Some("request-real")]);
     let claim = &claimed[0];
     assert_eq!(claim.request_id.as_deref(), Some("request-real"));
     assert_eq!(claim.session_generation, Some(1));
@@ -3076,7 +3086,7 @@ async fn postgres_artifact_catalog_excludes_inflight_and_later_receipts() {
         .discover_page(&scopes, "art_inflight", None, 7)
         .await
         .unwrap();
-    assert_eq!(fresh.records.len(), 1);
+    assert_eq!(fresh.records.iter().map(|record| record.content_reference().selector.to_string()).collect::<Vec<_>>(), vec!["artifact://art_inflight".to_string()]);
     assert_eq!(
         fresh.records[0].content_reference().selector,
         "artifact://art_inflight"
@@ -3289,6 +3299,72 @@ mod host_transcript_root_460_pg_tests {
         );
         assert_eq!(after.metrics.query_count - before.metrics.query_count, 1);
     }
+    #[test]
+    #[ignore = "requires an isolated COWD_TEST_POSTGRES_URL"]
+    fn agent_tool_outcome_node_root_is_bounded_and_session_scoped() {
+        let scope = PostgresTestScope::new();
+        let backend = backend(&scope);
+        let (mut input, artifact, _) = header(&"a".repeat(64));
+        input.schema_version = 1;
+        input.event.kind = "execution_node.transitioned".into();
+        let key = input.idempotency_key.clone().unwrap();
+        let stream = input.event.stream_id.clone();
+        let envelope = serde_json::json!({"content_schema":2,"sha256":artifact.sha256,
+            "bytes":artifact.bytes,"body":{"kind":"artifact_ref","artifact":artifact}});
+        let reference = format!("agent-tool-outcome-content-v1:{}", serde_json::json!({
+            "stream_id":stream,"idempotency_key":key,"content":envelope}));
+        input.event.payload["result"] = serde_json::json!({"result_ref":reference});
+        let origin = runtime::PreparedArtifactOrigin::EventBody { stream_id:stream.clone(),
+            idempotency_key:key.clone(), kind:"execution_node.transitioned".into() };
+        assert_eq!(backend.prepared_content_root(&origin, &artifact).unwrap(), runtime::PreparedContentRoot::Absent);
+        persist_untrusted_header(&backend, input);
+        assert_eq!(backend.prepared_content_root(&origin, &artifact).unwrap(), runtime::PreparedContentRoot::Canonical);
+        let mut foreign = artifact.clone();
+        foreign.visibility_scope = "session:foreign".into();
+        assert_eq!(backend.prepared_content_root(&origin, &foreign).unwrap(), runtime::PreparedContentRoot::Blocked);
+        let mut other = artifact.clone();
+        other.selector = format!("artifact://art_{}", "c".repeat(64));
+        assert_eq!(backend.prepared_content_root(&origin, &other).unwrap(), runtime::PreparedContentRoot::Absent);
+    }
+
+    #[test]
+    #[ignore = "requires an isolated COWD_TEST_POSTGRES_URL"]
+    fn delegated_outcome_root_requires_original_same_transaction_pair() {
+        let scope = PostgresTestScope::new();
+        let backend = backend(&scope);
+        let (_, mut artifact, _) = header(&"a".repeat(64));
+        artifact.media_type = "application/json".into();
+        let envelope = serde_json::json!({"content_schema":2,"sha256":artifact.sha256,"bytes":artifact.bytes,
+            "body":{"kind":"artifact_ref","artifact":artifact}});
+        let refs = vec![runtime::RuntimeEventRef { kind:"tool_invocation".into(), id:"call".into() },
+            runtime::RuntimeEventRef { kind:"execution_graph".into(), id:"graph".into() },
+            runtime::RuntimeEventRef { kind:"execution_node".into(), id:"node".into() },
+            runtime::RuntimeEventRef { kind:"agent_attempt".into(), id:"1".into() }];
+        let primary = RuntimeTransactionEventInput { event: RuntimeEventInput {
+            stream_id:"execution-effect:receipt-owner".into(), scope:RuntimeEventScope::ExecutionNode,
+            kind:"execution.read.receipt".into(), status:Some("completed".into()), actor:Some("governed_tool".into()),
+            refs:refs.clone(), payload:serde_json::json!({"idempotency_key":"receipt-owner",
+                "replay":{"session_id":"session-460-pg","parent_execution":{"execution_id":"graph","node_id":"node"}},
+                "outcome_truncated":true,"outcome":{"tool_use_id":"call"},"delegated_outcome_content_v1":envelope}),
+        }, idempotency_key:Some("receipt-owner:read-receipt".into()), schema_version:1 };
+        let index = RuntimeTransactionEventInput { event: RuntimeEventInput {
+            stream_id:"execution-agent-receipts:graph:node:1".into(), scope:RuntimeEventScope::ExecutionNode,
+            kind:"execution.agent_tool.receipt".into(), status:Some("completed".into()), actor:Some("governed_tool".into()),
+            refs, payload:serde_json::json!({"idempotency_key":"receipt-owner","effect_kind":"read",
+                "outcome_truncated":true,"outcome":{"tool_use_id":"call"},"delegated_outcome_content_v1":envelope}),
+        }, idempotency_key:Some("agent-tool-receipt:receipt-owner".into()), schema_version:2 };
+        let origin = runtime::PreparedArtifactOrigin::EventBody { stream_id:primary.event.stream_id.clone(),
+            idempotency_key:primary.idempotency_key.clone().unwrap(), kind:primary.event.kind.clone() };
+        assert_eq!(backend.prepared_content_root(&origin, &artifact).unwrap(), runtime::PreparedContentRoot::Absent);
+        backend.append_transaction(AppendTransactionRequest { transaction_id:"delegated-root-pair".into(),
+            expected_streams:vec![ExpectedStreamRevision { stream_id:primary.event.stream_id.clone(), expected_revision:0 },
+                ExpectedStreamRevision { stream_id:index.event.stream_id.clone(), expected_revision:0 }],
+            events:vec![primary,index], }).unwrap();
+        assert_eq!(backend.prepared_content_root(&origin, &artifact).unwrap(), runtime::PreparedContentRoot::Canonical);
+        let mut wrong = artifact.clone(); wrong.visibility_scope = "session:foreign".into();
+        assert_eq!(backend.prepared_content_root(&origin, &wrong).unwrap(), runtime::PreparedContentRoot::Absent);
+    }
+
 }
 
 mod pg_root_checkout_453_tests {
@@ -4071,4 +4147,162 @@ async fn skill_usage_original_worker_confirms_lost_commit_and_reopens_without_du
         drop(store); // destroy the old EventStore adapter and its IO ownership
     }
     drop(std::mem::ManuallyDrop::into_inner(fixture));
+}
+
+#[test]
+#[ignore = "requires centrally owned isolated PostgreSQL; member decision regression"]
+fn original_member_preparation_and_checked_decisions_share_one_winner() {
+    // Backend boundary test, using the existing isolated scope and real Session
+    // admission. This does not substitute for Host/Process producer validation.
+    let scope = PostgresTestScope::new();
+    let sessions = session_postgres::PostgresSessionStore::new(scope.reconnect()).unwrap();
+    sessions.create_session(&session::SessionRecord {
+        session_id: "member-session".into(), platform: "test".into(), chat_id: "chat".into(),
+        user_id: None, model: None, created_at: "2026-11-04T00:00:00Z".into(),
+        last_activity: "2026-11-04T00:00:00Z".into(), message_count: 0, reset_policy: "manual".into(),
+        metadata_json: None, input_tokens: 0, output_tokens: 0, status: "active".into(),
+    }).unwrap();
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
+    let ingress = session::SessionRuntimeOutboxRequest {
+        input_id: "member-input".into(), request_id: "member-request".into(), message_id: "member-message".into(),
+        turn_id: "member-turn".into(), session_generation: 1,
+        decision: harness_contract::turn::InputRoutingDecision::StartNewTurn, target_turn_id: None,
+        classification_json: None, task_route_hint: None, created_at_ms: now, runtime_options_json: None,
+    };
+    sessions.append_ingress_with_runtime_outbox("member-session", "user", Some("[]"), now, &ingress).unwrap();
+    let input = sessions.claim_session_runtime_outbox("member-worker", now, 60_000, 1, &[]).unwrap().remove(0);
+    let fence = session::SessionTerminalExecutionFence {
+        request_id: ingress.request_id.clone(), input_sequence: input.sequence, session_generation: 1,
+        claim_owner: input.claim_owner.unwrap(), claim_token: input.claim_token.unwrap(),
+        claim_fence_epoch: input.claim_fence_epoch.unwrap(),
+    };
+    let claim = runtime::RuntimeOriginalSessionClaim { session_id: "member-session", ingress_message_id: &ingress.message_id,
+        turn_id: &ingress.turn_id, fence: &fence, consumed_input_sequence: fence.input_sequence };
+    let backend = PostgresRuntimeEventStore::new(scope.reconnect()).unwrap();
+    struct Strict;
+    impl CheckedSourceValidator for Strict {
+        fn frame_digest(&self) -> &str { "member-frame" }
+        fn validate_tail(&self, source: &ExpectedStreamRevision, actual: u64, _: &[DurableRuntimeEvent]) -> RuntimeEventStoreResult<()> {
+            Err(RuntimeEventStoreError::StaleRevision { stream_id: source.stream_id.clone(), expected: source.expected_revision, actual })
+        }
+    }
+    // Existing-winner reads must not start/cancel/finish a new action decision.
+    struct NoNewCommit;
+    impl runtime::RuntimeTransactionCommitControl for NoNewCommit {
+        fn request_cancel(&self) -> bool { panic!("winner read requested cancellation") }
+        fn begin(&self) -> Result<bool, String> { panic!("winner read began an action") }
+        fn before_commit(&self) { panic!("winner read prepared an action commit") }
+        fn commit_wins(&self) -> Result<bool, String> { panic!("winner read decided a new commit") }
+        fn finish(&self, _: runtime::RuntimeTransactionOutcome) { panic!("winner read finished a new action") }
+    }
+    for mode in ["preparation", "winner", "checked-terminal", "race"] {
+        let outer = format!("member-{mode}");
+        let stream = format!("execution-effect:{outer}");
+        let ticket = serde_json::json!({"graph_id":format!("graph-{mode}"), "node_id":"node", "attempt":1});
+        let graph = ticket["graph_id"].as_str().unwrap();
+        let refs = vec![runtime::RuntimeEventRef { kind: "execution_graph".into(), id: graph.into() }];
+        let preparation = AppendTransactionRequest {
+            transaction_id: format!("preparation-{mode}"), expected_streams: vec![
+                ExpectedStreamRevision { stream_id: stream.clone(), expected_revision: 0 },
+                ExpectedStreamRevision { stream_id: graph.into(), expected_revision: 0 }],
+            events: vec![RuntimeTransactionEventInput { event: RuntimeEventInput {
+                stream_id: stream.clone(), scope: RuntimeEventScope::ExecutionNode, kind: "execution.effect.member_preparation".into(),
+                status: Some("inflight".into()), actor: Some("execution_commit_service".into()), refs: refs.clone(),
+                payload: serde_json::json!({"outer_key":outer,"member_index":0,"ticket":ticket,
+                    "session_id":"member-session","turn_id":"member-turn"}),
+            }, idempotency_key: Some("agentic-member-preparation:0".into()), schema_version: 1 }],
+        };
+        let preparation_receipt = backend.append_transaction(preparation.clone()).unwrap();
+        let program = format!("program-{mode}");
+        let action = RuntimeTransactionEventInput { event: RuntimeEventInput {
+            stream_id: program.clone(), scope: RuntimeEventScope::Program, kind: "agentic.action_applied".into(),
+            status: Some("applied".into()), actor: Some("member".into()), refs: vec![],
+            payload: serde_json::json!({"envelope":{"actor":{"session_id":"member-session","turn_id":"member-turn"}},
+                "member_admission":{"prepared":{"outer_key":outer,"index":0},"ticket":ticket}}),
+        }, idempotency_key: Some("action".into()), schema_version: 1 };
+        let marker = RuntimeTransactionEventInput { event: RuntimeEventInput {
+            stream_id: stream.clone(), scope: RuntimeEventScope::ExecutionNode, kind: "agentic.batch_member.index".into(),
+            status: Some("committed".into()), actor: Some("runtime.agentic_action".into()), refs: vec![],
+            payload: serde_json::json!({"outer_key":outer,"member_index":0,"ticket":ticket,
+                "program_event_index":0,"program_stream":program,"program_event_kind":"agentic.action_applied","program_event_key":"action"}),
+        }, idempotency_key: Some("agentic-member:0".into()), schema_version: 1 };
+        let checked = CheckedAppendRequest { transaction: AppendTransactionRequest {
+            transaction_id: format!("action-{mode}"), expected_streams: vec![
+                ExpectedStreamRevision { stream_id: stream.clone(), expected_revision: 1 },
+                ExpectedStreamRevision { stream_id: program.clone(), expected_revision: 0 },
+                ExpectedStreamRevision { stream_id: graph.into(), expected_revision: 0 }], events: vec![action, marker],
+        }, frame_digest: "member-frame".into(), budget: runtime::SourceCheckBudget::default() };
+        let mut orphan = checked.transaction.clone(); orphan.transaction_id.push_str("-orphan"); orphan.events.pop();
+        assert!(backend.append_transaction(orphan).is_err());
+        let decision = |checked: Option<&CheckedAppendRequest>| {
+            let mut payload = serde_json::json!({"ticket":ticket,"outer_key":outer,"member_index":0,
+                "preparation_transaction_id":preparation.transaction_id,"preparation_request_hash":preparation_receipt.request_hash});
+            let terminal_transaction_id = match checked {
+                Some(request) => { let hash = request.identity_hash().unwrap();
+                    payload["checked_transaction_id"] = serde_json::json!(request.transaction.transaction_id);
+                    payload["checked_request_hash"] = serde_json::json!(hash); format!("member-noncommit:{hash}") },
+                None => { payload["decision_identity"] = serde_json::json!("preparation");
+                    format!("member-preparation-noncommit:{}", preparation_receipt.request_hash) },
+            };
+            runtime::OriginalMemberDecisionInput { preparation: preparation.clone(), preparation_receipt: preparation_receipt.clone(),
+                terminal_transaction_id, terminal_event: RuntimeTransactionEventInput { event: RuntimeEventInput {
+                    stream_id: stream.clone(), scope: RuntimeEventScope::ExecutionNode, kind: "execution.effect.member_noncommit".into(),
+                    status: Some("not_committed".into()), actor: Some("execution_commit_service".into()), refs: refs.clone(), payload,
+                }, idempotency_key: Some("agentic-member:0".into()), schema_version: 1 } }
+        };
+        if mode == "preparation" {
+            let mut bad = decision(None); bad.preparation_receipt.request_hash = "foreign".into();
+            assert!(backend.settle_original_member(None, bad, &claim).is_err());
+            assert!(backend.event_by_idempotency_key(&stream, "agentic-member:0").unwrap().is_none());
+            let mut wrong_fence = fence.clone(); wrong_fence.claim_token = "foreign".into();
+            let wrong_claim = runtime::RuntimeOriginalSessionClaim { fence: &wrong_fence, ..claim };
+            assert!(backend.settle_original_member(None, decision(None), &wrong_claim).is_err());
+            assert!(backend.event_by_idempotency_key(&stream, "agentic-member:0").unwrap().is_none());
+            let first = backend.settle_original_member(None, decision(None), &claim).unwrap();
+            let runtime::OriginalMemberDecision::ConfirmedNoncommit { receipt, .. } = first else { panic!("preparation must settle without a checked command") };
+            assert!(backend.append_checked_transaction(checked.clone(), &Strict).is_err());
+            let runtime::OriginalMemberDecision::ConfirmedNoncommit { receipt: again, .. } = backend.settle_original_member(None, decision(None), &claim).unwrap() else { panic!("original terminal required") };
+            assert_eq!(receipt.commit_cursor, again.commit_cursor);
+            assert_eq!(backend.stream_revision(&program).unwrap(), 0);
+        } else if mode == "winner" {
+            let committed = backend.append_checked_transaction(checked.clone(), &Strict).unwrap();
+            let mut expired = fence.clone(); expired.claim_token = "expired".into();
+            let stale_claim = runtime::RuntimeOriginalSessionClaim { fence: &expired, ..claim };
+            let runtime::OriginalMemberDecision::Committed(winner) = backend.settle_original_member(Some(&checked), decision(Some(&checked)), &stale_claim).unwrap() else { panic!("winner precedes live claim") };
+            assert_eq!(winner.commit.commit_cursor, committed.commit.commit_cursor);
+            // A valid preparation cannot invent the missing checked identity of a winner.
+            assert!(backend.settle_original_member(None, decision(None), &claim).is_err());
+            let mut wrong = checked.clone(); wrong.transaction.events[0].event.payload["changed"] = serde_json::json!(true);
+            assert!(backend.settle_original_member(Some(&wrong), decision(Some(&wrong)), &claim).is_err());
+        } else if mode == "checked-terminal" {
+            let runtime::OriginalMemberDecision::ConfirmedNoncommit { receipt, transaction } =
+                backend.settle_original_member(Some(&checked), decision(Some(&checked)), &claim).unwrap()
+                else { panic!("checked stop must settle without new action") };
+            assert_eq!(transaction.events[0].event.payload["noncommit_reason"], "abandoned");
+            let mut expired = fence.clone(); expired.claim_token = "expired".into();
+            let stale_claim = runtime::RuntimeOriginalSessionClaim { fence: &expired, ..claim };
+            let runtime::OriginalMemberDecision::ConfirmedNoncommit { receipt: again, transaction: same } =
+                backend.append_original_member_decision(checked.clone(), decision(Some(&checked)), &Strict, &NoNewCommit, &stale_claim).unwrap()
+                else { panic!("same checked terminal must be idempotent") };
+            assert_eq!(receipt.commit_cursor, again.commit_cursor);
+            assert_eq!(receipt.request_hash, again.request_hash);
+            assert_eq!(transaction, same);
+            let mut wrong = decision(Some(&checked)); wrong.preparation_receipt.request_hash = "foreign".into();
+            assert!(backend.append_original_member_decision(checked.clone(), wrong, &Strict, &NoNewCommit, &claim).is_err());
+            assert_eq!(backend.stream_revision(&program).unwrap(), 0);
+        } else {
+            let barrier = Barrier::new(2);
+            let (action, settled) = thread::scope(|threads| {
+                let writer = threads.spawn(|| { barrier.wait(); backend.append_checked_transaction(checked.clone(), &Strict) });
+                barrier.wait();
+                let settled = backend.settle_original_member(Some(&checked), decision(Some(&checked)), &claim);
+                (writer.join().unwrap(), settled.unwrap())
+            });
+            match settled {
+                runtime::OriginalMemberDecision::Committed(winner) => assert_eq!(action.unwrap().commit.commit_cursor, winner.commit.commit_cursor),
+                runtime::OriginalMemberDecision::ConfirmedNoncommit { .. } => { assert!(action.is_err()); assert_eq!(backend.stream_revision(&program).unwrap(), 0); }
+            }
+            assert!(backend.event_by_idempotency_key(&stream, "agentic-member:0").unwrap().is_some());
+        }
+    }
 }

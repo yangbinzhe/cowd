@@ -226,6 +226,7 @@ async fn production_pg_execution_fixed_workload_and_cancel_release() {
             svc.executor_registry().register(work.clone()).unwrap();
             let graph = graph("complete");
             let id = graph.id.clone();
+            let expected_nodes: std::collections::BTreeSet<String> = graph.nodes.iter().map(|node| node.id.clone()).collect();
             let admitted = Instant::now();
             let usage_before = process_usage();
             let result = tokio::time::timeout(
@@ -258,15 +259,18 @@ async fn production_pg_execution_fixed_workload_and_cancel_release() {
                 assert!(peak > 1, "independent work must overlap");
             }
             let restored = replay(&scope, &id);
-            assert_eq!(restored.node_statuses.len(), 16);
+            assert_eq!(restored.node_statuses.keys().cloned().collect::<std::collections::BTreeSet<_>>(), expected_nodes);
+            assert_eq!(restored.node_statuses.len(), expected_nodes.len());
             assert!(restored
                 .node_statuses
                 .values()
                 .all(|s| *s == ExecutionNodeStatus::Completed));
             let starts = work.starts.lock().unwrap();
             let runs = work.runs.lock().unwrap();
-            assert_eq!(starts.len(), 16);
-            assert_eq!(runs.len(), 16);
+            assert_eq!(starts.iter().map(|(node, _)| node.clone()).collect::<std::collections::BTreeSet<_>>(), expected_nodes);
+            assert_eq!(starts.len(), expected_nodes.len());
+            assert_eq!(runs.iter().map(|(node, _, _)| node.clone()).collect::<std::collections::BTreeSet<_>>(), expected_nodes);
+            assert_eq!(runs.len(), expected_nodes.len());
             let node_samples: Vec<_> = runs.iter().map(|(node, start, end)| {
                 let executor_start = starts.iter().find(|(id, _)| id == node).unwrap().1;
                 json!({"node_id":node,"admission_to_start_us":executor_start.duration_since(admitted).as_micros(),
@@ -358,6 +362,8 @@ async fn production_pg_execution_fixed_workload_and_cancel_release() {
             "resource":svc.resource_manager().snapshot(&ExecutionResourceKind::Tool).unwrap()}),
         );
     }
+    assert_eq!(samples.iter().filter(|sample| sample.get("repeat").is_some()).count(), 20);
+    assert_eq!(samples.iter().filter(|sample| sample.get("cancel_release_us").is_some()).count(), 4);
     assert_eq!(samples.len(), 24);
     let report = json!({"schema_version":1,"scope":"production_pg_execution_kernel_deterministic_work",
         "business_provider_or_toolhost_e2e":false,"profile":"recorded by invoking runner",

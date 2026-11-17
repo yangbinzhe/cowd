@@ -543,8 +543,10 @@ fn terminate_failed_gateway_start(child: &mut Child) {
     reason = "a process-wide runtime is required by synchronous CLI adapters; construction failure aborts startup before serving work"
 )]
 pub(crate) static SHARED_RT: LazyLock<tokio::runtime::Runtime> = LazyLock::new(|| {
+    let threads = gateway_capacity::configured_runtime_threads();
     tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(gateway_capacity::configured_runtime_workers())
+        .worker_threads(threads.workers)
+        .thread_stack_size(threads.stack_bytes)
         .enable_all()
         .build()
         .expect("shared tokio runtime")
@@ -1007,6 +1009,7 @@ fn run_gateway_action(
                 .map_err(|error| format!("failed to resolve Gateway startup directory: {error}"))?;
             let (workspace_root, runtime_config) =
                 resolve_gateway_workspace_and_config(&startup_cwd)?;
+            gateway_capacity::configure_runtime_threads(&runtime_config.gateway().capacity)?;
             let api_server_platform = runtime_config
                 .gateway()
                 .platforms
@@ -1454,7 +1457,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                 let value = args
                     .get(index + 1)
                     .ok_or_else(|| "missing value for --reasoning-effort".to_string())?;
-                if !matches!(value.as_str(), "low" | "medium" | "high" | "max") {
+                if !model_protocol::provider_config::valid_reasoning_effort(value.as_str()) {
                     return Err(format!(
                         "invalid value for --reasoning-effort: '{value}'; must be low, medium, high, or max"
                     ));
@@ -1464,7 +1467,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
             }
             flag if flag.starts_with("--reasoning-effort=") => {
                 let value = &flag[19..];
-                if !matches!(value, "low" | "medium" | "high" | "max") {
+                if !model_protocol::provider_config::valid_reasoning_effort(value) {
                     return Err(format!(
                         "invalid value for --reasoning-effort: '{value}'; must be low, medium, high, or max"
                     ));

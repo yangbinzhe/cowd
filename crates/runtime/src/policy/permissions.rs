@@ -175,6 +175,10 @@ impl SessionExecutionPolicyControl {
             .clone()
     }
 
+    pub(crate) fn same_owner(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.policy, &other.policy)
+    }
+
     /// Hold the original effective-policy source while a synchronous domain
     /// transaction commits its authorization binding. Never cross a Provider
     /// await with this read set.
@@ -258,6 +262,14 @@ impl PermissionPolicy {
             || self.control.mode(),
             |ceiling| minimum_mode(self.control.mode(), ceiling),
         )
+    }
+
+    /// The immutable packet ceiling: the hard bound that no authorization may
+    /// cross, independent of the live Session mode. `None` means the Session
+    /// mode is the only bound.
+    #[must_use]
+    pub fn hard_ceiling(&self) -> Option<PermissionMode> {
+        self.immutable_ceiling
     }
 
     /// A delegated Agent may observe a stricter live Session policy, but a

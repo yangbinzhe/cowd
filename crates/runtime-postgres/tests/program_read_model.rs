@@ -25,6 +25,7 @@ fn append_messages(store: &RuntimeEventStore, program: &str, count: u64) {
                 action_id: id.clone(),
                 expected_revision: None,
                 actor: AgentActorBinding {
+                    original_execution: None,
                     objective_id: "fixed-objective".into(),
                     program_id: program.into(),
                     session_id: "fixed-session".into(),

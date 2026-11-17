@@ -5,8 +5,8 @@ use harness_contract::agent_action::{
 };
 
 use super::program::{
-    AgenticProgramProjection, AgenticTaskAttemptProjection, AgenticTaskProjection,
-    AgenticTaskRetirement, AgenticTaskStatus,
+    AgenticProgramProjection, AgenticReworkDirective, AgenticTaskAttemptProjection,
+    AgenticTaskObligation, AgenticTaskProjection, AgenticTaskRetirement, AgenticTaskStatus,
 };
 
 // Claims use a short rolling fence. Runtime renews the fence while the
@@ -26,6 +26,29 @@ pub(crate) fn claim_lease_ms() -> u64 {
         .filter(|value| *value > 0)
         .unwrap_or(90)
         .saturating_mul(1_000)
+}
+
+/// An expired lease may only be renewed by its still-active original attempt.
+pub(crate) fn expired_original_claim(
+    task: &AgenticTaskProjection,
+    agent_id: &str,
+    execution_id: &str,
+    membership_id: &str,
+    now_ms: u64,
+) -> bool {
+    task.status == AgenticTaskStatus::Claimed
+        && task.claimant.as_deref() == Some(agent_id)
+        && task.claim_execution_id.as_deref() == Some(execution_id)
+        && task.lease_expires_at_ms.is_some_and(|expires| expires <= now_ms)
+        && task.cancel_requested_by.is_none()
+        && task.pending_retirement.is_none()
+        && task.active_attempts.get(execution_id).is_some_and(|attempt| {
+            attempt.execution_id == execution_id
+                && attempt.agent_id == agent_id
+                && attempt.membership_id == membership_id
+                && attempt.mode == AgentAttemptMode::Execute
+                && attempt.generation.checked_add(1) == Some(task.claim_generation)
+        })
 }
 
 /// Consecutive claims of one Task with no progress in between.
@@ -49,6 +72,222 @@ pub(crate) fn claim_renewal_bound() -> Option<u32> {
             Err(_) => Some(3),
         },
     }
+}
+
+/// 032 K1 (B1-B3): the single compilation of a Task's acceptance face into
+/// its criterion record. Prose stays authoritative (B2); each machine check
+/// compiles to a hint-ranked criterion of the same record, and the publish
+/// provenance travels with every entry (B3). This is the only place prose or
+/// checks become criteria: the rework anchor, the K2 review input pack, and
+/// every completion read-out consume this list instead of re-splitting text -
+/// the two live runs whose reviewers invented standards (the "documented
+/// domains" and the counterexample construction) are the named failures this
+/// single source closes.
+pub(crate) fn compile_task_obligations(
+    acceptance: &str,
+    acceptance_checks: &[String],
+    criterion_source: harness_contract::agent_action::CriterionSource,
+) -> Vec<AgenticTaskObligation> {
+    let mut obligations = vec![AgenticTaskObligation {
+        key: "acceptance".to_string(),
+        text: acceptance.trim().to_string(),
+        authoritative: true,
+        criterion_source,
+    }];
+    obligations.extend(acceptance_checks.iter().enumerate().map(|(index, check)| {
+        AgenticTaskObligation {
+            key: format!("check:{index}"),
+            text: check.trim().to_string(),
+            authoritative: false,
+            criterion_source,
+        }
+    }));
+    obligations
+}
+
+/// 033 S8: the key of the review obligation a submitted Task owes.
+pub(crate) const REVIEW_PENDING_OBLIGATION_KEY: &str = "review_pending";
+
+/// 033 S8: the single source of the review obligation.
+///
+/// A submitted Task owes a review: the acceptance record compiled at publish
+/// is not judged until a reviewer says so. The obligation is compiled here,
+/// beside the acceptance obligations, so the Task's obligation record has one
+/// source - and it is not an operator criterion (`authoritative = false`): it
+/// is a duty the Runtime owes the Program, not a standard a reviewer may
+/// paraphrase.
+pub(crate) fn compile_review_pending_obligation(
+    criterion_source: harness_contract::agent_action::CriterionSource,
+) -> AgenticTaskObligation {
+    AgenticTaskObligation {
+        key: REVIEW_PENDING_OBLIGATION_KEY.to_string(),
+        text: "the submitted work must be reviewed against the compiled acceptance record"
+            .to_string(),
+        authoritative: false,
+        criterion_source,
+    }
+}
+
+/// 033 S8: the terminal obligation list of a Task, with each obligation's
+/// status, and the family that blocked it.
+///
+/// The status is derived, never stored twice: a Task whose review was
+/// accepted has satisfied its obligations; a Task that is blocked on a
+/// structural fault (a delegated child's receipt that never settled, a read
+/// with no original physical extent) has a *failed* obligation and the
+/// family's name travels with it - the review could not be judged because
+/// the evidence never settled, which is not the model's failure. A Task that
+/// is merely waiting keeps the obligation pending.
+pub(crate) fn terminal_obligation_list(task: &AgenticTaskProjection) -> Vec<serde_json::Value> {
+    let structural_family = task
+        .terminal_note
+        .as_deref()
+        .and_then(|note| note.split("failure_family=").nth(1))
+        .and_then(|rest| rest.split(';').next())
+        .map(str::trim)
+        .filter(|family| {
+            !family.is_empty() && *family != "unclassified" && *family != "model_refusal"
+        });
+    let accepted = task.status == AgenticTaskStatus::Accepted && task.reviews_accepted > 0;
+    // 033 S8 (R102 BLOCK-3): the structural failure is marked on the review
+    // duty alone. The acceptance obligations keep their own derivation - a
+    // structural stall says the review could not be judged, not that the
+    // operator's criteria went unsatisfied.
+    let mut entries = task
+        .obligations
+        .iter()
+        .map(|obligation| {
+            let status = if accepted { "satisfied" } else { "pending" };
+            serde_json::json!({
+                "key": obligation.key,
+                "text": obligation.text,
+                "authoritative": obligation.authoritative,
+                "criterion_source": obligation.criterion_source,
+                "status": status,
+                "failure_family": serde_json::Value::Null,
+            })
+        })
+        .collect::<Vec<_>>();
+    if let Some(obligation) = &task.review_obligation {
+        let status = if accepted {
+            "satisfied"
+        } else if task.status == AgenticTaskStatus::Blocked
+            && structural_family.is_some()
+        {
+            "failed_structural"
+        } else {
+            "pending"
+        };
+        entries.push(serde_json::json!({
+            "key": obligation.key,
+            "text": obligation.text,
+            "authoritative": obligation.authoritative,
+            "criterion_source": obligation.criterion_source,
+            "status": status,
+            "failure_family": structural_family,
+        }));
+    }
+    entries
+}
+
+/// 033 S7: the family a failed attempt belongs to.
+///
+/// The families are the ones the live B-family runs actually produced, so the
+/// account a failure is charged to is a fact about the failure and not a
+/// guess: a delegated child's receipt that never settles, a read that has no
+/// original physical extent, and a composite read whose child acquisitions
+/// never completed are all structural - the model cannot fix them by trying
+/// again. A refusal the model could have avoided (a mis-cited receipt) is
+/// the model's own failure and stays charged to the model. An unclassified
+/// failure is charged to the model, the conservative side of the ledger.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum AttemptFailureFamily {
+    /// The delegated child's receipt never settled ("original child receipt
+    /// remains unsettled", "original tool effect remains unknown").
+    ReceiptUnsettled,
+    /// The original review owner exhausted its pinned-source rebuild budget.
+    ReviewCutExhausted,
+    /// The read has no original physical extent ("proof_actual_input_extent
+    /// _unsupported").
+    PhysicalExtentUnsupported,
+    /// The composite read's child acquisitions never completed.
+    CompositeAcquisitionsIncomplete,
+    /// A refusal the model could have avoided (a mis-cited receipt).
+    ModelRefusal,
+    /// Nothing in the failure names a known family.
+    Unclassified,
+}
+
+impl AttemptFailureFamily {
+    /// The name that goes into the exhaustion note.
+    pub(crate) const fn note_name(self) -> &'static str {
+        match self {
+            Self::ReceiptUnsettled => "receipt_unsettled",
+            Self::ReviewCutExhausted => "review_cut_exhausted",
+            Self::PhysicalExtentUnsupported => "physical_extent_unsupported",
+            Self::CompositeAcquisitionsIncomplete => "composite_acquisitions_incomplete",
+            Self::ModelRefusal => "model_refusal",
+            Self::Unclassified => "unclassified",
+        }
+    }
+
+    /// A structural fault is not the model's output problem: it must not be
+    /// charged to the model's attempt budget.
+    pub(crate) const fn is_structural(self) -> bool {
+        matches!(
+            self,
+            Self::ReceiptUnsettled
+                | Self::ReviewCutExhausted
+                | Self::PhysicalExtentUnsupported
+                | Self::CompositeAcquisitionsIncomplete
+        )
+    }
+}
+
+/// 033 S7: classify a failed attempt by the family its reason names.
+pub(crate) fn attempt_failure_family(reason: &str) -> AttemptFailureFamily {
+    if reason.contains("original composite child acquisitions incomplete") {
+        AttemptFailureFamily::CompositeAcquisitionsIncomplete
+    } else if reason.contains("proof_actual_input_extent_unsupported") {
+        AttemptFailureFamily::PhysicalExtentUnsupported
+    } else if reason.contains("original child receipt remains unsettled")
+        || reason.contains("original tool effect remains unknown")
+    {
+        AttemptFailureFamily::ReceiptUnsettled
+    } else if reason.contains("has no canonical durable receipt")
+        || reason.contains("one edit away from the cited one")
+    {
+        AttemptFailureFamily::ModelRefusal
+    } else {
+        AttemptFailureFamily::Unclassified
+    }
+}
+
+/// 032 K3 (B10): the one spelling of a Task's blocked-on-exhaustion note.
+/// Failure family only - a Blocked Task never carries a satisfied bit. The
+/// bound interpolates from the same constant the decision used, so a budget
+/// change cannot leave a stale literal behind (the T1b single-token lesson).
+///
+/// 033 S7 (causal accounting): the note also names the family and the two
+/// accounts, so the root can see on its own face that the exhaustion was a
+/// structural fault rather than three model failures. The key=value pairs
+/// are the machine-readable part; the prose around them stays readable.
+fn blocked_exhaustion_note(
+    dimension: &str,
+    bound: u8,
+    last_failure: Option<&str>,
+    family: AttemptFailureFamily,
+    model_attempts_charged: u8,
+    structural_stalls: u8,
+) -> String {
+    format!(
+        "task_blocked: {dimension} exhausted at bounded {bound}; failure_family={family}; \
+account={account}; model_attempts_charged={model_attempts_charged}; \
+structural_stalls={structural_stalls}; last failure: {last}; remaining: not accepted",
+        family = family.note_name(),
+        account = if family.is_structural() { "structural" } else { "model" },
+        last = last_failure.unwrap_or("none recorded"),
+    )
 }
 
 /// The bound as a pure function of the configured value.
@@ -93,6 +332,9 @@ pub(crate) fn apply_task_publish(
     let Some(task_id) = entity_ref else {
         return;
     };
+    let criterion_source = derived_criterion_source(projection, input);
+    let obligations =
+        compile_task_obligations(&input.acceptance, &input.acceptance_checks, criterion_source);
     projection.tasks.insert(
         task_id.to_string(),
         AgenticTaskProjection {
@@ -102,7 +344,11 @@ pub(crate) fn apply_task_publish(
             objective: input.objective.trim().to_string(),
             acceptance: input.acceptance.trim().to_string(),
             acceptance_checks: input.acceptance_checks.clone(),
-            criterion_source: derived_criterion_source(projection, input),
+            criterion_source,
+            obligations,
+            rework_directives: Vec::new(),
+            unsettled_released_attempts: Vec::new(),
+            terminal_note: None,
             required_capabilities: input.required_capabilities.clone(),
             obligation_refs: input.obligation_refs.clone(),
             purpose: input.purpose,
@@ -125,6 +371,11 @@ pub(crate) fn apply_task_publish(
             failed_attempts: 0,
             review_generation: 0,
             failed_review_attempts: 0,
+            structural_execution_stalls: 0,
+            structural_review_stalls: 0,
+            reviews_applied: 0,
+            review_obligation: None,
+            reviews_accepted: 0,
             last_failure: None,
             replacement_task_refs: Vec::new(),
             supersede_evidence_refs: Vec::new(),
@@ -136,6 +387,9 @@ pub(crate) fn apply_task_publish(
             pending_retirement: None,
         },
     );
+    if let Some(rounds) = projection.applied_rework_rounds.as_mut() {
+        rounds.insert(task_id.to_string(), 0);
+    }
     if let Some(team) = projection.teams.get_mut(&input.team_ref) {
         team.task_ids.push(task_id.to_string());
     }
@@ -270,12 +524,24 @@ fn operator_requirement_summary(projection: &AgenticProgramProjection) -> String
     shortened
 }
 
-/// Persist executor admission before a physical graph is started.  This is
-/// an effect-outbox record, not a model claim: the Agent still decides whether
-/// to claim, submit, review, release, or replan when it runs.
+/// Persist executor admission before a physical graph is started.
+///
+/// This is an effect-outbox record and, for an Execute dispatch, the one
+/// writer of the Task's claim fence.  The dispatch decision already named the
+/// Agent and the physical graph that will run this Task, so the fence is
+/// written from that decision instead of being re-derived from a separate
+/// `task_claim` action: the Agent still decides whether to submit, review,
+/// release, or replan when it runs, but the admission it was dispatched under
+/// is already durable.
+///
+/// A Review or Coordination dispatch writes no claim.  The reviewer keeps the
+/// read path it has today, and the coordination consumer keeps its own
+/// consumption record; a second claim writer for those modes would give the
+/// Task two names for one execution.
 pub(crate) fn apply_task_attempt_dispatch(
     projection: &mut AgenticProgramProjection,
     input: &TaskAttemptDispatchInput,
+    applied_at_ms: u64,
 ) {
     let Some(task) = projection.tasks.get_mut(&input.task_ref) else {
         return;
@@ -290,6 +556,20 @@ pub(crate) fn apply_task_attempt_dispatch(
             generation: input.generation,
         },
     );
+    if input.mode == AgentAttemptMode::Execute {
+        // The fence names exactly the attempt that was just admitted, and its
+        // generation is that attempt's generation plus one - the same equation
+        // the admission authority checks when it decides an effect.
+        task.status = AgenticTaskStatus::Claimed;
+        task.claimant = Some(input.agent_ref.clone());
+        task.claim_execution_id = Some(input.execution_id.clone());
+        task.claim_generation = input.generation.saturating_add(1);
+        // The claim time is part of the fence, not a decoration: a publication
+        // is authenticated against the claim that was live when it was made,
+        // and a claim without a time cannot be one.
+        task.claimed_at_ms = Some(applied_at_ms);
+        task.lease_expires_at_ms = Some(applied_at_ms.saturating_add(claim_lease_ms()));
+    }
     if input.mode == AgentAttemptMode::Coordination {
         if let Some(entry) = projection
             .topics
@@ -311,6 +591,14 @@ pub(crate) fn apply_task_attempt_dispatch(
 pub(crate) fn apply_task_attempt_fail(
     projection: &mut AgenticProgramProjection,
     input: &TaskAttemptFailInput,
+) {
+    apply_task_attempt_fail_with_origin(projection, input, false);
+}
+
+pub(crate) fn apply_task_attempt_fail_with_origin(
+    projection: &mut AgenticProgramProjection,
+    input: &TaskAttemptFailInput,
+    trusted_review_cut: bool,
 ) {
     if input.mode == AgentAttemptMode::Coordination {
         projection.settle_coordination(&input.execution_id, Some(input.reason.clone()));
@@ -356,17 +644,47 @@ pub(crate) fn apply_task_attempt_fail(
                 {
                     task.claim_generation = task.claim_generation.saturating_add(1);
                 }
-                task.failed_attempts = task.failed_attempts.saturating_add(1);
-                let attempts_exhausted = task.failed_attempts >= MAX_TASK_EXECUTION_ATTEMPTS;
+                // 033 S7 (causal accounting): a structural fault is charged
+                // to the structural account, not to the model's attempt
+                // budget. The bound still covers both accounts, so a stall
+                // can never run forever, but the model is no longer charged
+                // for a fault it cannot fix.
+                let family = attempt_failure_family(input.reason.as_str());
+                if family.is_structural() {
+                    task.structural_execution_stalls =
+                        task.structural_execution_stalls.saturating_add(1);
+                } else {
+                    task.failed_attempts = task.failed_attempts.saturating_add(1);
+                }
+                let attempts_exhausted = task
+                    .failed_attempts
+                    .saturating_add(task.structural_execution_stalls)
+                    >= MAX_TASK_EXECUTION_ATTEMPTS;
                 task.claimant = None;
                 task.claim_execution_id = None;
                 task.claimed_at_ms = None;
                 task.lease_expires_at_ms = None;
                 task.status = if attempts_exhausted {
+                    task.terminal_note = Some(blocked_exhaustion_note(
+                        "execution attempts",
+                        MAX_TASK_EXECUTION_ATTEMPTS,
+                        task.last_failure.as_deref(),
+                        family,
+                        task.failed_attempts,
+                        task.structural_execution_stalls,
+                    ));
                     AgenticTaskStatus::Blocked
                 } else if input.retryable && !repeats_same_failure {
                     AgenticTaskStatus::Rework
                 } else if input.retryable {
+                    task.terminal_note = Some(blocked_exhaustion_note(
+                        "repeated identical failure",
+                        1,
+                        task.last_failure.as_deref(),
+                        family,
+                        task.failed_attempts,
+                        task.structural_execution_stalls,
+                    ));
                     AgenticTaskStatus::Blocked
                 } else {
                     // A non-retryable physical failure is a scheduling
@@ -377,14 +695,48 @@ pub(crate) fn apply_task_attempt_fail(
                 };
             }
             AgentAttemptMode::Review => {
-                task.failed_review_attempts = task.failed_review_attempts.saturating_add(1);
+                // 033 S7 (causal accounting): the review path is where the
+                // B-family ran out - three "model failures" that were all
+                // structural. A structural stall is charged to the structural
+                // account; the model's review budget only pays for the
+                // failures the model caused.
+                let family = if trusted_review_cut {
+                    AttemptFailureFamily::ReviewCutExhausted
+                } else {
+                    attempt_failure_family(input.reason.as_str())
+                };
+                if family.is_structural() {
+                    task.structural_review_stalls =
+                        task.structural_review_stalls.saturating_add(1);
+                } else {
+                    task.failed_review_attempts = task.failed_review_attempts.saturating_add(1);
+                }
                 task.review_generation = task.review_generation.saturating_add(1);
-                let reviews_exhausted = task.failed_review_attempts >= MAX_TASK_REVIEW_ATTEMPTS;
+                let reviews_exhausted = task
+                    .failed_review_attempts
+                    .saturating_add(task.structural_review_stalls)
+                    >= MAX_TASK_REVIEW_ATTEMPTS;
                 task.status = if reviews_exhausted {
+                    task.terminal_note = Some(blocked_exhaustion_note(
+                        "review attempts",
+                        MAX_TASK_REVIEW_ATTEMPTS,
+                        task.last_failure.as_deref(),
+                        family,
+                        task.failed_review_attempts,
+                        task.structural_review_stalls,
+                    ));
                     AgenticTaskStatus::Blocked
                 } else if input.retryable && !repeats_same_failure {
                     AgenticTaskStatus::Submitted
                 } else if input.retryable {
+                    task.terminal_note = Some(blocked_exhaustion_note(
+                        "repeated identical review failure",
+                        1,
+                        task.last_failure.as_deref(),
+                        family,
+                        task.failed_review_attempts,
+                        task.structural_review_stalls,
+                    ));
                     AgenticTaskStatus::Blocked
                 } else {
                     // The root can invite a new reviewer or replan the work;
@@ -624,6 +976,16 @@ pub(crate) fn apply_task_submit(
     // block as durable content, so the canonical Task artifact is synthesized
     // here through the same projection shape as `artifact_commit`. The id is a
     // pure function of (program, actor, action, kind), so replay is stable.
+    // 033 S8 (R102 rework): a submitted Task owes a review. The duty lives
+    // in its own projection slot, not in the acceptance obligation list: the
+    // work manifests carry the acceptance record, and a workflow duty is not
+    // semantic work for the worker.
+    if let Some(task) = projection.tasks.get_mut(&input.task_ref) {
+        if task.review_obligation.is_none() {
+            task.review_obligation =
+                Some(compile_review_pending_obligation(task.criterion_source));
+        }
+    }
     let mut artifact_refs = input.artifact_refs.clone();
     if artifact_refs.is_empty() {
         if let Some(content_ref) = input
@@ -727,6 +1089,32 @@ pub(crate) fn apply_task_review(
     envelope: &AgentActionEnvelope,
     input: &TaskReviewInput,
 ) {
+    // The durable event owner chooses the versioned path; direct reducer
+    // callers without a recovered count retain the historical rule.
+    let verdict_rule = projection.applied_rework_rounds.as_ref()
+        .is_some_and(|rounds| rounds.contains_key(&input.task_ref));
+    apply_task_review_with_round_rule(projection, envelope, input, verdict_rule)
+        .expect("known verdict round count");
+}
+
+pub(crate) fn apply_task_review_with_round_rule(
+    projection: &mut AgenticProgramProjection,
+    envelope: &AgentActionEnvelope,
+    input: &TaskReviewInput,
+    verdict_rule: bool,
+) -> Result<(), &'static str> {
+    let is_rework = matches!(input.decision, TaskReviewDecision::Challenge | TaskReviewDecision::Rework);
+    if verdict_rule && is_rework && projection.tasks.contains_key(&input.task_ref)
+        && projection.applied_rework_rounds.as_ref().and_then(|rounds| rounds.get(&input.task_ref)).is_none()
+    {
+        return Err("review_rework_history_unknown");
+    }
+    let rework_round = if is_rework && projection.tasks.contains_key(&input.task_ref) {
+        projection.applied_rework_rounds.as_mut().and_then(|rounds| rounds.get_mut(&input.task_ref)).map(|rounds| {
+            *rounds = rounds.saturating_add(1).min(MAX_TASK_REVIEW_ROUNDS);
+            *rounds
+        })
+    } else { None };
     if let Some(task) = projection.tasks.get_mut(&input.task_ref) {
         // A review is the task moving forward; the renewal streak resets.
         task.claim_renewal_streak = 0;
@@ -734,6 +1122,13 @@ pub(crate) fn apply_task_review(
             task.active_attempts.remove(execution_id);
         }
         task.reviewed_by = Some(envelope.actor.actor_id.clone());
+        // 033 S8: the two review measures sit side by side - every applied
+        // verdict (the old measure) and the applied verdicts that were an
+        // acceptance (the new one). The old count keeps its meaning.
+        task.reviews_applied = task.reviews_applied.saturating_add(1);
+        if matches!(input.decision, TaskReviewDecision::Accept) {
+            task.reviews_accepted = task.reviews_accepted.saturating_add(1);
+        }
         task.review_reason = Some(input.reason.clone());
         task.evidence_refs
             .extend(input.evidence_refs.iter().cloned());
@@ -748,17 +1143,53 @@ pub(crate) fn apply_task_review(
                 task.claim_execution_id = None;
                 task.claimed_at_ms = None;
                 task.lease_expires_at_ms = None;
-                // Drop every stale attempt so the reworked Task is immediately
-                // eligible for a fresh execute dispatch and does not look busy.
+                // 032 K3 (B8): releasing stale attempts must not erase them.
+                // Every attempt that leaves the active set without a durable
+                // terminal keeps its full identity in the unsettled list -
+                // the new round cannot inherit or launder an effect nobody
+                // observed settled, and the generation fence already refuses
+                // its late settlements (the ledger's no-redemption rule).
+                task.unsettled_released_attempts
+                    .extend(task.active_attempts.values().cloned());
                 task.active_attempts.clear();
+                if !input.gaps.is_empty() || !input.directed_actions.is_empty() {
+                    // The directive is a durable fact for the next claim and
+                    // for the root's dispatch decisions. Nothing here
+                    // dispatches: MissionVerdict never becomes an admission
+                    // path (v2 audit red line three).
+                    task.rework_directives.push(AgenticReworkDirective {
+                        source_action_id: envelope.action_id.clone(),
+                        gaps: input.gaps.clone(),
+                        directed_actions: input.directed_actions.clone(),
+                    });
+                }
                 // The reworked Task re-enters the market, so its next review is a
                 // new round: advance the review generation or the next review
                 // round reuses this round's graph identity. Past the bound the
-                // Task is forced Blocked, which the Program barrier already
-                // treats as a release condition, so the root gets a terminal
-                // instead of an unbounded rework loop.
+                // Task is forced Blocked with the named exhaustion note: the
+                // rework loop stops (the control phase refuses further claims
+                // and reviews on a Blocked Task), while the completion barrier
+                // keeps counting the Task as not-accepted until the root
+                // retires it (supersede/withdraw) or replans with a
+                // replacement - the note names which bound was reached.
+                // (032 K3 corrected this comment: the earlier wording claimed
+                // the barrier "already treats Blocked as a release condition",
+                // which the supervision gate contradicts - ledger finding H2.)
                 task.review_generation = task.review_generation.saturating_add(1);
-                task.status = if task.review_generation >= u64::from(MAX_TASK_REVIEW_ROUNDS) {
+                let rounds_exhausted = if verdict_rule {
+                    rework_round.is_some_and(|round| round >= MAX_TASK_REVIEW_ROUNDS)
+                } else {
+                    task.review_generation >= u64::from(MAX_TASK_REVIEW_ROUNDS)
+                };
+                task.status = if rounds_exhausted {
+                    task.terminal_note = Some(blocked_exhaustion_note(
+                        "review rounds",
+                        MAX_TASK_REVIEW_ROUNDS,
+                        Some(input.reason.as_str()),
+                        attempt_failure_family(input.reason.as_str()),
+                        task.failed_review_attempts,
+                        task.structural_review_stalls,
+                    ));
                     AgenticTaskStatus::Blocked
                 } else {
                     AgenticTaskStatus::Rework
@@ -766,6 +1197,7 @@ pub(crate) fn apply_task_review(
             }
         }
     }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -781,6 +1213,7 @@ mod tests {
         AgentActionEnvelope {
             action_id: format!("claim:{execution_id}"),
             actor: AgentActorBinding {
+                original_execution: None,
                 objective_id: "objective".to_string(),
                 program_id: "program".to_string(),
                 session_id: "session".to_string(),
@@ -819,6 +1252,10 @@ mod tests {
                 acceptance: "durable evidence".to_string(),
                 acceptance_checks: Vec::new(),
                 criterion_source: Default::default(),
+                obligations: Vec::new(),
+                rework_directives: Vec::new(),
+                unsettled_released_attempts: Vec::new(),
+                terminal_note: None,
                 required_capabilities: Vec::new(),
                 obligation_refs: Vec::new(),
                 purpose: Default::default(),
@@ -841,6 +1278,11 @@ mod tests {
                 failed_attempts: 0,
                 review_generation: 0,
                 failed_review_attempts: 0,
+                structural_execution_stalls: 0,
+                structural_review_stalls: 0,
+                reviews_applied: 0,
+                review_obligation: None,
+                reviews_accepted: 0,
                 last_failure: None,
                 replacement_task_refs: Vec::new(),
                 supersede_evidence_refs: Vec::new(),
@@ -879,6 +1321,10 @@ mod tests {
                 acceptance: "durable evidence".to_string(),
                 acceptance_checks: Vec::new(),
                 criterion_source: Default::default(),
+                obligations: Vec::new(),
+                rework_directives: Vec::new(),
+                unsettled_released_attempts: Vec::new(),
+                terminal_note: None,
                 required_capabilities: Vec::new(),
                 obligation_refs: Vec::new(),
                 purpose: Default::default(),
@@ -900,6 +1346,11 @@ mod tests {
                 failed_attempts: 0,
                 review_generation: 0,
                 failed_review_attempts: 0,
+                structural_execution_stalls: 0,
+                structural_review_stalls: 0,
+                reviews_applied: 0,
+                review_obligation: None,
+                reviews_accepted: 0,
                 last_failure: None,
                 replacement_task_refs: Vec::new(),
                 supersede_evidence_refs: Vec::new(),
@@ -973,6 +1424,10 @@ mod tests {
                 acceptance: "durable evidence".to_string(),
                 acceptance_checks: Vec::new(),
                 criterion_source: Default::default(),
+                obligations: Vec::new(),
+                rework_directives: Vec::new(),
+                unsettled_released_attempts: Vec::new(),
+                terminal_note: None,
                 required_capabilities: Vec::new(),
                 depends_on: Vec::new(),
                 status: AgenticTaskStatus::Published,
@@ -991,6 +1446,11 @@ mod tests {
                 failed_attempts: 0,
                 review_generation: 0,
                 failed_review_attempts: 0,
+                structural_execution_stalls: 0,
+                structural_review_stalls: 0,
+                reviews_applied: 0,
+                review_obligation: None,
+                reviews_accepted: 0,
                 last_failure: None,
                 replacement_task_refs: Vec::new(),
                 supersede_evidence_refs: Vec::new(),
@@ -1036,6 +1496,10 @@ mod tests {
                 acceptance: "durable evidence".to_string(),
                 acceptance_checks: Vec::new(),
                 criterion_source: Default::default(),
+                obligations: Vec::new(),
+                rework_directives: Vec::new(),
+                unsettled_released_attempts: Vec::new(),
+                terminal_note: None,
                 required_capabilities: Vec::new(),
                 depends_on: Vec::new(),
                 status: AgenticTaskStatus::Rework,
@@ -1053,6 +1517,11 @@ mod tests {
                 failed_attempts: 0,
                 review_generation: 0,
                 failed_review_attempts: 0,
+                structural_execution_stalls: 0,
+                structural_review_stalls: 0,
+                reviews_applied: 0,
+                review_obligation: None,
+                reviews_accepted: 0,
                 last_failure: None,
                 replacement_task_refs: Vec::new(),
                 supersede_evidence_refs: Vec::new(),
@@ -1100,6 +1569,10 @@ mod tests {
             acceptance: "accepted evidence".to_string(),
             acceptance_checks: Vec::new(),
             criterion_source: Default::default(),
+            obligations: Vec::new(),
+            rework_directives: Vec::new(),
+            unsettled_released_attempts: Vec::new(),
+            terminal_note: None,
             required_capabilities: Vec::new(),
             depends_on: Vec::new(),
             status: AgenticTaskStatus::Superseded,
@@ -1118,6 +1591,11 @@ mod tests {
             failed_attempts: 1,
             review_generation: 0,
             failed_review_attempts: 0,
+            structural_execution_stalls: 0,
+            structural_review_stalls: 0,
+            reviews_applied: 0,
+            review_obligation: None,
+            reviews_accepted: 0,
             last_failure: Some("disproved".to_string()),
             replacement_task_refs: vec!["part-a".to_string(), "part-b".to_string()],
             supersede_evidence_refs: vec!["tool://failure".to_string()],
@@ -1164,6 +1642,10 @@ mod tests {
             acceptance: "no orphaned execution".to_string(),
             acceptance_checks: Vec::new(),
             criterion_source: Default::default(),
+            obligations: Vec::new(),
+            rework_directives: Vec::new(),
+            unsettled_released_attempts: Vec::new(),
+            terminal_note: None,
             required_capabilities: Vec::new(),
             obligation_refs: Vec::new(),
             purpose: Default::default(),
@@ -1185,6 +1667,11 @@ mod tests {
             failed_attempts: 0,
             review_generation: 0,
             failed_review_attempts: 0,
+            structural_execution_stalls: 0,
+            structural_review_stalls: 0,
+            reviews_applied: 0,
+            review_obligation: None,
+            reviews_accepted: 0,
             last_failure: None,
             replacement_task_refs: Vec::new(),
             supersede_evidence_refs: Vec::new(),
@@ -1211,6 +1698,7 @@ mod tests {
                     },
                     generation: 0,
                 },
+                1_000,
             );
         }
         let withdrawal = TaskWithdrawInput {
@@ -1257,6 +1745,688 @@ mod tests {
             AgenticTaskStatus::Withdrawn
         );
         assert!(projection.tasks["task"].active_attempts.is_empty());
+    }
+}
+
+/// The seven paths that end a Task's claim, and the state each one leaves.
+/// A fence that is written once has to be ended exactly once too: these
+/// assertions say what every ending leaves behind, so a path that forgets to
+/// release the claim - or a path that releases it early - cannot pass
+/// unnoticed.
+#[cfg(test)]
+mod post_state_tests {
+    use super::*;
+    use harness_contract::agent_action::{
+        AgentAction, AgentActorBinding, AgentActorKind, AgentAttemptMode, MessagePublishInput,
+        TaskAttemptFailInput, TaskIntent, TaskIntentKind, TaskOneShotDeliverable,
+        TaskReleaseInput, TaskReviewDecision, TaskReviewInput, TaskSubmitInput, TaskSupersedeInput,
+        TaskWithdrawInput,
+    };
+
+    fn task() -> AgenticTaskProjection {
+        AgenticTaskProjection {
+            task_id: "task".to_string(),
+            team_id: "team".to_string(),
+            title: "task".to_string(),
+            objective: "objective".to_string(),
+            acceptance: "durable evidence".to_string(),
+            acceptance_checks: Vec::new(),
+            criterion_source: Default::default(),
+            obligations: Vec::new(),
+            rework_directives: Vec::new(),
+            unsettled_released_attempts: Vec::new(),
+            terminal_note: None,
+            required_capabilities: Vec::new(),
+            obligation_refs: Vec::new(),
+            purpose: Default::default(),
+            execution_requirements: Vec::new(),
+            expertise_hints: Vec::new(),
+            depends_on: Vec::new(),
+            status: AgenticTaskStatus::Published,
+            claimant: None,
+            claim_generation: 0,
+            claim_execution_id: None,
+            claimed_at_ms: None,
+            lease_expires_at_ms: None,
+            claim_renewal_streak: 0,
+            active_attempts: Default::default(),
+            artifact_refs: Vec::new(),
+            evidence_refs: Vec::new(),
+            unresolved: Vec::new(),
+            review_reason: None,
+            reviewed_by: None,
+            failed_attempts: 0,
+            review_generation: 0,
+            failed_review_attempts: 0,
+            structural_execution_stalls: 0,
+            structural_review_stalls: 0,
+            reviews_applied: 0,
+            review_obligation: None,
+            reviews_accepted: 0,
+            last_failure: None,
+            replacement_task_refs: Vec::new(),
+            supersede_evidence_refs: Vec::new(),
+            superseded_reason: None,
+            superseded_by: None,
+            cancel_requested_by: None,
+            cancel_reason_ref: None,
+            cancel_evidence_refs: Vec::new(),
+            pending_retirement: None,
+        }
+    }
+
+    fn envelope(execution_id: &str, agent_id: &str, action: AgentAction) -> AgentActionEnvelope {
+        AgentActionEnvelope {
+            action_id: format!("action:{execution_id}:{agent_id}"),
+            actor: AgentActorBinding {
+                original_execution: None,
+                objective_id: "objective".to_string(),
+                program_id: "program".to_string(),
+                session_id: "session".to_string(),
+                turn_id: "turn".to_string(),
+                root_execution_id: Some("root".to_string()),
+                required_team_count: 1,
+                exact_team_count: None,
+                objective_summary: "objective".to_string(),
+                model_lease: "model".to_string(),
+                permission_ceiling: Some(harness_contract::policy::PermissionMode::ReadOnly),
+                resource_scopes: Vec::new(),
+                actor_id: agent_id.to_string(),
+                kind: AgentActorKind::Agent,
+                execution_id: Some(execution_id.to_string()),
+                team_id: Some("team".to_string()),
+                agent_id: Some(agent_id.to_string()),
+            },
+            expected_revision: None,
+            action,
+        }
+    }
+
+    /// A Task whose Execute dispatch has already written the fence.
+    fn dispatched() -> AgenticProgramProjection {
+        let mut projection = AgenticProgramProjection::empty("program", "objective");
+        projection.tasks.insert("task".to_string(), task());
+        apply_task_attempt_dispatch(
+            &mut projection,
+            &TaskAttemptDispatchInput {
+                task_ref: "task".to_string(),
+                execution_id: "execute-graph".to_string(),
+                agent_ref: "agent".to_string(),
+                membership_id: "membership:agent:team".to_string(),
+                mode: AgentAttemptMode::Execute,
+                generation: 0,
+            },
+            1_000,
+        );
+        projection
+    }
+
+    fn attempt_fail(reason: &str, retryable: bool) -> TaskAttemptFailInput {
+        TaskAttemptFailInput {
+            task_ref: "task".to_string(),
+            execution_id: "execute-graph".to_string(),
+            mode: AgentAttemptMode::Execute,
+            reason: reason.to_string(),
+            retryable,
+        }
+    }
+
+    /// The generation equation in one named place: the fence belongs to the
+    /// attempt that holds it, one generation ahead of it.  A live pair is the
+    /// claim's *own* attempt - a Task whose submitter already submitted has
+    /// no live attempt for its claim, and the equation then applies to nobody
+    /// else's attempt either.
+    fn claim_generation_matches_its_attempt(task: &AgenticTaskProjection) -> Option<bool> {
+        let attempt = task
+            .active_attempts
+            .get(task.claim_execution_id.as_deref()?)?;
+        Some(attempt.generation + 1 == task.claim_generation)
+    }
+
+    /// Path 1 - a failed attempt takes the fence with it and returns the Task
+    /// to the market.
+    #[test]
+    fn a_failed_attempt_leaves_no_claim_behind() {
+        let mut projection = dispatched();
+        apply_task_attempt_fail(&mut projection, &attempt_fail("the worker died", true));
+        let task = &projection.tasks["task"];
+        assert!(task.active_attempts.is_empty());
+        assert_eq!(task.claimant, None);
+        assert_eq!(task.claim_execution_id, None);
+        assert_eq!(task.claimed_at_ms, None);
+        assert_eq!(task.lease_expires_at_ms, None);
+        assert_eq!(task.status, AgenticTaskStatus::Rework);
+    }
+
+    /// Path 2 - an explicit release ends the fence and hands the Task back.
+    #[test]
+    fn a_released_task_carries_no_claim() {
+        let mut projection = dispatched();
+        let input = TaskReleaseInput {
+            task_ref: "task".to_string(),
+            reason: "the work is not needed".to_string(),
+            expected_claim_generation: None,
+        };
+        apply_task_release(
+            &mut projection,
+            &envelope(
+                "execute-graph",
+                "agent",
+                AgentAction::TaskRelease(input.clone()),
+            ),
+            &input,
+        );
+        let task = &projection.tasks["task"];
+        assert_eq!(task.status, AgenticTaskStatus::Published);
+        assert_eq!(task.claimant, None);
+        assert_eq!(task.claim_execution_id, None);
+        assert_eq!(task.claimed_at_ms, None);
+        assert_eq!(task.lease_expires_at_ms, None);
+        assert_eq!(task.claim_renewal_streak, 0);
+        assert!(task.active_attempts.is_empty());
+    }
+
+    /// Path 3 - an accepted Task keeps the claim that produced it.  The
+    /// acceptance ends the work, not the fence: the claim still names the
+    /// execution that wrote the deliverable.
+    #[test]
+    fn an_accepted_task_keeps_the_claim_that_produced_it() {
+        let mut projection = dispatched();
+        let submit = TaskSubmitInput {
+            task_ref: "task".to_string(),
+            artifact_refs: vec!["artifact:deliverable".to_string()],
+            evidence_refs: Vec::new(),
+            unresolved: Vec::new(),
+            deliverable: None,
+        };
+        apply_task_submit(
+            &mut projection,
+            &envelope(
+                "execute-graph",
+                "agent",
+                AgentAction::TaskSubmit(submit.clone()),
+            ),
+            &submit,
+        );
+        let review = TaskReviewInput {
+            task_ref: "task".to_string(),
+            decision: TaskReviewDecision::Accept,
+            reason: "the evidence is there".to_string(),
+            operator_requirement: None,
+            evidence_refs: Vec::new(),
+        gaps: Vec::new(),
+        directed_actions: Vec::new(),
+        };
+        apply_task_review(
+            &mut projection,
+            &envelope(
+                "review-graph",
+                "reviewer",
+                AgentAction::TaskReview(review.clone()),
+            ),
+            &review,
+        );
+        let task = &projection.tasks["task"];
+        assert_eq!(task.status, AgenticTaskStatus::Accepted);
+        assert_eq!(task.claimant.as_deref(), Some("agent"));
+        assert_eq!(task.claim_execution_id.as_deref(), Some("execute-graph"));
+        assert_eq!(task.claimed_at_ms, Some(1_000));
+        assert_eq!(task.lease_expires_at_ms, Some(1_000 + claim_lease_ms()));
+    }
+
+    /// Path 5 - a withdrawal is two stages: the cancellation is the
+    /// intermediate state, the retirement is the end of it.  The claim is
+    /// released when the Task is actually retired.
+    #[test]
+    fn a_withdrawn_task_ends_retired_with_no_claim() {
+        let mut projection = dispatched();
+        let input = TaskWithdrawInput {
+            task_ref: "task".to_string(),
+            reason_ref: "artifact://withdrawal-reason".to_string(),
+            evidence_refs: Vec::new(),
+        };
+        apply_task_withdraw(
+            &mut projection,
+            &envelope(
+                "execute-graph",
+                "agent",
+                AgentAction::TaskWithdraw(input.clone()),
+            ),
+            &input,
+        );
+        let task = &projection.tasks["task"];
+        assert_eq!(task.status, AgenticTaskStatus::CancelRequested);
+        assert_eq!(
+            task.pending_retirement,
+            Some(AgenticTaskRetirement::Withdrawn)
+        );
+        apply_task_attempt_fail(&mut projection, &attempt_fail("cancelled", false));
+        let task = &projection.tasks["task"];
+        assert_eq!(task.status, AgenticTaskStatus::Withdrawn);
+        assert_eq!(task.pending_retirement, None);
+        assert!(task.active_attempts.is_empty());
+        assert_eq!(task.claimant, None);
+        assert_eq!(task.claim_execution_id, None);
+        assert_eq!(task.claimed_at_ms, None);
+        assert_eq!(task.lease_expires_at_ms, None);
+    }
+
+    /// Path 7 - a supersession is the same two stages as a withdrawal.
+    #[test]
+    fn a_superseded_task_ends_retired_with_no_claim() {
+        let mut projection = dispatched();
+        let input = TaskSupersedeInput {
+            task_ref: "task".to_string(),
+            replacement_task_refs: vec!["task:next".to_string()],
+            reason: "the plan changed".to_string(),
+            evidence_refs: Vec::new(),
+        };
+        apply_task_supersede(
+            &mut projection,
+            &envelope(
+                "execute-graph",
+                "agent",
+                AgentAction::TaskSupersede(input.clone()),
+            ),
+            &input,
+        );
+        let task = &projection.tasks["task"];
+        assert_eq!(task.status, AgenticTaskStatus::CancelRequested);
+        assert_eq!(
+            task.pending_retirement,
+            Some(AgenticTaskRetirement::Superseded)
+        );
+        apply_task_attempt_fail(&mut projection, &attempt_fail("cancelled", false));
+        let task = &projection.tasks["task"];
+        assert_eq!(task.status, AgenticTaskStatus::Superseded);
+        assert_eq!(task.pending_retirement, None);
+        assert!(task.active_attempts.is_empty());
+        assert_eq!(task.claimant, None);
+        assert_eq!(task.claim_execution_id, None);
+        assert_eq!(task.claimed_at_ms, None);
+        assert_eq!(task.lease_expires_at_ms, None);
+    }
+
+    /// B9 - the residual claim of an accepted Task is load-bearing, not
+    /// decoration.  The artifact was stamped with the claim that was live
+    /// when it was published, and the publication provenance gate reads the
+    /// Task's claim against the artifact's: clearing the claim on acceptance
+    /// would orphan every deliverable published under it.
+    #[test]
+    fn the_accepted_residual_claim_is_the_one_the_artifact_was_stamped_with() {
+        let mut projection = dispatched();
+        let submit = TaskSubmitInput {
+            task_ref: "task".to_string(),
+            artifact_refs: Vec::new(),
+            evidence_refs: Vec::new(),
+            unresolved: Vec::new(),
+            deliverable: Some(TaskOneShotDeliverable {
+                block_index: 0,
+                kind: "report".to_string(),
+                title: "report".to_string(),
+                resolved_content_ref: Some("artifact://content".to_string()),
+            }),
+        };
+        apply_task_submit(
+            &mut projection,
+            &envelope(
+                "execute-graph",
+                "agent",
+                AgentAction::TaskSubmit(submit.clone()),
+            ),
+            &submit,
+        );
+        let artifact_ref = projection.tasks["task"]
+            .artifact_refs
+            .first()
+            .cloned()
+            .expect("the submitted artifact");
+        let review = TaskReviewInput {
+            task_ref: "task".to_string(),
+            decision: TaskReviewDecision::Accept,
+            reason: "the evidence is there".to_string(),
+            operator_requirement: None,
+            evidence_refs: Vec::new(),
+        gaps: Vec::new(),
+        directed_actions: Vec::new(),
+        };
+        apply_task_review(
+            &mut projection,
+            &envelope(
+                "review-graph",
+                "reviewer",
+                AgentAction::TaskReview(review.clone()),
+            ),
+            &review,
+        );
+        let task = &projection.tasks["task"];
+        let artifact = &projection.artifacts[&artifact_ref];
+        assert_eq!(task.status, AgenticTaskStatus::Accepted);
+        assert_eq!(task.claimant.as_deref(), Some("agent"));
+        assert_eq!(task.claim_execution_id.as_deref(), Some("execute-graph"));
+        assert_eq!(artifact.claim_execution_id.as_deref(), Some("execute-graph"));
+        assert_eq!(artifact.claim_generation, Some(task.claim_generation));
+        assert_eq!(task.claimed_at_ms, Some(1_000));
+        let lease = task.lease_expires_at_ms.expect("the residual lease");
+        assert!(lease > 1_000 && lease < u64::MAX, "the lease is finite");
+        // The submit removed the submitter's attempt, so the claim has no
+        // live attempt of its own: the equation applies to nobody.
+        assert_eq!(claim_generation_matches_its_attempt(task), None);
+        // Nothing holds the accepted Task open.
+        assert_eq!(task.pending_retirement, None);
+        assert_eq!(task.cancel_requested_by, None);
+        assert!(task.active_attempts.is_empty());
+    }
+
+    /// B5 - a review dispatch must not put a second name on the work.  The
+    /// Task keeps the claim that names the executor, the artifact keeps the
+    /// same execution, and the reviewer's attempt does not take either over.
+    #[test]
+    fn a_review_dispatch_leaves_the_artifact_and_the_task_naming_the_same_execution() {
+        let mut projection = dispatched();
+        let submit = TaskSubmitInput {
+            task_ref: "task".to_string(),
+            artifact_refs: Vec::new(),
+            evidence_refs: Vec::new(),
+            unresolved: Vec::new(),
+            deliverable: Some(TaskOneShotDeliverable {
+                block_index: 0,
+                kind: "report".to_string(),
+                title: "report".to_string(),
+                resolved_content_ref: Some("artifact://content".to_string()),
+            }),
+        };
+        apply_task_submit(
+            &mut projection,
+            &envelope(
+                "execute-graph",
+                "agent",
+                AgentAction::TaskSubmit(submit.clone()),
+            ),
+            &submit,
+        );
+        let artifact_ref = projection.tasks["task"]
+            .artifact_refs
+            .first()
+            .cloned()
+            .expect("the submitted artifact");
+        apply_task_attempt_dispatch(
+            &mut projection,
+            &TaskAttemptDispatchInput {
+                task_ref: "task".to_string(),
+                execution_id: "review-graph".to_string(),
+                agent_ref: "reviewer".to_string(),
+                membership_id: "membership:reviewer:team".to_string(),
+                mode: AgentAttemptMode::Review,
+                generation: 0,
+            },
+            2_000,
+        );
+        let task = &projection.tasks["task"];
+        let artifact = &projection.artifacts[&artifact_ref];
+        assert_eq!(task.claimant.as_deref(), Some("agent"));
+        assert_eq!(task.claim_execution_id.as_deref(), Some("execute-graph"));
+        assert_eq!(artifact.claim_execution_id.as_deref(), Some("execute-graph"));
+        assert_eq!(artifact.claim_generation, Some(task.claim_generation));
+        // The reviewer's attempt is live; the claim's own attempt is not, so
+        // the equation has no pair to hold.
+        assert_eq!(claim_generation_matches_its_attempt(task), None);
+        assert_eq!(
+            task.active_attempts.get("review-graph").map(|a| a.mode),
+            Some(AgentAttemptMode::Review)
+        );
+    }
+
+    /// The dispatched executor that does not take the Task must not leave a
+    /// claim hanging.  Whatever it said on the topic - including a decline it
+    /// published through the message channel - the executor's exit settles
+    /// the attempt, the fence goes with it, and the Task is back in the
+    /// market instead of held by a claim nobody can renew.
+    #[test]
+    fn a_dispatched_executor_that_leaves_leaves_no_hanging_claim() {
+        let mut projection = dispatched();
+        let decline = MessagePublishInput {
+            topic_ref: "topic:program".to_string(),
+            summary: Some("this task does not fit my role".to_string()),
+            content_ref: None,
+            refs: vec!["task".to_string()],
+            recipients: Vec::new(),
+            intent: Some(TaskIntent {
+                task_ref: "task".to_string(),
+                kind: TaskIntentKind::Decline,
+                reason_ref: None,
+                requested_capability_refs: Vec::new(),
+            }),
+            issue_dispositions: Vec::new(),
+        };
+        let revision = projection.revision + 1;
+        super::super::topic::apply_message_publish(
+            &mut projection,
+            &envelope(
+                "execute-graph",
+                "agent",
+                AgentAction::MessagePublish(decline.clone()),
+            ),
+            &decline,
+            Some("topic:program:1"),
+            revision,
+        );
+        apply_task_attempt_fail(&mut projection, &attempt_fail("the executor left", false));
+        let task = &projection.tasks["task"];
+        assert!(task.active_attempts.is_empty());
+        assert_eq!(task.claimant, None);
+        assert_eq!(task.claim_execution_id, None);
+        assert_eq!(task.claimed_at_ms, None);
+        assert_eq!(task.lease_expires_at_ms, None);
+        assert_eq!(task.status, AgenticTaskStatus::Published);
+        assert_eq!(task.pending_retirement, None);
+    }
+
+    /// Path 6 - the stranded-attempt sweep settles a lapsed attempt through
+    /// the same failure action, so a lease that already ran out does not keep
+    /// the claim alive: the sweep does not clear the claim itself, the
+    /// settlement it emits does.
+    #[test]
+    fn an_expired_lease_does_not_keep_the_claim_alive() {
+        let mut projection = dispatched();
+        projection
+            .tasks
+            .get_mut("task")
+            .expect("task")
+            .lease_expires_at_ms = Some(500);
+        apply_task_attempt_fail(
+            &mut projection,
+            &attempt_fail("startup recovered a terminal Agent graph", false),
+        );
+        let task = &projection.tasks["task"];
+        assert!(task.active_attempts.is_empty());
+        assert_eq!(task.claimant, None);
+        assert_eq!(task.claim_execution_id, None);
+        assert_eq!(task.claimed_at_ms, None);
+        assert_eq!(task.lease_expires_at_ms, None);
+    }
+}
+
+/// The dispatch decision already named the Agent and the physical graph that
+/// will run the Task, so it is the one writer of the Task's claim fence.  A
+/// second writer - the Agent's own `task_claim` - would let the admission be
+/// re-derived from a different ledger than the dispatch that produced it.
+#[cfg(test)]
+mod dispatch_fence_tests {
+    use super::*;
+    use harness_contract::agent_action::{AgentAction, AgentAttemptMode, TaskClaimInput};
+
+    fn published_task() -> AgenticTaskProjection {
+        AgenticTaskProjection {
+            task_id: "task".to_string(),
+            team_id: "team".to_string(),
+            title: "task".to_string(),
+            objective: "objective".to_string(),
+            acceptance: "durable evidence".to_string(),
+            acceptance_checks: Vec::new(),
+            criterion_source: Default::default(),
+            obligations: Vec::new(),
+            rework_directives: Vec::new(),
+            unsettled_released_attempts: Vec::new(),
+            terminal_note: None,
+            required_capabilities: Vec::new(),
+            obligation_refs: Vec::new(),
+            purpose: Default::default(),
+            execution_requirements: Vec::new(),
+            expertise_hints: Vec::new(),
+            depends_on: Vec::new(),
+            status: AgenticTaskStatus::Published,
+            claimant: None,
+            claim_generation: 0,
+            claim_execution_id: None,
+            claimed_at_ms: None,
+            lease_expires_at_ms: None,
+            claim_renewal_streak: 0,
+            active_attempts: Default::default(),
+            artifact_refs: Vec::new(),
+            evidence_refs: Vec::new(),
+            unresolved: Vec::new(),
+            review_reason: None,
+            reviewed_by: None,
+            failed_attempts: 0,
+            review_generation: 0,
+            failed_review_attempts: 0,
+            structural_execution_stalls: 0,
+            structural_review_stalls: 0,
+            reviews_applied: 0,
+            review_obligation: None,
+            reviews_accepted: 0,
+            last_failure: None,
+            replacement_task_refs: Vec::new(),
+            supersede_evidence_refs: Vec::new(),
+            superseded_reason: None,
+            superseded_by: None,
+            cancel_requested_by: None,
+            cancel_reason_ref: None,
+            cancel_evidence_refs: Vec::new(),
+            pending_retirement: None,
+        }
+    }
+
+    fn claim_envelope(execution_id: &str) -> AgentActionEnvelope {
+        AgentActionEnvelope {
+            action_id: format!("claim:{execution_id}"),
+            actor: harness_contract::agent_action::AgentActorBinding {
+                original_execution: None,
+                objective_id: "objective".to_string(),
+                program_id: "program".to_string(),
+                session_id: "session".to_string(),
+                turn_id: "turn".to_string(),
+                root_execution_id: Some("root".to_string()),
+                required_team_count: 1,
+                exact_team_count: None,
+                objective_summary: "long-running task".to_string(),
+                model_lease: "model".to_string(),
+                permission_ceiling: Some(harness_contract::policy::PermissionMode::ReadOnly),
+                resource_scopes: Vec::new(),
+                actor_id: "agent".to_string(),
+                kind: harness_contract::agent_action::AgentActorKind::Agent,
+                execution_id: Some(execution_id.to_string()),
+                team_id: Some("team".to_string()),
+                agent_id: Some("agent".to_string()),
+            },
+            expected_revision: None,
+            action: AgentAction::TaskClaim(TaskClaimInput {
+                task_ref: "task".to_string(),
+                reason: None,
+            }),
+        }
+    }
+
+    fn dispatch(mode: AgentAttemptMode, execution_id: &str, generation: u64) -> TaskAttemptDispatchInput {
+        TaskAttemptDispatchInput {
+            task_ref: "task".to_string(),
+            execution_id: execution_id.to_string(),
+            agent_ref: "agent".to_string(),
+            membership_id: "membership:agent:team".to_string(),
+            mode,
+            generation,
+        }
+    }
+
+    /// The five fields of the fence, and the generation equation the admission
+    /// authority checks: the fence belongs to the attempt that was admitted.
+    #[test]
+    fn the_execute_dispatch_writes_the_claim_fence() {
+        let mut projection = AgenticProgramProjection::empty("program", "objective");
+        projection.tasks.insert("task".to_string(), published_task());
+        apply_task_attempt_dispatch(
+            &mut projection,
+            &dispatch(AgentAttemptMode::Execute, "execute-graph", 4),
+            1_000,
+        );
+        let task = &projection.tasks["task"];
+        assert_eq!(task.status, AgenticTaskStatus::Claimed);
+        assert_eq!(task.claimant.as_deref(), Some("agent"));
+        assert_eq!(task.claim_execution_id.as_deref(), Some("execute-graph"));
+        assert_eq!(task.claim_generation, 5);
+        assert_eq!(task.claimed_at_ms, Some(1_000));
+        assert_eq!(task.lease_expires_at_ms, Some(1_000 + claim_lease_ms()));
+        let attempt = task
+            .active_attempts
+            .get("execute-graph")
+            .expect("the dispatched attempt");
+        assert_eq!(attempt.generation + 1, task.claim_generation);
+        assert_eq!(attempt.mode, AgentAttemptMode::Execute);
+    }
+
+    /// The writer stays single.  The Agent's own `task_claim` after the
+    /// dispatch is a renewal of that fence, not a second claim: it cannot move
+    /// the generation, so the equation that binds the fence to its attempt
+    /// survives it, and the only thing it may change is how long the fence
+    /// holds.
+    #[test]
+    fn the_agents_own_claim_after_the_dispatch_is_a_renewal() {
+        let mut projection = AgenticProgramProjection::empty("program", "objective");
+        projection.tasks.insert("task".to_string(), published_task());
+        apply_task_attempt_dispatch(
+            &mut projection,
+            &dispatch(AgentAttemptMode::Execute, "execute-graph", 4),
+            1_000,
+        );
+        let envelope = claim_envelope("execute-graph");
+        let input = match &envelope.action {
+            AgentAction::TaskClaim(input) => input,
+            _ => unreachable!(),
+        };
+        apply_task_claim(&mut projection, &envelope, input, 2_000);
+        let task = &projection.tasks["task"];
+        assert_eq!(task.status, AgenticTaskStatus::Claimed);
+        assert_eq!(task.claim_generation, 5);
+        assert_eq!(task.claimant.as_deref(), Some("agent"));
+        assert_eq!(task.claim_execution_id.as_deref(), Some("execute-graph"));
+        assert_eq!(task.lease_expires_at_ms, Some(2_000 + claim_lease_ms()));
+        assert_eq!(task.claim_renewal_streak, 1);
+    }
+
+    /// Only the Execute dispatch writes a claim.  A reviewer has no fence of
+    /// its own: its reads keep going down the review path, and the Task keeps
+    /// the one claim that names the execution that will do the work.
+    #[test]
+    fn a_review_dispatch_writes_no_claim() {
+        let mut projection = AgenticProgramProjection::empty("program", "objective");
+        projection.tasks.insert("task".to_string(), published_task());
+        apply_task_attempt_dispatch(
+            &mut projection,
+            &dispatch(AgentAttemptMode::Review, "review-graph", 0),
+            1_000,
+        );
+        let task = &projection.tasks["task"];
+        assert_eq!(task.status, AgenticTaskStatus::Published);
+        assert_eq!(task.claimant, None);
+        assert_eq!(task.claim_execution_id, None);
+        assert_eq!(task.claim_generation, 0);
+        assert_eq!(task.claimed_at_ms, None);
+        assert_eq!(task.lease_expires_at_ms, None);
+        assert_eq!(
+            task.active_attempts.get("review-graph").map(|a| a.mode),
+            Some(AgentAttemptMode::Review)
+        );
     }
 }
 
@@ -1313,6 +2483,8 @@ mod criterion_source_tests {
             reason: "source evidence".into(),
             operator_requirement: None,
             evidence_refs: Vec::new(),
+        gaps: Vec::new(),
+        directed_actions: Vec::new(),
         };
         for _ in 0..2 {
             apply_task_review(&mut program, &envelope, &review);
@@ -1426,6 +2598,7 @@ mod criterion_source_tests {
         AgentActionEnvelope {
             action_id: "publish".to_string(),
             actor: harness_contract::agent_action::AgentActorBinding {
+                original_execution: None,
                 objective_id: "objective-1".to_string(),
                 program_id: "program-1".to_string(),
                 session_id: "session-1".to_string(),
@@ -1447,4 +2620,467 @@ mod criterion_source_tests {
             action: AgentAction::TaskPublish(publish_input("one verifiable fact")),
         }
     }
+
+    // ---- 032 K1/K3 (e1) contract fixtures. On the red tree (pre-wiring)
+    // these fail exactly where the old behaviour is wrong: no compiled record,
+    // erased attempts, silent Blocked, dropped directives. ----
+
+    fn k3_review(reason: &str, gaps: &[&str], actions: &[&str]) -> TaskReviewInput {
+        TaskReviewInput {
+            task_ref: "task".to_string(),
+            decision: TaskReviewDecision::Rework,
+            reason: reason.to_string(),
+            operator_requirement: None,
+            evidence_refs: Vec::new(),
+            gaps: gaps.iter().map(|item| item.to_string()).collect(),
+            directed_actions: actions.iter().map(|item| item.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn k1_a_publish_compiles_the_single_criterion_record() {
+        let mut program = program_with_objective("Read source");
+        let mut input = publish_input("the answer quotes Cargo.toml exactly");
+        input.acceptance_checks = vec!["cargo.toml sha matches the read".to_string()];
+        let mut env = envelope();
+        env.action = AgentAction::TaskPublish(input.clone());
+        super::apply_task_publish(&mut program, &env, &input, Some("task"));
+        let task = &program.tasks["task"];
+        let expected: std::collections::BTreeSet<_> = std::iter::once("acceptance".to_string())
+            .chain(input.acceptance_checks.iter().enumerate().map(|(index, _)| format!("check:{index}")))
+            .collect();
+        let mut actual = std::collections::BTreeSet::new();
+        for obligation in &task.obligations {
+            assert!(actual.insert(obligation.key.clone()), "each criterion is compiled once");
+        }
+        assert_eq!(actual, expected);
+        assert_eq!(task.obligations[0].key, "acceptance");
+        assert!(task.obligations[0].authoritative, "the prose stays the authoritative criterion");
+        assert_eq!(task.obligations[1].key, "check:0");
+        assert!(!task.obligations[1].authoritative, "checks are hints of the same record, never a second standard");
+        assert_eq!(
+            task.obligations[0].criterion_source, task.criterion_source,
+            "publish provenance travels with every criterion (B3)"
+        );
+        let again = super::compile_task_obligations(
+            &input.acceptance, &input.acceptance_checks, input.criterion_source,
+        );
+        assert_eq!(again, task.obligations, "the record is a pure function of the durable publish face");
+    }
+
+    #[test]
+    fn k3_a_rework_releases_stale_attempts_as_named_unsettlement() {
+        use harness_contract::agent_action::AgentAttemptMode;
+        let mut program = program_with_objective("Read source");
+        super::apply_task_publish(&mut program, &envelope(), &publish_input("source evidence"), Some("task"));
+        let task = program.tasks.get_mut("task").unwrap();
+        task.status = AgenticTaskStatus::Submitted;
+        program.tasks.get_mut("task").unwrap().active_attempts.insert(
+            "exec-old".to_string(),
+            crate::agentic::program::AgenticTaskAttemptProjection {
+                execution_id: "exec-old".to_string(),
+                agent_id: "agent:worker".to_string(),
+                membership_id: "m-1".to_string(),
+                mode: AgentAttemptMode::Execute,
+                generation: 0,
+            },
+        );
+        let review = k3_review("source evidence not delivered", &[], &[]);
+        let mut env = envelope();
+        env.action = AgentAction::TaskReview(review.clone());
+        env.action_id = "review-1".to_string();
+        super::apply_task_review(&mut program, &env, &review);
+        let task = &program.tasks["task"];
+        assert!(task.active_attempts.is_empty());
+        let released = &task.unsettled_released_attempts;
+        assert_eq!(released.len(), 1, "B8: the released attempt must survive the clear as a named fact");
+        assert_eq!(released[0].execution_id, "exec-old");
+        assert_eq!(released[0].agent_id, "agent:worker");
+        assert_eq!(released[0].generation, 0, "identity kept: no later round can launder this effect");
+    }
+
+    #[test]
+    fn k3_b_each_blocked_arm_names_its_exhaustion() {
+        use harness_contract::agent_action::{AgentAttemptMode, TaskAttemptFailInput};
+        let fail = |attempt: u8, mode| TaskAttemptFailInput {
+            task_ref: "task".to_string(),
+            execution_id: format!("exec-{attempt}"),
+            mode,
+            reason: format!("distinct failure {attempt}"),
+            retryable: true,
+        };
+        let mut program = program_with_objective("Read source");
+        super::apply_task_publish(&mut program, &envelope(), &publish_input("source evidence"), Some("task"));
+        program.tasks.get_mut("task").unwrap().status = AgenticTaskStatus::Claimed;
+        for attempt in 1..=3 {
+            super::apply_task_attempt_fail(&mut program, &fail(attempt, AgentAttemptMode::Execute));
+        }
+        let task = &program.tasks["task"];
+        assert_eq!(task.status, AgenticTaskStatus::Blocked);
+        let note = task.terminal_note.as_deref().expect("B10: execution exhaustion must be named");
+        assert!(note.contains("execution attempts exhausted at bounded 3"), "{note}");
+        assert!(note.contains("distinct failure 3"), "the note names the last failure: {note}");
+
+        let mut program = program_with_objective("Read source");
+        super::apply_task_publish(&mut program, &envelope(), &publish_input("source evidence"), Some("task"));
+        for attempt in 1..=3 {
+            super::apply_task_attempt_fail(&mut program, &fail(attempt, AgentAttemptMode::Review));
+        }
+        let task = &program.tasks["task"];
+        assert_eq!(task.status, AgenticTaskStatus::Blocked);
+        assert!(task.terminal_note.as_deref().expect("review exhaustion named").contains("review attempts exhausted at bounded 3"));
+
+        let mut program = program_with_objective("Read source");
+        super::apply_task_publish(&mut program, &envelope(), &publish_input("source evidence"), Some("task"));
+        for round in 1..=3 {
+            let review = k3_review("source evidence incomplete", &[], &[]);
+            let mut env = envelope();
+            env.action = AgentAction::TaskReview(review.clone());
+            env.action_id = format!("review-{round}");
+            program.tasks.get_mut("task").unwrap().status = AgenticTaskStatus::Submitted;
+            super::apply_task_review(&mut program, &env, &review);
+        }
+        let task = &program.tasks["task"];
+        assert_eq!(task.status, AgenticTaskStatus::Blocked, "the third rework round must stop the loop");
+        let note = task.terminal_note.as_deref().expect("rounds exhaustion named");
+        assert!(note.contains("review rounds exhausted at bounded 3"), "{note}");
+        assert!(!note.contains("satisfied"), "failure family only (B10): {note}");
+    }
+
+    #[test]
+    fn gb3_p2_only_applied_rework_counts_as_business_round() {
+        use harness_contract::agent_action::{AgentAttemptMode, TaskAttemptFailInput};
+        let mut program = program_with_objective("Read source");
+        super::apply_task_publish(&mut program, &envelope(), &publish_input("source evidence"), Some("task"));
+        for attempt in 1..=2 {
+            super::apply_task_attempt_fail(&mut program, &TaskAttemptFailInput {
+                task_ref: "task".into(), execution_id: format!("exec-{attempt}"), mode: AgentAttemptMode::Review,
+                reason: format!("proof_actual_input_extent_unsupported: distinct {attempt}"), retryable: true,
+            });
+        }
+        assert_eq!(program.tasks["task"].review_generation, 2);
+        assert_eq!(program.tasks["task"].structural_review_stalls, 2);
+        for round in 1..=3 {
+            let review = k3_review("source evidence incomplete", &[], &[]);
+            let mut env = envelope();
+            env.action = AgentAction::TaskReview(review.clone());
+            env.action_id = format!("gb3-rework-{round}");
+            program.tasks.get_mut("task").unwrap().status = AgenticTaskStatus::Submitted;
+            super::apply_task_review(&mut program, &env, &review);
+            let task = &program.tasks["task"];
+            assert_eq!(task.review_generation, 2 + round);
+            assert_eq!(task.status, if round == 3 { AgenticTaskStatus::Blocked } else { AgenticTaskStatus::Rework });
+            assert_eq!(task.failed_review_attempts, 0);
+            assert_eq!(task.structural_review_stalls, 2);
+        }
+    }
+
+    #[test]
+    fn gb3_p2_unavailable_history_cannot_apply_new_rework() {
+        let mut program = program_with_objective("Read source");
+        super::apply_task_publish(&mut program, &envelope(), &publish_input("source evidence"), Some("task"));
+        program.applied_rework_rounds = None;
+        let before = program.clone();
+        let review = k3_review("source evidence incomplete", &[], &[]);
+        let mut env = envelope();
+        env.action = AgentAction::TaskReview(review.clone());
+        assert_eq!(super::apply_task_review_with_round_rule(&mut program, &env, &review, true), Err("review_rework_history_unknown"));
+        assert_eq!(program, before);
+        program.applied_rework_rounds = Some(std::collections::BTreeMap::new());
+        let before_missing_task = program.clone();
+        assert_eq!(super::apply_task_review_with_round_rule(&mut program, &env, &review, true), Err("review_rework_history_unknown"));
+        assert_eq!(program, before_missing_task);
+    }
+
+    #[test]
+    fn gb3_p1_typed_cut_origin_not_reason_controls_real_failure_reducer() {
+        use harness_contract::agent_action::{AgentAttemptMode, TaskAttemptFailInput};
+        for trusted in [false, true] {
+            let mut program = program_with_objective("Read source");
+            super::apply_task_publish(&mut program, &envelope(), &publish_input("source evidence"), Some("task"));
+            let fail = TaskAttemptFailInput { task_ref: "task".into(), execution_id: "graph".into(),
+                mode: AgentAttemptMode::Review, reason: "review_window_unknown: review cut rebuild exhausted".into(), retryable: true };
+            super::apply_task_attempt_fail_with_origin(&mut program, &fail, trusted);
+            let task = &program.tasks["task"];
+            assert_eq!((task.failed_review_attempts, task.structural_review_stalls), if trusted { (0, 1) } else { (1, 0) });
+            assert_eq!(task.review_generation, 1);
+        }
+    }
+
+    #[test]
+    fn gb3_real_attempt_owner_classifies_and_bounds_both_modes() {
+        use harness_contract::agent_action::{AgentAttemptMode, TaskAttemptFailInput};
+        let cases = [
+            ("original composite child acquisitions incomplete", "composite_acquisitions_incomplete", true),
+            ("proof_actual_input_extent_unsupported", "physical_extent_unsupported", true),
+            ("original child receipt remains unsettled", "receipt_unsettled", true),
+            ("has no canonical durable receipt", "model_refusal", false),
+            ("ordinary model failure", "unclassified", false),
+        ];
+        for mode in [AgentAttemptMode::Execute, AgentAttemptMode::Review] {
+            for (reason, family, structural) in cases {
+                let mut program = program_with_objective("Read source");
+                super::apply_task_publish(&mut program, &envelope(), &publish_input("source evidence"), Some("task"));
+                for attempt in 1..=3 {
+                    let fail = TaskAttemptFailInput {
+                        task_ref: "task".into(), execution_id: format!("exec-{attempt}"), mode,
+                        reason: format!("{reason} (attempt {attempt})"), retryable: true,
+                    };
+                    super::apply_task_attempt_fail(&mut program, &fail);
+                    let task = &program.tasks["task"];
+                    let (model, stall) = match mode {
+                        AgentAttemptMode::Execute => (task.failed_attempts, task.structural_execution_stalls),
+                        AgentAttemptMode::Review => (task.failed_review_attempts, task.structural_review_stalls),
+                        _ => unreachable!(),
+                    };
+                    assert_eq!((model, stall), if structural { (0, attempt) } else { (attempt, 0) });
+                    assert_eq!(task.status == AgenticTaskStatus::Blocked, attempt == 3);
+                }
+                let note = program.tasks["task"].terminal_note.as_deref().expect("exhaustion note");
+                assert!(note.contains(&format!("failure_family={family}")), "{note}");
+                assert!(note.contains(if structural { "account=structural" } else { "account=model" }), "{note}");
+                assert!(note.contains(if structural { "model_attempts_charged=0" } else { "model_attempts_charged=3" }), "{note}");
+                assert!(note.contains(if structural { "structural_stalls=3" } else { "structural_stalls=0" }), "{note}");
+            }
+        }
+    }
+
+    /// 033 S7 (causal accounting): a structural stall is charged to the
+    /// structural account, not to the model's attempt budget, and the
+    /// exhaustion note names the family and both accounts so the root can
+    /// read on its own face that the exhaustion was not three model
+    /// failures.
+    ///
+    /// The old shape (033 pre-S7) was:
+    ///   task_blocked: review attempts exhausted at bounded 3; last failure:
+    ///   <prose>; remaining: not accepted
+    /// - no family, no account, and every structural stall charged to the
+    /// model.
+    #[test]
+    fn s7_structural_review_stalls_are_charged_to_the_structural_account() {
+        use harness_contract::agent_action::{AgentAttemptMode, TaskAttemptFailInput};
+        let structural = "agent action event store failed: proof_actual_input_extent_unsupported: actual read lacks an original physical extent; original child receipt remains unsettled";
+        let fail = |attempt: u8, reason: String| TaskAttemptFailInput {
+            task_ref: "task".to_string(),
+            execution_id: format!("exec-{attempt}"),
+            mode: AgentAttemptMode::Review,
+            reason,
+            retryable: true,
+        };
+        let mut program = program_with_objective("Read source");
+        super::apply_task_publish(&mut program, &envelope(), &publish_input("source evidence"), Some("task"));
+        for attempt in 1..=3 {
+            super::apply_task_attempt_fail(
+                &mut program,
+                &fail(attempt, format!("{structural} (attempt {attempt})")),
+            );
+        }
+        let task = &program.tasks["task"];
+        assert_eq!(task.status, AgenticTaskStatus::Blocked);
+        assert_eq!(
+            task.failed_review_attempts, 0,
+            "a structural stall is not the model's review budget"
+        );
+        assert_eq!(
+            task.structural_review_stalls, 3,
+            "the structural account carries the stall"
+        );
+        let note = task.terminal_note.as_deref().expect("the exhaustion is named");
+        assert!(note.contains("review attempts exhausted at bounded 3"), "{note}");
+        assert!(
+            note.contains("failure_family=physical_extent_unsupported"),
+            "the note names the family: {note}"
+        );
+        assert!(note.contains("account=structural"), "{note}");
+        assert!(note.contains("model_attempts_charged=0"), "{note}");
+        assert!(note.contains("structural_stalls=3"), "{note}");
+
+        // The model's own failures stay on the model's account.
+        let mut program = program_with_objective("Read source");
+        super::apply_task_publish(&mut program, &envelope(), &publish_input("source evidence"), Some("task"));
+        for attempt in 1..=3 {
+            super::apply_task_attempt_fail(
+                &mut program,
+                &fail(attempt, format!("distinct model failure {attempt}")),
+            );
+        }
+        let task = &program.tasks["task"];
+        assert_eq!(task.failed_review_attempts, 3, "the model's failures stay on the model account");
+        assert_eq!(task.structural_review_stalls, 0);
+        let note = task.terminal_note.as_deref().expect("the exhaustion is named");
+        assert!(note.contains("account=model"), "{note}");
+        assert!(note.contains("failure_family=unclassified"), "{note}");
+        assert!(note.contains("model_attempts_charged=3"), "{note}");
+    }
+
+    /// 033 S8: a submitted Task owes a review, the obligation enters the
+    /// compiled record, the two review measures sit side by side, and the
+    /// terminal obligation list names the family that blocked the Task.
+    ///
+    /// The old shape (033 pre-S8): a submission left the Task's obligation
+    /// record at the publish-time acceptance criteria only, the review left
+    /// no count the root could read, and a Task blocked by a structural fault
+    /// read as "not verifiable" with no obligation and no family.
+    #[test]
+    fn s8_a_submission_owes_a_review_and_the_terminal_list_names_the_family() {
+        let mut program = program_with_objective("Read source");
+        super::apply_task_publish(
+            &mut program,
+            &envelope(),
+            &publish_input("source evidence"),
+            Some("task"),
+        );
+        let before = program.tasks["task"].obligations.len();
+        let submit = AgentAction::TaskSubmit(
+            serde_json::from_value(serde_json::json!({
+                "task_ref": "task",
+                "artifact_refs": [],
+                "evidence_refs": [],
+                "unresolved": []
+            }))
+            .unwrap(),
+        );
+        let mut env = envelope();
+        env.action = submit.clone();
+        env.action_id = "submit-1".to_string();
+        super::apply_task_submit(&mut program, &env, match &submit {
+            AgentAction::TaskSubmit(input) => input,
+            _ => unreachable!("submit action"),
+        });
+        let task = &program.tasks["task"];
+        assert_eq!(
+            task.obligations.len(),
+            before,
+            "the review duty is not part of the acceptance record: it is a duty, not a criterion"
+        );
+        assert!(
+            task.review_obligation.is_some(),
+            "the submission owes a review: {:?}",
+            task.review_obligation
+        );
+        assert_eq!(
+            task.review_obligation.as_ref().map(|o| o.key.clone()),
+            Some(super::REVIEW_PENDING_OBLIGATION_KEY.to_string()),
+            "the review duty is named"
+        );
+        // A second submission does not duplicate the duty.
+        let mut env = envelope();
+        env.action = submit.clone();
+        env.action_id = "submit-2".to_string();
+        super::apply_task_submit(&mut program, &env, match &submit {
+            AgentAction::TaskSubmit(input) => input,
+            _ => unreachable!("submit action"),
+        });
+        assert!(
+            program.tasks["task"]
+                .review_obligation
+                .as_ref()
+                .map(|o| o.key.clone())
+                == Some(super::REVIEW_PENDING_OBLIGATION_KEY.to_string()),
+            "the review duty is compiled once"
+        );
+
+        // The terminal list: pending while the review is open.
+        let list = super::terminal_obligation_list(&program.tasks["task"]);
+        assert!(!list.is_empty(), "the terminal obligation list is not empty");
+        let review = list
+            .iter()
+            .find(|entry| entry["key"] == super::REVIEW_PENDING_OBLIGATION_KEY)
+            .expect("the review duty is in the terminal list");
+        assert_eq!(review["status"], "pending", "{review}");
+
+        // A structural block names its family instead of reading as the
+        // model's failure.
+        let mut blocked = program.tasks["task"].clone();
+        blocked.status = AgenticTaskStatus::Blocked;
+        blocked.terminal_note = Some(
+            "task_blocked: review attempts exhausted at bounded 3; failure_family=receipt_unsettled; account=structural; model_attempts_charged=0; structural_stalls=3; last failure: none recorded; remaining: not accepted".into(),
+        );
+        let list = super::terminal_obligation_list(&blocked);
+        let review = list
+            .iter()
+            .find(|entry| entry["key"] == super::REVIEW_PENDING_OBLIGATION_KEY)
+            .expect("the review obligation is in the terminal list");
+        assert_eq!(review["status"], "failed_structural", "{review}");
+        assert_eq!(review["failure_family"], "receipt_unsettled", "{review}");
+        // 033 S8 (BLOCK-3): the structural failure is marked on the review
+        // duty alone. The acceptance obligations keep their own derivation -
+        // a stall that stopped the review from being judged says nothing about
+        // whether the operator's criteria were met.
+        for entry in list
+            .iter()
+            .filter(|entry| entry["key"] != super::REVIEW_PENDING_OBLIGATION_KEY)
+        {
+            assert_eq!(
+                entry["status"], "pending",
+                "an acceptance obligation keeps its own derivation: {entry}"
+            );
+            assert!(
+                entry["failure_family"].is_null(),
+                "the structural family is not projected onto an acceptance obligation: {entry}"
+            );
+        }
+    }
+
+    /// 033 S8: the two review measures sit side by side - every applied
+    /// verdict (the old measure) and the applied verdicts that were an
+    /// acceptance (the new one).
+    #[test]
+    fn s8_b_the_two_review_measures_are_reported_side_by_side() {
+        let mut program = program_with_objective("Read source");
+        super::apply_task_publish(
+            &mut program,
+            &envelope(),
+            &publish_input("source evidence"),
+            Some("task"),
+        );
+        program.tasks.get_mut("task").unwrap().status = AgenticTaskStatus::Submitted;
+        let mut env = envelope();
+        env.action = AgentAction::TaskReview(k3_review("source evidence incomplete", &[], &[]));
+        env.action_id = "review-rework".to_string();
+        super::apply_task_review(&mut program, &env, match &env.action {
+            AgentAction::TaskReview(input) => input,
+            _ => unreachable!("review action"),
+        });
+        let task = &program.tasks["task"];
+        assert_eq!(task.reviews_applied, 1, "every applied verdict is counted");
+        assert_eq!(
+            task.reviews_accepted, 0,
+            "a rework is not an acceptance, and the old measure still counts it"
+        );
+    }
+
+    #[test]
+    fn k3_c_directives_are_durable_and_dispatch_inert() {
+        let mut program = program_with_objective("Read source");
+        super::apply_task_publish(&mut program, &envelope(), &publish_input("source evidence"), Some("task"));
+        let task = program.tasks.get_mut("task").unwrap();
+        task.status = AgenticTaskStatus::Submitted;
+        let review = k3_review("source evidence misses the quote", &["quote section absent"], &["re-read Cargo.toml and quote line 12"]);
+        let mut env = envelope();
+        env.action = AgentAction::TaskReview(review.clone());
+        env.action_id = "review-1".to_string();
+        let action_id = env.action_id.clone();
+        super::apply_task_review(&mut program, &env, &review);
+        let task = &program.tasks["task"];
+        assert_eq!(task.rework_directives.len(), 1, "K3: the gaps channel must be durable");
+        assert_eq!(task.rework_directives[0].source_action_id, action_id);
+        assert_eq!(task.rework_directives[0].gaps, vec!["quote section absent".to_string()]);
+        assert_eq!(
+            task.rework_directives[0].directed_actions,
+            vec!["re-read Cargo.toml and quote line 12".to_string()]
+        );
+        assert!(task.claimant.is_none() && task.active_attempts.is_empty(),
+            "a directive names next work; it never dispatches or claims by itself");
+        // A verdict without directives leaves the channel untouched (default
+        // payloads keep their exact old behaviour).
+        let plain = k3_review("source evidence accepted on rerun", &[], &[]);
+        program.tasks.get_mut("task").unwrap().status = AgenticTaskStatus::Submitted;
+        let mut env = envelope();
+        env.action = AgentAction::TaskReview(plain.clone());
+        env.action_id = "review-2".to_string();
+        super::apply_task_review(&mut program, &env, &plain);
+        assert_eq!(program.tasks["task"].rework_directives.len(), 1, "no gaps, no new directive");
+    }
+
 }

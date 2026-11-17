@@ -46,6 +46,42 @@ pub(super) fn result_refs_cover(
     })
 }
 
+/// The named failures a review's required writes left behind, in the
+/// closure projection's existing entry shape.
+///
+/// A required write that ran and failed is carried as its own named failure:
+/// it is never a satisfied requirement, and it is never an effect that did
+/// not happen. The entry names the write and points at the receipt that
+/// settled it, so the failure can be read plainly wherever the review's
+/// conclusion is recorded.
+///
+/// A review whose required writes did not fail names nothing: an empty list
+/// here is the ordinary case, and filling it would be noise.
+pub(crate) fn required_write_failure_entries(
+    snapshot: &ProofInputSnapshot,
+) -> Vec<serde_json::Value> {
+    snapshot
+        .terminal_failures
+        .iter()
+        .map(|failure| {
+            let effect_key = failure["effect_key"].as_str().unwrap_or_default();
+            serde_json::json!({
+                "name": format!("required_write_terminally_failed:{effect_key}"),
+                "passed": false,
+                "evidence": {
+                    "grade": failure["grade"],
+                    "effect_key": failure["effect_key"],
+                    "tool_use_id": failure["tool_use_id"],
+                    "tool_name": failure["tool_name"],
+                    "failure_class": failure["failure_class"],
+                    "error": failure["error"],
+                    "receipt_cursor": failure["receipt_cursor"],
+                },
+            })
+        })
+        .collect()
+}
+
 pub(crate) fn validate_review_coverage(
     goal: &GoalContract,
     program: &AgenticProgramProjection,
@@ -81,7 +117,8 @@ pub(crate) fn validate_review_coverage(
             .all(|(stream, revision)| {
                 snapshot.sources.iter().any(|source| {
                     &source.stream_id == stream && source.expected_revision == *revision
-                })
+                }) || snapshot.pre_authenticated_session_source.as_ref().is_some_and(|source|
+                    &source.stream_id == stream && source.expected_revision == *revision)
             })
     {
         return Err(ReviewCoverageError::Snapshot);
@@ -136,6 +173,138 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    /// R-E-1: a required write that ran and failed is named in the closure
+    /// entries, plainly, with the write and the receipt that settled it.
+    #[test]
+    fn r_e_1_a_terminally_failed_required_write_is_named_in_the_closure_entries() {
+        let snapshot = snapshot_with_terminal_failures(vec![serde_json::json!({
+            "grade": "required_write_terminally_failed",
+            "effect_key": "f24-failed-effect-key",
+            "tool_use_id": "f24-failed-call",
+            "tool_name": "task_review",
+            "failure_class": "terminal_failure",
+            "error": "Runtime did not execute 'task_review': the objective requirement was not met",
+            "receipt_cursor": 4242,
+        })]);
+        let entries = super::required_write_failure_entries(&snapshot);
+        assert_eq!(entries.len(), 1);
+        let entry = &entries[0];
+        assert_eq!(entry["evidence"]["grade"], "required_write_terminally_failed");
+        assert_eq!(entry["evidence"]["effect_key"], "f24-failed-effect-key");
+        assert_eq!(entry["evidence"]["tool_use_id"], "f24-failed-call");
+        assert_eq!(entry["evidence"]["receipt_cursor"], 4242);
+        assert_eq!(entry["passed"], false);
+        // Plain readable: the name carries the effect key as it is.
+        let name = entry["name"].as_str().unwrap_or_default();
+        assert!(name.contains("required_write_terminally_failed"), "{name}");
+        assert!(name.contains("f24-failed-effect-key"), "{name}");
+    }
+
+    /// R-E-1: the named failure reaches the durable projection, plainly
+    /// readable - and it is absent when no required write failed.
+    #[test]
+    fn r_e_1_the_named_failure_is_in_the_serialized_projection() {
+        let mut projection = crate::agentic::program::AgenticProgramProjection::empty(
+            "gc-program",
+            "gc-objective",
+        );
+        projection.required_write_failures = super::required_write_failure_entries(
+            &snapshot_with_terminal_failures(vec![serde_json::json!({
+                "grade": "required_write_terminally_failed",
+                "effect_key": "f24-failed-effect-key",
+                "tool_use_id": "f24-failed-call",
+                "tool_name": "task_review",
+                "failure_class": "terminal_failure",
+                "error": "Runtime did not execute 'task_review': the objective requirement was not met",
+                "receipt_cursor": 4242,
+            })]),
+        );
+        let encoded = serde_json::to_value(&projection).expect("the projection");
+        let entry = &encoded["required_write_failures"][0];
+        let name = entry["name"].as_str().unwrap_or_default();
+        assert!(name.contains("required_write_terminally_failed"), "{name}");
+        assert!(name.contains("f24-failed-effect-key"), "{name}");
+        assert_eq!(entry["passed"], false);
+        assert_eq!(entry["evidence"]["grade"], "required_write_terminally_failed");
+        assert_eq!(entry["evidence"]["effect_key"], "f24-failed-effect-key");
+        assert_eq!(entry["evidence"]["tool_use_id"], "f24-failed-call");
+        assert_eq!(entry["evidence"]["receipt_cursor"], 4242);
+        // The same entries again: the same durable facts give the same bytes.
+        let mut again = crate::agentic::program::AgenticProgramProjection::empty(
+            "gc-program",
+            "gc-objective",
+        );
+        again.required_write_failures = super::required_write_failure_entries(
+            &snapshot_with_terminal_failures(vec![serde_json::json!({
+                "grade": "required_write_terminally_failed",
+                "effect_key": "f24-failed-effect-key",
+                "tool_use_id": "f24-failed-call",
+                "tool_name": "task_review",
+                "failure_class": "terminal_failure",
+                "error": "Runtime did not execute 'task_review': the objective requirement was not met",
+                "receipt_cursor": 4242,
+            })]),
+        );
+        assert_eq!(
+            serde_json::to_string(&again).expect("the projection"),
+            serde_json::to_string(&projection).expect("the projection"),
+            "the same durable facts give the same projection bytes"
+        );
+        // Negative control: no required write failed, so no entry appears.
+        let mut quiet = crate::agentic::program::AgenticProgramProjection::empty(
+            "gc-program",
+            "gc-objective",
+        );
+        quiet.required_write_failures =
+            super::required_write_failure_entries(&snapshot_with_terminal_failures(vec![]));
+        let encoded = serde_json::to_value(&quiet).expect("the projection");
+        assert!(
+            encoded["required_write_failures"]
+                .as_array()
+                .is_some_and(|entries| entries.is_empty()),
+            "a review without a failed required write names nothing"
+        );
+    }
+
+    /// Negative control: a review whose required writes did not fail leaves
+    /// no failure entry - the closure is not filled with noise.
+    #[test]
+    fn r_e_1_a_review_without_a_failed_required_write_names_nothing() {
+        let snapshot = snapshot_with_terminal_failures(vec![]);
+        assert!(super::required_write_failure_entries(&snapshot).is_empty());
+    }
+
+    /// A snapshot whose required writes did not fail, or whose failures are
+    /// not the named ones, names nothing.
+    fn snapshot_with_terminal_failures(
+        terminal_failures: Vec<serde_json::Value>,
+    ) -> ProofInputSnapshot {
+        ProofInputSnapshot {
+            work_digest: "work".into(),
+            task_refs: vec![],
+            artifact_refs: vec![],
+            reviewer_execution_refs: ["review-run".into()].into_iter().collect(),
+            reviewer_packet: None,
+            retiring_optional_task_refs: Default::default(),
+            semantic_digest: "semantic".into(),
+            policy_digest: "policy".into(),
+            sources: vec![],
+            current_review_effect_key: None,
+            terminal_failures,
+            dependency_frame: super::super::policy::ConclusionMaterialDependencies::empty_for_coverage_test(),
+            pre_authenticated_session_source: None,
+            effects: super::super::policy::RootReviewPolicySnapshot {
+                digest: "effects".into(),
+                last_effect_cursor: 0,
+                additional_sources: vec![],
+                source: crate::ExpectedStreamRevision {
+                    stream_id: "source".into(),
+                    expected_revision: 1,
+                },
+            },
+        }
+    }
+
     #[test]
     fn shared_coverage_keeps_condition_identity_independence_and_read_boundaries() {
         let program = AgenticProgramProjection::empty("program", "objective");
@@ -169,11 +338,16 @@ mod tests {
             task_refs: vec![],
             artifact_refs: vec![],
             reviewer_execution_refs: ["review-run".into()].into_iter().collect(),
+            reviewer_packet: None,
             retiring_optional_task_refs: Default::default(),
             semantic_digest: "semantic".into(),
             policy_digest: "policy".into(),
             sources: vec![],
             current_review_effect_key: None,
+            // The coverage fixture has no required write that ran and failed.
+            terminal_failures: vec![],
+            dependency_frame: super::super::policy::ConclusionMaterialDependencies::empty_for_coverage_test(),
+            pre_authenticated_session_source: None,
             effects: super::super::policy::RootReviewPolicySnapshot {
                 digest: "effects".into(),
                 last_effect_cursor: 0,

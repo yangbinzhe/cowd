@@ -228,7 +228,9 @@ fn background_evolution_configuration_controls_real_registration_without_removin
                     )
                     .await
                     .unwrap();
-                assert_eq!(reports.len(), 2);
+                let mut projection_ids = reports.iter().map(|report| report.projection_id.as_str()).collect::<Vec<_>>();
+                projection_ids.sort_unstable();
+                assert_eq!(projection_ids, [crate::evolution::collaboration_experience::PROJECTOR_ID, crate::evolution::projector::PROJECTOR_ID]);
                 assert!(reports.iter().all(|report| report.last_error.is_none()));
                 let remaining = services
                     .event_reactor
@@ -667,6 +669,9 @@ async fn generalized_episode_set_executable_baseline() {
 
 #[tokio::test]
 async fn paired_skill_executes_native_writes_and_reads_in_distinct_runtime_leases() {
+    if crate::test_support::skip_if_env_absent("COWD_TEST_POSTGRES_URL") {
+        return;
+    }
     episode_set_pair(true).await;
 }
 
@@ -683,6 +688,7 @@ async fn episode_set_pair(real_skill: bool) {
         providers: std::collections::HashMap::from([(
             "test".into(),
             crate::config::ProviderConfig {
+                reasoning_effort: None,
                 name: "test".into(),
                 base_url: local.as_ref().map_or_else(
                     || "https://example.test/v1".into(),
@@ -957,8 +963,8 @@ async fn episode_set_pair(real_skill: bool) {
     let packets = captured_packets
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    assert_eq!(packets.len(), 2);
-    assert_ne!(packets[0].session_id(), packets[1].session_id());
+    let [_first_packets_964, _second_packets_964] = packets.as_slice() else { panic!("expected both original packets exactly once") };
+    assert_ne!(_first_packets_964.session_id(), packets[1].session_id());
     let isolated_output = |packet: &AgentTaskPacket| {
         packet
             .resource_scopes
@@ -1615,6 +1621,7 @@ impl crate::RuntimeExecutionHost for TestExecutionHost {
         request: &crate::RuntimeToolExecutionRequest,
     ) -> crate::RuntimeToolExecutionOutcome {
         crate::RuntimeToolExecutionOutcome {
+            pending_agent_batch: None,
             tool_use_id: request.tool_use_id.clone(),
             tool_name: request.tool_name.clone(),
             status: crate::RuntimeToolExecutionStatus::Executed,
@@ -2412,6 +2419,9 @@ fn explicit_toml_import_is_runtime_owned_and_never_enters_runnable_catalog() {
 
 #[test]
 fn builder_rejects_partial_session_port_sets() {
+    if crate::test_support::skip_if_env_absent("COWD_TEST_POSTGRES_URL") {
+        return;
+    }
     let temp = tempfile::tempdir().unwrap();
     let store = Arc::new(crate::test_support::session_store());
     let ports = crate::session_runtime_port::TestSessionPortAdapter::new(store);
@@ -2427,6 +2437,9 @@ fn builder_rejects_partial_session_port_sets() {
 
 #[tokio::test]
 async fn session_integrated_runtime_holds_all_autonomous_producers_until_recovery_release() {
+    if crate::test_support::skip_if_env_absent("COWD_TEST_POSTGRES_URL") {
+        return;
+    }
     let temp = tempfile::tempdir().unwrap();
     let workspace = temp.path().join("producer-gate");
     std::fs::create_dir_all(&workspace).unwrap();
@@ -2553,6 +2566,9 @@ async fn session_integrated_runtime_holds_all_autonomous_producers_until_recover
 
 #[test]
 fn workspace_builders_isolate_provider_tool_host_and_session_router() {
+    if crate::test_support::skip_if_env_absent("COWD_TEST_POSTGRES_URL") {
+        return;
+    }
     let temp = tempfile::tempdir().unwrap();
     let left_provider = Arc::new(crate::ProviderRegistry::empty());
     let right_provider = Arc::new(crate::ProviderRegistry::empty());
@@ -2621,6 +2637,9 @@ fn workspace_builders_isolate_provider_tool_host_and_session_router() {
 
 #[tokio::test]
 async fn due_schedule_submits_one_durable_handoff_graph_and_never_duplicates_it() {
+    if crate::test_support::skip_if_env_absent("COWD_TEST_POSTGRES_URL") {
+        return;
+    }
     let store = Arc::new(crate::test_support::session_store());
     let timestamp = chrono::Utc::now().to_rfc3339();
     store
@@ -2689,8 +2708,9 @@ async fn due_schedule_submits_one_durable_handoff_graph_and_never_duplicates_it(
         .dispatch_due_mission_schedules(due_at_ms)
         .await
         .unwrap();
-    assert_eq!(first.tick.claimed.len(), 1);
-    assert_eq!(first.submitted.len(), 1);
+    assert!(matches!(first.tick.claimed.as_slice(), [fire] if fire.mission_id == "schedule-mission" && fire.target_session_id == "scheduled-target" && fire.due_at_ms == due_at_ms));
+    assert!(matches!(first.submitted.as_slice(), [submission]
+        if submission.target_policy_binding.as_ref().is_some_and(|binding| binding.policy_revision == 7)));
     assert!(first.failed.is_empty());
     let binding = first.submitted[0]
         .target_policy_binding
@@ -2730,7 +2750,7 @@ async fn due_schedule_submits_one_durable_handoff_graph_and_never_duplicates_it(
         )
         .await
         .unwrap();
-    assert_eq!(target_outbox.len(), 1);
+    assert!(matches!(target_outbox.as_slice(), [item] if item.session_id == "scheduled-target"));
     assert_eq!(target_outbox[0].session_id, "scheduled-target");
 
     services
@@ -3248,9 +3268,8 @@ async fn startup_recovery_rejects_missing_lineage_before_any_durable_mutation() 
         .await
         .expect("invalid lineage is reported, not executed");
 
-    assert_eq!(report.errors.len(), 1);
-    assert_eq!(report.records.len(), 1);
-    assert_eq!(report.records[0].action, "invalid_lineage");
+    assert!(matches!(report.errors.as_slice(), [error] if error.graph_id == "missing-lineage-recovery"));
+    assert!(matches!(report.records.as_slice(), [record] if record.action == "invalid_lineage"));
     assert_eq!(report.notified_graphs, 0);
     assert_eq!(
         services
@@ -3264,6 +3283,9 @@ async fn startup_recovery_rejects_missing_lineage_before_any_durable_mutation() 
 
 #[tokio::test]
 async fn startup_recovery_does_not_resolve_handoff_for_an_excluded_session() {
+    if crate::test_support::skip_if_env_absent("COWD_TEST_POSTGRES_URL") {
+        return;
+    }
     let temp = tempfile::tempdir().unwrap();
     let workspace = temp.path().join("workspace");
     let cowd_home = temp.path().join("home");
@@ -3302,7 +3324,6 @@ async fn startup_recovery_does_not_resolve_handoff_for_an_excluded_session() {
     source.id = "excluded-handoff-source".to_string();
     crate::test_support::attach_execution_graph_lineage(&mut source);
     source.lineage.as_mut().unwrap().session_id = "failed-session".to_string();
-    source.revision = 1;
     let mut node = ExecutionNodeSpec::new(
         ExecutionNodeKind::SessionDispatch,
         crate::SESSION_DISPATCH_EXECUTOR,
@@ -3312,23 +3333,20 @@ async fn startup_recovery_does_not_resolve_handoff_for_an_excluded_session() {
         ),
     );
     node.id = "excluded-handoff-node".to_string();
+    node.idempotency_key = "excluded-handoff-node".to_string();
     source.nodes.push(node);
-    source.node_statuses.insert(
-        "excluded-handoff-node".to_string(),
+    let mut source = services.commit_service().register_graph(source).unwrap().graph;
+    for status in [
+        ExecutionNodeStatus::Ready,
+        ExecutionNodeStatus::Running,
         ExecutionNodeStatus::WaitingExternal,
-    );
-    services
-        .event_store()
-        .append(crate::RuntimeEventInput {
-            stream_id: source.id.clone(),
-            scope: crate::RuntimeEventScope::ExecutionGraph,
-            kind: "execution_graph.planned".to_string(),
-            status: Some("waiting".to_string()),
-            actor: Some("handoff-recovery-fixture".to_string()),
-            refs: Vec::new(),
-            payload: serde_json::json!({"event": "planned", "graph": source}),
-        })
-        .unwrap();
+    ] {
+        source = services
+            .commit_service()
+            .transition_node(&source, "excluded-handoff-node", status, None, Vec::new())
+            .unwrap()
+            .graph;
+    }
     services
         .event_store()
         .append(crate::RuntimeEventInput {
@@ -3411,6 +3429,7 @@ async fn canonical_agent_task_flows_through_runner_and_commits_once() {
         providers: std::collections::HashMap::from([(
             "test".into(),
             crate::config::ProviderConfig {
+                reasoning_effort: None,
                 name: "test".into(),
                 base_url: "https://example.test/v1".into(),
                 api_key: "test".into(),
@@ -3538,7 +3557,9 @@ async fn canonical_agent_task_flows_through_runner_and_commits_once() {
     );
     assert_eq!(binding.data_lease.session_id, packet.session_id());
     assert_eq!(binding.data_lease.task_id, packet.task_id());
-    assert_eq!(services.agent_runtime().events(packet.agent_id()).len(), 3);
+    let events = services.agent_runtime().events(packet.agent_id());
+    assert_eq!(events.iter().map(|event| event.kind.as_str()).collect::<Vec<_>>(), ["agent.prepared", "agent.running", "agent.terminal"]);
+    assert!(events.iter().all(|event| event.agent_id == packet.agent_id()));
 }
 
 #[tokio::test]
@@ -3550,6 +3571,7 @@ async fn one_definition_can_drive_eight_isolated_runtime_instances() {
         providers: std::collections::HashMap::from([(
             "test".into(),
             crate::config::ProviderConfig {
+                reasoning_effort: None,
                 name: "test".into(),
                 base_url: "https://example.test/v1".into(),
                 api_key: "test".into(),
@@ -3720,15 +3742,15 @@ async fn one_definition_can_drive_eight_isolated_runtime_instances() {
         "terminal Agent projections must leave bounded hot state"
     );
     let snapshots = agent_ids
-        .into_iter()
+        .iter()
         .map(|agent_id| {
             services
                 .agent_runtime()
-                .get(&agent_id)
+                .get(agent_id)
                 .expect("durable terminal Agent projection")
         })
         .collect::<Vec<_>>();
-    assert_eq!(snapshots.len(), 8);
+    assert_eq!(snapshots.iter().map(|snapshot| &snapshot.agent_id).collect::<Vec<_>>(), agent_ids.iter().collect::<Vec<_>>());
     let bindings = snapshots
         .iter()
         .map(|snapshot| snapshot.binding.as_ref().expect("durable binding"))
@@ -3742,7 +3764,7 @@ async fn one_definition_can_drive_eight_isolated_runtime_instances() {
         .iter()
         .map(|binding| binding.instance.instance_id.as_str())
         .collect::<std::collections::BTreeSet<_>>();
-    assert_eq!(instances.len(), 8);
+    assert_eq!(instances.len(), bindings.len(), "each original agent must have a distinct instance");
     assert!(max_active.load(Ordering::SeqCst) >= 2);
 }
 
@@ -4030,7 +4052,7 @@ fn r1_bounded_history_session_timeline_scopes_and_commit_ties() {
     let first = reader
         .session_timeline_events("timeline-session", None, 1)
         .expect("first page").events;
-    assert_eq!(first.len(), 1);
+    assert!(matches!(first.as_slice(), [item] if item.transaction_index == 0));
     assert_eq!(first[0].transaction_index, 0);
     let second = reader
         .session_timeline_events(
@@ -4039,7 +4061,7 @@ fn r1_bounded_history_session_timeline_scopes_and_commit_ties() {
             1,
         )
         .expect("second page").events;
-    assert_eq!(second.len(), 1);
+    assert!(matches!(second.as_slice(), [item] if item.transaction_index == 1));
     assert_eq!(second[0].transaction_index, 1);
     assert_eq!(second[0].kind, "timeline.second");
     assert!(reader
@@ -4479,6 +4501,7 @@ async fn mixed_lease_start_442(
                 .map_err(|error| error.to_string())
         })
         .unwrap();
+    services.model_step_executor().prepare_original_binding(&admitted).unwrap();
     let graph = services
         .commit_service()
         .bind_and_start_nodes(
@@ -4995,9 +5018,8 @@ async fn r453_timeline_expanded_bodies_continue_without_loss_or_foreign_records(
             Some((last.commit_cursor, last.transaction_index)),
             100,
         )?;
-        assert_eq!(second.events.len(), 1);
+        assert!(matches!(second.events.as_slice(), [event] if event.event_id == expected[1]));
         assert!(!second.has_more);
-        assert_eq!(second.events[0].event_id, expected[1]);
         assert_eq!(
             second.events[0].payload["graph"]["nodes"][0]["payload_ref"],
             body
@@ -5070,9 +5092,8 @@ fn r453_timeline_byte_short_transaction_resumes_by_exact_position_and_rejects_si
     let first = reader
         .session_timeline_events("r453-tied", None, 100)
         .unwrap();
-    assert_eq!(first.events.len(), 1);
+    assert!(matches!(first.events.as_slice(), [event] if event.event_id == receipt.event_ids[0]));
     assert!(first.has_more);
-    assert_eq!(first.events[0].event_id, receipt.event_ids[0]);
     assert_eq!(
         first.complete_through_cursor,
         receipt.commit_cursor - 1,
@@ -5081,9 +5102,8 @@ fn r453_timeline_byte_short_transaction_resumes_by_exact_position_and_rejects_si
     let second = reader
         .session_timeline_events("r453-tied", Some((receipt.commit_cursor, 0)), 100)
         .unwrap();
-    assert_eq!(second.events.len(), 1);
+    assert!(matches!(second.events.as_slice(), [event] if event.event_id == receipt.event_ids[1]));
     assert!(!second.has_more);
-    assert_eq!(second.events[0].event_id, receipt.event_ids[1]);
     assert_eq!(second.complete_through_cursor, receipt.commit_cursor);
     store
         .append(crate::RuntimeEventInput {
@@ -5103,4 +5123,1729 @@ fn r453_timeline_byte_short_transaction_resumes_by_exact_position_and_rejects_si
             .unwrap()
             .starts_with("HistoryBudgetExceeded:")
     );
+}
+
+/// A Session query port that answers with one durable input claim.
+///
+/// The owner recovery under test reuses the claim and the control the
+/// original ingress installed, and asks the durable Session whether that
+/// claim is still the live one. This port answers exactly that question and
+/// nothing else.
+struct A8SessionQueryPort {
+    records: std::sync::Mutex<Vec<crate::RuntimeSessionInputRecord>>,
+    admission: std::sync::Mutex<Option<crate::RuntimeSessionInputAdmission>>,
+    returned_record: std::sync::Mutex<Option<crate::RuntimeSessionInputRecord>>,
+}
+
+impl A8SessionQueryPort {
+    fn new(records: Vec<crate::RuntimeSessionInputRecord>) -> Arc<Self> {
+        Arc::new(Self { records: std::sync::Mutex::new(records), admission: std::sync::Mutex::new(None), returned_record: std::sync::Mutex::new(None) })
+    }
+
+    fn set(&self, records: Vec<crate::RuntimeSessionInputRecord>) {
+        *self.records.lock().unwrap() = records;
+    }
+
+    fn set_admission(&self, admission: Option<crate::RuntimeSessionInputAdmission>) {
+        *self.admission.lock().unwrap() = admission;
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::SessionRuntimeQueryPort for A8SessionQueryPort {
+    async fn cancellation_authorization_by_id(
+        &self,
+        _request: &crate::session_runtime_port::RuntimeSessionCancellationAuthorizationRequest,
+    ) -> Result<Option<session::SessionDomainEvent>, session::SessionError> {
+        Ok(None)
+    }
+
+    fn history_reader(&self) -> Option<Arc<session::SessionHistoryReader>> {
+        None
+    }
+
+    async fn session_record(
+        &self,
+        _session_id: &str,
+    ) -> Result<Option<crate::RuntimeSessionRecord>, session::SessionError> {
+        Ok(None)
+    }
+
+    async fn runtime_input(
+        &self,
+        request_id: &str,
+    ) -> Result<Option<crate::RuntimeSessionInputRecord>, session::SessionError> {
+        if let Some(record) = self.returned_record.lock().unwrap().clone() {
+            return Ok(Some(record));
+        }
+        Ok(self
+            .records
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|record| record.request_id == request_id)
+            .cloned())
+    }
+
+    async fn runtime_input_by_input_id(
+        &self,
+        _input_id: &str,
+    ) -> Result<Option<crate::RuntimeSessionInputRecord>, session::SessionError> {
+        Ok(None)
+    }
+
+    async fn pending_session_input_applications(
+        &self,
+        _session_id: &str,
+        _session_generation: u64,
+        _after: Option<(usize, String)>,
+        _limit: usize,
+    ) -> Result<Vec<crate::RuntimeSessionInputRecord>, session::SessionError> {
+        Ok(Vec::new())
+    }
+
+    async fn input_admission(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<crate::RuntimeSessionInputAdmission>, session::SessionError> {
+        Ok(self.admission.lock().unwrap().as_ref()
+            .filter(|admission| admission.session_id == session_id).cloned())
+    }
+
+    async fn evidence_access(
+        &self,
+        _session_id: &str,
+        _evidence_id: &str,
+    ) -> Result<Option<harness_contract::context::EvidenceAccessRef>, session::SessionError> {
+        Ok(None)
+    }
+
+    async fn session_evidence_receipt_ids(
+        &self,
+        _session_id: &str,
+        _limit: usize,
+    ) -> Result<Vec<String>, session::SessionError> {
+        Ok(Vec::new())
+    }
+}
+
+fn a8_original_ingress() -> crate::TurnIngressRef {
+    crate::TurnIngressRef {
+        request_id: "request-a8".into(),
+        turn_id: "turn-a8".into(),
+        message_id: "message-a8".into(),
+        session_id: "session-a8".into(),
+        primary_task_id: "task-a8".into(),
+        root_task_id: "task-a8".into(),
+        session_generation: 4,
+        input_sequence: 9,
+        claim_owner: "session-a8".into(),
+        claim_token: "claim-token-a8".into(),
+        claim_revision: 2,
+        handoff_id: None,
+    }
+}
+
+/// The durable input claim of the original root turn, still live.
+fn a8_live_input_record(ingress: &crate::TurnIngressRef) -> crate::RuntimeSessionInputRecord {
+    crate::RuntimeSessionInputRecord {
+        input_id: "input-a8".into(),
+        request_id: ingress.request_id.clone(),
+        turn_id: ingress.turn_id.clone(),
+        message_id: ingress.message_id.clone(),
+        session_id: ingress.session_id.clone(),
+        sequence: ingress.input_sequence as usize,
+        session_generation: ingress.session_generation,
+        decision: harness_contract::turn::InputRoutingDecision::StartNewTurn,
+        target_turn_id: Some(ingress.turn_id.clone()),
+        classification_json: None,
+        task_route_hint: None,
+        status: crate::RuntimeSessionInputStatus::Running,
+        runtime_commit_cursor: None,
+        attempts: 1,
+        next_attempt_at_ms: 0,
+        claim_owner: Some(ingress.claim_owner.clone()),
+        claim_token: Some(ingress.claim_token.clone()),
+        claim_fence_epoch: Some(ingress.claim_revision),
+        claim_expires_at_ms: Some(crate::tool_invocation::now_ms() + 600_000),
+        failure_class: None,
+        last_error: None,
+        revision: ingress.claim_revision,
+        created_at_ms: 0,
+        updated_at_ms: 0,
+        terminal_at_ms: None,
+        runtime_options_json: None,
+        application_receipt: None,
+    }
+}
+
+/// The root graph ends and its bus lease is retired, but the original Session
+/// turn still owes its members an owner. The owner is recovered from the same
+/// claim and the same original turn control, never from a new one.
+#[tokio::test]
+async fn a8_original_session_owner_survives_the_root_bus_lease() {
+    let temp = tempfile::tempdir().unwrap();
+    let workspace = temp.path().join("workspace");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let services = RuntimeServices::test_builder(temp.path(), workspace)
+        .build()
+        .expect("runtime services");
+    let ingress = a8_original_ingress();
+    let execution_id = crate::session_ingress_graph_id(
+        &ingress.session_id,
+        &ingress.request_id,
+        &ingress.turn_id,
+    );
+    let control = services
+        .create_turn_cancellation_control(&execution_id, &ingress)
+        .expect("original turn control");
+    services.live_execution_store.record_queued(
+        &ingress.session_id,
+        execution_id.clone(),
+        ingress.turn_id.clone(),
+    );
+    let lease = services
+        .bind_active_execution_bus(execution_id.clone(), crate::CowdEventBus::new())
+        .expect("root execution bus");
+    let port = A8SessionQueryPort::new(vec![a8_live_input_record(&ingress)]);
+    let fence = crate::SessionExecutionFence::from_claim(
+        Arc::clone(&port) as Arc<dyn crate::SessionRuntimeQueryPort>,
+        ingress.request_id.clone(),
+        ingress.session_id.clone(),
+        ingress.session_generation,
+        ingress.input_sequence as usize,
+        ingress.claim_owner.clone(),
+        ingress.claim_token.clone(),
+    )
+    .expect("durable execution fence");
+    let claim = lease
+        .install_session_fence(
+            &ingress,
+            fence,
+            Arc::clone(&control),
+            crate::SessionInputStream::new(ingress.session_id.clone()),
+            Arc::new(crate::conversation::OriginalTurnInputControl::default()),
+            crate::permissions::PermissionPolicy::new(crate::permissions::PermissionMode::ReadOnly),
+        )
+        .expect("original Session fence");
+    // The root graph ends: its active execution bus lease is retired.
+    drop(lease);
+
+    let recovered = services
+        .recovered_original_conclusion_owner(
+            &ingress.session_id,
+            &ingress.turn_id,
+            &execution_id,
+            "agentic-graph:a8-member",
+        )
+        .await
+        .expect("the original Session owner is recovered from the original fence");
+    // The recovered owner carries the very claim the ingress installed, so its
+    // claim token is not lost and its commit_wins identity is unchanged.
+    assert!(Arc::ptr_eq(&recovered.claim, &claim));
+    assert_eq!(recovered.claim.session_id(), ingress.session_id);
+    assert_eq!(recovered.claim.turn_id(), ingress.turn_id);
+
+    // Another root execution never inherits that owner.
+    assert!(services
+        .recovered_original_conclusion_owner(
+            &ingress.session_id,
+            &ingress.turn_id,
+            "session-ingress-graph:00000000000000000000000000000000",
+            "agentic-graph:a8-member",
+        )
+        .await
+        .is_none());
+    // Another turn of that Session never inherits it either.
+    assert!(services
+        .recovered_original_conclusion_owner(
+            &ingress.session_id,
+            "turn-other",
+            &execution_id,
+            "agentic-graph:a8-member",
+        )
+        .await
+        .is_none());
+    // A Session without an original fence has no owner to recover.
+    assert!(services
+        .recovered_original_conclusion_owner(
+            "session-other",
+            &ingress.turn_id,
+            &execution_id,
+            "agentic-graph:a8-member",
+        )
+        .await
+        .is_none());
+
+    // A finished original turn keeps no recoverable owner: the Session no
+    // longer holds that turn's live claim.
+    port.set(vec![crate::RuntimeSessionInputRecord {
+        status: crate::RuntimeSessionInputStatus::Completed,
+        claim_expires_at_ms: None,
+        ..a8_live_input_record(&ingress)
+    }]);
+    assert!(services
+        .recovered_original_conclusion_owner(
+            &ingress.session_id,
+            &ingress.turn_id,
+            &execution_id,
+            "agentic-graph:a8-member",
+        )
+        .await
+        .is_none());
+
+    // The original turn's own cancellation still refuses the recovery.
+    port.set(vec![a8_live_input_record(&ingress)]);
+    control.signal_operational();
+    assert!(services
+        .recovered_original_conclusion_owner(
+            &ingress.session_id,
+            &ingress.turn_id,
+            &execution_id,
+            "agentic-graph:a8-member",
+        )
+        .await
+        .is_none());
+}
+
+/// Install one original Session fence on a fresh root execution bus.
+fn a8_install_session_fence(
+    services: &RuntimeServices,
+    port: &Arc<A8SessionQueryPort>,
+    ingress: &crate::TurnIngressRef,
+) -> Arc<crate::execution_core::services::OriginalSessionClaim> {
+    let execution_id = crate::session_ingress_graph_id(
+        &ingress.session_id,
+        &ingress.request_id,
+        &ingress.turn_id,
+    );
+    let control = services
+        .create_turn_cancellation_control(&execution_id, ingress)
+        .expect("original turn control");
+    services.live_execution_store.record_queued(
+        &ingress.session_id,
+        execution_id.clone(),
+        ingress.turn_id.clone(),
+    );
+    let lease = services
+        .bind_active_execution_bus(execution_id.clone(), crate::CowdEventBus::new())
+        .expect("root execution bus");
+    let fence = crate::SessionExecutionFence::from_claim(
+        Arc::clone(port) as Arc<dyn crate::SessionRuntimeQueryPort>,
+        ingress.request_id.clone(),
+        ingress.session_id.clone(),
+        ingress.session_generation,
+        ingress.input_sequence as usize,
+        ingress.claim_owner.clone(),
+        ingress.claim_token.clone(),
+    )
+    .expect("durable execution fence");
+    let claim = lease
+        .install_session_fence(
+            ingress,
+            fence,
+            Arc::clone(&control),
+            crate::SessionInputStream::new(ingress.session_id.clone()),
+            Arc::new(crate::conversation::OriginalTurnInputControl::default()),
+            crate::permissions::PermissionPolicy::new(crate::permissions::PermissionMode::ReadOnly),
+        )
+        .expect("original Session fence");
+    // The root graph ends: its active execution bus lease is retired.
+    drop(lease);
+    claim
+}
+
+/// The retained original Session owner is released by identity.
+///
+/// The next turn for the same Session replaces the retained entry. A release
+/// that belongs to the previous turn must not remove the new turn's owner.
+#[tokio::test]
+async fn a8_retained_owner_release_is_identity_qualified() {
+    let temp = tempfile::tempdir().unwrap();
+    let workspace = temp.path().join("workspace");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let services = RuntimeServices::test_builder(temp.path(), workspace)
+        .build()
+        .expect("runtime services");
+    let first = a8_original_ingress();
+    let second = crate::TurnIngressRef {
+        request_id: "request-b8".into(),
+        turn_id: "turn-b8".into(),
+        message_id: "message-b8".into(),
+        session_generation: 5,
+        input_sequence: 10,
+        claim_token: "claim-token-b8".into(),
+        claim_revision: 3,
+        ..first.clone()
+    };
+    let port = A8SessionQueryPort::new(vec![
+        a8_live_input_record(&first),
+        a8_live_input_record(&second),
+    ]);
+    let first_claim = a8_install_session_fence(&services, &port, &first);
+    let second_claim = a8_install_session_fence(&services, &port, &second);
+    let second_execution_id = crate::session_ingress_graph_id(
+        &second.session_id,
+        &second.request_id,
+        &second.turn_id,
+    );
+
+    // The previous turn releases its owner. The retained entry now belongs to
+    // the new turn, so that owner must survive.
+    services.release_original_session_owner(&first.session_id, &first_claim);
+    assert!(services
+        .recovered_original_conclusion_owner(
+            &second.session_id,
+            &second.turn_id,
+            &second_execution_id,
+            "agentic-graph:a8-member",
+        )
+        .await
+        .is_some());
+
+    // The new turn releases its own owner, and that owner is gone.
+    services.release_original_session_owner(&second.session_id, &second_claim);
+    assert!(services
+        .recovered_original_conclusion_owner(
+            &second.session_id,
+            &second.turn_id,
+            &second_execution_id,
+            "agentic-graph:a8-member",
+        )
+        .await
+        .is_none());
+}
+
+/// Write one Program action into the Runtime's durable store with the
+/// production Program event shape.
+fn a8_append_program_action(
+    services: &RuntimeServices,
+    program_id: &str,
+    envelope: &harness_contract::agent_action::AgentActionEnvelope,
+    entity_ref: Option<&str>,
+) {
+    let mut payload = serde_json::json!({ "envelope": envelope });
+    if let Some(entity_ref) = entity_ref {
+        payload["entity_ref"] = serde_json::json!(entity_ref);
+    }
+    services
+        .event_store()
+        .append(crate::RuntimeEventInput {
+            stream_id: format!("agentic-program:{program_id}"),
+            scope: crate::RuntimeEventScope::Program,
+            kind: "agentic.action_applied".into(),
+            status: Some("applied".into()),
+            actor: Some(envelope.actor.actor_id.clone()),
+            refs: vec![],
+            payload,
+        })
+        .expect("durable Program action");
+}
+
+/// The Program owner identity of one Session turn.
+fn a8_program_actor(
+    program_id: &str,
+    objective_id: &str,
+    session_id: &str,
+    turn_id: &str,
+    root_execution_id: &str,
+) -> harness_contract::agent_action::AgentActorBinding {
+    harness_contract::agent_action::AgentActorBinding {
+        original_execution: None,
+        objective_id: objective_id.into(),
+        program_id: program_id.into(),
+        session_id: session_id.into(),
+        turn_id: turn_id.into(),
+        root_execution_id: Some(root_execution_id.into()),
+        required_team_count: 0,
+        exact_team_count: None,
+        objective_summary: "a8 owner recovery fixture".into(),
+        model_lease: "test".into(),
+        permission_ceiling: Some(harness_contract::policy::PermissionMode::ReadOnly),
+        resource_scopes: vec![],
+        actor_id: format!("root:{session_id}"),
+        kind: harness_contract::agent_action::AgentActorKind::Root,
+        execution_id: None,
+        team_id: None,
+        agent_id: None,
+    }
+}
+
+/// Write one Program with its member attempts into the Runtime's durable
+/// store, and read it back through the production projection.
+///
+/// The Program writer inside the action service is broken at the baseline
+/// (123 baseline failures share its "new root action requires original
+/// physical execution" refusal), so this fixture writes the same durable
+/// events that writer writes and lets the production reducer and the
+/// production read path build the projection. Every member is registered by
+/// the production dispatch event, and every settled member by the
+/// production attempt-fail event.
+///
+/// Returns the Program id, which is the one the Session turn derives.
+fn a8_program_with_members(
+    services: &RuntimeServices,
+    session_id: &str,
+    turn_id: &str,
+    root_execution_id: &str,
+    members: &[(&str, bool)],
+) -> String {
+    use harness_contract::agent_action::{
+        AgentAction, AgentActionEnvelope, AgentAttemptMode, AgentInviteInput,
+        TaskAttemptDispatchInput, TaskAttemptFailInput, TeamCreateInput,
+    };
+    let objective_id = harness_contract::agent_action::root_objective_id(session_id, turn_id);
+    let program_id = harness_contract::agent_action::program_id_for_objective(&objective_id);
+    let actor = a8_program_actor(&program_id, &objective_id, session_id, turn_id, root_execution_id);
+    let envelope = |action_id: &str, action: AgentAction| AgentActionEnvelope {
+        action_id: action_id.into(),
+        actor: actor.clone(),
+        expected_revision: None,
+        action,
+    };
+    if !services.event_store().list_stream(&format!("agentic-program:{program_id}"))
+        .unwrap().iter().any(|event| event.kind == "agentic.program_opened") {
+    services
+        .event_store()
+        .append(crate::RuntimeEventInput {
+            stream_id: format!("agentic-program:{program_id}"),
+            scope: crate::RuntimeEventScope::Program,
+            kind: "agentic.program_opened".into(),
+            status: Some("open".into()),
+            actor: Some(actor.actor_id.clone()),
+            refs: vec![],
+            payload: serde_json::json!({
+                "program_id": program_id,
+                "objective_id": objective_id,
+                "session_id": session_id,
+                "turn_id": turn_id,
+                "root_execution_id": root_execution_id,
+                "required_team_count": 0,
+                "team_count_contract_version": 1,
+                "objective_summary": "a8 owner recovery fixture",
+                "model_lease": "test",
+                "resource_scopes": [],
+            }),
+        })
+        .expect("durable Program opening");
+    }
+    a8_append_program_action(
+        services,
+        &program_id,
+        &envelope(
+            "a8-team",
+            AgentAction::TeamCreate(TeamCreateInput {
+                name: "Delivery".into(),
+                mission: "deliver independent evidence".into(),
+                objective: None,
+            }),
+        ),
+        Some("a8-team"),
+    );
+    a8_append_program_action(
+        services,
+        &program_id,
+        &envelope(
+            "a8-agent",
+            AgentAction::AgentInvite(AgentInviteInput {
+                team_ref: "a8-team".into(),
+                role: "worker".into(),
+                mission: "work the Task".into(),
+                required_capabilities: vec!["read".into()],
+                existing_agent_ref: None,
+                definition_ref: None,
+                model_profile_ref: None,
+                expertise_hints: vec![],
+                execution_requirements: vec![],
+            }),
+        ),
+        Some("a8-agent"),
+    );
+    a8_append_program_action(
+        services,
+        &program_id,
+        &envelope(
+            "a8-task",
+            AgentAction::TaskPublish(
+                serde_json::from_value(serde_json::json!({
+                    "team_ref": "a8-team",
+                    "title": "Evidence",
+                    "objective": "collect cited evidence",
+                    "acceptance": "independent cited evidence",
+                }))
+                .expect("task input"),
+            ),
+        ),
+        Some("a8-task"),
+    );
+    for (index, (member, unsettled)) in members.iter().enumerate() {
+        // The first live member holds the Task claim, so that the claim
+        // branch of the per-member fact is exercised as well.
+        let mode = if index == 0 {
+            AgentAttemptMode::Execute
+        } else {
+            AgentAttemptMode::Review
+        };
+        let mut supervisor = actor.clone();
+        supervisor.kind = harness_contract::agent_action::AgentActorKind::Supervisor;
+        supervisor.actor_id = "runtime.program-supervisor".into();
+        supervisor.execution_id = Some((*member).into());
+        supervisor.agent_id = None;
+        supervisor.team_id = None;
+        let dispatch = AgentActionEnvelope {
+            action_id: format!("runtime-attempt-dispatch:{program_id}:a8-task:{member}"),
+            actor: supervisor,
+            expected_revision: None,
+            action: AgentAction::TaskAttemptDispatch(TaskAttemptDispatchInput {
+                task_ref: "a8-task".into(),
+                execution_id: (*member).into(),
+                agent_ref: "a8-agent".into(),
+                membership_id: "membership:a8-agent:a8-team".into(),
+                mode,
+                generation: 0,
+            }),
+        };
+        a8_append_program_action(services, &program_id, &dispatch, None);
+        if !unsettled {
+            let mut supervisor = actor.clone();
+            supervisor.kind = harness_contract::agent_action::AgentActorKind::Supervisor;
+            supervisor.actor_id = "runtime.program-supervisor".into();
+            supervisor.execution_id = Some((*member).into());
+            supervisor.agent_id = None;
+            supervisor.team_id = None;
+            let fail = AgentActionEnvelope {
+                action_id: format!("runtime-attempt-fail:{program_id}:a8-task:{member}"),
+                actor: supervisor,
+                expected_revision: None,
+                action: AgentAction::TaskAttemptFail(TaskAttemptFailInput {
+                    task_ref: "a8-task".into(),
+                    execution_id: (*member).into(),
+                    mode,
+                    reason: "a8 member settled".into(),
+                    retryable: false,
+                }),
+            };
+            a8_append_program_action(services, &program_id, &fail, None);
+        }
+    }
+    program_id
+}
+
+/// Settle every member attempt of the fixture Program.
+fn a8_settle_member_attempts(
+    services: &RuntimeServices,
+    session_id: &str,
+    turn_id: &str,
+    root_execution_id: &str,
+    members: &[&str],
+) {
+    use harness_contract::agent_action::{
+        AgentAction, AgentActionEnvelope, TaskAttemptFailInput,
+    };
+    let objective_id = harness_contract::agent_action::root_objective_id(session_id, turn_id);
+    let program_id = harness_contract::agent_action::program_id_for_objective(&objective_id);
+    let actor = a8_program_actor(&program_id, &objective_id, session_id, turn_id, root_execution_id);
+    for member in members {
+        // Re-dispatch is valid here only when every retained attempt names the same identity.
+        let mut original_dispatch = None;
+        for event in services.event_store().list_stream(&format!("agentic-program:{program_id}"))
+            .expect("member Program journal").iter().filter(|event| event.kind == "agentic.action_applied")
+        {
+            let envelope: AgentActionEnvelope = serde_json::from_value(event.payload["envelope"].clone())
+                .expect("Program action envelope");
+            if let AgentAction::TaskAttemptDispatch(input) = envelope.action {
+                if input.execution_id != *member { continue; }
+                assert_eq!(envelope.actor.execution_id.as_deref(), Some(*member));
+                assert_eq!(envelope.actor.session_id, session_id);
+                assert_eq!(envelope.actor.turn_id, turn_id);
+                assert_eq!(envelope.actor.program_id, program_id);
+                assert_eq!(envelope.actor.root_execution_id.as_deref(), Some(root_execution_id));
+                let identity = (input.task_ref, input.mode, input.generation, input.agent_ref, input.membership_id);
+                if let Some(previous) = &original_dispatch {
+                    assert_eq!(previous, &identity, "ambiguous original member attempt");
+                }
+                original_dispatch = Some(identity);
+            }
+        }
+        let (task_ref, mode, _, _, _) = original_dispatch.expect("member original dispatch");
+        let mut supervisor = actor.clone();
+        supervisor.kind = harness_contract::agent_action::AgentActorKind::Supervisor;
+        supervisor.actor_id = "runtime.program-supervisor".into();
+        supervisor.execution_id = Some((*member).into());
+        supervisor.agent_id = None;
+        supervisor.team_id = None;
+        let fail = AgentActionEnvelope {
+            action_id: format!("runtime-attempt-fail:{program_id}:a8-task:{member}"),
+            actor: supervisor,
+            expected_revision: None,
+            action: AgentAction::TaskAttemptFail(TaskAttemptFailInput {
+                task_ref,
+                execution_id: (*member).into(),
+                mode,
+                reason: "a8 member settled".into(),
+                retryable: false,
+            }),
+        };
+        a8_append_program_action(services, &program_id, &fail, None);
+    }
+}
+
+/// A store backend whose one Program journal read can be made to fail.
+///
+/// The recovery gate has to tell "this turn registered no member work" apart
+/// from "this turn's journal could not be read", and only the second state
+/// keeps a retained owner. The ephemeral backend never fails a read, so this
+/// wrapper is the only way to reach that state in-process. Every other read
+/// is forwarded untouched.
+struct A8JournalFaultBackend {
+    inner: crate::runtime_event_store::EphemeralRuntimeEventStore,
+    failed_stream: std::sync::Mutex<Option<String>>,
+}
+
+impl std::fmt::Debug for A8JournalFaultBackend {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_struct("A8JournalFaultBackend").finish_non_exhaustive()
+    }
+}
+
+impl A8JournalFaultBackend {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            inner: crate::runtime_event_store::EphemeralRuntimeEventStore::new(),
+            failed_stream: std::sync::Mutex::new(None),
+        })
+    }
+
+    /// Fail every read of one stream until the fault is cleared.
+    fn fail_stream(&self, stream_id: &str) {
+        *self.failed_stream.lock().unwrap() = Some(stream_id.to_string());
+    }
+
+    fn clear_fault(&self) {
+        *self.failed_stream.lock().unwrap() = None;
+    }
+}
+
+impl crate::RuntimeEventStoreBackend for A8JournalFaultBackend {
+    fn list_stream(&self, stream_id: &str) -> Result<Vec<crate::DurableRuntimeEvent>, String> {
+        if self.failed_stream.lock().unwrap().as_deref() == Some(stream_id) {
+            return Err(format!("injected Program journal read failure for {stream_id}"));
+        }
+        self.inner.list_stream(stream_id)
+    }
+
+fn recent_event_lines(&self, stream_id: &str, references: &[crate::RuntimeEventRef], through_cursor: u64, max_events: usize, max_bytes: usize) -> Result<Vec<harness_contract::mission::MissionControlEventLine>, String> {
+        self.inner.recent_event_lines(stream_id, references, through_cursor, max_events, max_bytes)
+    }
+    fn append(&self, input: crate::RuntimeEventInput) -> Result<crate::DurableRuntimeEvent, String> {
+        self.inner.append(input)
+    }
+    fn append_transaction(&self, request: crate::AppendTransactionRequest) -> crate::RuntimeEventStoreResult<crate::AppendTransactionReceipt> {
+        self.inner.append_transaction(request)
+    }
+    fn append_transaction_with_terminal(&self, request: crate::AppendTransactionRequest, terminal: crate::SessionTerminalInput) -> crate::RuntimeEventStoreResult<crate::AppendTransactionReceipt> {
+        self.inner.append_transaction_with_terminal(request, terminal)
+    }
+    fn consume_verified_decision_lease(&self, lease_id: &str, principal_id: &str, review_id: &str, action: &str, scope: &str, evidence_digest: &str, credential_epoch: u64, consumed_at_ms: u64) -> crate::RuntimeEventStoreResult<()> {
+        self.inner.consume_verified_decision_lease(lease_id, principal_id, review_id, action, scope, evidence_digest, credential_epoch, consumed_at_ms)
+    }
+    fn append_transaction_with_verified_decision_lease(&self, request: crate::AppendTransactionRequest, lease: &crate::VerifiedDecisionLease) -> crate::RuntimeEventStoreResult<crate::AppendTransactionReceipt> {
+        self.inner.append_transaction_with_verified_decision_lease(request, lease)
+    }
+    fn append_batch_if_revision(&self, stream_id: String, expected_revision: u64, transaction_id: String, events: Vec<crate::RuntimeTransactionEventInput>) -> crate::RuntimeEventStoreResult<crate::AppendTransactionReceipt> {
+        self.inner.append_batch_if_revision(stream_id, expected_revision, transaction_id, events)
+    }
+    fn events_after_cursor(&self, cursor: u64, max_commits: usize) -> crate::RuntimeEventStoreResult<Vec<crate::CommittedEventBatch>> {
+        self.inner.events_after_cursor(cursor, max_commits)
+    }
+    fn projection_scan_page(&self, cursor: u64, interest: &crate::RuntimeProjectionInterest, max_commits: usize, max_events: usize, max_bytes: usize) -> crate::RuntimeEventStoreResult<crate::RuntimeProjectionScanPage> {
+        self.inner.projection_scan_page(cursor, interest, max_commits, max_events, max_bytes)
+    }
+    fn projection_checkpoint(&self, projection_id: &str) -> crate::RuntimeEventStoreResult<Option<crate::RuntimeProjectionCheckpoint>> {
+        self.inner.projection_checkpoint(projection_id)
+    }
+    fn projection_checkpoints_with_prefix(&self, prefix: &str) -> crate::RuntimeEventStoreResult<Vec<crate::RuntimeProjectionCheckpoint>> {
+        self.inner.projection_checkpoints_with_prefix(prefix)
+    }
+    fn put_projection_checkpoint(&self, projection_id: &str, source_cursor: u64, payload: &serde_json::Value, updated_at_ms: u64) -> crate::RuntimeEventStoreResult<crate::RuntimeProjectionCheckpoint> {
+        self.inner.put_projection_checkpoint(projection_id, source_cursor, payload, updated_at_ms)
+    }
+    fn compare_and_put_projection_checkpoint(&self, projection_id: &str, source_cursor: u64, expected_revision: u64, payload: &serde_json::Value, updated_at_ms: u64) -> crate::RuntimeEventStoreResult<crate::RuntimeProjectionCheckpoint> {
+        self.inner.compare_and_put_projection_checkpoint(projection_id, source_cursor, expected_revision, payload, updated_at_ms)
+    }
+    fn compare_and_repair_projection_checkpoint(&self, projection_id: &str, source_cursor: u64, expected_revision: u64, payload: &serde_json::Value, updated_at_ms: u64) -> crate::RuntimeEventStoreResult<crate::RuntimeProjectionCheckpoint> {
+        self.inner.compare_and_repair_projection_checkpoint(projection_id, source_cursor, expected_revision, payload, updated_at_ms)
+    }
+    fn delete_projection_checkpoint(&self, projection_id: &str) -> crate::RuntimeEventStoreResult<bool> {
+        self.inner.delete_projection_checkpoint(projection_id)
+    }
+    fn event_by_idempotency_key(&self, stream_id: &str, idempotency_key: &str) -> crate::RuntimeEventStoreResult<Option<crate::RuntimeEventRecord>> {
+        self.inner.event_by_idempotency_key(stream_id, idempotency_key)
+    }
+    fn stream_revision(&self, stream_id: &str) -> crate::RuntimeEventStoreResult<u64> {
+        self.inner.stream_revision(stream_id)
+    }
+    fn position_page(&self, scope: crate::RuntimeEventScope, identity: &str, kind: Option<&str>, after: Option<(u64, u32)>, through_cursor: u64, max_events: usize, max_bytes: usize) -> Result<Vec<crate::DurableRuntimeEvent>, String> {
+        self.inner.position_page(scope, identity, kind, after, through_cursor, max_events, max_bytes)
+    }
+    fn list_stream_after(&self, stream_id: &str, after_sequence: u64, through_sequence: u64, max_events: usize, max_bytes: usize) -> Result<Vec<crate::DurableRuntimeEvent>, String> {
+        self.inner.list_stream_after(stream_id, after_sequence, through_sequence, max_events, max_bytes)
+    }
+    fn list_stream_before(&self, stream_id: &str, through_sequence: u64, max_events: usize, max_bytes: usize) -> Result<Vec<crate::DurableRuntimeEvent>, String> {
+        self.inner.list_stream_before(stream_id, through_sequence, max_events, max_bytes)
+    }
+    fn count_stream_kinds(&self, stream_id: &str, kinds: &[&str], through_sequence: u64) -> Result<u64, String> {
+        self.inner.count_stream_kinds(stream_id, kinds, through_sequence)
+    }
+    fn list_stream_page_desc(&self, stream_id: &str, limit: usize, offset: usize) -> Result<Vec<crate::DurableRuntimeEvent>, String> {
+        self.inner.list_stream_page_desc(stream_id, limit, offset)
+    }
+    fn stream_event_count(&self, stream_id: &str) -> Result<usize, String> {
+        self.inner.stream_event_count(stream_id)
+    }
+    fn execution_events_for_session(&self, session_id: &str, after_position: Option<(u64, u32)>, limit: usize) -> Result<Vec<crate::DurableRuntimeEvent>, String> {
+        self.inner.execution_events_for_session(session_id, after_position, limit)
+    }
+    fn events_for_root_execution(&self, root_execution_id: &str, after_position: Option<(u64, u32)>, limit: usize) -> Result<Vec<crate::DurableRuntimeEvent>, String> {
+        self.inner.events_for_root_execution(root_execution_id, after_position, limit)
+    }
+    fn events_for_root_execution_kind(&self, root_execution_id: &str, kind: &str, after_position: Option<(u64, u32)>, limit: usize) -> Result<Vec<crate::DurableRuntimeEvent>, String> {
+        self.inner.events_for_root_execution_kind(root_execution_id, kind, after_position, limit)
+    }
+    fn events_for_activity(&self, activity_id: &str, after_position: Option<(u64, u32)>, limit: usize) -> Result<Vec<crate::DurableRuntimeEvent>, String> {
+        self.inner.events_for_activity(activity_id, after_position, limit)
+    }
+    fn list_scope(&self, scope: crate::RuntimeEventScope, limit: usize) -> Result<Vec<crate::DurableRuntimeEvent>, String> {
+        self.inner.list_scope(scope, limit)
+    }
+    fn list_scope_page_asc(&self, scope: crate::RuntimeEventScope, after_position: Option<(u64, u32)>, limit: usize) -> Result<Vec<crate::DurableRuntimeEvent>, String> {
+        self.inner.list_scope_page_asc(scope, after_position, limit)
+    }
+    fn list_scope_stream_prefix_page_asc(&self, scope: crate::RuntimeEventScope, stream_prefix: &str, after_position: Option<(u64, u32)>, limit: usize) -> Result<Vec<crate::DurableRuntimeEvent>, String> {
+        self.inner.list_scope_stream_prefix_page_asc(scope, stream_prefix, after_position, limit)
+    }
+    fn list_scope_kind_page_asc(&self, scope: crate::RuntimeEventScope, kind: &str, after_position: Option<(u64, u32)>, limit: usize) -> Result<Vec<crate::DurableRuntimeEvent>, String> {
+        self.inner.list_scope_kind_page_asc(scope, kind, after_position, limit)
+    }
+    fn stream_ids_for_scope(&self, scope: crate::RuntimeEventScope) -> crate::RuntimeEventStoreResult<Vec<String>> {
+        self.inner.stream_ids_for_scope(scope)
+    }
+    fn stream_ids_for_scope_kind_at_sequence(&self, scope: crate::RuntimeEventScope, kind: &str, sequence: u64) -> crate::RuntimeEventStoreResult<Vec<String>> {
+        self.inner.stream_ids_for_scope_kind_at_sequence(scope, kind, sequence)
+    }
+    fn stream_ids_for_scope_kind_at_sequence_page(&self, scope: crate::RuntimeEventScope, kind: &str, sequence: u64, after: Option<(u64, String)>, limit: usize) -> crate::RuntimeEventStoreResult<Vec<(String, u64)>> {
+        self.inner.stream_ids_for_scope_kind_at_sequence_page(scope, kind, sequence, after, limit)
+    }
+    fn latest_stream_statuses_for_scope_kind_at_sequence(&self, scope: crate::RuntimeEventScope, kind: &str, sequence: u64) -> crate::RuntimeEventStoreResult<Vec<(String, Option<String>)>> {
+        self.inner.latest_stream_statuses_for_scope_kind_at_sequence(scope, kind, sequence)
+    }
+    fn all_events(&self, limit: usize) -> Result<Vec<crate::DurableRuntimeEvent>, String> {
+        self.inner.all_events(limit)
+    }
+    fn latest_for_stream(&self, stream_id: &str) -> Result<Option<crate::DurableRuntimeEvent>, String> {
+        self.inner.latest_for_stream(stream_id)
+    }
+    fn latest_for_stream_kind(&self, stream_id: &str, kind: &str) -> Result<Option<crate::DurableRuntimeEvent>, String> {
+        self.inner.latest_for_stream_kind(stream_id, kind)
+    }
+    fn enqueue_session_terminal(&self, terminal_id: &str, message_id: &str, session_id: &str, commit_cursor: u64, payload_ref: &str) -> crate::RuntimeEventStoreResult<crate::RuntimeSessionOutboxRecord> {
+        self.inner.enqueue_session_terminal(terminal_id, message_id, session_id, commit_cursor, payload_ref)
+    }
+    fn claim_session_terminals(&self, worker_id: &str, now_ms: u64, lease_ms: u64, limit: usize) -> crate::RuntimeEventStoreResult<Vec<crate::RuntimeSessionOutboxRecord>> {
+        self.inner.claim_session_terminals(worker_id, now_ms, lease_ms, limit)
+    }
+    fn session_terminal(&self, terminal_id: &str) -> crate::RuntimeEventStoreResult<Option<crate::RuntimeSessionOutboxRecord>> {
+        self.inner.session_terminal(terminal_id)
+    }
+    fn has_unsettled_session_terminals(&self, session_id: &str) -> crate::RuntimeEventStoreResult<bool> {
+        self.inner.has_unsettled_session_terminals(session_id)
+    }
+    fn session_terminal_for_execution(&self, session_id: &str, execution_id: &str, turn_id: &str) -> crate::RuntimeEventStoreResult<Option<crate::RuntimeSessionOutboxRecord>> {
+        self.inner.session_terminal_for_execution(session_id, execution_id, turn_id)
+    }
+    fn materialized_session_terminals_after(&self, session_id: &str, after_commit_cursor: u64, limit: usize) -> crate::RuntimeEventStoreResult<Vec<crate::RuntimeSessionOutboxRecord>> {
+        self.inner.materialized_session_terminals_after(session_id, after_commit_cursor, limit)
+    }
+    fn session_terminal_health(&self) -> crate::RuntimeEventStoreResult<crate::RuntimeSessionOutboxHealth> {
+        self.inner.session_terminal_health()
+    }
+    fn blocked_session_terminals(&self, limit: usize) -> crate::RuntimeEventStoreResult<Vec<crate::RuntimeSessionOutboxRecord>> {
+        self.inner.blocked_session_terminals(limit)
+    }
+    fn retry_session_terminal(&self, terminal_id: &str, actor: &str, reason: &str, now_ms: u64) -> crate::RuntimeEventStoreResult<crate::RuntimeSessionOutboxRecord> {
+        self.inner.retry_session_terminal(terminal_id, actor, reason, now_ms)
+    }
+    fn adopt_session_terminal_fence(&self, request: &crate::RuntimeSessionTerminalFenceAdoption) -> crate::RuntimeEventStoreResult<crate::RuntimeSessionOutboxRecord> {
+        self.inner.adopt_session_terminal_fence(request)
+    }
+    fn ack_session_terminal(&self, terminal_id: &str, worker_id: &str, expected_revision: u64, now_ms: u64) -> crate::RuntimeEventStoreResult<crate::RuntimeSessionOutboxRecord> {
+        self.inner.ack_session_terminal(terminal_id, worker_id, expected_revision, now_ms)
+    }
+    fn suppress_session_terminal(&self, terminal_id: &str, worker_id: &str, expected_revision: u64, reason: &str, now_ms: u64) -> crate::RuntimeEventStoreResult<crate::RuntimeSessionOutboxRecord> {
+        self.inner.suppress_session_terminal(terminal_id, worker_id, expected_revision, reason, now_ms)
+    }
+    fn fail_session_terminal(&self, terminal_id: &str, worker_id: &str, expected_revision: u64, class: crate::RuntimeSessionOutboxFailureClass, error: &str, retry_at_ms: u64, max_attempts: u32, now_ms: u64) -> crate::RuntimeEventStoreResult<crate::RuntimeSessionOutboxRecord> {
+        self.inner.fail_session_terminal(terminal_id, worker_id, expected_revision, class, error, retry_at_ms, max_attempts, now_ms)
+    }
+}
+
+/// Build Runtime services whose Program journal read can be failed on demand.
+fn a8_wc_faulting_services(
+    root: &std::path::Path,
+    backend: &Arc<A8JournalFaultBackend>,
+) -> Arc<RuntimeServices> {
+    let workspace = root.join("workspace");
+    std::fs::create_dir_all(&workspace).unwrap();
+    RuntimeServices::builder(root, workspace)
+        .non_durable_backends_for_testing(root)
+        .runtime_event_store(Arc::new(crate::RuntimeEventStore::from_backend(Arc::clone(
+            backend,
+        )
+            as Arc<dyn crate::RuntimeEventStoreBackend>)))
+        .build()
+        .expect("runtime services")
+}
+
+/// The Program journal stream of one Session turn.
+fn a8_wc_program_stream(session_id: &str, turn_id: &str) -> String {
+    let objective_id = harness_contract::agent_action::root_objective_id(session_id, turn_id);
+    format!(
+        "agentic-program:{}",
+        harness_contract::agent_action::program_id_for_objective(&objective_id)
+    )
+}
+
+/// The root graph ended and its bus lease is retired, and the root ingress
+/// execution reached its terminal: the durable Session claim is gone.
+fn a8_wc_terminal_root_claim(
+    services: &RuntimeServices,
+    port: &Arc<A8SessionQueryPort>,
+    ingress: &crate::TurnIngressRef,
+) -> (Arc<crate::execution_core::services::OriginalSessionClaim>, String) {
+    let execution_id = crate::session_ingress_graph_id(
+        &ingress.session_id,
+        &ingress.request_id,
+        &ingress.turn_id,
+    );
+    let claim = a8_install_session_fence(services, port, ingress);
+    port.set(vec![crate::RuntimeSessionInputRecord {
+        status: crate::RuntimeSessionInputStatus::Completed,
+        claim_expires_at_ms: None,
+        ..a8_live_input_record(ingress)
+    }]);
+    (claim, execution_id)
+}
+
+
+
+/// A member that is still running recovers the original Session owner after
+/// the root graph ended and the root ingress claim is already terminal.
+///
+/// The recovery returns the very claim the ingress installed, so the claim
+/// token and the commit_wins identity are not lost.
+#[tokio::test]
+async fn a8_wc_an_unsettled_member_recovers_the_original_owner_after_the_root_claim_ended() {
+    let temp = tempfile::tempdir().unwrap();
+    let workspace = temp.path().join("workspace");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let services = RuntimeServices::test_builder(temp.path(), workspace)
+        .build()
+        .expect("runtime services");
+    let ingress = a8_original_ingress();
+    let port = A8SessionQueryPort::new(vec![a8_live_input_record(&ingress)]);
+    let (claim, execution_id) = a8_wc_terminal_root_claim(&services, &port, &ingress);
+    a8_program_with_members(
+        &services,
+        &ingress.session_id,
+        &ingress.turn_id,
+        &execution_id,
+        &[("agentic-graph:live-member", true)],
+    );
+
+    let recovered = services
+        .recovered_original_conclusion_owner(
+            &ingress.session_id,
+            &ingress.turn_id,
+            &execution_id,
+            "agentic-graph:live-member",
+        )
+        .await
+        .expect("the unsettled member recovers the original Session owner");
+    // The recovered owner is the one the ingress installed: same claim, same
+    // claim token, same original turn control. Nothing is minted here.
+    assert!(Arc::ptr_eq(&recovered.claim, &claim));
+    assert_eq!(recovered.claim.session_id(), ingress.session_id);
+    assert_eq!(recovered.claim.turn_id(), ingress.turn_id);
+}
+
+/// A member with no unsettled work of its own is still refused, in the very
+/// shape where the root ingress claim is already terminal.
+///
+/// The refusal wording of an ownerless delegation is unchanged by the
+/// recovery: it is pinned here so a later change cannot rewrite what an
+/// ownerless delegation says. A member whose attempt already settled, and a
+/// member that was never dispatched, own no live work and get no owner.
+#[tokio::test]
+async fn a8_wc_a_member_without_unsettled_work_is_still_refused() {
+    let temp = tempfile::tempdir().unwrap();
+    let workspace = temp.path().join("workspace");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let services = RuntimeServices::test_builder(temp.path(), workspace)
+        .build()
+        .expect("runtime services");
+    let ingress = a8_original_ingress();
+    let port = A8SessionQueryPort::new(vec![a8_live_input_record(&ingress)]);
+    let (_claim, execution_id) = a8_wc_terminal_root_claim(&services, &port, &ingress);
+    a8_program_with_members(
+        &services,
+        &ingress.session_id,
+        &ingress.turn_id,
+        &execution_id,
+        &[
+            ("agentic-graph:settled-member", false),
+            ("agentic-graph:live-member", true),
+        ],
+    );
+
+    // The member whose attempt already settled owns no live work, so it gets
+    // no owner.
+    assert!(services
+        .recovered_original_conclusion_owner(
+            &ingress.session_id,
+            &ingress.turn_id,
+            &execution_id,
+            "agentic-graph:settled-member",
+        )
+        .await
+        .is_none());
+    // A member that was never registered owns no live work either.
+    assert!(services
+        .recovered_original_conclusion_owner(
+            &ingress.session_id,
+            &ingress.turn_id,
+            &execution_id,
+            "agentic-graph:absent-member",
+        )
+        .await
+        .is_none());
+    // Another Session turn never inherits this owner, settled or not.
+    assert!(services
+        .recovered_original_conclusion_owner(
+            &ingress.session_id,
+            "turn-other",
+            &execution_id,
+            "agentic-graph:live-member",
+        )
+        .await
+        .is_none());
+    // A turn whose durable Program journal cannot be read has no fact to
+    // recover from. This is a different turn of the same Session: its own
+    // owner is retained, its claim is terminal, and there is simply no
+    // attempt record behind it. An unreadable fact is not permission.
+    let journal_free = crate::TurnIngressRef {
+        request_id: "request-a8-nojournal".into(),
+        turn_id: "turn-a8-nojournal".into(),
+        message_id: "message-a8-nojournal".into(),
+        session_generation: 4,
+        input_sequence: 11,
+        claim_token: "claim-token-a8-nojournal".into(),
+        claim_revision: 2,
+        ..ingress.clone()
+    };
+    let journal_free_execution = crate::session_ingress_graph_id(
+        &journal_free.session_id,
+        &journal_free.request_id,
+        &journal_free.turn_id,
+    );
+    let journal_free_claim = a8_install_session_fence(&services, &port, &journal_free);
+    port.set(vec![
+        crate::RuntimeSessionInputRecord {
+            status: crate::RuntimeSessionInputStatus::Completed,
+            claim_expires_at_ms: None,
+            ..a8_live_input_record(&ingress)
+        },
+        crate::RuntimeSessionInputRecord {
+            status: crate::RuntimeSessionInputStatus::Completed,
+            claim_expires_at_ms: None,
+            ..a8_live_input_record(&journal_free)
+        },
+    ]);
+    assert!(
+        !services.session_has_unsettled_attempts(
+            &journal_free.session_id,
+            &journal_free.turn_id
+        ),
+        "this turn has no readable Program journal at all"
+    );
+    assert!(services
+        .recovered_original_conclusion_owner(
+            &journal_free.session_id,
+            &journal_free.turn_id,
+            &journal_free_execution,
+            "agentic-graph:live-member",
+        )
+        .await
+        .is_none());
+    // The write side moves the same way, in the same refusal: with no
+    // readable journal nobody in the turn is unsettled, so the release that
+    // refusal ran already removed the retained owner. The explicit release
+    // is therefore a no-op, and the window stays shut.
+    assert!(!services.release_original_session_owner_after_terminal(
+        &journal_free.session_id,
+        &journal_free_claim
+    ));
+    assert!(services
+        .recovered_original_conclusion_owner(
+            &journal_free.session_id,
+            &journal_free.turn_id,
+            &journal_free_execution,
+            "agentic-graph:live-member",
+        )
+        .await
+        .is_none());
+
+    // The ownerless delegation keeps its own refusal, word for word.
+    let source = include_str!("../../agentic/action_invocation.rs");
+    assert!(
+        source.contains("\"unknown: original delegated Session owner unavailable\""),
+        "the ownerless delegation refusal text must not change"
+    );
+}
+
+/// A large batch gives every live member an owner, and leaks none.
+///
+/// No live member of a batch is left ownerless, and no member whose attempt
+/// already settled receives one. The recovery window of the Session stays
+/// open while any member is still unsettled, and the first member that asks
+/// after the last settlement finds it closed.
+#[tokio::test]
+async fn a8_wc_a_large_batch_keeps_every_live_member_an_owner_and_leaks_none() {
+    let temp = tempfile::tempdir().unwrap();
+    let workspace = temp.path().join("workspace");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let services = RuntimeServices::test_builder(temp.path(), workspace)
+        .build()
+        .expect("runtime services");
+    let ingress = a8_original_ingress();
+    let port = A8SessionQueryPort::new(vec![a8_live_input_record(&ingress)]);
+    let (claim, execution_id) = a8_wc_terminal_root_claim(&services, &port, &ingress);
+    let live: Vec<String> = (0..6).map(|index| format!("agentic-graph:live-{index}")).collect();
+    let settled: Vec<String> = (0..2)
+        .map(|index| format!("agentic-graph:settled-{index}"))
+        .collect();
+    let mut members: Vec<(String, bool)> = live
+        .iter()
+        .map(|member| (member.clone(), true))
+        .chain(settled.iter().map(|member| (member.clone(), false)))
+        .collect();
+    members.sort_by(|left, right| right.0.cmp(&left.0));
+    let members: Vec<(&str, bool)> = members
+        .iter()
+        .map(|(member, unsettled)| (member.as_str(), *unsettled))
+        .collect();
+    a8_program_with_members(
+        &services,
+        &ingress.session_id,
+        &ingress.turn_id,
+        &execution_id,
+        &members,
+    );
+
+    // Every live member of the batch recovers the original owner.
+    for member in &live {
+        assert!(
+            services
+                .recovered_original_conclusion_owner(
+                    &ingress.session_id,
+                    &ingress.turn_id,
+                    &execution_id,
+                    member,
+                )
+                .await
+                .is_some(),
+            "the live member {member} must keep an owner"
+        );
+    }
+    // No settled member receives one.
+    for member in &settled {
+        assert!(
+            services
+                .recovered_original_conclusion_owner(
+                    &ingress.session_id,
+                    &ingress.turn_id,
+                    &execution_id,
+                    member,
+                )
+                .await
+                .is_none(),
+            "the settled member {member} must not receive an owner"
+        );
+    }
+
+    // The recovery window of the Session does not close while a member is
+    // still unsettled, so the write side cannot take the owner away from a
+    // member the read side still serves.
+    assert!(!services.release_original_session_owner_after_terminal(
+        &ingress.session_id,
+        &claim
+    ));
+    assert!(services
+        .recovered_original_conclusion_owner(
+            &ingress.session_id,
+            &ingress.turn_id,
+            &execution_id,
+            &live[0],
+        )
+        .await
+        .is_some());
+
+    // With the last member settled, the window closes with the turn, and the
+    // next member that asks about it finds nothing to recover.
+    let live_refs: Vec<&str> = live.iter().map(String::as_str).collect();
+    a8_settle_member_attempts(
+        &services,
+        &ingress.session_id,
+        &ingress.turn_id,
+        &execution_id,
+        &live_refs,
+    );
+    assert!(services
+        .recovered_original_conclusion_owner(
+            &ingress.session_id,
+            &ingress.turn_id,
+            &execution_id,
+            &live[0],
+        )
+        .await
+        .is_none());
+    // That refusal already closed the window: nobody in the turn is
+    // unsettled any more, so the release it ran removed the retained owner.
+    // The explicit release is therefore a no-op, and the window stays shut.
+    assert!(!services.release_original_session_owner_after_terminal(
+        &ingress.session_id,
+        &claim
+    ));
+    assert!(services
+        .recovered_original_conclusion_owner(
+            &ingress.session_id,
+            &ingress.turn_id,
+            &execution_id,
+            &live[0],
+        )
+        .await
+        .is_none());
+}
+
+/// Once the recovery window has closed, no later attempt registration can
+/// reopen it.
+///
+/// The window boundary is the attempt settlement. A member dispatched after
+/// the turn's members have all settled belongs to a turn that is over, and
+/// the retained owner for it was already removed: the entry itself is the
+/// boundary, so a fresh dispatch record grants nothing.
+#[tokio::test]
+async fn a8_wc_a_closed_window_admits_no_later_attempt_registration() {
+    let temp = tempfile::tempdir().unwrap();
+    let workspace = temp.path().join("workspace");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let services = RuntimeServices::test_builder(temp.path(), workspace)
+        .build()
+        .expect("runtime services");
+    let ingress = a8_original_ingress();
+    let port = A8SessionQueryPort::new(vec![a8_live_input_record(&ingress)]);
+    let (claim, execution_id) = a8_wc_terminal_root_claim(&services, &port, &ingress);
+    // Every member of the turn settles before the turn's terminal close, so
+    // the window closes with the turn itself.
+    a8_program_with_members(
+        &services,
+        &ingress.session_id,
+        &ingress.turn_id,
+        &execution_id,
+        &[("agentic-graph:settled-member", false)],
+    );
+    assert!(services.release_original_session_owner_after_terminal(
+        &ingress.session_id,
+        &claim
+    ));
+
+    // A later attempt registration for the same turn is still recorded
+    // durably, and it changes nothing about the closed window.
+    a8_program_with_members(
+        &services,
+        &ingress.session_id,
+        &ingress.turn_id,
+        &execution_id,
+        &[("agentic-graph:late-member", true)],
+    );
+    assert!(
+        services.session_has_unsettled_attempts(&ingress.session_id, &ingress.turn_id),
+        "the fixture records the later attempt as unsettled"
+    );
+    assert!(services
+        .recovered_original_conclusion_owner(
+            &ingress.session_id,
+            &ingress.turn_id,
+            &execution_id,
+            "agentic-graph:late-member",
+        )
+        .await
+        .is_none());
+    // The removal stays identity qualified: a release that belongs to the
+    // previous turn cannot remove a later turn's retained owner.
+    services.release_original_session_owner(&ingress.session_id, &claim);
+}
+
+/// A Program journal that cannot be read is no fact at all.
+///
+/// The read side refuses the member, and the write side keeps the retained
+/// owner rather than removing an owner it cannot reason about. A turn with no
+/// Program journal at all is the opposite case: that one removes.
+#[tokio::test]
+async fn a8_wc_an_unreadable_program_journal_keeps_the_owner_and_refuses_the_member() {
+    let temp = tempfile::tempdir().unwrap();
+    let backend = A8JournalFaultBackend::new();
+    let services = a8_wc_faulting_services(temp.path(), &backend);
+    let ingress = a8_original_ingress();
+    let port = A8SessionQueryPort::new(vec![a8_live_input_record(&ingress)]);
+    let (claim, execution_id) = a8_wc_terminal_root_claim(&services, &port, &ingress);
+    a8_program_with_members(
+        &services,
+        &ingress.session_id,
+        &ingress.turn_id,
+        &execution_id,
+        &[("agentic-graph:live-member", true)],
+    );
+    let program_stream = a8_wc_program_stream(&ingress.session_id, &ingress.turn_id);
+
+    // The journal is readable, so the live member has its owner.
+    assert!(services
+        .recovered_original_conclusion_owner(
+            &ingress.session_id,
+            &ingress.turn_id,
+            &execution_id,
+            "agentic-graph:live-member",
+        )
+        .await
+        .is_some());
+
+    // The journal read now fails. That is no fact: the member is refused.
+    backend.fail_stream(&program_stream);
+    assert!(services
+        .recovered_original_conclusion_owner(
+            &ingress.session_id,
+            &ingress.turn_id,
+            &execution_id,
+            "agentic-graph:live-member",
+        )
+        .await
+        .is_none());
+    // The write side does not remove an owner it cannot reason about.
+    assert!(!services.release_original_session_owner_after_terminal(
+        &ingress.session_id,
+        &claim
+    ));
+    // The retained owner is still there: once the journal reads again, the
+    // same member is served again.
+    backend.clear_fault();
+    assert!(services
+        .recovered_original_conclusion_owner(
+            &ingress.session_id,
+            &ingress.turn_id,
+            &execution_id,
+            "agentic-graph:live-member",
+        )
+        .await
+        .is_some());
+    // A turn with no Program journal at all is the other state: it removes.
+    let empty = crate::TurnIngressRef {
+        request_id: "request-a8-noprogram".into(),
+        turn_id: "turn-a8-noprogram".into(),
+        message_id: "message-a8-noprogram".into(),
+        session_generation: 4,
+        input_sequence: 12,
+        claim_token: "claim-token-a8-noprogram".into(),
+        claim_revision: 2,
+        ..ingress.clone()
+    };
+    let empty_execution = crate::session_ingress_graph_id(
+        &empty.session_id,
+        &empty.request_id,
+        &empty.turn_id,
+    );
+    let empty_claim = a8_install_session_fence(&services, &port, &empty);
+    assert!(
+        !services.session_has_unsettled_attempts(&empty.session_id, &empty.turn_id),
+        "a turn with no Program journal has no member work"
+    );
+    assert!(services.release_original_session_owner_after_terminal(
+        &empty.session_id,
+        &empty_claim
+    ));
+    assert!(services
+        .recovered_original_conclusion_owner(
+            &empty.session_id,
+            &empty.turn_id,
+            &empty_execution,
+            "agentic-graph:live-member",
+        )
+        .await
+        .is_none());
+}
+
+/// The read side and the write side fold one member's attempt the same way.
+///
+/// A member that was dispatched, settled and dispatched again is unsettled:
+/// the last record wins. Both predicates read that same fold, so neither can
+/// call that member settled while the other calls it live.
+#[tokio::test]
+async fn a8_wc_both_sides_fold_one_members_attempt_the_same_way() {
+    let temp = tempfile::tempdir().unwrap();
+    let workspace = temp.path().join("workspace");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let services = RuntimeServices::test_builder(temp.path(), workspace)
+        .build()
+        .expect("runtime services");
+    let ingress = a8_original_ingress();
+    let port = A8SessionQueryPort::new(vec![a8_live_input_record(&ingress)]);
+    let (claim, execution_id) = a8_wc_terminal_root_claim(&services, &port, &ingress);
+    a8_program_with_members(
+        &services,
+        &ingress.session_id,
+        &ingress.turn_id,
+        &execution_id,
+        &[("agentic-graph:retried-member", false)],
+    );
+    // The same physical execution is dispatched again after its settlement.
+    // The member is running again, and both sides have to see that.
+    a8_program_with_members(
+        &services,
+        &ingress.session_id,
+        &ingress.turn_id,
+        &execution_id,
+        &[("agentic-graph:retried-member", true)],
+    );
+
+    assert!(
+        services.session_has_unsettled_attempts(&ingress.session_id, &ingress.turn_id),
+        "the re-dispatched member is unsettled for the write side too"
+    );
+    assert!(services
+        .recovered_original_conclusion_owner(
+            &ingress.session_id,
+            &ingress.turn_id,
+            &execution_id,
+            "agentic-graph:retried-member",
+        )
+        .await
+        .is_some());
+    // So the release keeps the owner: it cannot take away what the read side
+    // still serves.
+    assert!(!services.release_original_session_owner_after_terminal(
+        &ingress.session_id,
+        &claim
+    ));
+    // And once that member settles for good, both sides agree it is over.
+    a8_settle_member_attempts(
+        &services,
+        &ingress.session_id,
+        &ingress.turn_id,
+        &execution_id,
+        &["agentic-graph:retried-member"],
+    );
+    assert!(
+        !services.session_has_unsettled_attempts(&ingress.session_id, &ingress.turn_id),
+        "the settled member is over for both sides"
+    );
+    assert!(services
+        .recovered_original_conclusion_owner(
+            &ingress.session_id,
+            &ingress.turn_id,
+            &execution_id,
+            "agentic-graph:retried-member",
+        )
+        .await
+        .is_none());
+}
+
+#[test]
+fn a8_attempt_fold_rejects_unreadable_and_foreign_facts() {
+    use harness_contract::agent_action::{
+        AgentAction, AgentActionEnvelope, AgentActorKind, AgentAttemptMode,
+        MemberAttemptFactError, MemberAttemptFold, TaskAttemptDispatchInput,
+        TaskAttemptFailInput, TaskClaimInput, TaskReleaseInput,
+        OriginalAgentExecution, MemberAttemptObservation,
+    };
+    let session = "a8-fold-session";
+    let turn = "a8-fold-turn";
+    let objective = harness_contract::agent_action::root_objective_id(session, turn);
+    let program = harness_contract::agent_action::program_id_for_objective(&objective);
+    let mut actor = a8_program_actor(&program, &objective, session, turn, "a8-root");
+    actor.kind = AgentActorKind::Supervisor;
+    actor.execution_id = Some("a8-member".into());
+    let dispatch = AgentActionEnvelope {
+        action_id: "a8-dispatch".into(), actor: actor.clone(), expected_revision: None,
+        action: AgentAction::TaskAttemptDispatch(TaskAttemptDispatchInput {
+            task_ref: "task".into(), execution_id: "a8-member".into(),
+            agent_ref: "agent".into(), membership_id: "membership".into(),
+            mode: AgentAttemptMode::Execute, generation: 1,
+        }),
+    };
+    let settled = AgentActionEnvelope {
+        action_id: "a8-settle".into(), actor: actor.clone(), expected_revision: None,
+        action: AgentAction::TaskAttemptFail(TaskAttemptFailInput {
+            task_ref: "task".into(), execution_id: "a8-member".into(),
+            mode: AgentAttemptMode::Execute, reason: "settled".into(), retryable: false,
+        }),
+    };
+    let mut fold = MemberAttemptFold::default();
+    let event = |envelope: &AgentActionEnvelope| serde_json::json!({"envelope": envelope});
+    let mut root = actor.clone();
+    root.kind = AgentActorKind::Root;
+    root.execution_id = None;
+    let root_action = AgentActionEnvelope {
+        action_id: "a8-root-action".into(), actor: root, expected_revision: None,
+        action: AgentAction::TaskClaim(TaskClaimInput { task_ref: "task".into(), reason: None }),
+    };
+    fold.observe_action_applied(&event(&root_action), session, turn, &program, None).unwrap();
+    assert!(!fold.any_unsettled());
+    let mut physical_root = root_action.actor.clone();
+    physical_root.actor_id = format!("root:{session}");
+    physical_root.original_execution = Some(OriginalAgentExecution {
+        graph_id: "a8-root".into(), node_id: "node".into(), attempt: 1,
+    });
+    let root_release = AgentActionEnvelope {
+        action_id: "a8-root-release".into(), actor: physical_root,
+        expected_revision: None,
+        action: AgentAction::TaskRelease(TaskReleaseInput {
+            task_ref: "task".into(), reason: "release".into(), expected_claim_generation: None,
+        }),
+    };
+    assert_eq!(fold.observe_action_applied(&event(&root_release), session, turn, &program, Some("a8-root")),
+               Ok(MemberAttemptObservation::RootNonMember));
+    assert_eq!(fold.observe_action_applied(&event(&root_release), session, turn, &program, Some("other")),
+               Err(MemberAttemptFactError::UnprovenRoot));
+    fold.observe_action_applied(&event(&dispatch), session, turn, &program, None).unwrap();
+    assert!(fold.is_unsettled("a8-member"));
+    fold.observe_action_applied(&event(&settled), session, turn, &program, None).unwrap();
+    assert!(!fold.any_unsettled());
+    fold.observe_action_applied(&event(&dispatch), session, turn, &program, None).unwrap();
+    assert!(fold.is_unsettled("a8-member"), "the last dispatch reopens the attempt");
+    assert_eq!(fold.observe_action_applied(&serde_json::json!({}), session, turn, &program, None),
+               Err(MemberAttemptFactError::MalformedEnvelope));
+    let mut bad = settled.clone();
+    bad.actor.execution_id = None;
+    assert_eq!(fold.observe_action_applied(&event(&bad), session, turn, &program, None),
+               Err(MemberAttemptFactError::MissingExecution));
+    bad.actor.execution_id = Some("other".into());
+    assert_eq!(fold.observe_action_applied(&event(&bad), session, turn, &program, None),
+               Err(MemberAttemptFactError::MismatchedExecution));
+    bad.actor.session_id = "other-session".into();
+    assert_eq!(fold.observe_action_applied(&event(&bad), session, turn, &program, None),
+               Err(MemberAttemptFactError::ForeignLineage));
+    let mut wrong_task = settled.clone();
+    if let AgentAction::TaskAttemptFail(input) = &mut wrong_task.action {
+        input.task_ref = "other-task".into();
+    }
+    assert_eq!(fold.observe_action_applied(&event(&wrong_task), session, turn, &program, None),
+               Err(MemberAttemptFactError::AmbiguousAttempt));
+    let mut wrong_generation = dispatch.clone();
+    if let AgentAction::TaskAttemptDispatch(input) = &mut wrong_generation.action {
+        input.generation += 1;
+    }
+    assert_eq!(fold.observe_action_applied(&event(&wrong_generation), session, turn, &program, None),
+               Err(MemberAttemptFactError::AmbiguousAttempt));
+    assert!(fold.is_unsettled("a8-member"), "invalid facts cannot close the attempt");
+}
+
+#[tokio::test]
+async fn a8_attempt_fence_distinguishes_refusal_from_unavailable_record() {
+    use crate::session_execution::{SessionExecutionFenceConjunction, SessionExecutionFenceError};
+    let ingress = a8_original_ingress();
+    let mut record = a8_live_input_record(&ingress);
+    record.claim_token = Some("another-token".into());
+    let port = A8SessionQueryPort::new(vec![record]);
+    let fence = crate::SessionExecutionFence::from_claim(
+        Arc::clone(&port) as Arc<dyn crate::SessionRuntimeQueryPort>,
+        ingress.request_id.clone(), ingress.session_id.clone(), ingress.session_generation,
+        ingress.input_sequence as usize, ingress.claim_owner.clone(), ingress.claim_token.clone(),
+    ).unwrap();
+    let phase = crate::SessionExecutionFencePhase::ProviderRequest;
+    let refusal = fence.verify_attempt(phase, "a8-member").await.unwrap_err();
+    assert!(matches!(&refusal, SessionExecutionFenceError::Refused { phase: actual, verdict, .. }
+        if *actual == phase && verdict.failed == Some(SessionExecutionFenceConjunction::ClaimToken)));
+    assert!(refusal.to_string().contains("Session execution fence rejected ProviderRequest"));
+    let fence = fence.with_claim_fence_epoch(ingress.claim_revision);
+    let mut wrong_request = a8_live_input_record(&ingress);
+    wrong_request.request_id = "another-request".into();
+    assert_eq!(fence.classify(&wrong_request).failed,
+               Some(SessionExecutionFenceConjunction::RequestIdentity));
+    *port.returned_record.lock().unwrap() = Some(wrong_request);
+    let refusal = fence.verify_attempt(phase, "a8-member").await.unwrap_err();
+    assert!(matches!(refusal, SessionExecutionFenceError::Refused { verdict, .. }
+        if verdict.failed == Some(SessionExecutionFenceConjunction::RequestIdentity)));
+    *port.returned_record.lock().unwrap() = None;
+    port.set(vec![a8_live_input_record(&ingress)]);
+    port.set_admission(Some(crate::RuntimeSessionInputAdmission {
+        session_id: ingress.session_id.clone(), generation: ingress.session_generation, open: true,
+    }));
+    assert_eq!(fence.verify_attempt(phase, "a8-member").await.unwrap().claim_fence_epoch,
+               ingress.claim_revision);
+    port.set_admission(Some(crate::RuntimeSessionInputAdmission {
+        session_id: ingress.session_id.clone(), generation: ingress.session_generation, open: false,
+    }));
+    let closed = fence.verify_attempt(phase, "a8-member").await.unwrap_err();
+    assert!(matches!(closed, SessionExecutionFenceError::Refused { verdict, .. }
+        if verdict.failed == Some(SessionExecutionFenceConjunction::ClaimStatus)));
+    port.set_admission(Some(crate::RuntimeSessionInputAdmission {
+        session_id: ingress.session_id.clone(), generation: ingress.session_generation + 1, open: true,
+    }));
+    let advanced = fence.verify_attempt(phase, "a8-member").await.unwrap_err();
+    assert!(matches!(advanced, SessionExecutionFenceError::Refused { verdict, .. }
+        if verdict.failed == Some(SessionExecutionFenceConjunction::Generation)));
+    let mut wrong_epoch = a8_live_input_record(&ingress);
+    wrong_epoch.claim_fence_epoch = Some(ingress.claim_revision + 1);
+    port.set(vec![wrong_epoch]);
+    let refusal = fence.verify_attempt(phase, "a8-member").await.unwrap_err();
+    assert!(matches!(&refusal, SessionExecutionFenceError::Refused { verdict, .. }
+        if verdict.failed == Some(SessionExecutionFenceConjunction::ClaimFenceEpoch)));
+    let mut released = a8_live_input_record(&ingress);
+    released.status = crate::RuntimeSessionInputStatus::Completed;
+    released.claim_owner = None;
+    released.claim_token = None;
+    released.claim_fence_epoch = None;
+    released.claim_expires_at_ms = None;
+    port.set(vec![released]);
+    let refusal = fence.verify_attempt(phase, "a8-member").await.unwrap_err();
+    assert!(matches!(&refusal, SessionExecutionFenceError::Refused { verdict, .. }
+        if verdict.failed == Some(SessionExecutionFenceConjunction::ClaimOwner)));
+    port.set(vec![]);
+    let unavailable = fence.verify_attempt(phase, "a8-member").await.unwrap_err();
+    assert!(matches!(unavailable, SessionExecutionFenceError::Unavailable { phase: actual, .. }
+        if actual == phase));
+}
+
+#[tokio::test]
+async fn a8_synthesis_waits_for_original_members_and_keeps_cancellation() {
+    let temp = tempfile::tempdir().unwrap();
+    let workspace = temp.path().join("workspace");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let services = RuntimeServices::test_builder(temp.path(), workspace).build().unwrap();
+    let ingress = a8_original_ingress();
+    let port = A8SessionQueryPort::new(vec![a8_live_input_record(&ingress)]);
+    port.set_admission(Some(crate::RuntimeSessionInputAdmission {
+        session_id: ingress.session_id.clone(), generation: ingress.session_generation, open: true,
+    }));
+    let _claim = a8_install_session_fence(&services, &port, &ingress);
+    let graph = crate::session_ingress_graph_id(&ingress.session_id, &ingress.request_id, &ingress.turn_id);
+    a8_program_with_members(&services, &ingress.session_id, &ingress.turn_id, &graph,
+        &[("agentic-graph:pending-member", true)]);
+    let copy = Arc::clone(&services);
+    let captured = ingress.clone();
+    let captured_graph = graph.clone();
+    let mut waiter = tokio::spawn(async move {
+        copy.wait_for_original_members_before_synthesis(&captured_graph, &captured.session_id, &captured.turn_id).await
+    });
+    assert!(tokio::time::timeout(std::time::Duration::from_millis(100), &mut waiter).await.is_err());
+    a8_settle_member_attempts(&services, &ingress.session_id, &ingress.turn_id, &graph,
+        &["agentic-graph:pending-member"]);
+    assert!(tokio::time::timeout(std::time::Duration::from_secs(5), waiter).await.unwrap().unwrap().unwrap());
+    let mut expired = a8_live_input_record(&ingress);
+    expired.status = crate::RuntimeSessionInputStatus::Completed;
+    port.set(vec![expired]);
+    assert!(services.wait_for_original_members_before_synthesis(&graph, &ingress.session_id, &ingress.turn_id).await.is_err());
+    port.set(vec![a8_live_input_record(&ingress)]);
+    a8_program_with_members(&services, &ingress.session_id, &ingress.turn_id, &graph,
+        &[("agentic-graph:pending-member", true)]);
+    let copy = Arc::clone(&services);
+    let captured = ingress.clone();
+    let captured_graph = graph.clone();
+    let mut waiter = tokio::spawn(async move {
+        copy.wait_for_original_members_before_synthesis(&captured_graph, &captured.session_id, &captured.turn_id).await
+    });
+    assert!(tokio::time::timeout(std::time::Duration::from_millis(100), &mut waiter).await.is_err());
+    let control = services.original_session_owners.lock().unwrap()
+        .get(&ingress.session_id).unwrap().root_control.clone();
+    control.signal_operational();
+    let error = tokio::time::timeout(std::time::Duration::from_secs(5), waiter).await.unwrap().unwrap().unwrap_err();
+    assert_eq!(error, "terminal_presentation_cancelled");
+}
+
+#[test]
+fn a8_member_journal_requires_one_original_opening_after_diagnostics() {
+    let temp = tempfile::tempdir().unwrap();
+    let workspace = temp.path().join("workspace");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let services = RuntimeServices::test_builder(temp.path(), workspace).build().unwrap();
+    let ingress = a8_original_ingress();
+    let port = A8SessionQueryPort::new(vec![a8_live_input_record(&ingress)]);
+    let _claim = a8_install_session_fence(&services, &port, &ingress);
+    let graph = crate::session_ingress_graph_id(&ingress.session_id, &ingress.request_id, &ingress.turn_id);
+    let stream = a8_wc_program_stream(&ingress.session_id, &ingress.turn_id);
+    services.event_store().append(crate::RuntimeEventInput {
+        stream_id: stream.clone(), scope: crate::RuntimeEventScope::Program,
+        kind: "agentic.tool_contract".into(), status: None, actor: None, refs: vec![], payload: serde_json::json!({}),
+    }).unwrap();
+    assert!(services.session_has_unsettled_attempts(&ingress.session_id, &ingress.turn_id));
+    assert!(!services.member_attempt_is_unsettled(&ingress.session_id, &ingress.turn_id, "agentic-graph:pending-member"));
+    a8_program_with_members(&services, &ingress.session_id, &ingress.turn_id, &graph,
+        &[("agentic-graph:pending-member", true)]);
+    let events = services.event_store().list_stream(&stream).unwrap();
+    assert!(services.member_attempt_fold(&events, &ingress.session_id, &ingress.turn_id).unwrap().any_unsettled());
+    let mut foreign = events.clone();
+    foreign.iter_mut().find(|event| event.kind == "agentic.program_opened").unwrap().payload["root_execution_id"] = serde_json::json!("foreign");
+    assert!(services.member_attempt_fold(&foreign, &ingress.session_id, &ingress.turn_id).is_err());
+    let opening = events.iter().find(|event| event.kind == "agentic.program_opened").unwrap();
+    services.event_store().append(crate::RuntimeEventInput {
+        stream_id: stream, scope: opening.scope, kind: opening.kind.clone(), status: opening.status.clone(),
+        actor: opening.actor.clone(), refs: opening.refs.clone(), payload: opening.payload.clone(),
+    }).unwrap();
+    assert!(services.session_has_unsettled_attempts(&ingress.session_id, &ingress.turn_id));
+    assert!(!services.member_attempt_is_unsettled(&ingress.session_id, &ingress.turn_id, "agentic-graph:pending-member"));
+}
+
+#[test]
+fn a8_corrupt_attempt_fact_refuses_member_and_keeps_owner() {
+    let temp = tempfile::tempdir().unwrap();
+    let workspace = temp.path().join("workspace");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let services = RuntimeServices::test_builder(temp.path(), workspace)
+        .build().expect("runtime services");
+    let ingress = a8_original_ingress();
+    services.event_store().append(crate::RuntimeEventInput {
+        stream_id: a8_wc_program_stream(&ingress.session_id, &ingress.turn_id),
+        scope: crate::RuntimeEventScope::Program,
+        kind: "agentic.action_applied".into(), status: Some("applied".into()),
+        actor: Some("runtime.program-supervisor".into()), refs: vec![],
+        payload: serde_json::json!({"envelope": {"action": "unreadable"}}),
+    }).expect("append corrupt applied action");
+    assert!(!services.member_attempt_is_unsettled(
+        &ingress.session_id, &ingress.turn_id, "agentic-graph:member"));
+    assert!(services.session_has_unsettled_attempts(&ingress.session_id, &ingress.turn_id),
+            "unreadable facts cannot justify removing the original owner");
+}
+
+#[test]
+fn a8_original_owner_rejects_a_fence_from_another_claim() {
+    let temp = tempfile::tempdir().unwrap();
+    let workspace = temp.path().join("workspace");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let services = RuntimeServices::test_builder(temp.path(), workspace).build().unwrap();
+    let ingress = a8_original_ingress();
+    let execution = crate::session_ingress_graph_id(&ingress.session_id, &ingress.request_id, &ingress.turn_id);
+    let control = services.create_turn_cancellation_control(&execution, &ingress).unwrap();
+    services.live_execution_store.record_queued(&ingress.session_id, execution.clone(), ingress.turn_id.clone());
+    let lease = services.bind_active_execution_bus(execution, crate::CowdEventBus::new()).unwrap();
+    let port = A8SessionQueryPort::new(vec![a8_live_input_record(&ingress)]);
+    let make_fence = |token: String| crate::SessionExecutionFence::from_claim(
+        Arc::clone(&port) as Arc<dyn crate::SessionRuntimeQueryPort>,
+        ingress.request_id.clone(), ingress.session_id.clone(), ingress.session_generation,
+        ingress.input_sequence as usize, ingress.claim_owner.clone(), token,
+    ).unwrap();
+    let input = || crate::SessionInputStream::new(ingress.session_id.clone());
+    let requested = || Arc::new(crate::conversation::OriginalTurnInputControl::default());
+    let policy = || crate::permissions::PermissionPolicy::new(crate::permissions::PermissionMode::ReadOnly);
+    assert!(lease.install_session_fence(&ingress, make_fence("foreign-token".into()), Arc::clone(&control),
+        input(), requested(), policy()).is_err());
+    assert!(lease.install_session_fence(&ingress, make_fence(ingress.claim_token.clone()), control,
+        input(), requested(), policy()).is_ok(), "a refused foreign fence must not occupy the owner");
 }

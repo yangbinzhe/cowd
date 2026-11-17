@@ -685,6 +685,7 @@ mod tests {
             },
             evidence_refs: Vec::new(),
             evidence_completeness: EvidenceCompleteness::Sufficient,
+            verified: None,
             schema_revision: OUTCOME_SCHEMA_REVISION,
         }
     }

@@ -123,7 +123,7 @@ impl GatewayToolExecutor {
                 .execute_runtime_tool_with_binding(
                     &tool_name,
                     value,
-                    RuntimeToolExecutionBinding {
+                    RuntimeToolExecutionBinding { action_invocation: None,
                         tool_lease: is_step_bound.then_some(&lease),
                         action_id: None,
                         session_id: self.runtime_session_id.as_deref(),
@@ -132,6 +132,7 @@ impl GatewayToolExecutor {
                         reality_context: None,
                         model_lease: self.runtime_model_lease.as_deref(),
                         parent_execution: None,
+                        parent_execution_attempt: None,
                         execution_decision: None,
                         permission_ceiling: authorization.authorization_lease.ceiling,
                     },
@@ -140,21 +141,18 @@ impl GatewayToolExecutor {
                 .map(harness_contract::context::ToolOutputDraft::bounded_inline);
         }
         let authorization = authorization.clone();
-        if is_step_bound && tool_name == "tool_orchestrate" {
+        if is_step_bound && matches!(tool_name.as_str(), "tool_orchestrate" | "grep_search") {
             let effect = lease.describe_effect(&tool_name, &value);
             if effect.effect_kind == harness_contract::tool::ToolEffectKind::Read
                 && !effect.uses_network && !effect.spawns_process
             {
-                let (output, reads) = runtime::ToolExecutionPlane::adapt_blocking(move || {
-                    lease.execute_with_orchestrated_read_trace(&authorization, &value)
+                let (output, children) = runtime::ToolExecutionPlane::adapt_blocking(move || {
+                    lease.execute_with_read_trace(&authorization, &tool_name, &value)
                         .map_err(|error| ToolError::new(error.to_string()))
                 }).await.map_err(|error| ToolError::new(error.to_string()))??;
-                return Ok(match reads {
-                    Some(reads) => harness_contract::context::ToolOutputDraft::InProcess {
-                        content: output,
-                        evidence: harness_contract::context::InProcessToolEvidence::new(reads),
-                    },
-                    None => harness_contract::context::ToolOutputDraft::bounded_inline(output),
+                return Ok(harness_contract::context::ToolOutputDraft::InProcess {
+                    content: output,
+                    evidence: harness_contract::context::InProcessToolEvidence::new(children),
                 });
             }
         }

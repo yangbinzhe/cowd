@@ -184,7 +184,14 @@ impl AnthropicClient {
 
     #[must_use]
     pub fn new(api_key: impl Into<String>) -> Self {
-        Self::new_with_http(api_key, reqwest::Client::new())
+        Self::new_with_http(api_key, Self::default_http_client())
+    }
+
+    fn default_http_client() -> reqwest::Client {
+        reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .expect("failed to construct no-redirect Anthropic transport")
     }
 
     #[must_use]
@@ -203,7 +210,7 @@ impl AnthropicClient {
 
     #[must_use]
     pub fn from_auth(auth: AuthSource) -> Self {
-        Self::from_auth_with_http(auth, reqwest::Client::new())
+        Self::from_auth_with_http(auth, Self::default_http_client())
     }
 
     #[must_use]
@@ -424,7 +431,6 @@ impl AnthropicClient {
         let response = self
             .http
             .post(&config.token_url)
-            .header("content-type", "application/x-www-form-urlencoded")
             .form(&request.form_params())
             .send()
             .await
@@ -444,7 +450,6 @@ impl AnthropicClient {
         let response = self
             .http
             .post(&config.token_url)
-            .header("content-type", "application/x-www-form-urlencoded")
             .form(&request.form_params())
             .send()
             .await
@@ -573,8 +578,7 @@ impl AnthropicClient {
         };
 
         // Best-effort refinement using the Anthropic count_tokens endpoint.
-        // On any failure (network, parse, auth), fall back to the local
-        // byte-estimate result which already passed above.
+        // Network, parse or auth failures fall back to the local estimate.
         let Ok(counted_input_tokens) = self.count_tokens(request).await else {
             return Ok(());
         };
@@ -1164,6 +1168,15 @@ struct AnthropicErrorBody {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn default_anthropic_api_key_client_refuses_redirects() {
+        crate::http_client::fixture_assert_redirect_refused(super::AnthropicClient::new("fixture").http).await;
+    }
+
+    #[tokio::test]
+    async fn default_anthropic_auth_client_refuses_redirects() {
+        crate::http_client::fixture_assert_redirect_refused(super::AnthropicClient::from_auth(super::AuthSource::ApiKey("fixture".into())).http).await;
+    }
     use super::{
         cache_control_marker, retry_after_from_headers, ALT_REQUEST_ID_HEADER, REQUEST_ID_HEADER,
     };

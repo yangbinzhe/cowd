@@ -63,6 +63,29 @@ pub enum RuntimeSessionInputStatus {
     Expired,
 }
 
+impl RuntimeSessionInputStatus {
+    /// Whether this status is a terminal state of the input.
+    ///
+    /// A terminal input is closed: its owner withdrew or finished it, and no
+    /// further work may run under it.  A live input that lost its claim is a
+    /// different fact - the input went back to the queue - and must not be
+    /// read as a terminal withdrawal.
+    #[must_use]
+    pub const fn is_terminal(self) -> bool {
+        matches!(
+            self,
+            Self::Completed
+                | Self::Supplemented
+                | Self::Failed
+                | Self::Blocked
+                | Self::Cancelled
+                | Self::Expired
+                | Self::RejectedDuplicate
+                | Self::RejectedPolicy
+        )
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuntimeSessionInputRecord {
     pub input_id: String,
@@ -350,6 +373,23 @@ pub trait SessionRuntimeQueryPort: Send + Sync {
         session_id: &str,
         evidence_id: &str,
     ) -> Result<Option<harness_contract::context::EvidenceAccessRef>, SessionError>;
+
+    /// List the durable receipt ids recorded in one Session, bounded.
+    ///
+    /// Read-only mirror of the journal `evidence_access` walks: it names what
+    /// Runtime recorded and decides nothing, so a refusal hint can correct a
+    /// drifted citation without any chance of resolving it. No acceptance
+    /// path may consume this list for validation.
+    ///
+    /// The bound is oldest-first: a Session past `limit` receipts reads for
+    /// the hint as "no suggestion" (today's exact behavior), never as a wrong
+    /// one. Newest-first would need store support and is deliberately not a
+    /// 030 face (R48/e2 三.1).
+    async fn session_evidence_receipt_ids(
+        &self,
+        session_id: &str,
+        limit: usize,
+    ) -> Result<Vec<String>, SessionError>;
 }
 
 #[async_trait]
@@ -605,6 +645,53 @@ impl SessionRuntimeQueryPort for TestSessionPortAdapter {
             from_sequence = next_sequence;
         }
         Ok(prefix_match)
+    }
+
+    async fn session_evidence_receipt_ids(
+        &self,
+        session_id: &str,
+        limit: usize,
+    ) -> Result<Vec<String>, SessionError> {
+        // Mirror the production listing: recorded ids in journal order,
+        // bounded by `limit` oldest-first, resolution tiers deliberately not
+        // applied.
+        let mut from_sequence = 0;
+        let mut ids: Vec<String> = Vec::new();
+        while ids.len() < limit {
+            let events = self
+                .store
+                .get_session_domain_events_by_kind_limited(
+                    session_id,
+                    RuntimeSessionEventKind::EvidenceRawPersisted.as_str(),
+                    from_sequence,
+                    128.min(limit - ids.len()).max(1),
+                )
+                .await?;
+            if events.is_empty() {
+                break;
+            }
+            let mut next_sequence = from_sequence;
+            for stored in events {
+                next_sequence = next_sequence.max(stored.sequence.saturating_add(1));
+                let event = session::SessionDomainEvent::from_session_event(&stored)
+                    .map_err(|error| SessionError::Store(error.to_string()))?;
+                if let Some(recorded) =
+                    crate::context_evidence::raw::persisted_evidence_id(&event.payload)
+                {
+                    ids.push(recorded.to_string());
+                    if ids.len() == limit {
+                        return Ok(ids);
+                    }
+                }
+            }
+            if next_sequence <= from_sequence {
+                return Err(SessionError::Store(
+                    "evidence event pagination did not advance".to_string(),
+                ));
+            }
+            from_sequence = next_sequence;
+        }
+        Ok(ids)
     }
 }
 

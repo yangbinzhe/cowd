@@ -362,10 +362,141 @@ fn matching_windows(
     (windows, matches)
 }
 
+// The original lease pins the workspace FD. Directory scopes need a kernel
+// ancestry proof, not a lexical path prefix or a fabricated admitted file id.
+struct SearchDirectory<'a> {
+    root: &'a fs::File,
+    directory: fs::File,
+    root_path: PathBuf,
+    path: PathBuf,
+    relative: String,
+    root_identity: String,
+    identity: String,
+    root_stamp: (i64, i64, i64, i64),
+    directory_stamp: (i64, i64, i64, i64),
+}
+
+#[cfg(target_os = "linux")]
+fn directory_identity(file: &fs::File, path: &Path) -> Option<String> {
+    use std::os::unix::fs::MetadataExt;
+    let fd = file.metadata().ok()?;
+    let named = fs::symlink_metadata(path).ok()?;
+    if !fd.is_dir() || !named.is_dir() || (fd.dev(), fd.ino()) != (named.dev(), named.ino()) {
+        return None;
+    }
+    Some(format!("unix-directory:{}:{}", fd.dev(), fd.ino()))
+}
+
+#[cfg(target_os = "linux")]
+fn directory_stamp(file: &fs::File) -> Option<(i64, i64, i64, i64)> {
+    use std::os::unix::fs::MetadataExt;
+    let metadata = file.metadata().ok()?;
+    Some((metadata.mtime(), metadata.mtime_nsec(), metadata.ctime(), metadata.ctime_nsec()))
+}
+
+impl<'a> SearchDirectory<'a> {
+    fn pin(root: Option<&'a fs::File>, policy: &WorkspacePathPolicy, base: &Path) -> Option<Self> {
+        #[cfg(target_os = "linux")]
+        {
+            use rustix::fs::{openat2, Mode, OFlags, ResolveFlags};
+            let root = root?;
+            let relative = base.strip_prefix(policy.workspace_root()).ok()?.to_str()?;
+            let relative = if relative.is_empty() { "." } else { relative };
+            let root_stamp = directory_stamp(root)?;
+            let root_identity = directory_identity(root, policy.workspace_root())?;
+            let directory = fs::File::from(openat2(root, relative,
+                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+                Mode::empty(), ResolveFlags::BENEATH | ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_MAGICLINKS).ok()?);
+            let directory_stamp = directory_stamp(&directory)?;
+            let identity = directory_identity(&directory, base)?;
+            Some(Self { root, directory, root_path: policy.workspace_root().into(), path: base.into(),
+                relative: relative.into(), root_identity, identity, root_stamp, directory_stamp })
+        }
+        #[cfg(not(target_os = "linux"))]
+        { let _ = (root, policy, base); None }
+    }
+
+    fn open_proof(&self, path: &Path) -> Option<fs::File> {
+        #[cfg(target_os = "linux")]
+        {
+            use rustix::fs::{openat2, Mode, OFlags, ResolveFlags};
+            if !self.valid() { return None; }
+            Some(fs::File::from(openat2(&self.directory, path.strip_prefix(&self.path).ok()?,
+                OFlags::PATH | OFlags::CLOEXEC,
+                Mode::empty(), ResolveFlags::BENEATH | ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_MAGICLINKS).ok()?))
+        }
+        #[cfg(not(target_os = "linux"))]
+        { let _ = path; None }
+    }
+
+    fn valid(&self) -> bool {
+        #[cfg(target_os = "linux")]
+        { directory_identity(self.root, &self.root_path).as_ref() == Some(&self.root_identity)
+            && directory_identity(&self.directory, &self.path).as_ref() == Some(&self.identity)
+            && directory_stamp(self.root) == Some(self.root_stamp)
+            && directory_stamp(&self.directory) == Some(self.directory_stamp) }
+        #[cfg(not(target_os = "linux"))]
+        { false }
+    }
+}
+
+// The original path open exclusively owns the business bytes. The second FD is
+// O_PATH: only metadata is inspected, never used as a substitute body source.
+fn read_search_file(policy: &WorkspacePathPolicy, path: &Path, directory: Option<&SearchDirectory<'_>>)
+    -> io::Result<(String, Option<String>, Option<(String, String, String)>)> {
+    use std::io::Read;
+    let mut file = fs::File::open(path)?;
+    let before = file.metadata().ok();
+    let proof = directory.and_then(|directory| directory.open_proof(path));
+    let proof_before = proof.as_ref().and_then(|proof| proof.metadata().ok());
+    #[cfg(target_os = "linux")]
+    let path_before = {
+        use std::os::fd::AsRawFd;
+        policy.ensure_resolved_path(&PathBuf::from(format!("/proc/self/fd/{}", file.as_raw_fd())))
+            .is_ok_and(|actual| actual == path)
+    };
+    let mut contents = String::new();
+    file.read_to_string(&mut contents)?;
+    let mut identity = None;
+    let mut ancestry = None;
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::fs::MetadataExt;
+        use std::os::fd::AsRawFd;
+        let stamp = |m: &fs::Metadata| (m.dev(), m.ino(), m.len(), m.mtime(), m.mtime_nsec(), m.ctime(), m.ctime_nsec(), m.nlink());
+        let path_after = policy.ensure_resolved_path(&PathBuf::from(format!("/proc/self/fd/{}", file.as_raw_fd())))
+            .is_ok_and(|actual| actual == path);
+        if let (Some(before), Ok(after)) = (before.as_ref(), file.metadata()) {
+            if path_before && path_after && before.is_file() && before.len() <= MAX_READ_SIZE
+                && stamp(before) == stamp(&after) && before.len() == contents.len() as u64
+                && before.nlink() == 1 && fs::symlink_metadata(path).is_ok_and(|m| m.is_file() && stamp(&m) == stamp(before)) {
+                identity = Some(format!("unix-file:{}:{}", before.dev(), before.ino()));
+                let proof_matches = proof_before.as_ref().zip(proof.as_ref())
+                    .is_some_and(|(proof_before, proof)| stamp(proof_before) == stamp(before)
+                        && proof.metadata().is_ok_and(|proof_after| stamp(&proof_after) == stamp(before)));
+                if proof.is_some() && !proof_matches {
+                    identity = None;
+                }
+                if let Some(directory) = directory.filter(|directory| proof_matches && directory.valid()) {
+                    ancestry = Some((directory.relative.clone(), directory.root_identity.clone(), directory.identity.clone()));
+                }
+            }
+        }
+    }
+    let _ = (policy, before, proof, proof_before);
+    Ok((contents, identity, ancestry))
+}
+
 pub fn grep_search(
     policy: &WorkspacePathPolicy,
     input: &GrepSearchInput,
 ) -> io::Result<GrepSearchOutput> {
+    grep_search_with_windows(policy, input, false, None).map(|(output, _)| output)
+}
+
+pub(crate) fn grep_search_with_windows(
+    policy: &WorkspacePathPolicy, input: &GrepSearchInput, capture: bool, root: Option<&fs::File>,
+) -> io::Result<(GrepSearchOutput, Option<Vec<GrepReadWindow>>)> {
     let pattern = input
         .pattern
         .as_deref()
@@ -377,6 +508,7 @@ pub fn grep_search(
         .map(|path| policy.resolve(path))
         .transpose()?
         .unwrap_or_else(|| policy.workspace_root().into());
+    let directory = capture.then(|| SearchDirectory::pin(root, policy, &base)).flatten();
     let mode = input.output_mode.as_deref().unwrap_or("content");
     if !matches!(mode, "content" | "files_with_matches" | "count") {
         return Err(invalid(
@@ -421,6 +553,8 @@ pub fn grep_search(
         .unwrap_or_default();
     let mut filenames = Vec::new();
     let mut output = Vec::new();
+    let mut captured = capture.then(Vec::<GrepReadWindow>::new);
+    let mut captured_bytes = 0usize;
     let mut matches = 0usize;
     let mut visited = 0;
     let mut bytes_out = 0;
@@ -503,8 +637,13 @@ pub fn grep_search(
             omit(&mut omissions, "file_too_large_or_unavailable");
             continue;
         }
-        let contents = match fs::read_to_string(&path) {
-            Ok(contents) => contents,
+        let read = if capture {
+            read_search_file(policy, &path, directory.as_ref())
+        } else {
+            fs::read_to_string(&path).map(|contents| (contents, None, None))
+        };
+        let (contents, physical, ancestry) = match read {
+            Ok(value) => value,
             Err(_) => {
                 omit(&mut omissions, "file_not_readable_as_text");
                 continue;
@@ -550,6 +689,11 @@ pub fn grep_search(
             }
             continue;
         }
+        // Lossy display remains valid business output, never a source identity.
+        // Evidence-only path failures affect this file alone.
+        let evidence_path = path.to_str().zip(
+            path.strip_prefix(policy.workspace_root()).ok().and_then(Path::to_str)
+        ).zip(physical.as_deref());
         let row_count = windows
             .iter()
             .map(|(start, end)| end - start)
@@ -593,6 +737,29 @@ pub fn grep_search(
                 filenames.push(path.to_string_lossy().into_owned());
             }
             bytes_out += value.len();
+            if let (Some(windows), Some(((full_path, relative_path), physical))) = (captured.as_mut(), evidence_path) {
+                captured_bytes = captured_bytes.saturating_add(value.len()).saturating_add(lines[index].len());
+                if windows.len() >= 400 || captured_bytes > 4 * 1024 * 1024 {
+                    captured = None;
+                } else {
+                    let contiguous = windows.last_mut().filter(|last| last.path == full_path
+                        && last.start_line + last.line_count == index as u64 + 1);
+                    if let Some(last) = contiguous {
+                        last.line_count += 1;
+                        last.body.push('\n'); last.body.push_str(lines[index]);
+                        last.presentation.push('\n'); last.presentation.push_str(&value);
+                    } else {
+                        windows.push(GrepReadWindow {
+                            path: full_path.into(),
+                            relative_path: relative_path.into(),
+                            physical_identity: physical.into(), directory_ancestry: ancestry.clone(), source_sha256: format!("sha256:{hash}"),
+                            source_bytes: contents.len() as u64, total_lines: lines.len() as u64,
+                            ends_with_newline: contents.ends_with('\n'), start_line: index as u64 + 1, line_count: 1,
+                            body: lines[index].into(), presentation: value.clone(), output_row: output.len(),
+                        });
+                    }
+                }
+            }
             output.push(value);
         }
         if next_cursor.is_some() {
@@ -625,7 +792,7 @@ pub fn grep_search(
         value
     });
     let truncated = next_cursor.is_some();
-    Ok(GrepSearchOutput {
+    Ok((GrepSearchOutput {
         base_path: base.to_string_lossy().into_owned(),
         scan_complete: !truncated && omissions.is_empty(),
         mode: Some(mode.into()),
@@ -642,7 +809,7 @@ pub fn grep_search(
         next_request,
         coverage: serde_json::json!({"consistency": "live_filesystem", "resumed_file_hash_checked": resume.as_ref().is_some_and(|cursor| cursor.file_hash.is_some()),
             "include_ignored": input.search_options.include_ignored, "ignore_patterns": input.search_options.ignore_patterns}),
-    })
+    }, captured))
 }
 
 #[cfg(test)]
@@ -673,6 +840,70 @@ mod tests {
             let _ = fs::remove_dir_all(&self.0);
         }
     }
+    #[test]
+    fn grep_samecall_auxiliary_identity_failure_keeps_original_bytes() {
+        let fixture = Fixture::new();
+        let other = Fixture::new();
+        fixture.write("a.txt", "hit original\n");
+        let path = fixture.0.join("a.txt");
+        // An unprovable FD path cannot affect the successful original body read.
+        let (body, identity, ancestry) = read_search_file(&other.policy(), &path, None).unwrap();
+        assert_eq!(body, fs::read_to_string(&path).unwrap());
+        assert!(identity.is_none());
+        assert!(ancestry.is_none());
+        let input = request(serde_json::json!({"path":".","pattern":"hit"}));
+        let (captured, _) = grep_search_with_windows(&fixture.policy(), &input, true, None).unwrap();
+        let original = grep_search(&fixture.policy(), &input).unwrap();
+        assert_eq!(serde_json::to_value(captured).unwrap(), serde_json::to_value(original).unwrap());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn grep_samecall_directory_replacement_invalidates_pinned_ancestry() {
+        let fixture = Fixture::new();
+        fixture.write("docs/a.txt", "old hit\n");
+        let policy = fixture.policy();
+        let root = fs::File::open(&fixture.0).unwrap();
+        let directory = SearchDirectory::pin(Some(&root), &policy, &fixture.0.join("docs")).unwrap();
+        fs::rename(fixture.0.join("docs"), fixture.0.join("old-docs")).unwrap();
+        fixture.write("docs/a.txt", "new hit\n");
+        assert!(!directory.valid());
+        let (body, _, ancestry) = read_search_file(&policy, &fixture.0.join("docs/a.txt"), Some(&directory)).unwrap();
+        assert_eq!(body, "new hit\n");
+        assert!(ancestry.is_none());
+        fs::remove_dir_all(fixture.0.join("docs")).unwrap();
+        std::os::unix::fs::symlink(fixture.0.join("old-docs"), fixture.0.join("docs")).unwrap();
+        assert!(SearchDirectory::pin(Some(&root), &policy, &fixture.0.join("docs")).is_none());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn grep_samecall_proof_fd_is_metadata_only_and_never_supplies_business_bytes() {
+        use std::io::Seek;
+        let fixture = Fixture::new();
+        fixture.write("docs/a.txt", "old body\n");
+        let policy = fixture.policy();
+        let root = fs::File::open(&fixture.0).unwrap();
+        let directory = SearchDirectory::pin(Some(&root), &policy, &fixture.0.join("docs")).unwrap();
+        let path = fixture.0.join("docs/a.txt");
+        let mut proof = directory.open_proof(&path).unwrap();
+        assert!(proof.metadata().unwrap().is_file());
+        assert!(proof.stream_position().is_err(), "O_PATH is not a body IO descriptor");
+        let (body, identity, ancestry) = read_search_file(&policy, &path, Some(&directory)).unwrap();
+        assert_eq!(body, fs::read_to_string(&path).unwrap());
+        assert!(identity.is_some());
+        assert!(ancestry.is_some());
+        // A previously pinned proof must never substitute its old object's body
+        // for the next original path open after a directory replacement.
+        fs::rename(fixture.0.join("docs"), fixture.0.join("old-docs")).unwrap();
+        fixture.write("docs/a.txt", "current path body\n");
+        let (body, _, ancestry) = read_search_file(&policy, &path, Some(&directory)).unwrap();
+        assert_eq!(body, fs::read_to_string(&path).unwrap());
+        assert_eq!(body, "current path body\n");
+        assert!(ancestry.is_none());
+        assert_eq!(proof.metadata().unwrap().len(), "old body\n".len() as u64);
+    }
+
     fn request(value: serde_json::Value) -> GrepSearchInput {
         serde_json::from_value(value).unwrap()
     }

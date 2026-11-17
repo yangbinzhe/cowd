@@ -1671,6 +1671,7 @@ mod bounded_program_reader_429_tests {
         let envelope = AgentActionEnvelope {
             action_id: format!("{program}:team"),
             actor: AgentActorBinding {
+                original_execution: None,
                 objective_id: format!("custom-objective:{program}"),
                 program_id: program.into(),
                 session_id: "session-429".into(),

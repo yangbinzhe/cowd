@@ -697,11 +697,13 @@ impl ManagedWorkerHandle {
     pub async fn shutdown(&self) -> ManagedWorkerResult<WorkerExit> {
         if let Some(exit) = self.try_wait().await? {
             self.finish_cleanup().await;
+            self.terminate_remaining_process_group().await?;
             return Ok(exit);
         }
         if let Err(signal_error) = signal_process_group(self.pid(), "TERM").await {
             if let Some(exit) = self.try_wait().await? {
                 self.finish_cleanup().await;
+                self.terminate_remaining_process_group().await?;
                 return Ok(exit);
             }
             return Err(signal_error);
@@ -713,20 +715,50 @@ impl ManagedWorkerHandle {
             )
             .await;
         match wait {
-            Ok(exit) => Ok(exit),
+            Ok(exit) => {
+                self.terminate_remaining_process_group().await?;
+                Ok(exit)
+            }
             Err(ManagedWorkerError::DeadlineExceeded(_)) => {
                 if let Err(signal_error) = signal_process_group(self.pid(), "KILL").await {
                     if let Some(exit) = self.try_wait().await? {
                         self.finish_cleanup().await;
+                        self.terminate_remaining_process_group().await?;
                         return Ok(exit);
                     }
                     return Err(signal_error);
                 }
-                self.wait_for_exit(Duration::from_secs(1), &CancellationToken::default())
-                    .await
+                let exit = self
+                    .wait_for_exit(Duration::from_secs(1), &CancellationToken::default())
+                    .await?;
+                self.terminate_remaining_process_group().await?;
+                Ok(exit)
             }
             Err(error) => Err(error),
         }
+    }
+
+    async fn terminate_remaining_process_group(&self) -> ManagedWorkerResult<()> {
+        // The leader can exit on TERM while a TERM-resistant descendant keeps
+        // the process group alive. Waiting for the leader alone would report a
+        // successful shutdown and leak that descendant.
+        if crate::recovery::process_group_members(self.pid()) == 0 {
+            return Ok(());
+        }
+        if let Err(signal_error) = signal_process_group(self.pid(), "KILL").await {
+            if crate::recovery::process_group_members(self.pid()) == 0 {
+                return Ok(());
+            }
+            return Err(signal_error);
+        }
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while crate::recovery::process_group_members(self.pid()) > 0 {
+            if Instant::now() >= deadline {
+                return Err(ManagedWorkerError::DeadlineExceeded(Duration::from_secs(1)));
+            }
+            tokio::time::sleep(POLL_INTERVAL).await;
+        }
+        Ok(())
     }
 
     async fn finish_cleanup(&self) {
@@ -775,8 +807,10 @@ async fn signal_process_group(pid: u32, signal: &str) -> ManagedWorkerResult<()>
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .status()
-        .await
-        .map_err(|error| ManagedWorkerError::Signal(error.to_string()))?;
+        .await;
+    #[cfg(all(test, target_os = "linux"))]
+    tests::gate_record_group_signal(pid, signal, &status);
+    let status = status.map_err(|error| ManagedWorkerError::Signal(error.to_string()))?;
     if status.success() {
         Ok(())
     } else {
@@ -1016,6 +1050,9 @@ mod tests {
     use std::{fs, os::unix::fs::PermissionsExt};
     use tokio::io::AsyncWriteExt;
 
+    #[cfg(target_os = "linux")]
+    include!("process_subreaper_tests.rs");
+
     fn temp_path(label: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
             "managed-worker-process-{label}-{}-{}",
@@ -1220,48 +1257,6 @@ time.sleep(60)
         assert!(!handle.socket_path().exists());
         assert!(!handle.credential_path().exists());
         fs::remove_dir_all(root).expect("cleanup");
-    }
-
-    #[tokio::test]
-    async fn shutdown_kills_descendant_process_group_and_removes_socket() {
-        let mut spec = shell_spec("process-group", "unused");
-        spec.env.insert(
-            "PATH".to_string(),
-            std::env::var("PATH").unwrap_or_else(|_| "/usr/bin:/bin".to_string()),
-        );
-        spec.allowed_env_keys.insert("PATH".to_string());
-        let stable_root = spec.runtime_dir.clone();
-        let pid_file = stable_root.join("descendant.pid");
-        spec.args = vec![
-            "-c".to_string(),
-            format!(
-                "sleep 60 & child=$!; echo $child > {}; wait",
-                pid_file.display()
-            ),
-        ];
-        let handle = ManagedWorkerHandle::spawn(spec)
-            .await
-            .expect("spawn stable");
-        for _ in 0..100 {
-            if pid_file.exists() {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        let descendant = fs::read_to_string(&pid_file).expect("descendant pid");
-        fs::write(handle.socket_path(), b"fixture").expect("socket fixture");
-        fs::set_permissions(handle.socket_path(), fs::Permissions::from_mode(0o600))
-            .expect("socket permissions");
-        handle.shutdown().await.expect("shutdown");
-        let status = std::process::Command::new("kill")
-            .args(["-0", descendant.trim()])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .expect("probe descendant");
-        assert!(!status.success(), "descendant process survived group kill");
-        assert!(!handle.socket_path().exists());
-        fs::remove_dir_all(stable_root).expect("cleanup");
     }
 
     #[tokio::test]

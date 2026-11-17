@@ -20,8 +20,6 @@ pub(super) struct ResultProducer {
 pub(super) enum ResultOrigin {
     Strong,
     StrongRaw { anchors: BTreeSet<String> },
-    LegacyWeak,
-    LegacyIncomplete,
 }
 
 impl ResultOrigin {
@@ -38,9 +36,6 @@ impl ResultOrigin {
     }
 
     pub(super) fn require_strong(&self) -> Result<(), String> {
-        if !matches!(self, Self::Strong | Self::StrongRaw { .. }) {
-            return Err("proof requires strong original provenance; legacy raw metadata remains weak/incomplete and requires governed recovery".into());
-        }
         Ok(())
     }
 
@@ -63,7 +58,7 @@ impl RuntimeServices {
         program: &AgenticProgramProjection,
         reference: &str,
     ) -> Result<ArtifactRef, String> {
-        let metadata = resolve_material(self, actor, program, reference).await?;
+        let metadata = resolve_material(self, actor, program, reference).await.map_err(|error| error.to_string())?;
         metadata.origin.require_strong()?;
         Ok(metadata.content)
     }
@@ -132,7 +127,7 @@ impl RuntimeServices {
             .agent_action_service()
             .project(&actor.program_id)
             .unwrap();
-        let metadata = resolve_result(self, actor, &program, reference).await?;
+        let metadata = resolve_result(self, actor, &program, reference).await.map_err(|error| error.to_string())?;
         metadata
             .origin
             .require_strong()
@@ -269,6 +264,15 @@ fn bounded_process_source_fault(event: &mut DurableRuntimeEvent, admission: bool
     });
 }
 
+fn bounded_process_scope_allowed(tool_id: &str, scope: &harness_contract::policy::PermissionScope) -> bool {
+    use harness_contract::policy::{PermissionOperation, PermissionResource};
+    matches!((&scope.resource, &scope.operation),
+        (PermissionResource::File, PermissionOperation::Read)
+        | (PermissionResource::Shell, PermissionOperation::Execute))
+        || (tool_id == "execute_code" && scope.resource == PermissionResource::Tool
+            && scope.operation == PermissionOperation::Call && scope.target.is_none())
+}
+
 fn valid_process_sha256(digest: &str) -> bool {
     digest.len() == 64
         && digest
@@ -353,7 +357,7 @@ pub(super) fn process_ticket_start(
     node_id: &str,
     attempt: u32,
     intent: &DurableRuntimeEvent,
-) -> Result<Vec<DurableRuntimeEvent>, String> {
+) -> Result<Vec<DurableRuntimeEvent>, ReviewEvidenceError> {
     use crate::execution_core::graph::ExecutionGraphEvent;
     use harness_contract::execution_graph::ExecutionNodeStatus;
     let mut cuts = std::collections::BTreeMap::new();
@@ -423,29 +427,50 @@ pub(super) fn process_ticket_start(
     selected.ok_or_else(|| "bounded process original ticket attempt was never started".into())
 }
 
+/// A read of original Process material is bounded by the cut that was pinned
+/// for it. When the source moved while the read ran, the material the read
+/// returned is not the material this review certified: the review is refused
+/// by name, with both heads, instead of re-pinning the source to its newer
+/// head and reading past the certified window.
+fn bounded_process_read_fence(
+    store: &crate::RuntimeEventStore,
+    source: &str,
+    read_head: u64,
+) -> Result<(), String> {
+    let observed = store
+        .stream_revision(source)
+        .map_err(|error| error.to_string())?;
+    if observed != read_head {
+        return Err(format!(
+            "bounded process original source changed during authentication; source={source} read_head={read_head} observed_head={observed}"
+        ));
+    }
+    Ok(())
+}
+
 pub(super) fn authenticate_bounded_process(
     store: &std::sync::Arc<crate::RuntimeEventStore>,
     primary: &DurableRuntimeEvent,
-) -> Result<AuthenticatedProcessExecution, String> {
+) -> Result<AuthenticatedProcessExecution, ReviewEvidenceError> {
     use harness_contract::context::EvidenceTargetIdentity;
-    use harness_contract::policy::{PermissionOperation, PermissionResource};
     let key = primary.payload["idempotency_key"]
         .as_str()
         .filter(|key| !key.is_empty())
         .ok_or("bounded process call identity missing")?;
     let source = format!("execution-effect:{key}");
-    let original = store
-        .event_by_idempotency_key(&source, &format!("{key}:receipt"))
-        .map_err(|error| error.to_string())?
+    // The original Process material is read through the cut this review
+    // pinned for it: the pin comes first, the read is bounded by that cut,
+    // and a source that moved while the read ran is refused by name instead
+    // of being re-pinned to a newer head.
+    let mut cuts = std::collections::BTreeMap::new();
+    let effect_cut = pin_result_source(store, &source, &mut cuts)?;
+    let original = result_event_at_cut(store, &source, &format!("{key}:receipt"), effect_cut)?
         .ok_or("bounded process original primary missing")?;
-    let intent = store
-        .event_by_idempotency_key(&source, &format!("{key}:intent"))
-        .map_err(|error| error.to_string())?
+    let intent = result_event_at_cut(store, &source, &format!("{key}:intent"), effect_cut)?
         .ok_or("bounded process original intent missing")?;
-    let admitted = store
-        .event_by_idempotency_key(&source, &format!("{key}:process-admission"))
-        .map_err(|error| error.to_string())?
+    let admitted = result_event_at_cut(store, &source, &format!("{key}:process-admission"), effect_cut)?
         .ok_or("bounded process original admission missing")?;
+    bounded_process_read_fence(store, &source, effect_cut)?;
     #[cfg(test)]
     let admitted = {
         let mut original = admitted;
@@ -583,13 +608,8 @@ pub(super) fn authenticate_bounded_process(
         || descriptor.mutates_packages
         || descriptor.mutates_system
         || scope.complete
-        || descriptor.scopes.iter().any(|scope| {
-            !matches!(
-                (&scope.resource, &scope.operation),
-                (PermissionResource::File, PermissionOperation::Read)
-                    | (PermissionResource::Shell, PermissionOperation::Execute)
-            )
-        })
+        || descriptor.tool_id != "execute_code"
+        || descriptor.scopes.iter().any(|scope| !bounded_process_scope_allowed(&descriptor.tool_id, scope))
         || primary.payload["tool_name"] != "execute_code"
         || outcome.tool_name != "execute_code"
         || outcome.tool_use_id != fact.admission.binding.tool_use_id
@@ -655,7 +675,6 @@ pub(super) fn authenticate_bounded_process(
         return Err("bounded process original input budget exceeded".into());
     }
     let parent = &primary.payload["replay"]["parent_execution"];
-    let mut cuts = std::collections::BTreeMap::new();
     let (graph, node, attempt) = if parent.is_null() {
         authenticate_root_receipt_owner(store, primary, &mut cuts)?;
         let (owner, attempt, _) = original_root_effect_owner(primary)?;
@@ -671,9 +690,15 @@ pub(super) fn authenticate_bounded_process(
         let node_id = parent["node_id"]
             .as_str()
             .ok_or("bounded process parent node missing")?;
+        // The original graph is rebuilt through the cut this review pinned
+        // for it instead of being read from the hot snapshot: a graph that
+        // moved while the read ran is refused by name.
+        let graph_source = crate::execution_core::graph::graph_id_for_lookup(graph_id);
+        let graph_cut = pin_result_source(store, graph_source, &mut cuts)?;
         let graph = crate::ExecutionGraphStateStore::new(std::sync::Arc::clone(store))
-            .load(graph_id)
+            .load_graph_at_revision(graph_source, graph_cut)
             .map_err(|error| error.to_string())?;
+        bounded_process_read_fence(store, graph_source, graph_cut)?;
         let node = graph
             .nodes
             .iter()
@@ -708,10 +733,15 @@ pub(super) fn authenticate_bounded_process(
         (graph_id.to_string(), node_id.to_string(), attempt)
     };
     let index_source = format!("execution-agent-receipts:{graph}:{node}:{attempt}");
-    let index = store
-        .event_by_idempotency_key(&index_source, &format!("agent-tool-receipt:{key}"))
-        .map_err(|error| error.to_string())?
+    let index_cut = pin_result_source(store, &index_source, &mut cuts)?;
+    let index = result_event_at_cut(
+        store,
+        &index_source,
+        &format!("agent-tool-receipt:{key}"),
+        index_cut,
+    )?
         .ok_or("bounded process original index missing")?;
+    bounded_process_read_fence(store, &index_source, index_cut)?;
     #[cfg(test)]
     let index = {
         let mut original = index;
@@ -752,7 +782,7 @@ pub(super) fn retain_process_execution(
     store: &std::sync::Arc<crate::RuntimeEventStore>,
     run: &AuthenticatedProcessExecution,
     cuts: &mut std::collections::BTreeMap<String, u64>,
-) -> Result<Vec<harness_contract::goal::ProofInputEvent>, String> {
+) -> Result<Vec<harness_contract::goal::ProofInputEvent>, ReviewEvidenceError> {
     let mut materials = vec![
         run.primary.clone(),
         run.admission.clone(),
@@ -821,6 +851,7 @@ pub(super) fn validate_process_archives(
         if canonical != *artifact {
             return Err("bounded process original archive identity changed".into());
         }
+        if let Some(frame) = readers.process_inputs { frame.retain_artifact(artifacts, artifact)?; }
         let limit = if artifact.media_type == "application/json" {
             6291456
         } else {
@@ -1008,7 +1039,7 @@ fn project_result_effect(
     scope: &harness_contract::goal::ProofEffectScope,
     primary: &DurableRuntimeEvent,
     cuts: &mut std::collections::BTreeMap<String, u64>,
-) -> Result<(), String> {
+) -> Result<(), ReviewEvidenceError> {
     if runtime_control_descriptor(descriptor) {
         let checked = require_original_effect_scope(
             &serde_json::to_value(scope).map_err(|error| error.to_string())?,
@@ -1032,7 +1063,7 @@ fn project_result_effect(
         }
         Ok(())
     } else {
-        merge_authenticated_result_effect(resolved, descriptor, scope, primary.commit_cursor)
+        merge_authenticated_result_effect(resolved, descriptor, scope, primary.commit_cursor).map_err(Into::into)
     }
 }
 
@@ -1040,14 +1071,17 @@ pub(super) fn process_runs_for_boundaries(
     store: &std::sync::Arc<crate::RuntimeEventStore>,
     boundaries: &[ResultInputBoundary],
     cuts: &mut std::collections::BTreeMap<String, u64>,
-) -> Result<Vec<AuthenticatedProcessExecution>, String> {
+) -> Result<Vec<AuthenticatedProcessExecution>, ReviewEvidenceError> {
     let mut sources = BTreeSet::new();
     for boundary in boundaries {
         if let Some(packet) = &boundary.packet {
+            let graph_cut = pin_result_source(store, packet.graph_id(), cuts)?;
             let graph = crate::ExecutionGraphStateStore::new(std::sync::Arc::clone(store))
-                .load(packet.graph_id())
+                .load_graph_at_revision(
+                    crate::execution_core::graph::graph_id_for_lookup(packet.graph_id()),
+                    graph_cut,
+                )
                 .map_err(|error| error.to_string())?;
-            pin_result_source(store, packet.graph_id(), cuts)?;
             let attempts = graph
                 .recovery_cursor
                 .node_attempts
@@ -1062,10 +1096,13 @@ pub(super) fn process_runs_for_boundaries(
                 ));
             }
         } else if let Some(root) = boundary.producer.strip_prefix("root-execution:") {
+            let graph_cut = pin_result_source(store, root, cuts)?;
             let graph = crate::ExecutionGraphStateStore::new(std::sync::Arc::clone(store))
-                .load(root)
+                .load_graph_at_revision(
+                    crate::execution_core::graph::graph_id_for_lookup(root),
+                    graph_cut,
+                )
                 .map_err(|error| error.to_string())?;
-            pin_result_source(store, root, cuts)?;
             for (node, attempts) in &graph.recovery_cursor.node_attempts {
                 for attempt in 1..=*attempts {
                     sources.insert(format!("execution-agent-receipts:{root}:{node}:{attempt}"));
@@ -1085,9 +1122,8 @@ pub(super) fn process_runs_for_boundaries(
                 .as_str()
                 .ok_or("process history original call missing")?;
             let stream = format!("execution-effect:{key}");
-            let primary = store
-                .event_by_idempotency_key(&stream, &format!("{key}:receipt"))
-                .map_err(|error| error.to_string())?;
+            let through = store.stream_revision(&stream).map_err(|error| error.to_string())?;
+            let primary = result_event_at_cut(store, &stream, &format!("{key}:receipt"), through)?;
             let claimed = event.payload["effect_kind"] == "process"
                 || has_process_fact(&event)
                 || !event.payload["process_admission_ref"].is_null();
@@ -1104,7 +1140,7 @@ pub(super) fn process_runs_for_boundaries(
             {
                 continue;
             }
-            pin_result_source(store, &stream, cuts)?;
+            fence_process_history_source(store, &stream, through, cuts)?;
             let run = authenticate_bounded_process(store, &primary)?;
             process_has_no_external_effects(&run)?;
             retain_process_execution(store, &run, cuts)?;
@@ -1368,7 +1404,7 @@ pub(super) fn authenticate_original_root_owner(
         u32,
         u64,
     ),
-    String,
+    ReviewEvidenceError,
 > {
     authenticate_original_root_owner_with_reader(
         &mut super::read_source::StoreReadSource(store),
@@ -1387,7 +1423,7 @@ pub(super) fn authenticate_original_root_owner_with_reader(
         u32,
         u64,
     ),
-    String,
+    ReviewEvidenceError,
 > {
     let (binding, attempt, revision) = original_root_effect_owner(intent)?;
     let node = binding
@@ -1432,7 +1468,7 @@ pub(super) fn root_owner_materials(
     store: &crate::RuntimeEventStore,
     intent: &DurableRuntimeEvent,
     cuts: &mut std::collections::BTreeMap<String, u64>,
-) -> Result<Vec<DurableRuntimeEvent>, String> {
+) -> Result<Vec<DurableRuntimeEvent>, ReviewEvidenceError> {
     let (owner, attempt, _) = authenticate_original_root_owner(store, intent, cuts)?;
     let node = owner
         .node_id
@@ -1453,7 +1489,7 @@ pub(super) fn authenticate_root_receipt_owner(
     store: &crate::RuntimeEventStore,
     primary: &DurableRuntimeEvent,
     cuts: &mut std::collections::BTreeMap<String, u64>,
-) -> Result<(), String> {
+) -> Result<(), ReviewEvidenceError> {
     authenticate_root_receipt_owner_with_reader(
         &mut super::read_source::StoreReadSource(store),
         primary,
@@ -1465,7 +1501,7 @@ pub(super) fn authenticate_root_receipt_owner_with_reader(
     reader: &mut dyn super::read_source::ReadAuthSource,
     primary: &DurableRuntimeEvent,
     cuts: &mut std::collections::BTreeMap<String, u64>,
-) -> Result<(), String> {
+) -> Result<(), ReviewEvidenceError> {
     let key = primary.payload["idempotency_key"]
         .as_str()
         .ok_or("root receipt original identity missing")?;
@@ -1731,7 +1767,7 @@ async fn tool_content(
     program: &AgenticProgramProjection,
     session: &str,
     reference: &str,
-) -> Result<ArtifactRef, String> {
+) -> Result<ArtifactRef, ReviewEvidenceError> {
     let id = reference.strip_prefix("tool://").ok_or_else(|| {
         format!(
             "result {reference} is not a Tool evidence reference; cite a `tool://` reference a \
@@ -1793,7 +1829,7 @@ async fn tool_content(
         return Err(format!(
             "result Tool evidence {reference} does not match its durable content; re-read it with \
              evidence_retrieve and cite the reference that call returns"
-        ));
+        ).into());
     }
     Ok(content)
 }
@@ -1803,7 +1839,7 @@ pub(super) async fn resolve_result(
     actor: &AgentActorBinding,
     program: &AgenticProgramProjection,
     reference: &str,
-) -> Result<ResolvedReviewResult, String> {
+) -> Result<ResolvedReviewResult, ReviewEvidenceError> {
     let reference = super::review_result_identity(program, reference)?;
     resolve_material(services, actor, program, &reference).await
 }
@@ -1813,7 +1849,7 @@ pub(super) async fn resolve_material(
     actor: &AgentActorBinding,
     program: &AgenticProgramProjection,
     reference: &str,
-) -> Result<ResolvedReviewResult, String> {
+) -> Result<ResolvedReviewResult, ReviewEvidenceError> {
     let identity = super::identity::auxiliary_identity(program, reference)?;
     let reference = identity.reference();
     let content = if reference.starts_with("approval:v1:") {
@@ -1851,7 +1887,7 @@ pub(super) async fn resolve_material(
     } else {
         return Err(format!(
             "review result has no Runtime-resolved producer:{reference}"
-        ));
+        ).into());
     };
     let history = services.session_history_reader();
     resolve_result_metadata(
@@ -1868,11 +1904,192 @@ pub(super) async fn resolve_material(
     )
 }
 
+/// One pinned source, classified against the window this review already pinned.
+enum SourcePinJudgment {
+    /// The head is admissible: this is the window the review pins.
+    Pinned(u64),
+    /// The head moved against the pinned window, naming both revisions.
+    Refused {
+        movement: ReviewSourceMovement,
+        pinned_cut: u64,
+        observed_head: u64,
+    },
+}
+
+/// The single place that decides whether a source head still matches a review's
+/// pinned window.
+///
+/// The refusal sentence and the rebuild ticket both come out of here, so a
+/// rebuild can never disagree with the refusal it is rebuilding from.
+///
+/// A head that moved backwards is a truncated or replaced stream, and growth on
+/// any source this review judges is the object under review moving. Only growth
+/// on a shared aggregate stream is another actor appending while this review
+/// reads, which leaves the pinned window unchanged.
+fn judge_source_head(
+    reader: &mut dyn super::read_source::ReadAuthSource,
+    source: &str,
+    cuts: &std::collections::BTreeMap<String, u64>,
+) -> Result<SourcePinJudgment, String> {
+    let revision = reader
+        .stream_revision(source)
+        .map_err(|error| error.to_string())?;
+    let Some(previous) = cuts.get(source).copied() else {
+        return Ok(SourcePinJudgment::Pinned(revision));
+    };
+    if revision < previous {
+        return Ok(SourcePinJudgment::Refused {
+            movement: ReviewSourceMovement::Backwards,
+            pinned_cut: previous,
+            observed_head: revision,
+        });
+    }
+    if revision != previous && !super::repin_accepts_moved_head(source, previous, revision) {
+        return Ok(SourcePinJudgment::Refused {
+            movement: ReviewSourceMovement::ForwardNotAccepted,
+            pinned_cut: previous,
+            observed_head: revision,
+        });
+    }
+    Ok(SourcePinJudgment::Pinned(revision))
+}
+
+/// The refusal sentence for one movement. Both resolution-time shapes keep the
+/// wording the pin has produced since A2f, character for character.
+fn source_refusal_sentence(
+    movement: ReviewSourceMovement,
+    source: &str,
+    pinned_cut: u64,
+    observed_head: u64,
+) -> String {
+    let lead = match movement {
+        ReviewSourceMovement::Backwards => {
+            "result metadata source moved backwards during resolution"
+        }
+        ReviewSourceMovement::ForwardNotAccepted => {
+            "result metadata source changed during resolution"
+        }
+    };
+    format!("{lead}; rebuild the review; source={source} expected={pinned_cut} actual={observed_head} phase=result_source_pin")
+}
+
+/// Whether a source head still leaves the result package self-consistent inside
+/// the cut it pinned.
+///
+/// The package can only cite what it read, and every read here is bounded by the
+/// pinned cut: `result_source_events` pages a stream strictly below that cut and
+/// validates its per-source sequence, and `result_source_events_at_session_cut`
+/// reads the original material cut against the independently authenticated head.
+/// A shared aggregate that grew above the pinned cut therefore added nothing this
+/// review can cite. Demanding the live head equal the pinned cut turned a busy
+/// Session into an unresolvable review: the 030 T7 stalled frames (2458/2482,
+/// 889/905, 1831/1849, each after three rebuilds) all named `source=session:...`.
+///
+/// What still refuses is what always refused. A head that is not the pinned cut
+/// and not admissible growth is a truncated or replaced stream, so the material
+/// already cited may no longer be there; and on a source this review judges,
+/// growth is the object under review moving, which the earlier work proved must
+/// not be absorbed.
+pub(crate) fn result_cut_remains_consistent(
+    source: &str,
+    pinned_cut: u64,
+    observed_head: u64,
+) -> bool {
+    observed_head == pinned_cut
+        || super::repin_accepts_moved_head(source, pinned_cut, observed_head)
+}
+
+/// The result package's closing cut fence over every source it pinned.
+fn verify_result_package_cuts(
+    store: &crate::RuntimeEventStore,
+    reference: &str,
+    cuts: &std::collections::BTreeMap<String, u64>,
+) -> Result<(), ReviewEvidenceError> {
+    for (source, expected) in cuts {
+        let observed = store
+            .stream_revision(source)
+            .map_err(|error| error.to_string())?;
+        if result_cut_remains_consistent(source, *expected, observed) {
+            continue;
+        }
+        return Err(ReviewEvidenceError::program_advanced(format!(
+            "result metadata changed after original effect enumeration: result={reference} source={source} expected={expected} observed={observed}; rebuild the review"
+        )));
+    }
+    Ok(())
+}
+
+/// Fold the actual-input phase's cuts into the package's own cuts.
+///
+/// The published value is the later of the two, which is what keeps the promise
+/// every consumer relies on: a published cut is never below a revision this
+/// review actually read. A cut that shrank, or any movement on a source the
+/// review judges, still refuses with the sentence this path has always produced.
+///
+/// Every entry is judged before anything is written. The caller aborts the whole
+/// resolution on refusal, and the next attempt re-pins from durable facts, so a
+/// refused merge leaving a half-folded map behind would be a mutated hint with no
+/// owner - the write is all of it or none of it.
+fn merge_actual_input_cuts(
+    cuts: &mut std::collections::BTreeMap<String, u64>,
+    actual: &std::collections::BTreeMap<String, u64>,
+) -> Result<(), String> {
+    for (source, revision) in actual {
+        if let Some(previous) = cuts.get(source).copied() {
+            if !result_cut_remains_consistent(source, previous, *revision) {
+                return Err("actual result input source moved during enumeration".into());
+            }
+        }
+    }
+    for (source, revision) in actual {
+        if !cuts.get(source).is_some_and(|previous| *previous >= *revision) {
+            cuts.insert(source.clone(), *revision);
+        }
+    }
+    Ok(())
+}
+
+/// The completeness of an original tool outcome, as a three-state fact.
+///
+/// A missing flag is not false: a record that never recorded completeness
+/// cannot be read as complete. The Host side refuses that shape outright
+/// (`conversation/host_backend.rs`), so the review-evidence domain must not
+/// treat the same durable record as complete. The two domains used to disagree
+/// about one record, and the review side was the permissive one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum OutcomeCompleteness {
+    Complete,
+    Truncated,
+}
+
+/// Read the recorded completeness of an original tool outcome.
+pub(super) fn outcome_completeness(
+    primary: &DurableRuntimeEvent,
+) -> Result<OutcomeCompleteness, String> {
+    outcome_completeness_of(&primary.payload).map_err(|error| {
+        format!("{error}; source={} event={}", primary.stream_id, primary.event_id)
+    })
+}
+
+/// The three-state reading itself, over the recorded payload.
+pub(super) fn outcome_completeness_of(
+    payload: &serde_json::Value,
+) -> Result<OutcomeCompleteness, String> {
+    match payload
+        .get("outcome_truncated")
+        .and_then(serde_json::Value::as_bool)
+    {
+        Some(false) => Ok(OutcomeCompleteness::Complete),
+        Some(true) => Ok(OutcomeCompleteness::Truncated),
+        None => Err("original tool outcome completeness was not recorded".to_string()),
+    }
+}
+
 pub(super) fn pin_result_source(
     store: &crate::RuntimeEventStore,
     source: &str,
     cuts: &mut std::collections::BTreeMap<String, u64>,
-) -> Result<u64, String> {
+) -> Result<u64, ReviewEvidenceError> {
     pin_result_source_with_reader(
         &mut super::read_source::StoreReadSource(store),
         source,
@@ -1884,25 +2101,480 @@ pub(super) fn pin_result_source_with_reader(
     reader: &mut dyn super::read_source::ReadAuthSource,
     source: &str,
     cuts: &mut std::collections::BTreeMap<String, u64>,
-) -> Result<u64, String> {
-    let revision = reader
-        .stream_revision(source)
-        .map_err(|error| error.to_string())?;
-    if let Some(previous) = cuts.insert(source.to_string(), revision) {
-        if previous != revision {
-            return Err(format!(
-                "result metadata source changed during resolution; rebuild the review; source={source} expected={previous} actual={revision} phase=result_source_pin"
-            ));
+) -> Result<u64, ReviewEvidenceError> {
+    match judge_source_head(reader, source, cuts)? {
+        SourcePinJudgment::Pinned(revision) => {
+            cuts.insert(source.to_string(), revision);
+            Ok(revision)
+        }
+        SourcePinJudgment::Refused { movement, pinned_cut, observed_head } => Err(
+            ReviewEvidenceError::source_moved(source, pinned_cut, observed_head, movement),
+        ),
+    }
+}
+
+/// Which way the authoritative head moved against the window a review pinned.
+///
+/// Both shapes are the resolution-time refusals this pin has always produced,
+/// and only their names decide whether a rebuild may open a window: growth on a
+/// source the review judges can be re-read at a fresh head, a head that moved
+/// backwards cannot.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ReviewSourceMovement {
+    /// The stream truncated or was replaced: its head fell below the pin.
+    Backwards,
+    /// The head grew on a source this review judges, not a shared aggregate.
+    ForwardNotAccepted,
+}
+
+impl ReviewSourceMovement {
+    /// Whether a refusal of this shape may be rebuilt at a fresh head at all.
+    ///
+    /// A head that moved backwards means the material the reviewer read may no
+    /// longer be there, so re-reading at "whatever the head is now" would
+    /// resolve the review against a window nobody observed. That shape settles
+    /// on its original refusal instead of rebuilding.
+    pub(crate) fn rebuildable(self) -> bool {
+        matches!(self, Self::ForwardNotAccepted)
+    }
+}
+
+/// The named rebuild record a refused source pin produces.
+///
+/// Before this record existed, a refusal travelled only as a sentence. That
+/// sentence already named the source, the pinned cut and the head, but nothing
+/// bound it to the review that had been refused: the runner could not tell
+/// which ticket and attempt to rebuild, nor prove that a rebuild re-read the
+/// same source it was refused on instead of quietly choosing a wider window.
+/// The ticket carries exactly that: original ticket, original attempt, original
+/// pinned cut, and the head the store reported at refusal time.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ReviewRepinTicket {
+    review_ref: String,
+    attempt: u32,
+    source: String,
+    pinned_cut: u64,
+    observed_head: u64,
+    movement: ReviewSourceMovement,
+}
+
+/// Review-budget authority travels with the actual source judgment, never in
+/// the text shown to the model. Ordinary failures can only become Message.
+#[derive(Debug)]
+pub(crate) struct ReviewEvidenceError {
+    message: String,
+    kind: ReviewEvidenceErrorKind,
+}
+
+#[derive(Debug)]
+enum ReviewEvidenceErrorKind {
+    Message,
+    SourceMoved { source: String, pinned_cut: u64, observed_head: u64, movement: ReviewSourceMovement },
+    ProducerPinRefused(ReviewRepinTicket),
+    ProgramAdvanced,
+}
+
+impl ReviewEvidenceError {
+    fn source_moved(source: &str, pinned_cut: u64, observed_head: u64, movement: ReviewSourceMovement) -> Self {
+        Self { message: source_refusal_sentence(movement, source, pinned_cut, observed_head),
+            kind: ReviewEvidenceErrorKind::SourceMoved { source: source.to_owned(), pinned_cut, observed_head, movement } }
+    }
+
+    fn program_advanced(message: String) -> Self {
+        Self { message, kind: ReviewEvidenceErrorKind::ProgramAdvanced }
+    }
+
+    pub(super) fn from_repin(rejection: RepinRejection) -> Self {
+        match rejection {
+            RepinRejection::Refused(ticket) => Self {
+                message: ticket.reason(),
+                kind: ReviewEvidenceErrorKind::ProducerPinRefused(ticket),
+            },
+            other => Self::from(other.reason()),
         }
     }
+
+    pub(crate) fn is_program_advanced(&self) -> bool {
+        matches!(&self.kind, ReviewEvidenceErrorKind::ProgramAdvanced)
+    }
+
+    pub(super) fn with_prefix(mut self, prefix: &str) -> Self {
+        self.message = format!("{prefix}{}", self.message);
+        self
+    }
+
+    #[cfg(test)]
+    pub(super) fn contains(&self, pattern: impl AsRef<str>) -> bool { self.message.contains(pattern.as_ref()) }
+
+    #[cfg(test)]
+    pub(super) fn starts_with(&self, pattern: &str) -> bool { self.message.starts_with(pattern) }
+
+    pub(crate) fn review_ticket(&self, review_ref: &str, attempt: u32) -> Option<ReviewRepinTicket> {
+        let (source, pinned_cut, observed_head, movement) = match &self.kind {
+            ReviewEvidenceErrorKind::SourceMoved { source, pinned_cut, observed_head, movement } => (source, *pinned_cut, *observed_head, *movement),
+            ReviewEvidenceErrorKind::ProducerPinRefused(ticket) => (&ticket.source, ticket.pinned_cut, ticket.observed_head, ticket.movement),
+            _ => return None,
+        };
+        Some(ReviewRepinTicket { review_ref: review_ref.into(), attempt, source: source.clone(),
+            pinned_cut, observed_head, movement })
+    }
+}
+
+impl From<String> for ReviewEvidenceError {
+    fn from(message: String) -> Self { Self { message, kind: ReviewEvidenceErrorKind::Message } }
+}
+impl From<&str> for ReviewEvidenceError {
+    fn from(message: &str) -> Self { message.to_owned().into() }
+}
+impl std::fmt::Display for ReviewEvidenceError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str(&self.message) }
+}
+
+impl ReviewRepinTicket {
+    pub(crate) fn review_ref(&self) -> &str {
+        &self.review_ref
+    }
+    pub(crate) fn attempt(&self) -> u32 {
+        self.attempt
+    }
+    pub(crate) fn source(&self) -> &str {
+        &self.source
+    }
+    pub(crate) fn pinned_cut(&self) -> u64 {
+        self.pinned_cut
+    }
+    pub(crate) fn observed_head(&self) -> u64 {
+        self.observed_head
+    }
+    pub(crate) fn movement(&self) -> ReviewSourceMovement {
+        self.movement
+    }
+
+    /// The identity a bounded rebuild budget counts refusals against: the same
+    /// review ticket and attempt refusing twice is the signal to settle on a
+    /// named Unknown rather than to rebuild a third time.
+    pub(crate) fn lineage(&self) -> (&str, u32) {
+        (self.review_ref.as_str(), self.attempt)
+    }
+
+    /// The refusal sentence. For the two resolution-time shapes this is the
+    /// wording the pin has always produced, so the propagated reason does not
+    /// change shape when a ticket exists alongside it.
+    pub(crate) fn reason(&self) -> String {
+        source_refusal_sentence(self.movement, &self.source, self.pinned_cut, self.observed_head)
+    }
+
+    /// Rebuild the ticket from a propagated refusal reason, bound to the review
+    /// ticket and attempt the caller is resolving.
+    ///
+    /// Strict by construction: the reason has to match this grammar exactly, and
+    /// anything else yields `None`, so a rebuild never runs on a guess and a
+    /// rebuild-time refusal (which is not a fresh rebuild request) cannot be
+    /// laundered into another rebuild.
+    #[cfg(test)]
+    pub(crate) fn from_refusal(review_ref: &str, attempt: u32, reason: &str) -> Option<Self> {
+        let (movement, rest) = if let Some(rest) =
+            reason.strip_prefix("result metadata source moved backwards during resolution; rebuild the review; source=")
+        {
+            (ReviewSourceMovement::Backwards, rest)
+        } else if let Some(rest) =
+            reason.strip_prefix("result metadata source changed during resolution; rebuild the review; source=")
+        {
+            (ReviewSourceMovement::ForwardNotAccepted, rest)
+        } else {
+            return None;
+        };
+        let (source, rest) = rest.split_once(" expected=")?;
+        let (pinned_cut, rest) = rest.split_once(" actual=")?;
+        let (observed_head, tail) = rest.split_once(" phase=result_source_pin")?;
+        if !tail.is_empty() || source.is_empty() {
+            return None;
+        }
+        Some(Self {
+            review_ref: review_ref.to_string(),
+            attempt,
+            source: source.to_string(),
+            pinned_cut: pinned_cut.parse().ok()?,
+            observed_head: observed_head.parse().ok()?,
+            movement,
+        })
+    }
+}
+
+/// The one way a review names the node whose source it is pinning.
+///
+/// Every pin site has to hand over the same identity or a bounded rebuild
+/// budget would count two refusals of the same review as one of it and one of
+/// something else, so the format lives here rather than at each call site.
+pub(crate) fn node_review_ref(graph_id: &str, node_id: &str) -> String {
+    format!("{graph_id}/{node_id}")
+}
+
+/// Why one pin or rebuild request did not get a window, named per shape.
+///
+/// The rebuild side has to tell these apart: a window that moved again is a
+/// budget question, an unreadable store is not a review verdict at all, and a
+/// ticket belonging to another review ticket or attempt is a dispatch bug.
+/// Collapsing them into one sentence is what made the old refusal impossible to
+/// act on, so each shape keeps its own wording here.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum RepinRejection {
+    /// The pin refused this source: its head moved while the review read it.
+    Refused(ReviewRepinTicket),
+    /// A backwards head is not a rebuildable window; the review keeps its
+    /// original refusal instead of re-reading at a head nobody observed.
+    NotRebuildable(ReviewRepinTicket),
+    /// The refused ticket belongs to another review ticket or attempt.
+    Identity {
+        refused: ReviewRepinTicket,
+        review_ref: String,
+        attempt: u32,
+    },
+    /// The map does not pin the window this ticket refused on.
+    Window { refused: ReviewRepinTicket, pinned: u64 },
+    /// The store's head fell behind the head the refusal reported.
+    BehindHead { refused: ReviewRepinTicket, head: u64 },
+    /// The store could not report a head for the refused source at all.
+    Unavailable(String),
+}
+
+impl RepinRejection {
+    /// The reason to propagate. `Refused` and `NotRebuildable` render the
+    /// sentence the pin has always produced, so wiring the ticket into a call
+    /// site changes no wording on either refusal path.
+    pub(crate) fn reason(&self) -> String {
+        match self {
+            Self::Refused(ticket) | Self::NotRebuildable(ticket) => ticket.reason(),
+            Self::Identity { refused, review_ref, attempt } => format!(
+                "review rebuild ticket belongs to another review; source={} expected={}#{} actual={review_ref}#{attempt} movement=identity-mismatch phase=result_source_repin",
+                refused.source, refused.review_ref, refused.attempt
+            ),
+            Self::Window { refused, pinned } => format!(
+                "review rebuild ticket does not name the pinned window; source={} expected={} actual={pinned} movement=window-mismatch phase=result_source_repin",
+                refused.source, refused.pinned_cut
+            ),
+            Self::BehindHead { refused, head } => format!(
+                "review rebuild head is behind the refused head; source={} expected={} actual={head} movement=head-behind-refused-head phase=result_source_repin",
+                refused.source, refused.observed_head
+            ),
+            Self::Unavailable(error) => error.clone(),
+        }
+    }
+
+    /// The refused ticket, whenever this rejection is about a window at all.
+    pub(crate) fn ticket(&self) -> Option<&ReviewRepinTicket> {
+        match self {
+            Self::Refused(ticket) | Self::NotRebuildable(ticket) => Some(ticket),
+            Self::Identity { refused, .. }
+            | Self::Window { refused, .. }
+            | Self::BehindHead { refused, .. } => Some(refused),
+            Self::Unavailable(_) => None,
+        }
+    }
+}
+
+/// The pin for one named review ticket and attempt: the same judgment, but a
+/// refusal comes back as a rebuild ticket instead of only a sentence.
+pub(crate) fn pin_result_source_ticketed(
+    store: &crate::RuntimeEventStore,
+    review_ref: &str,
+    attempt: u32,
+    source: &str,
+    cuts: &mut std::collections::BTreeMap<String, u64>,
+) -> Result<u64, RepinRejection> {
+    pin_result_source_ticketed_with_reader(
+        &mut super::read_source::StoreReadSource(store),
+        review_ref,
+        attempt,
+        source,
+        cuts,
+    )
+}
+
+pub(crate) fn pin_result_source_ticketed_with_reader(
+    reader: &mut dyn super::read_source::ReadAuthSource,
+    review_ref: &str,
+    attempt: u32,
+    source: &str,
+    cuts: &mut std::collections::BTreeMap<String, u64>,
+) -> Result<u64, RepinRejection> {
+    match judge_source_head(reader, source, cuts) {
+        Ok(SourcePinJudgment::Pinned(revision)) => {
+            cuts.insert(source.to_string(), revision);
+            Ok(revision)
+        }
+        Ok(SourcePinJudgment::Refused { movement, pinned_cut, observed_head }) => Err(
+            RepinRejection::Refused(ReviewRepinTicket {
+                review_ref: review_ref.to_string(),
+                attempt,
+                source: source.to_string(),
+                pinned_cut,
+                observed_head,
+                movement,
+            }),
+        ),
+        Err(error) => Err(RepinRejection::Unavailable(error)),
+    }
+}
+
+/// Open the rebuild window for one refused review source.
+///
+/// Three rules are deliberate. There is no `cut` parameter: the window comes from
+/// the store, so a caller cannot report a head, and every read the rebuilt
+/// review makes still goes through the original authority rules - a Session
+/// material cut above the durable head is still refused
+/// (`HistoricalSessionCut::for_live_material`), and growth inside the new window
+/// is still refused by the ordinary pin. A rebuild may only move forward: a head
+/// that has fallen behind the head the refusal reported means the stream was
+/// truncated or replaced, so the material that review read is no longer there.
+/// The third rule is that the window is only ever opened for the review ticket
+/// and attempt the refusal was bound to.
+///
+/// This entry does not absorb the growth it refused, and it does not widen what
+/// a review may cite beyond the head the store itself reported at rebuild time.
+/// A second movement is refused again by the ordinary pin, which produces a
+/// second ticket on the same lineage; the caller's bounded rebuild budget then
+/// decides when the review settles to a named Unknown.
+pub(crate) fn repin_at_fresh_head(
+    store: &crate::RuntimeEventStore,
+    review_ref: &str,
+    attempt: u32,
+    ticket: &ReviewRepinTicket,
+    cuts: &mut std::collections::BTreeMap<String, u64>,
+) -> Result<u64, RepinRejection> {
+    repin_at_fresh_head_with_reader(
+        &mut super::read_source::StoreReadSource(store),
+        review_ref,
+        attempt,
+        ticket,
+        cuts,
+    )
+}
+
+pub(crate) fn repin_at_fresh_head_with_reader(
+    reader: &mut dyn super::read_source::ReadAuthSource,
+    review_ref: &str,
+    attempt: u32,
+    ticket: &ReviewRepinTicket,
+    cuts: &mut std::collections::BTreeMap<String, u64>,
+) -> Result<u64, RepinRejection> {
+    if ticket.review_ref != review_ref || ticket.attempt != attempt {
+        return Err(RepinRejection::Identity {
+            refused: ticket.clone(),
+            review_ref: review_ref.to_string(),
+            attempt,
+        });
+    }
+    if !ticket.movement.rebuildable() {
+        // A backwards head is a truncated or replaced stream. The rebuild would
+        // resolve the review at a head nobody observed, so the original refusal
+        // stands and the caller settles the review instead of rebuilding.
+        return Err(RepinRejection::NotRebuildable(ticket.clone()));
+    }
+    if let Some(pinned) = cuts.get(ticket.source.as_str()).copied() {
+        if pinned != ticket.pinned_cut {
+            return Err(RepinRejection::Window { refused: ticket.clone(), pinned });
+        }
+    }
+    let revision = match reader.stream_revision(ticket.source.as_str()) {
+        Ok(revision) => revision,
+        Err(error) => return Err(RepinRejection::Unavailable(error)),
+    };
+    if revision < ticket.observed_head {
+        return Err(RepinRejection::BehindHead { refused: ticket.clone(), head: revision });
+    }
+    cuts.insert(ticket.source.clone(), revision);
     Ok(revision)
+}
+
+// The bounded store lookup is bounded by commit cursor, not stream sequence.
+fn result_event_at_cut(
+    store: &crate::RuntimeEventStore,
+    source: &str,
+    key: &str,
+    through: u64,
+) -> Result<Option<DurableRuntimeEvent>, String> {
+    result_event_at_cut_with_limit(store, source, key, through, usize::MAX)
+}
+
+fn result_event_at_cut_with_limit(
+    store: &crate::RuntimeEventStore,
+    source: &str,
+    key: &str,
+    through: u64,
+    max_bytes: usize,
+) -> Result<Option<DurableRuntimeEvent>, String> {
+    let head = store.stream_revision(source).map_err(|error| error.to_string())?;
+    if head < through {
+        return Err("result original source moved backwards before bounded lookup".into());
+    }
+    if through == 0 {
+        return Ok(None);
+    }
+    // The exact key is unique in its stream. Look up through the greatest
+    // representable store cursor, then apply the independent stream cut.
+    let found = store.bounded_event_by_idempotency_key(source, key, i64::MAX as u64, max_bytes)
+        .map_err(|error| error.to_string())?;
+    if store.stream_revision(source).map_err(|error| error.to_string())? < through {
+        return Err("result original source moved backwards during bounded lookup".into());
+    }
+    match found {
+        crate::RuntimeBoundedEventLookup::Absent => Ok(None),
+        crate::RuntimeBoundedEventLookup::Deferred { required_bytes } => Err(format!(
+            "HistoryBudgetExceeded: result original event requires {required_bytes} bytes"
+        )),
+        crate::RuntimeBoundedEventLookup::Record { record, encoded_bytes } => {
+            struct EncodedBytes(usize);
+            impl std::io::Write for EncodedBytes {
+                fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                    self.0 = self.0.checked_add(bytes.len())
+                        .ok_or_else(|| std::io::Error::other("result event extent overflow"))?;
+                    Ok(bytes.len())
+                }
+                fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+            }
+            let mut measured = EncodedBytes(0);
+            serde_json::to_writer(&mut measured, &record).map_err(|error| error.to_string())?;
+            if record.stream_id != source || record.idempotency_key.as_deref() != Some(key)
+                || record.commit_cursor == 0 || encoded_bytes > max_bytes
+                || measured.0 != encoded_bytes
+            {
+                return Err("result original bounded event identity or extent differs".into());
+            }
+            // Multiple events in one transaction can share the anchor cursor.
+            if record.sequence > through { return Ok(None); }
+            if record.sequence == 0 { return Err("result original event sequence invalid".into()); }
+            Ok(Some(*record))
+        }
+    }
+}
+
+/// The head read before a Process-history receipt is only a discovery hint:
+/// the authoritative position for a source is the one recorded by the pin
+/// into the review's cuts. If the stream moved between the two, the receipt
+/// was found under no fence that accepted that position, so discovery is
+/// refused explicitly instead of re-pinning to a newer head or pretending
+/// the read still stands.
+fn fence_process_history_source(
+    store: &crate::RuntimeEventStore,
+    stream: &str,
+    through: u64,
+    cuts: &mut std::collections::BTreeMap<String, u64>,
+) -> Result<(), ReviewEvidenceError> {
+    let pinned = pin_result_source(store, stream, cuts)?;
+    if pinned != through {
+        return Err(format!(
+            "process history source changed during discovery; source={stream} read_head={through} pinned_head={pinned}"
+        ).into());
+    }
+    Ok(())
 }
 
 pub(super) fn result_source_events(
     store: &crate::RuntimeEventStore,
     source: &str,
     cuts: &mut std::collections::BTreeMap<String, u64>,
-) -> Result<Vec<DurableRuntimeEvent>, String> {
+) -> Result<Vec<DurableRuntimeEvent>, ReviewEvidenceError> {
     let head = pin_result_source(store, source, cuts)?;
     let mut after = 0;
     let mut events = Vec::new();
@@ -1923,17 +2595,56 @@ pub(super) fn result_source_events(
     Ok(events)
 }
 
-fn result_packet(
+/// Read historical Session material through its original cut while keeping
+/// the independently authenticated current head as the checked source.
+pub(super) fn result_source_events_at_session_cut(
+    store: &crate::RuntimeEventStore, source: &str,
+    cuts: &mut std::collections::BTreeMap<String, u64>,
+    historical_cut: u64, authenticated_head: u64,
+) -> Result<Vec<DurableRuntimeEvent>, ReviewEvidenceError> {
+    if !source.starts_with("session:") || historical_cut > authenticated_head
+        || pin_result_source(store, source, cuts)? < authenticated_head {
+        return Err("original Session material cut or current head differs".into());
+    }
+    let mut after = 0;
+    let mut events = Vec::new();
+    while after < historical_cut {
+        let page = store.list_stream_after(source, after, historical_cut, 64, 4 * 1024 * 1024)?;
+        if page.is_empty() { return Err("original Session material page incomplete".into()); }
+        for event in page {
+            if event.stream_id != source || event.sequence != after + 1 || event.sequence > historical_cut {
+                return Err("original Session material sequence invalid".into());
+            }
+            after = event.sequence;
+            events.push(event);
+        }
+    }
+    // The authenticated head is a cut point that must still exist. Another
+    // actor appending to the Session while this review reads leaves it valid;
+    // a head below it means the cut was truncated away.
+    if pin_result_source(store, source, cuts)? < authenticated_head {
+        return Err("current Session head moved backwards while reading original material".into());
+    }
+    Ok(events)
+}
+
+pub(super) fn result_packet(
     store: &std::sync::Arc<crate::RuntimeEventStore>,
     execution: &str,
     program: &AgenticProgramProjection,
     cuts: &mut std::collections::BTreeMap<String, u64>,
-) -> Result<AgentTaskPacket, String> {
+) -> Result<AgentTaskPacket, ReviewEvidenceError> {
     let graphs = crate::ExecutionGraphStateStore::new(std::sync::Arc::clone(store));
     let source = crate::execution_core::graph::graph_id_for_lookup(execution);
-    pin_result_source(store, source, cuts)?;
-    let graph = graphs.load(execution).map_err(|error| error.to_string())?;
-    if cuts.get(&graph.id) != Some(&graph.revision)
+    let graph_cut = pin_result_source(store, source, cuts)?;
+    let graph = graphs.load_graph_at_revision(source, graph_cut)
+        .map_err(|error| error.to_string())?;
+    // A graph that grew since its cut is another actor advancing it; a graph
+    // with no cut at all is a foreign producer, and a graph strictly older
+    // than its cut means the material moved. The lineage and Session
+    // conjunct below is unchanged.
+    if !cuts.contains_key(&graph.id)
+        || cuts.get(&graph.id).is_some_and(|cut| graph.revision < *cut)
         || graph
             .lineage
             .as_ref()
@@ -1965,7 +2676,9 @@ fn result_packet(
     {
         return Err("result physical producer packet is ambiguous or unauthenticated".into());
     }
-    pin_result_source(store, &graph.id, cuts)?;
+    if pin_result_source(store, &graph.id, cuts)? != graph_cut {
+        return Err("result producer graph changed during original packet read".into());
+    }
     Ok(packet)
 }
 
@@ -1975,7 +2688,7 @@ fn authenticate_callback_parent_chain(
     binding: &harness_contract::projection::RuntimeActivityBinding,
     programs: &[AgenticProgramProjection],
     cuts: &mut std::collections::BTreeMap<String, u64>,
-) -> Result<(), String> {
+) -> Result<(), ReviewEvidenceError> {
     let graphs = crate::ExecutionGraphStateStore::new(std::sync::Arc::clone(store));
     let mut execution = producer_graph.to_string();
     let mut visited = BTreeSet::new();
@@ -1983,8 +2696,12 @@ fn authenticate_callback_parent_chain(
         if !visited.insert(execution.clone()) {
             return Err("result callback producer parent chain is cyclic".into());
         }
-        pin_result_source(store, &execution, cuts)?;
-        let graph = graphs.load(&execution).map_err(|error| error.to_string())?;
+        let graph_cut = pin_result_source(store, &execution, cuts)?;
+        let graph = graphs.load_graph_at_revision(
+            crate::execution_core::graph::graph_id_for_lookup(&execution),
+            graph_cut,
+        )
+            .map_err(|error| error.to_string())?;
         if cuts.get(&execution) != Some(&graph.revision)
             || graph.lineage.as_ref().is_none_or(|lineage| {
                 lineage.session_id != binding.session_id
@@ -2022,9 +2739,12 @@ fn authenticate_callback_parent_chain(
         {
             return Err("result callback producer lacks its original parent link".into());
         }
-        pin_result_source(store, &parent.execution_id, cuts)?;
+        let parent_cut = pin_result_source(store, &parent.execution_id, cuts)?;
         let original_parent = graphs
-            .load(&parent.execution_id)
+            .load_graph_at_revision(
+                crate::execution_core::graph::graph_id_for_lookup(&parent.execution_id),
+                parent_cut,
+            )
             .map_err(|error| error.to_string())?;
         if !original_parent
             .nodes
@@ -2124,7 +2844,18 @@ pub(super) fn original_tool_primary(
     owner: &DurableRuntimeEvent,
     task: &serde_json::Value,
     cuts: &mut std::collections::BTreeMap<String, u64>,
-) -> Result<DurableRuntimeEvent, String> {
+) -> Result<DurableRuntimeEvent, ReviewEvidenceError> {
+    original_tool_primary_and_index(store, owner, task, cuts).map(|(primary, _)| primary)
+}
+
+/// Return the exact index already selected by the original owner, so callers
+/// that need a transaction witness do not rediscover an attempt by guessing.
+pub(super) fn original_tool_primary_and_index(
+    store: &std::sync::Arc<crate::RuntimeEventStore>,
+    owner: &DurableRuntimeEvent,
+    task: &serde_json::Value,
+    cuts: &mut std::collections::BTreeMap<String, u64>,
+) -> Result<(DurableRuntimeEvent, DurableRuntimeEvent), ReviewEvidenceError> {
     let step: crate::step_snapshot::StepCallBinding =
         serde_json::from_value(task["step_binding"].clone()).map_err(|_| {
             "result_origin_requires_original_immutable_content: publication Step missing"
@@ -2141,12 +2872,10 @@ pub(super) fn original_tool_primary(
     }
     let key = step.effect_idempotency_key();
     let source = format!("execution-effect:{key}");
-    pin_result_source(store, &source, cuts)?;
+    let primary_cut = pin_result_source(store, &source, cuts)?;
     let mut selected = None;
     for suffix in ["read-receipt", "receipt"] {
-        if let Some(event) = store
-            .event_by_idempotency_key(&source, &format!("{key}:{suffix}"))
-            .map_err(|error| error.to_string())?
+        if let Some(event) = result_event_at_cut(store, &source, &format!("{key}:{suffix}"), primary_cut)?
         {
             if selected.replace(event).is_some() {
                 return Err("publication has ambiguous original primary receipts".into());
@@ -2179,9 +2908,7 @@ pub(super) fn original_tool_primary(
         return Err("publication primary does not authenticate its actual output".into());
     }
     if primary.kind == "execution.effect.receipt" {
-        let intent = store
-            .event_by_idempotency_key(&source, &format!("{key}:intent"))
-            .map_err(|error| error.to_string())?
+        let intent = result_event_at_cut(store, &source, &format!("{key}:intent"), primary_cut)?
             .ok_or("result producer effect has no original admitted intent")?;
         if intent.schema_version != 1
             || intent.kind != "execution.effect.intent"
@@ -2230,9 +2957,7 @@ pub(super) fn original_tool_primary(
         } else {
             "intent"
         };
-        let intent = store
-            .event_by_idempotency_key(&source, &format!("{key}:{suffix}"))
-            .map_err(|error| error.to_string())?
+        let intent = result_event_at_cut(store, &source, &format!("{key}:{suffix}"), primary_cut)?
             .ok_or("root output lacks its original admitted intent")?;
         let (admitted, attempt, graph_revision) =
             authenticate_original_root_owner(store, &intent, cuts)?;
@@ -2288,9 +3013,12 @@ pub(super) fn original_tool_primary(
     };
     let graph = graph_owned.as_str();
     let node = node_owned.as_str();
-    pin_result_source(store, graph, cuts)?;
+    let graph_cut = pin_result_source(store, graph, cuts)?;
     let graph_state = crate::ExecutionGraphStateStore::new(std::sync::Arc::clone(store))
-        .load(graph)
+        .load_graph_at_revision(
+            crate::execution_core::graph::graph_id_for_lookup(graph),
+            graph_cut,
+        )
         .map_err(|error| error.to_string())?;
     if cuts.get(graph) != Some(&graph_state.revision)
         || !graph_state
@@ -2377,7 +3105,7 @@ pub(super) fn original_tool_primary(
             || !super::binding_is_owned_by_root(&binding, Some(graph))
         {
             return Err(format!("graph-bound root output original caller mismatch: graph={graph} node={node} kind={:?} step={} actor={:?}",
-                original_node.kind, identity.step_id, identity.actor_ref));
+                original_node.kind, identity.step_id, identity.actor_ref).into());
         }
         0
     } else {
@@ -2411,10 +3139,8 @@ pub(super) fn original_tool_primary(
     }
     for attempt in first_attempt..=last_attempt {
         let index_source = format!("execution-agent-receipts:{graph}:{node}:{attempt}");
-        pin_result_source(store, &index_source, cuts)?;
-        if let Some(index) = store
-            .event_by_idempotency_key(&index_source, &format!("agent-tool-receipt:{key}"))
-            .map_err(|error| error.to_string())?
+        let index_cut = pin_result_source(store, &index_source, cuts)?;
+        if let Some(index) = result_event_at_cut(store, &index_source, &format!("agent-tool-receipt:{key}"), index_cut)?
         {
             if root_owner.is_none() && packet_attempt == 0 {
                 let states = crate::ExecutionGraphStateStore::new(std::sync::Arc::clone(store));
@@ -2517,10 +3243,10 @@ pub(super) fn original_tool_primary(
         {
             return Err("publication primary/index do not authenticate one original output".into());
         }
+        Ok((primary, index))
     } else {
-        return Err("original tool output has no original physical index".into());
+        Err("original tool output has no original physical index".into())
     }
-    Ok(primary)
 }
 
 fn original_output_identity(owner: &DurableRuntimeEvent) -> Result<Option<(&str, u64)>, String> {
@@ -2551,243 +3277,6 @@ fn original_output_identity(owner: &DurableRuntimeEvent) -> Result<Option<(&str,
     Ok(Some((digest, bytes)))
 }
 
-fn raw_input_matches_owner(
-    payload: &serde_json::Value,
-    owner: &DurableRuntimeEvent,
-    task: Option<&serde_json::Value>,
-) -> bool {
-    let Some(recorded) = payload["input_hash"].as_str() else {
-        return false;
-    };
-    let Some(expected) = owner.payload["input_hash"].as_str() else {
-        return false;
-    };
-    if recorded == expected {
-        return !recorded.is_empty();
-    }
-    let source = format!(
-        "runtime-tool:{}",
-        owner.payload["tool_call_id"].as_str().unwrap_or_default()
-    );
-    if payload["source_evidence_ref"] != source
-        || payload["native_staged_artifact"] == true
-        || recorded.len() != 16
-        || !recorded.bytes().all(|byte| byte.is_ascii_hexdigit())
-        || expected.len() != 64
-        || !expected.bytes().all(|byte| byte.is_ascii_hexdigit())
-    {
-        return false;
-    }
-    let plan_input = task
-        .and_then(|task| task.get("normalized_input"))
-        .and_then(|input| serde_json::to_string(input).ok());
-    owner.payload["input_preview"]
-        .as_str()
-        .into_iter()
-        .chain(plan_input.as_deref())
-        .any(|input| {
-            crate::tool_invocation::stable_hash(input) == expected
-                && recorded
-                    == format!(
-                        "{:016x}",
-                        model_protocol::fingerprint::stable_hash_bytes(input.as_bytes())
-                    )
-        })
-}
-
-fn observed_raw_selector_conflict(
-    readers: super::ResultContentReaders<'_>,
-    owner: &DurableRuntimeEvent,
-    selector: &str,
-) -> bool {
-    let (Some(history), Some(binding), Some(reference)) = (
-        readers.history,
-        owner.activity_binding(),
-        owner.payload["full_output_ref"].as_str(),
-    ) else {
-        return false;
-    };
-    let Some(evidence_id) = reference.strip_prefix("tool://") else {
-        return false;
-    };
-    let Ok(mut remaining) = history.domain_event_count_blocking(&binding.session_id) else {
-        return false;
-    };
-    let mut after = 0;
-    while remaining > 0 {
-        let limit = remaining.min(128);
-        let Ok(page) = history.domain_events_by_kind_blocking(
-            &binding.session_id,
-            "evidence.raw.persisted",
-            after,
-            limit,
-        ) else {
-            return false;
-        };
-        if page.is_empty() || page.len() > limit {
-            return false;
-        }
-        for event in page {
-            remaining -= 1;
-            if event.session_id == binding.session_id
-                && event.kind == "evidence.raw.persisted"
-                && event.payload["evidence_id"] == evidence_id
-                && event.payload["artifact_selector"] == selector
-            {
-                return true;
-            }
-            if event.sequence < after {
-                return false;
-            }
-            let Some(next) = event.sequence.checked_add(1) else {
-                return false;
-            };
-            after = next;
-        }
-    }
-    false
-}
-
-fn original_session_raw(
-    readers: super::ResultContentReaders<'_>,
-    owner: &DurableRuntimeEvent,
-    task: Option<&serde_json::Value>,
-) -> Result<(ArtifactRef, ResultOrigin), String> {
-    let binding = owner
-        .activity_binding()
-        .ok_or("raw origin has no physical owner")?;
-    let reference = owner.payload["full_output_ref"]
-        .as_str()
-        .ok_or("raw origin lacks its canonical full_output_ref")?;
-    let evidence_id = reference
-        .strip_prefix("tool://")
-        .filter(|id| !id.is_empty())
-        .ok_or("raw origin has no canonical Tool identity")?;
-    let history = readers.history.ok_or(
-        "result_origin_requires_original_immutable_content: original Session history reader missing",
-    )?;
-    let mut from_sequence = 0;
-    let mut original = None;
-    let mut original_metadata = None;
-    let mut remaining = history
-        .domain_event_count_blocking(&binding.session_id)
-        .map_err(|error| error.to_string())?;
-    while remaining > 0 {
-        let limit = remaining.min(128);
-        let page = history
-            .domain_events_by_kind_blocking(
-                &binding.session_id,
-                "evidence.raw.persisted",
-                from_sequence,
-                limit,
-            )
-            .map_err(|error| error.to_string())?;
-        if page.is_empty() {
-            break;
-        }
-        if page.len() > limit {
-            return Err("original Session raw history exceeds its finite page budget".into());
-        }
-        for event in page {
-            remaining -= 1;
-            if event.session_id != binding.session_id
-                || event.kind != "evidence.raw.persisted"
-                || event.sequence < from_sequence
-            {
-                return Err("original Session raw history has an invalid page".into());
-            }
-            from_sequence = event
-                .sequence
-                .checked_add(1)
-                .ok_or("original Session raw cursor overflow")?;
-            let payload = &event.payload;
-            if payload["evidence_id"] != evidence_id {
-                continue;
-            }
-            if payload["session_id"] != binding.session_id
-                || payload["tool_call_id"] != owner.payload["tool_call_id"]
-                || payload["tool_name"] != owner.payload["tool_name"]
-                || !raw_input_matches_owner(payload, owner, task)
-                || payload["is_error"] != false
-                || payload["visibility_scope"] != format!("session:{}", binding.session_id)
-            {
-                return Err(
-                    "original Session raw metadata crosses its exact lifecycle owner".into(),
-                );
-            }
-            let metadata = serde_json::json!([
-                payload["session_id"],
-                payload["tool_call_id"],
-                payload["tool_name"],
-                payload["input_hash"],
-                payload["is_error"],
-                payload["source_evidence_ref"],
-                payload["native_staged_artifact"],
-            ]);
-            if original_metadata
-                .as_ref()
-                .is_some_and(|previous| previous != &metadata)
-            {
-                return Err(
-                    "original Session raw identity has conflicting producer metadata".into(),
-                );
-            }
-            original_metadata = Some(metadata);
-            let access =
-                crate::context_evidence::raw::access_from_persisted_payload(evidence_id, payload)
-                    .ok_or("original Session raw receipt is incomplete")?;
-            let artifact = ArtifactRef::durable(
-                access.retrieval_selector,
-                access.sha256,
-                access.bytes,
-                access.media_type,
-                access.visibility_scope,
-            );
-            let call = owner.payload["tool_call_id"]
-                .as_str()
-                .ok_or("original raw call missing")?;
-            let prefix = format!("tool-raw-{call}-");
-            let suffix = evidence_id
-                .strip_prefix(&prefix)
-                .ok_or("raw receipt has a foreign producer format")?;
-            let staged = payload["native_staged_artifact"] == true;
-            if staged {
-                if suffix
-                    != artifact
-                        .sha256
-                        .strip_prefix("sha256:")
-                        .unwrap_or(&artifact.sha256)
-                {
-                    return Err("staged raw identity disagrees with its original digest".into());
-                }
-            } else if suffix.len() != 16 || !suffix.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-                return Err("ordinary raw identity is not its original fingerprint format".into());
-            }
-            if original
-                .as_ref()
-                .is_some_and(|previous| previous != &artifact)
-            {
-                return Err("original Session raw identity has conflicting exact receipts".into());
-            }
-            original = Some(artifact);
-        }
-    }
-    original.map(|artifact| {
-        let call = owner.payload["tool_call_id"].as_str().unwrap_or_default();
-        let staged = format!("tool://tool-raw-{call}-{}", artifact.sha256.trim_start_matches("sha256:"));
-        let origin = if reference == staged {
-            ResultOrigin::Strong
-        } else if remaining == 0 {
-            ResultOrigin::LegacyIncomplete
-        } else {
-            ResultOrigin::LegacyWeak
-        };
-        (artifact, origin)
-    }).ok_or_else(|| format!(
-        "result_origin_requires_original_immutable_content: exact original Session raw mapping missing:{reference}; finite recovery budget exhausted={}", remaining == 0
-    ))
-}
-
 fn checked_original_bytes(bytes: Vec<u8>, digest: &str, expected: u64) -> Result<Vec<u8>, String> {
     let normalized = digest.strip_prefix("sha256:").unwrap_or(digest);
     let actual = crate::context_evidence::read_sha256(&bytes);
@@ -2812,6 +3301,7 @@ fn read_original_session_body(
     let binding = owner
         .activity_binding()
         .ok_or("raw body has no original owner")?;
+    if let Some(frame) = readers.process_inputs { frame.retain_artifact(artifacts, artifact)?; }
     let bytes = artifacts
         .read_blocking(artifact, &format!("session:{}", binding.session_id), None)
         .map_err(|error| error.to_string())?;
@@ -2910,7 +3400,7 @@ fn original_tool_body(
     task: Option<&serde_json::Value>,
     cuts: &mut std::collections::BTreeMap<String, u64>,
     limit: Option<u64>,
-) -> Result<Option<OriginalToolBody>, String> {
+) -> Result<Option<OriginalToolBody>, ReviewEvidenceError> {
     if let Some(artifact) = runtime_raw_artifact(owner)? {
         if limit.is_some_and(|limit| artifact.bytes > limit) {
             return Ok(None);
@@ -2926,30 +3416,36 @@ fn original_tool_body(
     let identity = original_output_identity(owner)?;
     if let Some(task) = task {
         match original_tool_primary(store, owner, task, cuts) {
-            Ok(primary) if primary.payload["outcome_truncated"] != true => {
-                if let Some(output) = primary.payload["outcome"]["output"].as_str() {
-                    if limit.is_some_and(|limit| output.len() as u64 > limit) {
-                        return Ok(None);
-                    }
-                    let bytes = output.as_bytes().to_vec();
-                    let bytes = match identity {
-                        Some((digest, expected)) => {
-                            checked_original_bytes(bytes, digest, expected)?
+            Ok(primary) => {
+                match outcome_completeness(&primary)? {
+                    OutcomeCompleteness::Complete => {
+                        if let Some(output) = primary.payload["outcome"]["output"].as_str() {
+                            if limit.is_some_and(|limit| output.len() as u64 > limit) {
+                                return Ok(None);
+                            }
+                            let bytes = output.as_bytes().to_vec();
+                            let bytes = match identity {
+                                Some((digest, expected)) => {
+                                    checked_original_bytes(bytes, digest, expected)?
+                                }
+                                None => bytes,
+                            };
+                            if canonical_original_bytes(owner, &bytes).is_ok() {
+                                return Ok(Some(OriginalToolBody {
+                                    bytes,
+                                    origin: ResultOrigin::Strong,
+                                    content: None,
+                                }));
+                            }
                         }
-                        None => bytes,
-                    };
-                    if canonical_original_bytes(owner, &bytes).is_ok() {
-                        return Ok(Some(OriginalToolBody {
-                            bytes,
-                            origin: ResultOrigin::Strong,
-                            content: None,
-                        }));
                     }
+                    // A truncated original is not a complete body: the preview
+                    // path below is the only remaining source.
+                    OutcomeCompleteness::Truncated => {}
                 }
             }
-            Ok(_) => {}
             Err(error)
-                if error.starts_with("result_origin_requires_original_immutable_content:") => {}
+                if error.to_string().starts_with("result_origin_requires_original_immutable_content:") => {}
             Err(error) => return Err(error),
         }
     }
@@ -2983,9 +3479,10 @@ fn original_tool_body(
         let binding = owner
             .activity_binding()
             .ok_or("raw body has no original owner")?;
-        let bytes = artifacts
-            .read_session_content_by_digest_blocking(&binding.session_id, digest, expected)
+        let (selected, bytes) = artifacts
+            .read_session_content_by_digest_with_ref_blocking(&binding.session_id, digest, expected)
             .map_err(|error| error.to_string())?;
+        if let Some(frame) = readers.process_inputs { frame.retain_artifact(artifacts, &selected)?; }
         let bytes = checked_original_bytes(bytes, digest, expected)?;
         if canonical_original_bytes(owner, &bytes).is_ok() {
             return Ok(Some(OriginalToolBody {
@@ -2995,16 +3492,7 @@ fn original_tool_body(
             }));
         }
     }
-    let (artifact, origin) = original_session_raw(readers, owner, task)?;
-    if limit.is_some_and(|limit| artifact.bytes > limit) {
-        return Ok(None);
-    }
-    let bytes = read_original_session_body(readers, owner, &artifact)?;
-    Ok(Some(OriginalToolBody {
-        bytes,
-        origin,
-        content: Some(artifact),
-    }))
+    Err("original Tool body lacks authenticated immutable identity".into())
 }
 
 fn canonical_raw_result_content(
@@ -3143,7 +3631,7 @@ fn publication_output(
     owner: &DurableRuntimeEvent,
     task: Option<&serde_json::Value>,
     cuts: &mut std::collections::BTreeMap<String, u64>,
-) -> Result<Option<(serde_json::Value, ResultOrigin)>, String> {
+) -> Result<Option<(serde_json::Value, ResultOrigin)>, ReviewEvidenceError> {
     struct UniqueReply;
     impl<'de> serde::de::Visitor<'de> for UniqueReply {
         type Value = serde_json::Value;
@@ -3173,11 +3661,34 @@ fn publication_output(
     decoder.end().map_err(|error| error.to_string())?;
     Ok(Some((value, body.origin)))
 }
+fn result_program_at_cut(
+    store: &std::sync::Arc<crate::RuntimeEventStore>,
+    program_id: &str,
+    through: u64,
+) -> Result<AgenticProgramProjection, String> {
+    let source = format!("agentic-program:{program_id}");
+    if store.stream_revision(&source).map_err(|error| error.to_string())? < through {
+        return Err("result continuation Program moved backwards".into());
+    }
+    let opened = store.list_stream_after(&source, 0, 1, 1, 1024 * 1024)?
+        .into_iter().next().ok_or("result continuation Program opening missing")?;
+    let prior = crate::AgentActionService::new(std::sync::Arc::clone(store))
+        .project_snapshot_bounded(
+            program_id, through, &opened, None,
+            |after, cut| store.list_stream_after(&source, after, cut, 100, 1024 * 1024),
+            |error| error.to_string(),
+        )?;
+    if store.stream_revision(&source).map_err(|error| error.to_string())? < through {
+        return Err("result continuation Program moved backwards during projection".into());
+    }
+    Ok((*prior).clone())
+}
+
 fn publication_sources(
     store: &std::sync::Arc<crate::RuntimeEventStore>,
     program: &AgenticProgramProjection,
     cuts: &mut std::collections::BTreeMap<String, u64>,
-) -> Result<(Vec<AgenticProgramProjection>, Vec<DurableRuntimeEvent>), String> {
+) -> Result<(Vec<AgenticProgramProjection>, Vec<DurableRuntimeEvent>), ReviewEvidenceError> {
     let mut programs = vec![program.clone()];
     let mut seen = BTreeSet::from([program.program_id.clone()]);
     while let Some(binding) = programs
@@ -3188,10 +3699,8 @@ fn publication_sources(
             return Err("result continuation lineage is cyclic".into());
         }
         let source = format!("agentic-program:{}", binding.source_program_id);
-        pin_result_source(store, &source, cuts)?;
-        let prior = crate::AgentActionService::new(std::sync::Arc::clone(store))
-            .project(&binding.source_program_id)
-            .map_err(|error| error.to_string())?;
+        let source_cut = pin_result_source(store, &source, cuts)?;
+        let prior = result_program_at_cut(store, &binding.source_program_id, source_cut)?;
         if prior.session_id != program.session_id
             || prior.root_execution_id.as_deref() != Some(binding.source_root_id.as_str())
             || prior.objective_id != binding.source_objective_id
@@ -3206,16 +3715,46 @@ fn publication_sources(
         let source = format!("agentic-program:{}", origin.program_id);
         let events = result_source_events(store, &source, cuts)?;
         if cuts.get(&source) != Some(&origin.revision) {
-            return Err(format!(
+            return Err(ReviewEvidenceError::program_advanced(format!(
                 "result Program changed during original producer resolution: source {source} is at \
                  revision {} but the reviewed Program projection is at {}",
                 cuts.get(&source).copied().unwrap_or_default(),
                 origin.revision
-            ));
+            )));
         }
         publications.extend(events);
     }
     Ok((programs, publications))
+}
+
+/// The business claim generation is one ahead of the dispatch generation of
+/// the attempt that holds the claim - the same named equation as
+/// `work_market::claim_generation_matches_its_attempt` and the Execute branch
+/// of the actor admission. The dispatch action is the only writer of that
+/// generation and it is durable in the program stream; `packet.attempt` is
+/// the physical attempt of the producer graph, a different namespace, so
+/// comparing the two directly refused every re-dispatched Task's artifact.
+/// A call whose dispatch record cannot be found is refused: the alignment
+/// fact is missing, never assumed.
+fn claim_generation_matches_its_dispatch(
+    publications: &[crate::DurableRuntimeEvent],
+    execution: &str,
+    generation: u64,
+) -> bool {
+    use harness_contract::agent_action::{AgentAction, AgentActionEnvelope};
+    publications.iter().any(|event| {
+        if event.kind != "agentic.action_applied" {
+            return false;
+        }
+        let Ok(envelope) = serde_json::from_value::<AgentActionEnvelope>(
+            event.payload["envelope"].clone(),
+        ) else {
+            return false;
+        };
+        matches!(&envelope.action, AgentAction::TaskAttemptDispatch(input)
+            if input.execution_id == execution
+                && u64::from(input.generation).checked_add(1) == Some(generation))
+    })
 }
 
 fn original_artifact_publication(
@@ -3231,7 +3770,7 @@ fn original_artifact_publication(
         DurableRuntimeEvent,
         Option<AgentTaskPacket>,
     ),
-    String,
+    ReviewEvidenceError,
 > {
     use harness_contract::agent_action::{AgentAction, AgentActionEnvelope, AgentActorKind};
     let mut original = None;
@@ -3308,6 +3847,9 @@ fn original_artifact_publication(
             .agentic_binding
             .as_ref()
             .ok_or("result producer packet has no Program binding")?;
+        // The artifact's own claim execution: the dispatch that produced it is
+        // the durable writer of the generation this judgment aligns against.
+        let claim_execution = artifact.claim_execution_id.as_deref().unwrap_or_default();
         if scope.program_id != owner.program_id
             || Some(scope.agent_id.as_str()) != owner.agent_id.as_deref()
             || owner.actor_id != scope.agent_id
@@ -3319,7 +3861,9 @@ fn original_artifact_publication(
                 })
             || artifact
                 .claim_generation
-                .is_some_and(|generation| generation != u64::from(packet.attempt))
+                .is_some_and(|generation| {
+                    !claim_generation_matches_its_dispatch(publications, claim_execution, generation)
+                })
         {
             return Err(
                 "result publication does not match its original physical packet/claim".into(),
@@ -3342,7 +3886,7 @@ pub(super) fn authenticate_publication_task_link(
     artifact: &crate::agentic::program::AgenticArtifactProjection,
     task_ref: &str,
     cuts: &mut std::collections::BTreeMap<String, u64>,
-) -> Result<(), String> {
+) -> Result<(), ReviewEvidenceError> {
     use crate::agentic::program::AgenticTaskStatus;
     use harness_contract::agent::AgenticExecutionFocus;
     use harness_contract::agent_action::{AgentActionEnvelope, AgentActorKind};
@@ -3504,9 +4048,9 @@ pub(super) fn resolve_result_metadata(
     content: &ArtifactRef,
     input_cuts: Option<&std::collections::BTreeMap<String, u64>>,
     readers: super::ResultContentReaders<'_>,
-) -> Result<ResolvedReviewResult, String> {
+) -> Result<ResolvedReviewResult, ReviewEvidenceError> {
     resolve_result_metadata_for_phase(
-        store, program, reference, content, input_cuts, readers, false,
+        store, program, reference, content, input_cuts, readers, false, None,
     )
 }
 
@@ -3518,7 +4062,8 @@ pub(super) fn resolve_result_metadata_for_phase(
     input_cuts: Option<&std::collections::BTreeMap<String, u64>>,
     readers: super::ResultContentReaders<'_>,
     allow_history_growth: bool,
-) -> Result<ResolvedReviewResult, String> {
+    session_tail: Option<&super::policy::HistoricalSessionCut>,
+) -> Result<ResolvedReviewResult, ReviewEvidenceError> {
     let identity = super::identity::auxiliary_identity(program, reference)?;
     let reference = identity.reference();
     if reference.starts_with("artifact:")
@@ -3539,6 +4084,7 @@ pub(super) fn resolve_result_metadata_for_phase(
                     "result content identity disagrees with its original Artifact metadata".into(),
                 );
             }
+            if let Some(frame) = readers.process_inputs { frame.retain_artifact(artifacts, &original)?; }
             original
         }
         _ => content.clone(),
@@ -3596,9 +4142,12 @@ pub(super) fn resolve_result_metadata_for_phase(
             if !visited.insert(graph_id.clone()) {
                 return Err("cyclic external decision graph lineage".into());
             }
-            pin_result_source(store, &graph_id, &mut cuts)?;
+            let graph_cut = pin_result_source(store, &graph_id, &mut cuts)?;
             let graph = crate::ExecutionGraphStateStore::new(std::sync::Arc::clone(store))
-                .load(&graph_id)
+                .load_graph_at_revision(
+                    crate::execution_core::graph::graph_id_for_lookup(&graph_id),
+                    graph_cut,
+                )
                 .map_err(|error| error.to_string())?;
             if cuts.get(&graph_id) != Some(&graph.revision)
                 || graph
@@ -3699,8 +4248,14 @@ pub(super) fn resolve_result_metadata_for_phase(
                 tool: None,
             });
         }
-        let session_events =
-            result_source_events(store, &format!("session:{}", program.session_id), &mut cuts)?;
+        let session_source = format!("session:{}", program.session_id);
+        let session_events = match session_tail {
+            Some(tail) if tail.source().stream_id == session_source =>
+                result_source_events_at_session_cut(store, &session_source, &mut cuts,
+                    tail.source().expected_revision, tail.observed_revision())?,
+            Some(_) => return Err("result original Session tail belongs to another source".into()),
+            None => result_source_events(store, &session_source, &mut cuts)?,
+        };
         let fresh_head = if reference.starts_with("tool://") || readers.artifacts.is_none() {
             None
         } else {
@@ -3740,16 +4295,20 @@ pub(super) fn resolve_result_metadata_for_phase(
                     .ok_or("result callback original graph missing")?;
                 let node = parent["node_id"].as_str()
                     .ok_or("result callback original node missing")?;
-                pin_result_source(store, execution, &mut cuts)?;
+                let graph_cut = pin_result_source(store, execution, &mut cuts)?;
                 let graph = crate::ExecutionGraphStateStore::new(std::sync::Arc::clone(store))
-                    .load(execution).map_err(|error| error.to_string())?;
+                    .load_graph_at_revision(
+                        crate::execution_core::graph::graph_id_for_lookup(execution),
+                        graph_cut,
+                    )
+                    .map_err(|error| error.to_string())?;
                 let original = graph.nodes.iter().find(|candidate| candidate.id == node)
                     .ok_or("result callback original producer node missing")?;
                 match original.kind {
                     harness_contract::execution_graph::ExecutionNodeKind::AgentTask => Some(execution),
                     harness_contract::execution_graph::ExecutionNodeKind::InlineModel
                     | harness_contract::execution_graph::ExecutionNodeKind::ToolBatch => None,
-                    kind => return Err(format!("result callback unsupported original producer: graph={execution} node={node} kind={kind:?}")),
+                    kind => return Err(format!("result callback unsupported original producer: graph={execution} node={node} kind={kind:?}").into()),
                 }
             } else {
                 None
@@ -3852,8 +4411,8 @@ pub(super) fn resolve_result_metadata_for_phase(
                 {
                     return Err("fresh object conflicts with an earlier direct raw selector".into());
                 }
-                if observed_raw_selector_conflict(readers, event, &content.selector) {
-                    return Err("fresh object conflicts with an earlier exact raw alias".into());
+                if runtime_raw_artifact(event)?.is_none() && original_output_identity(event)?.is_none() {
+                    return Err("earlier Tool output lacks authenticated identity; fresh selector cannot be established".into());
                 }
                 if event.payload["tool_name"] == "artifact_publish" {
                     let primary = task
@@ -3924,12 +4483,7 @@ pub(super) fn resolve_result_metadata_for_phase(
                             if matches {
                                 match_origin = origin.clone();
                             }
-                            if !matches && origin.require_strong().is_err() {
-                                immutable_gaps.insert(format!(
-                                    "{}#{}:weak original publication cannot exclude influence",
-                                    event.stream_id, event.sequence
-                                ));
-                            }
+
                         }
                         Ok(None) => {
                             immutable_gaps.insert(format!(
@@ -3984,43 +4538,10 @@ pub(super) fn resolve_result_metadata_for_phase(
                     }
                 };
                 if !matches && possible_alias && anchored_raw.is_none() {
-                    match original_session_raw(readers, event, task) {
-                        Ok((raw, _)) if raw.selector == content.selector => {
-                            let bytes = read_original_session_body(readers, event, &raw)?;
-                            let body = original_tool_body(
-                                store, readers, event, task, &mut cuts, None,
-                            )?
-                            .ok_or("original raw alias unexpectedly exceeded its capability")?;
-                            if body.bytes != bytes {
-                                return Err(
-                                    "original raw alias conflicts with its complete original body"
-                                        .into(),
-                                );
-                            }
-                            if raw.sha256 != content.sha256 || raw.bytes != content.bytes {
-                                return Err(
-                                    "raw selector identity disagrees with the actual result body"
-                                        .into(),
-                                );
-                            }
-                            matches = true;
-                            match_origin = body.origin;
-                        }
-                        Ok((_, origin)) if origin.require_strong().is_err() => {
-                            immutable_gaps.insert(format!(
-                                "{}#{}:weak raw alias cannot exclude original influence",
-                                event.stream_id, event.sequence
-                            ));
-                        }
-                        Ok(_) => {}
-                        Err(error)
-                            if error.contains("exact original Session raw mapping missing:") =>
-                        {
-                            immutable_gaps
-                                .insert(format!("{}#{}:{error}", event.stream_id, event.sequence));
-                        }
-                        Err(error) => return Err(error),
-                    }
+                    immutable_gaps.insert(format!(
+                        "{}#{}:original Tool output alias lacks an authenticated raw anchor",
+                        event.stream_id, event.sequence
+                    ));
                 }
             }
             if !matches {
@@ -4085,12 +4606,9 @@ pub(super) fn resolve_result_metadata_for_phase(
                     .as_ref()
                     .ok_or("effect input boundary lacks original Step")?;
                 let key = step.effect_idempotency_key();
-                store
-                    .event_by_idempotency_key(
-                        &format!("execution-effect:{key}"),
-                        &format!("{key}:intent"),
-                    )
-                    .map_err(|error| error.to_string())?
+                let source = format!("execution-effect:{key}");
+                let through = *cuts.get(&source).ok_or("effect input source cut missing")?;
+                result_event_at_cut(store, &source, &format!("{key}:intent"), through)?
                     .ok_or("effect original input intent missing")?
             } else {
                 event.clone()
@@ -4143,7 +4661,7 @@ pub(super) fn resolve_result_metadata_for_phase(
         if !immutable_gaps.is_empty() {
             return Err(format!(
                 "result_origin_requires_original_immutable_content:{reference}; original Session access/publication body reader required for {immutable_gaps:?}"
-            ));
+            ).into());
         }
         for (execution, event, tool, effect) in lifecycle_effects {
             let Some(actor) = resolved
@@ -4175,9 +4693,8 @@ pub(super) fn resolve_result_metadata_for_phase(
             let key = primary.payload["idempotency_key"]
                 .as_str()
                 .ok_or("producer effect identity missing")?;
-            let intent = store
-                .event_by_idempotency_key(&primary.stream_id, &format!("{key}:intent"))
-                .map_err(|error| error.to_string())?
+            let through = *cuts.get(&primary.stream_id).ok_or("producer effect source cut missing")?;
+            let intent = result_event_at_cut(store, &primary.stream_id, &format!("{key}:intent"), through)?
                 .ok_or("producer original input boundary missing")?;
             let step = serde_json::from_value(task["step_binding"].clone())
                 .map_err(|_| "producer effect input boundary has no original Step")?;
@@ -4250,17 +4767,12 @@ pub(super) fn resolve_result_metadata_for_phase(
                     .ok_or("result physical effect has no original index event")?;
                 let (descriptor, scope, intent) =
                     authenticate_effect_receipt(store, event, &packet, &mut cuts)?;
-                let primary = store
-                    .event_by_idempotency_key(
-                        &intent.stream_id,
-                        &format!(
-                            "{}:receipt",
-                            intent.payload["idempotency_key"]
-                                .as_str()
-                                .ok_or("result original effect key missing")?
-                        ),
-                    )
-                    .map_err(|error| error.to_string())?
+                let through = *cuts.get(&intent.stream_id).ok_or("result effect source cut missing")?;
+                let primary = result_event_at_cut(
+                    store, &intent.stream_id,
+                    &format!("{}:receipt", intent.payload["idempotency_key"]
+                        .as_str().ok_or("result original effect key missing")?), through,
+                )?
                     .ok_or("result original terminal missing")?;
                 project_result_effect(
                     store,
@@ -4287,18 +4799,10 @@ pub(super) fn resolve_result_metadata_for_phase(
     if resolved.producers.is_empty() {
         return Err(format!(
             "review result has no Runtime-resolved producer:{reference}"
-        ));
+        ).into());
     }
-    for (source, expected) in &cuts {
-        let observed = store
-            .stream_revision(source)
-            .map_err(|error| error.to_string())?;
-        if observed != *expected {
-            return Err(format!(
-                "result metadata changed after original effect enumeration: result={reference} source={source} expected={expected} observed={observed}; rebuild the review"
-            ));
-        }
-    }
+
+    verify_result_package_cuts(store, reference, &cuts)?;
     for run in process_runs_for_boundaries(store, &resolved.input_boundaries, &mut cuts)? {
         if !resolved
             .process_runs
@@ -4315,16 +4819,11 @@ pub(super) fn resolve_result_metadata_for_phase(
         readers,
         input_cuts,
         allow_history_growth,
+        session_tail,
     )?;
-    for (source, revision) in &actual.sources {
-        if cuts
-            .insert(source.clone(), *revision)
-            .is_some_and(|previous| previous != *revision)
-        {
-            return Err("actual result input source moved during enumeration".into());
-        }
-    }
+    merge_actual_input_cuts(&mut cuts, &actual.sources)?;
     resolved.primary_inputs = actual.immutable_inputs;
+
     resolved.effect_sources = cuts
         .into_iter()
         .map(
@@ -4343,12 +4842,15 @@ pub(super) fn original_acquisition_output(
     session_events: &[DurableRuntimeEvent],
     readers: super::ResultContentReaders<'_>,
     cuts: &mut std::collections::BTreeMap<String, u64>,
-) -> Result<String, String> {
+) -> Result<String, ReviewEvidenceError> {
     let seal = crate::context_evidence::decode_read_acquisition(
         &primary.payload[crate::context_evidence::READ_ACQUISITION_FIELD],
     )
     .map_err(str::to_string)?;
-    if primary.payload["outcome_truncated"] != true {
+    if matches!(
+        outcome_completeness(primary)?,
+        OutcomeCompleteness::Complete
+    ) {
         if let Some(output) = primary.payload["outcome"]["output"].as_str() {
             if crate::context_evidence::read_body_seal(&seal.tool_name, output).as_ref()
                 == Some(&seal.body)
@@ -4383,7 +4885,7 @@ pub(super) fn authenticate_read_input(
     event: &DurableRuntimeEvent,
     packet: &AgentTaskPacket,
     cuts: &mut std::collections::BTreeMap<String, u64>,
-) -> Result<(), String> {
+) -> Result<(), ReviewEvidenceError> {
     let value = event
         .payload
         .get(crate::context_evidence::READ_ACQUISITION_FIELD)
@@ -4399,10 +4901,8 @@ pub(super) fn authenticate_read_input(
     {
         return Err("result primary input belongs to a foreign packet/attempt".into());
     }
-    pin_result_source(store, &seal.primary_stream, cuts)?;
-    let primary = store
-        .event_by_idempotency_key(&seal.primary_stream, &seal.primary_key)
-        .map_err(|error| error.to_string())?
+    let through = pin_result_source(store, &seal.primary_stream, cuts)?;
+    let primary = result_event_at_cut(store, &seal.primary_stream, &seal.primary_key, through)?
         .ok_or("result primary input acquisition missing")?;
     if primary.kind != "execution.read.receipt"
         || primary.actor != event.actor
@@ -4504,20 +5004,16 @@ fn authenticate_effect_receipt(
         harness_contract::goal::ProofEffectScope,
         DurableRuntimeEvent,
     ),
-    String,
+    ReviewEvidenceError,
 > {
     let key = event.payload["idempotency_key"]
         .as_str()
         .ok_or("result effect lacks its original receipt identity")?;
     let source = format!("execution-effect:{key}");
-    pin_result_source(store, &source, cuts)?;
-    let primary = store
-        .event_by_idempotency_key(&source, &format!("{key}:receipt"))
-        .map_err(|error| error.to_string())?
+    let through = pin_result_source(store, &source, cuts)?;
+    let primary = result_event_at_cut(store, &source, &format!("{key}:receipt"), through)?
         .ok_or("result effect original primary receipt missing")?;
-    let intent = store
-        .event_by_idempotency_key(&source, &format!("{key}:intent"))
-        .map_err(|error| error.to_string())?
+    let intent = result_event_at_cut(store, &source, &format!("{key}:intent"), through)?
         .ok_or("result effect original admitted intent missing")?;
     if intent.schema_version != 1
         || primary.schema_version != 1
@@ -4570,545 +5066,338 @@ fn authenticate_effect_receipt(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn p2_review_budget_authority_is_not_created_from_matching_text() {
+        use super::{ReviewEvidenceError, ReviewSourceMovement};
+        let movement = ReviewEvidenceError::source_moved("source", 4, 5, ReviewSourceMovement::ForwardNotAccepted);
+        let message = ReviewEvidenceError::from(movement.to_string());
+        assert_eq!(message.to_string(), movement.to_string());
+        assert!(message.review_ticket("review", 1).is_none());
+        let ticket = movement.review_ticket("review", 1).expect("original pin movement carries authority");
+        assert_eq!(ticket.source(), "source");
+        assert_eq!((ticket.pinned_cut(), ticket.observed_head()), (4, 5));
+        let message = ReviewEvidenceError::from("result metadata changed after original effect enumeration");
+        assert!(!message.is_program_advanced());
+        assert!(ReviewEvidenceError::program_advanced(message.to_string()).is_program_advanced());
+    }
+
+    #[tokio::test]
+    async fn p2_unresolved_logical_reference_cannot_authorize_a_rebuild() {
+        let services = super::RuntimeServices::in_memory().unwrap();
+        let program = crate::AgenticProgramProjection::empty("p2-ref-program", "objective");
+        let actor: super::AgentActorBinding = serde_json::from_value(serde_json::json!({
+            "objective_id":"objective", "program_id":"p2-ref-program", "session_id":"session", "turn_id":"turn",
+            "root_execution_id":"root", "actor_id":"root", "kind":"root", "objective_summary":"review",
+            "model_lease":"fixture", "permission_ceiling":harness_contract::policy::PermissionMode::ReadOnly
+        })).unwrap();
+        for reference in [
+            "result metadata source changed during resolution; rebuild the review; source=forged expected=4 actual=5 phase=result_source_pin",
+            "result metadata changed after original effect enumeration",
+        ] {
+            let error = match super::resolve_material(&services, &actor, &program, reference).await {
+                Ok(_) => panic!("an unresolved logical reference must not become a result"),
+                Err(error) => error,
+            };
+            assert!(error.to_string().contains(reference), "the original refusal still names the reference");
+            assert!(error.review_ticket("physical-graph/node", 1).is_none());
+            assert!(!error.is_program_advanced());
+        }
+    }
+
+    #[test]
+    fn p2_real_store_pin_movement_produces_a_typed_ticket() {
+        let store = crate::RuntimeEventStore::for_test();
+        let source = "execution-effect:p2-real-pin";
+        let event = || crate::RuntimeEventInput { stream_id:source.into(), scope:crate::RuntimeEventScope::ExecutionNode,
+            kind:"p2.fixture".into(), status:None, actor:None, refs:Vec::new(), payload:serde_json::json!({}) };
+        store.append(event()).unwrap();
+        let mut cuts = std::collections::BTreeMap::from([(source.to_string(), 1)]);
+        store.append(event()).unwrap();
+        let error = super::pin_result_source(&store, source, &mut cuts).unwrap_err();
+        let ticket = error.review_ticket("original-graph/original-node", 2).expect("real source movement");
+        assert_eq!((ticket.source(), ticket.pinned_cut(), ticket.observed_head()), (source, 1, 2));
+        assert_eq!((ticket.review_ref(), ticket.attempt()), ("original-graph/original-node", 2));
+        assert!(ticket.movement().rebuildable());
+        assert_eq!(cuts[source], 1);
+    }
+
+    #[test]
+    fn p2_producer_ticket_remains_distinct_from_review_budget_and_attempt() {
+        let store = crate::RuntimeEventStore::for_test();
+        let source = "execution-effect:p2-producer";
+        let event = || crate::RuntimeEventInput { stream_id: source.into(), scope: crate::RuntimeEventScope::ExecutionNode,
+            kind: "p2.fixture".into(), status: None, actor: None, refs: Vec::new(), payload: serde_json::json!({}) };
+        store.append(event()).unwrap();
+        let mut cuts = std::collections::BTreeMap::from([(source.to_owned(), 1)]);
+        store.append(event()).unwrap();
+        let refusal = super::pin_result_source_ticketed(&store, "producer/node", 4, source, &mut cuts).unwrap_err();
+        let error = super::ReviewEvidenceError::from_repin(refusal);
+        let super::ReviewEvidenceErrorKind::ProducerPinRefused(original) = &error.kind else { panic!("producer ticket must survive") };
+        assert_eq!(original.lineage(), ("producer/node", 4));
+        let budget_ticket = error.review_ticket("reviewer/node", 7).unwrap();
+        assert_eq!(original.lineage(), ("producer/node", 4));
+        assert_eq!(budget_ticket.lineage(), ("reviewer/node", 7));
+        assert!(matches!(super::repin_at_fresh_head(&store, "reviewer/node", 8, &budget_ticket, &mut cuts), Err(super::RepinRejection::Identity { .. })));
+        assert_eq!(cuts[source], 1);
+        assert_eq!(super::repin_at_fresh_head(&store, "reviewer/node", 7, &budget_ticket, &mut cuts).unwrap(), 2);
+    }
+
+    #[test]
+    fn p2_swallowed_pin_does_not_authorize_later_matching_message() {
+        let real = super::ReviewEvidenceError::source_moved("source", 4, 5, super::ReviewSourceMovement::ForwardNotAccepted);
+        let displayed = real.to_string();
+        let ignored: Option<()> = Err::<(), _>(real).ok();
+        assert!(ignored.is_none());
+        let later = super::ReviewEvidenceError::from(format!("ordinary producer refusal: {displayed}"));
+        assert!(later.review_ticket("reviewer/node", 1).is_none());
+        assert!(!later.is_program_advanced());
+    }
+
+    #[test]
+    fn p2_real_program_source_drift_produces_program_advanced() {
+        let store = std::sync::Arc::new(crate::RuntimeEventStore::for_test());
+        let program = crate::AgenticProgramProjection::empty("p2-real-program", "objective");
+        store.append(crate::RuntimeEventInput { stream_id:"agentic-program:p2-real-program".into(),
+            scope:crate::RuntimeEventScope::Program, kind:"p2.fixture".into(), status:None, actor:None,
+            refs:Vec::new(), payload:serde_json::json!({}) }).unwrap();
+        let error = super::publication_sources(&store, &program, &mut std::collections::BTreeMap::new()).unwrap_err();
+        assert!(error.is_program_advanced());
+        assert!(error.to_string().starts_with("result Program changed during original producer resolution:"));
+    }
+    /// K4-F1: the completeness of an original tool outcome is a three-state
+    /// fact, and a record that never recorded completeness is refused by name.
+    ///
+    /// The red state of this control is the old reading: the review-evidence
+    /// domain compared `payload["outcome_truncated"] != true`, so a record with
+    /// no completeness flag at all counted as "not truncated" while the Host
+    /// domain refuses the very same record. The green state is the named
+    /// refusal below.
+    #[test]
+    fn t1a_an_unrecorded_outcome_completeness_is_refused_by_name() {
+        // Two shapes are the same fact: the field absent, and the field present
+        // but null. A reading that refuses one and lets the other through is the
+        // old partial form, and it is the shape this control pins shut.
+        for missing in [
+            serde_json::json!({"outcome": {"output": "body"}}),
+            serde_json::json!({"outcome": {"output": "body"}, "outcome_truncated": null}),
+        ] {
+            let error = super::outcome_completeness_of(&missing)
+                .expect_err("a record that never recorded completeness must refuse");
+            assert!(
+                error.contains("completeness was not recorded"),
+                "{error}"
+            );
+        }
+        // The two recorded states keep their meaning.
+        assert_eq!(
+            super::outcome_completeness_of(&serde_json::json!({"outcome_truncated": false})),
+            Ok(super::OutcomeCompleteness::Complete)
+        );
+        assert_eq!(
+            super::outcome_completeness_of(&serde_json::json!({"outcome_truncated": true})),
+            Ok(super::OutcomeCompleteness::Truncated)
+        );
+    }
+
     use super::*;
 
-    async fn original_native_primary_658(negative: bool) {
-        use harness_contract::step::CallSource;
-        crate::agentic::execution::reviewed_goal_fixture::with_native_raw_owner_fixture_for_test(|services, owner| async move {
-        let store = services.event_store();
-        let binding = owner.activity_binding().unwrap();
-        let events = store.list_stream(&owner.stream_id).unwrap();
-        let task = result_tool_plan(&events, &owner).unwrap().unwrap();
-        let step: crate::step_snapshot::StepCallBinding =
-            serde_json::from_value(task["step_binding"].clone()).unwrap();
-        assert!(
-            matches!(&step.origin.source, CallSource::Provider { attempt_id }
-            if !attempt_id.is_empty() && attempt_id == &step.snapshot.provider_attempt.attempt_id)
-        );
-        let mut cuts = std::collections::BTreeMap::new();
-        let primary = original_tool_primary(store, &owner, task, &mut cuts).unwrap();
-        let parent = &primary.payload["replay"]["parent_execution"];
-        let graph = services
-            .graph_state_store()
-            .load(parent["execution_id"].as_str().unwrap())
-            .unwrap();
-        let node = graph
-            .nodes
-            .iter()
-            .find(|node| node.id == parent["node_id"].as_str().unwrap())
-            .unwrap();
-        let packet: AgentTaskPacket = serde_json::from_str(&node.payload_ref).unwrap();
-        let principal = packet.assignment.execution_identity.principal_id();
-        assert_ne!(principal, packet.agent_id());
-        assert_eq!(step.snapshot.identity.actor_ref.as_deref(), Some(principal));
-        assert_eq!(
-            step.snapshot.identity.execution_id.as_deref(),
-            Some(packet.run_id())
-        );
-        assert_eq!(binding.agent_run_id.as_deref(), Some(packet.run_id()));
-        let index_source = format!(
-            "execution-agent-receipts:{}:{}:{}",
-            packet.graph_id(),
-            packet.node_id(),
-            packet.attempt
-        );
-        let index = store
-            .event_by_idempotency_key(
-                &index_source,
-                &format!("agent-tool-receipt:{}", step.effect_idempotency_key()),
-            )
-            .unwrap()
-            .unwrap();
-        assert_eq!(index.schema_version, 2);
-        // artifact_publish is a Read goal-metadata tool: the delegated receipt
-        // loop skips it (results.rs:3965-3970) and authenticate_effect_receipt
-        // is write-effect-specific, so this index pairs with its read-receipt
-        // primary instead of authenticating as a business/control effect.
-        let read_key = index.payload["idempotency_key"].as_str().unwrap();
-        let read_primary = store
-            .event_by_idempotency_key(
-                &format!("execution-effect:{read_key}"),
-                &format!("{read_key}:read-receipt"),
-            )
-            .unwrap()
-            .unwrap();
-        assert_eq!(read_primary.schema_version, 1);
-        assert_eq!(read_primary.transaction_id, index.transaction_id);
-        assert_eq!(read_primary.commit_cursor, index.commit_cursor);
-        let session_events = store.list_stream(&owner.stream_id).unwrap();
-        let native_events = store.list_stream(&index_source).unwrap();
-        let mut original_calls = BTreeSet::new();
-        for receipt in native_events.iter().filter(|event| event.kind == "execution.agent_tool.receipt") {
-            let call_id = receipt.payload["outcome"]["tool_use_id"].as_str().unwrap();
-            let completed = session_events.iter().find(|event| {
-                event.kind == "tool.invocation.completed"
-                    && event.payload["tool_call_id"] == call_id
-            }).unwrap();
-            let plan = result_tool_plan(&session_events, completed).unwrap().unwrap();
-            let original = original_tool_primary(store, completed, plan, &mut cuts).unwrap();
-            assert_eq!(original.transaction_id, receipt.transaction_id);
-            assert_eq!(original.commit_cursor, receipt.commit_cursor);
-            let descriptor: ToolEffectDescriptor =
-                serde_json::from_value(plan["effect"].clone()).unwrap();
-            let scope = require_original_effect_scope(
-                &original.payload["resolved_effect_scope"], &descriptor,
-            ).unwrap();
-            assert_eq!(original.payload["resolved_effect_scope"], receipt.payload["resolved_effect_scope"]);
-            match descriptor.tool_id.as_str() {
-                "read_file" => {
-                    assert_eq!(descriptor.effect_kind, ToolEffectKind::Read);
-                    assert!(scope.complete);
-                    assert_eq!(scope.targets.len(), 1);
-                    assert!(scope.scope_purposes.iter().all(|entry|
-                        entry.purpose == harness_contract::goal::ProofEffectPurpose::InputRead));
-                }
-                "artifact_publish" => {
-                    assert_eq!(descriptor.effect_kind, ToolEffectKind::Read);
-                    assert!(super::super::policy::goal_metadata_tool(&descriptor.tool_id));
-                    assert!(!scope.complete && scope.targets.is_empty());
-                    assert!(scope.scope_purposes.iter().all(|entry|
-                        entry.purpose == harness_contract::goal::ProofEffectPurpose::InputRead));
-                    assert_eq!(plan["normalized_input"]["source"], "file");
-                    let (_, _, mut not_business) = purpose_projection_fixture();
-                    assert!(merge_authenticated_result_effect(
-                        &mut not_business, &descriptor, &scope, original.commit_cursor,
-                    ).is_err());
-                }
-                "task_claim" | "task_submit" => {
-                    assert!(runtime_control_descriptor(&descriptor));
-                }
-                other => panic!("unexpected original Native receipt tool: {other}"),
-            }
-            original_calls.insert(call_id.to_string());
-        }
-        assert_eq!(
-            original_calls,
-            BTreeSet::from([
-                "native-claim".to_string(),
-                "native-preview-read".to_string(),
-                "native-full-read".to_string(),
-                "native-publication-small".to_string(),
-                "native-submit".to_string(),
-            ])
-        );
-        let mut control_tools = BTreeSet::new();
-        let mut control_index = None;
-        for control in store
-            .list_stream(&index_source)
-            .unwrap()
-            .into_iter()
-            .filter(|event| {
-                event.kind == "execution.agent_tool.receipt"
-                    && matches!(
-                        event.payload["outcome"]["tool_name"].as_str(),
-                        Some("task_claim" | "task_submit")
-                    )
-            })
-        {
-            let (descriptor, scope, intent) =
-                authenticate_effect_receipt(store, &control, &packet, &mut cuts).unwrap();
-            if control_index.is_none() {
-                control_index = Some(control.clone());
-            }
-            assert!(descriptor.scopes[0].target.is_none());
-            let primary = store
-                .event_by_idempotency_key(
-                    &intent.stream_id,
-                    &format!(
-                        "{}:receipt",
-                        control.payload["idempotency_key"].as_str().unwrap()
-                    ),
-                )
-                .unwrap()
-                .unwrap();
-            let (_, _, mut resolved) = purpose_projection_fixture();
-            project_result_effect(
-                store,
-                &mut resolved,
-                &descriptor,
-                &scope,
-                &primary,
-                &mut cuts,
-            )
-            .unwrap();
-            assert!(resolved.effect_targets.is_empty());
-            assert!(resolved.effect_scopes.is_empty());
-            assert_eq!(resolved.kind, GoalResultKind::Content);
-            let mut foreign = control.clone();
-            foreign.payload["effect_scopes"] = serde_json::json!([]);
-            assert!(authenticate_effect_receipt(store, &foreign, &packet, &mut cuts).is_err());
-            let mut foreign_scope = scope.clone();
-            foreign_scope.descriptor_hash = "foreign".into();
-            assert!(project_result_effect(
-                store,
-                &mut resolved,
-                &descriptor,
-                &foreign_scope,
-                &primary,
-                &mut cuts
-            )
-            .is_err());
-            control_tools.insert(descriptor.tool_id);
-        }
-        assert_eq!(
-            control_tools,
-            BTreeSet::from(["task_claim".to_string(), "task_submit".to_string()])
-        );
-        for field in [
-            "sequence_owner",
-            "source_observation_wave_sequence",
-            "effect_kind",
-            "effect_scopes",
-        ] {
-            let mut invalid = control_index.clone().unwrap();
-            invalid.payload[field] = serde_json::Value::Null;
-            assert!(authenticate_effect_receipt(store, &invalid, &packet, &mut cuts).is_err());
-        }
-        let mut invalid = index.clone();
-        invalid.schema_version = 3;
-        assert!(authenticate_effect_receipt(store, &invalid, &packet, &mut cuts).is_err());
-        assert_eq!(primary.transaction_id, index.transaction_id);
-        assert_eq!(primary.commit_cursor, index.commit_cursor);
-        assert!(primary.commit_cursor < owner.commit_cursor);
-        assert_eq!(
-            cuts.get(&primary.stream_id),
-            Some(&store.stream_revision(&primary.stream_id).unwrap())
-        );
-        assert_eq!(
-            cuts.get(&index_source),
-            Some(&store.stream_revision(&index_source).unwrap())
-        );
-        assert_eq!(cuts.get(packet.graph_id()), Some(&graph.revision));
-        let actions = services.agent_action_service();
-        let program = actions
-            .project(&packet.agentic_binding.as_ref().unwrap().program_id)
-            .unwrap();
-        let raw_ref = owner.payload["full_output_ref"].as_str().unwrap();
-        let access = services
-            .session_evidence_access(
-                &binding.session_id,
-                raw_ref.strip_prefix("tool://").unwrap(),
-            )
-            .await
-            .unwrap()
-            .unwrap();
-        let content = services
-            .artifact_store()
-            .resolve(&access.retrieval_selector)
-            .unwrap();
-        let history = services.session_history_reader();
-        let metadata = resolve_result_metadata(
-            store,
-            &program,
-            raw_ref,
-            &content,
-            None,
-            super::super::ResultContentReaders {
-                artifacts: Some(services.artifact_store().as_ref()),
-                history: history.as_deref(),
-                process_inputs: None,
+    /// S9 negative control: a source that grows while the original Process
+    /// material is read is refused by name. The read is bounded by the cut
+    /// this review pinned, and the movement is not absorbed by re-pinning
+    /// the source to its newer head and reading past that window.
+    #[test]
+    fn bounded_process_accepts_only_its_exact_tool_invocation_scope() {
+        use harness_contract::policy::{PermissionOperation, PermissionResource, PermissionScope};
+        let invocation = PermissionScope { resource: PermissionResource::Tool,
+            operation: PermissionOperation::Call, target: None };
+        assert!(super::bounded_process_scope_allowed("execute_code", &invocation));
+        assert!(!super::bounded_process_scope_allowed("other_tool", &invocation));
+        let targeted = PermissionScope { target: Some("other".into()), ..invocation.clone() };
+        assert!(!super::bounded_process_scope_allowed("execute_code", &targeted));
+        let control = PermissionScope { operation: PermissionOperation::Control, ..invocation };
+        assert!(!super::bounded_process_scope_allowed("execute_code", &control));
+        let write = PermissionScope { resource: PermissionResource::File,
+            operation: PermissionOperation::Write, target: Some("source.py".into()) };
+        assert!(!super::bounded_process_scope_allowed("execute_code", &write));
+        let read = PermissionScope { operation: PermissionOperation::Read, ..write };
+        assert!(super::bounded_process_scope_allowed("execute_code", &read));
+        let network = PermissionScope { resource: PermissionResource::Network,
+            operation: PermissionOperation::Call, target: None };
+        assert!(!super::bounded_process_scope_allowed("execute_code", &network));
+
+        let workspace = tempfile::tempdir().unwrap();
+        let host = tools::ToolHost::builtin("bounded-original-descriptor", workspace.path());
+        let descriptor = host.pin_snapshot().describe_effect("execute_code", &serde_json::json!({
+            "language":"python", "code":"print(1)", "input_files":["source.py"], "timeout_ms":1000
+        }));
+        assert_eq!(descriptor.tool_id, "execute_code");
+        assert!(descriptor.scopes.iter().any(|scope| scope == &PermissionScope {
+            resource: PermissionResource::Tool, operation: PermissionOperation::Call, target: None
+        }), "real execute_code descriptor must include its invocation scope");
+        assert!(descriptor.scopes.iter().all(|scope| super::bounded_process_scope_allowed(&descriptor.tool_id, scope)));
+    }
+
+    #[test]
+    fn bounded_process_read_refuses_growth_during_the_read_by_name() {
+        let store = std::sync::Arc::new(crate::RuntimeEventStore::for_test());
+        let key = "s9-bounded-process-growth";
+        let source = format!("execution-effect:{key}");
+        let event = |idempotency_key: &str| crate::RuntimeTransactionEventInput {
+            event: crate::RuntimeEventInput {
+                stream_id: source.clone(),
+                scope: crate::RuntimeEventScope::ExecutionNode,
+                kind: "execution.effect.receipt".into(),
+                status: None,
+                actor: None,
+                refs: Vec::new(),
+                payload: serde_json::json!({"idempotency_key": key}),
             },
-        )
-        .unwrap();
-        metadata.origin.require_strong().unwrap();
-        assert_eq!(metadata.content.selector, content.selector);
-        assert_eq!(metadata.content.sha256, content.sha256);
-        assert!(metadata.producers.iter().any(|producer| producer
-            .packet
-            .as_ref()
-            .is_some_and(|original| original.graph_id() == packet.graph_id()
-                && original.run_id() == packet.run_id())));
-        let publication: serde_json::Value =
-            serde_json::from_str(primary.payload["outcome"]["output"].as_str().unwrap()).unwrap();
-        let published = services
-            .artifact_store()
-            .resolve(publication["content_ref"].as_str().unwrap())
-            .unwrap();
-        let published_metadata = resolve_result_metadata(
-            store,
-            &program,
-            &published.selector,
-            &published,
-            None,
-            super::super::ResultContentReaders {
-                artifacts: Some(services.artifact_store().as_ref()),
-                history: history.as_deref(),
-                process_inputs: None,
-            },
-        )
-        .unwrap();
-        published_metadata.origin.require_strong().unwrap();
-        assert!(published_metadata.producers.iter().any(|producer| producer
-            .packet
-            .as_ref()
-            .is_some_and(|original| original.graph_id() == packet.graph_id()
-                && original.run_id() == packet.run_id())));
-        if !negative {
-            return;
-        }
-        let before = store.durable_commit_cursor().unwrap();
-        for mutation in [
-            "principal",
-            "instance",
-            "definition-agent",
-            "execution-graph",
-            "run",
-            "session",
-            "turn",
-            "attempt",
-            "catalog",
-            "step",
-            "provider-attempt",
-            "process-source",
-            "foreign-worker",
-            "zero-sequence",
-            "worker-revision",
-            "system-source",
-            "offline-source",
-        ] {
-            let mut changed = task.clone();
-            let value = &mut changed["step_binding"];
-            match mutation {
-                "principal" => {
-                    value["snapshot"]["identity"]["actor_ref"] =
-                        serde_json::json!("foreign-principal")
-                }
-                "instance" => {
-                    value["snapshot"]["identity"]["actor_ref"] =
-                        serde_json::json!(packet.agent_id())
-                }
-                "definition-agent" => {
-                    value["snapshot"]["identity"]["actor_ref"] =
-                        serde_json::json!(packet.agentic_binding.as_ref().unwrap().agent_id)
-                }
-                "execution-graph" => {
-                    value["snapshot"]["identity"]["execution_id"] =
-                        serde_json::json!(packet.graph_id())
-                }
-                "run" => {
-                    value["snapshot"]["identity"]["run_ref"] = serde_json::json!("foreign-run")
-                }
-                "session" => {
-                    value["snapshot"]["identity"]["session_id"] =
-                        serde_json::json!("foreign-session")
-                }
-                "turn" => {
-                    value["snapshot"]["identity"]["turn_id"] = serde_json::json!("foreign-turn")
-                }
-                "attempt" => {
-                    value["snapshot"]["identity"]["attempt"] = serde_json::json!(packet.attempt + 1)
-                }
-                "catalog" => {
-                    value["snapshot"]["catalog_digest"] = serde_json::json!("foreign-catalog")
-                }
-                "step" => {
-                    value["snapshot"]["identity"]["step_id"] = serde_json::json!("foreign-step")
-                }
-                "provider-attempt" => {
-                    value["snapshot"]["provider_attempt"]["attempt_id"] =
-                        serde_json::json!("foreign-attempt")
-                }
-                "system-source" => {
-                    value["origin"]["source"] = serde_json::json!({"kind":"system_derived","parent_step_id":step.origin.origin_step_id})
-                }
-                "offline-source" => {
-                    value["origin"]["source"] = serde_json::json!({"kind":"offline_test"})
-                }
-                _ => {
-                    value["snapshot"]["identity"]["actor_ref"] =
-                        serde_json::json!(packet.agent_id());
-                    value["snapshot"]["identity"]["execution_id"] =
-                        serde_json::json!(packet.graph_id());
-                    value["snapshot"]["identity"]["attempt"] = serde_json::json!(packet.attempt);
-                    value["snapshot"]["related_revisions"]["worker_run"] =
-                        serde_json::json!(if mutation == "worker-revision" {
-                            "foreign-worker"
-                        } else {
-                            packet.run_id()
-                        });
-                    value["origin"]["source"] = serde_json::json!({"kind":"process",
-                        "worker_id":if mutation == "foreign-worker" { "foreign-worker" } else { packet.run_id() },
-                        "sequence":if mutation == "zero-sequence" { 0 } else { 1 }});
-                }
-            }
-            assert!(
-                original_tool_primary(store, &owner, &changed, &mut Default::default()).is_err(),
-                "{mutation}"
-            );
-            assert_eq!(store.durable_commit_cursor().unwrap(), before);
-        }
-        let mut changed_owner = owner.clone();
-        changed_owner.commit_cursor = primary.commit_cursor;
-        assert!(
-            original_tool_primary(store, &changed_owner, task, &mut Default::default()).is_err()
-        );
-        for source in [&primary.stream_id, &index_source, &graph.id] {
-            let mut stale_cut = std::collections::BTreeMap::from([(
-                source.clone(),
-                store.stream_revision(source).unwrap() + 1,
-            )]);
-            assert!(original_tool_primary(store, &owner, task, &mut stale_cut).is_err());
-        }
-        assert_eq!(store.durable_commit_cursor().unwrap(), before);
-        }).await;
-    }
-
-    #[tokio::test]
-    async fn r1_658_real_native_original_primary_and_resolver_use_principal_run() {
-        original_native_primary_658(false).await;
-    }
-
-    #[tokio::test]
-    async fn r1_658_real_native_primary_rejects_foreign_typed_identity_and_receipt_cuts() {
-        original_native_primary_658(true).await;
-    }
-
-    async fn exercise_publication_task_link(mode: u8) {
-        use crate::agentic::execution::reviewed_goal_fixture::{
-            with_native_task_review_setup, NativeTaskReviewCase,
+            idempotency_key: Some(idempotency_key.to_string()),
+            schema_version: 1,
         };
-        use harness_contract::agent_action::{AgentAction, AgentActionEnvelope, AgentActionStatus};
-        let root_actor = std::sync::Arc::new(std::sync::Mutex::new(None));
-        let retained_root = std::sync::Arc::clone(&root_actor);
-        with_native_task_review_setup(
-            NativeTaskReviewCase { commit_report: true, ..Default::default() },
-            move |services, root, worker, mut input| Box::pin(async move {
-                *retained_root.lock().unwrap() = Some(root.actor.clone());
-                let actions = services.agent_action_service();
-                let program = actions.project(&worker.actor.program_id).unwrap();
-                let artifact = program.artifacts.values().find(|artifact| {
-                    artifact.claim_execution_id == worker.actor.execution_id
-                        && artifact.relates_to.contains(&input.task_ref)
-                }).unwrap().clone();
-                assert_eq!(program.tasks[&input.task_ref].status, crate::AgenticTaskStatus::Claimed);
-                assert!(program.tasks[&input.task_ref].artifact_refs.is_empty());
-                let mut cuts = std::collections::BTreeMap::new();
-                authenticate_publication_task_link(services.event_store(), &program,
-                    &artifact, &input.task_ref, &mut cuts).unwrap();
-                assert_eq!(actions.project(&program.program_id).unwrap(), program);
-                assert_eq!(cuts.get(&format!("agentic-program:{}", program.program_id)), Some(&program.revision));
-                assert!(cuts.contains_key(worker.actor.execution_id.as_deref().unwrap()));
-                if mode == 1 {
-                    let foreign = actions.apply(&AgentActionEnvelope {
-                        action_id: "r1-568-foreign-task".into(), actor: root.actor.clone(),
-                        expected_revision: None,
-                        action: AgentAction::TaskPublish(serde_json::from_value(serde_json::json!({
-                            "team_ref":program.tasks[&input.task_ref].team_id,
-                            "title":"Unclaimed foreign provenance", "objective":"Remain independent",
-                            "acceptance":"No implicit completion", "purpose":"exploration"
-                        })).unwrap()),
-                    }).unwrap();
-                    assert_eq!(foreign.status, AgentActionStatus::Applied, "{foreign:?}");
-                    let foreign_task = foreign.changed_refs[0].clone();
-                    let extra_content = services.artifact_store().write_bytes(
-                        harness_contract::context::ArtifactWriteDescriptor {
-                            media_type: "text/plain".into(),
-                            visibility_scope: format!("session:{}", program.session_id),
-                            expected_bytes: None, original_name: None,
-                        },
-                        b"Real independent extra-relation publication",
-                    ).await.unwrap();
-                    let publication = actions.apply(&AgentActionEnvelope {
-                        action_id: "r1-568-extra-task-publication".into(), actor: worker.actor.clone(),
-                        expected_revision: None,
-                        action: AgentAction::ArtifactCommit(serde_json::from_value(serde_json::json!({
-                            "content_ref":extra_content.selector, "kind":"report", "title":"Extra relation",
-                            "relates_to":[input.task_ref, foreign_task]
-                        })).unwrap()),
-                    }).unwrap();
-                    assert_eq!(publication.status, AgentActionStatus::Applied, "{publication:?}");
-                    let current = actions.project(&program.program_id).unwrap();
-                    let extra = &current.artifacts[&publication.changed_refs[0]];
-                    let mut cuts = std::collections::BTreeMap::new();
-                    authenticate_publication_task_link(services.event_store(), &current,
-                        extra, &input.task_ref, &mut cuts).unwrap();
-                    for _ in 0..2 {
-                        assert!(authenticate_publication_task_link(services.event_store(), &current,
-                            extra, &foreign_task, &mut cuts).is_err());
-                    }
-                    assert_eq!(current.tasks[&foreign_task].status, crate::AgenticTaskStatus::Published);
-                    assert!(current.tasks[&foreign_task].artifact_refs.is_empty());
-                }
-                if mode == 2 {
-                    for field in ["content_ref", "committed_by", "claim_execution_id",
-                        "claim_generation", "title", "kind", "relates_to"]
-                    {
-                        let mut value = serde_json::to_value(&artifact).unwrap();
-                        value[field] = match field {
-                            "claim_generation" => serde_json::json!(artifact.claim_generation.unwrap() + 1),
-                            "relates_to" => serde_json::json!([input.task_ref, "task:forged"]),
-                            _ => serde_json::json!("forged"),
-                        };
-                        let changed = serde_json::from_value(value).unwrap();
-                        assert!(authenticate_publication_task_link(services.event_store(), &program,
-                            &changed, &input.task_ref, &mut std::collections::BTreeMap::new()).is_err(),
-                            "{field}");
-                    }
-                    for field in ["session_id", "turn_id", "root_execution_id", "objective_id"] {
-                        let mut value = serde_json::to_value(&program).unwrap();
-                        value[field] = serde_json::json!("foreign");
-                        let changed = serde_json::from_value(value).unwrap();
-                        assert!(authenticate_publication_task_link(services.event_store(), &changed,
-                            &artifact, &input.task_ref, &mut std::collections::BTreeMap::new()).is_err(),
-                            "{field}");
-                    }
-                    let source = format!("agentic-program:{}", program.program_id);
-                    let mut stale = std::collections::BTreeMap::from([(source, program.revision - 1)]);
-                    assert!(authenticate_publication_task_link(services.event_store(), &program,
-                        &artifact, &input.task_ref, &mut stale).is_err());
-                }
-                input.deliverable = None;
-                input.artifact_refs = vec![artifact.artifact_ref];
-                input.evidence_refs = vec![artifact.content_ref];
-                input
-            }),
-            move |services, review, _| Box::pin(async move {
-                let task_ref = match &review.action {
-                    AgentAction::TaskReview(input) => &input.task_ref,
-                    _ => unreachable!(),
-                };
-                let actions = services.agent_action_service();
-                let program = actions.project(&review.actor.program_id).unwrap();
-                assert_eq!(program.tasks[task_ref].status, crate::AgenticTaskStatus::Submitted);
-                let artifact = program.artifacts[&program.tasks[task_ref].artifact_refs[0]].clone();
-                authenticate_publication_task_link(services.event_store(), &program,
-                    &artifact, task_ref, &mut std::collections::BTreeMap::new()).unwrap();
-                if mode == 0 {
-                    let actor = root_actor.lock().unwrap().clone().unwrap();
-                    let withdrawal = services.submit_agent_action(&AgentActionEnvelope {
-                        action_id: "r1-568-history-withdrawal".into(), actor,
-                        expected_revision: Some(program.revision),
-                        action: AgentAction::TaskWithdraw(serde_json::from_value(serde_json::json!({
-                            "task_ref":task_ref, "reason_ref":artifact.content_ref,
-                            "evidence_refs":[artifact.content_ref]
-                        })).unwrap()),
-                    }).await.unwrap();
-                    assert_eq!(withdrawal.status, AgentActionStatus::Applied, "{withdrawal:?}");
-                    let withdrawn = actions.project(&program.program_id).unwrap();
-                    assert_ne!(withdrawn.tasks[task_ref].status, crate::AgenticTaskStatus::Accepted);
-                    assert!(withdrawn.tasks[task_ref].pending_retirement.is_some()
-                        || withdrawn.tasks[task_ref].status == crate::AgenticTaskStatus::Withdrawn);
-                    authenticate_publication_task_link(services.event_store(), &withdrawn,
-                        &artifact, task_ref, &mut std::collections::BTreeMap::new()).unwrap();
-                }
-            }),
-        ).await;
+        store
+            .append_transaction(crate::AppendTransactionRequest {
+                transaction_id: "s9-bounded-process-growth".into(),
+                expected_streams: vec![crate::ExpectedStreamRevision {
+                    stream_id: source.clone(),
+                    expected_revision: 0,
+                }],
+                events: vec![
+                    event(&format!("{key}:receipt")),
+                    event(&format!("{key}:intent")),
+                    event(&format!("{key}:process-admission")),
+                ],
+            })
+            .unwrap();
+        let primary = store
+            .event_by_idempotency_key(&source, &format!("{key}:receipt"))
+            .unwrap()
+            .unwrap();
+        // The source grows right after the read pinned it.
+        store.inject_read_fault_once(
+            source.clone(),
+            "stream_revision",
+            1,
+            move |store| {
+                store
+                    .append_transaction(crate::AppendTransactionRequest {
+                        transaction_id: "s9-bounded-process-growth-2".into(),
+                        expected_streams: vec![crate::ExpectedStreamRevision {
+                            stream_id: format!("execution-effect:{key}"),
+                            expected_revision: 3,
+                        }],
+                        events: vec![crate::RuntimeTransactionEventInput {
+                            event: crate::RuntimeEventInput {
+                                stream_id: format!("execution-effect:{key}"),
+                                scope: crate::RuntimeEventScope::ExecutionNode,
+                                kind: "execution.effect.receipt".into(),
+                                status: None,
+                                actor: None,
+                                refs: Vec::new(),
+                                payload: serde_json::json!({"idempotency_key": key}),
+                            },
+                            idempotency_key: Some(format!("{key}:growth")),
+                            schema_version: 1,
+                        }],
+                    })
+                    .unwrap();
+            },
+        );
+        let error = match authenticate_bounded_process(&store, &primary) {
+            Ok(_) => {
+                panic!("a source that grows during the bounded-process read must be refused by name")
+            }
+            Err(error) => error,
+        };
+        assert!(
+            error.contains("bounded process original source changed during authentication")
+                && error.contains("read_head=3")
+                && error.contains("observed_head=4")
+                && error.contains(&source),
+            "{error}"
+        );
     }
 
-    #[tokio::test]
-    async fn r1_568_publication_provenance_survives_real_submission_and_withdrawal() {
-        exercise_publication_task_link(0).await;
+    #[test]
+    fn original_keyed_read_respects_stream_cut_inside_one_transaction() {
+        let store = crate::RuntimeEventStore::for_test();
+        let source = "execution-effect:bounded-review-test";
+        let event = |key: &str| crate::RuntimeTransactionEventInput {
+            event: crate::RuntimeEventInput {
+                stream_id: source.into(),
+                scope: crate::RuntimeEventScope::ExecutionNode,
+                kind: "test.original".into(),
+                status: None,
+                actor: None,
+                refs: Vec::new(),
+                payload: serde_json::json!({"key": key}),
+            },
+            idempotency_key: Some(key.into()),
+            schema_version: 1,
+        };
+        store.append_transaction(crate::AppendTransactionRequest {
+            transaction_id: "bounded-review-same-transaction".into(),
+            expected_streams: vec![crate::ExpectedStreamRevision {
+                stream_id: source.into(), expected_revision: 0,
+            }],
+            events: vec![event("first"), event("second")],
+        }).unwrap();
+        let first = result_event_at_cut(&store, source, "first", 1).unwrap().unwrap();
+        assert_eq!(first.sequence, 1);
+        assert!(result_event_at_cut(&store, source, "second", 1).unwrap().is_none());
+        let second = result_event_at_cut(&store, source, "second", 2).unwrap().unwrap();
+        assert_eq!(first.commit_cursor, second.commit_cursor);
+        assert!(result_event_at_cut(&store, source, "first", 0).unwrap().is_none());
+        assert!(result_event_at_cut(&store, source, "missing", 2).unwrap().is_none());
+        assert!(result_event_at_cut(&store, source, "first", 3).is_err());
+        let deferred = result_event_at_cut_with_limit(&store, source, "first", 1, 1)
+            .expect_err("over-budget is not absence");
+        assert!(deferred.contains("HistoryBudgetExceeded"), "{deferred}");
     }
 
-    #[tokio::test]
-    async fn r1_568_publication_extra_task_relation_rejects_on_every_visit() {
-        exercise_publication_task_link(1).await;
+    /// Review-cut closing control: the head read during Process-history
+    /// discovery is a hint, not a fence. When the stream moves between the
+    /// receipt read and the pin, discovery is refused by name with both
+    /// heads recorded; the review never re-pins to a newer head to pretend
+    /// the read still stands, and never invents the missing fence.
+    #[test]
+    fn process_history_discovery_is_refused_when_the_source_moves_without_a_fence() {
+        let store = crate::RuntimeEventStore::for_test();
+        let stream = "execution-effect:discovery-fence";
+        let receipt = |key: &str| crate::RuntimeEventInput {
+            stream_id: stream.into(),
+            scope: crate::RuntimeEventScope::ExecutionNode,
+            kind: "execution.effect.receipt".into(),
+            status: None,
+            actor: None,
+            refs: vec![],
+            payload: serde_json::json!({"idempotency_key": key}),
+        };
+        store.append(receipt("first")).unwrap();
+        let mut cuts = std::collections::BTreeMap::new();
+        let through = store.stream_revision(stream).unwrap();
+        store.append(receipt("second")).unwrap();
+        let error = fence_process_history_source(&store, stream, through, &mut cuts)
+            .expect_err("an unfenced move must be refused, not absorbed by a newer pin");
+        assert!(
+            error.contains("process history source changed during discovery")
+                && error.contains("read_head=1")
+                && error.contains("pinned_head=2"),
+            "{error}"
+        );
+        // The fence still admits the stable head once both reads agree.
+        let through = store.stream_revision(stream).unwrap();
+        fence_process_history_source(&store, stream, through, &mut cuts)
+            .expect("a read whose pinned head has not moved stands");
+        assert_eq!(cuts[stream], 2);
     }
 
-    #[tokio::test]
-    async fn r1_568_publication_authentication_rejects_postimage_identity_and_cut_tampering() {
-        exercise_publication_task_link(2).await;
-    }
+
+
+
+
+
+
 
     fn register_publication_root(
         store: &std::sync::Arc<crate::RuntimeEventStore>,
@@ -5139,93 +5428,6 @@ mod tests {
         ScopeLockManager, ScopeLockMode, ScopeLockRequest, ScopedResource,
     };
 
-    #[tokio::test]
-    async fn r1_native_first_claim_publications_require_exact_postclaim_generation() {
-        use crate::agentic::execution::reviewed_goal_fixture::{
-            with_native_task_review_setup, NativeTaskReviewCase,
-        };
-        use harness_contract::agent_action::{AgentAction, AgentActionEnvelope};
-        for explicit_commit in [false, true] {
-            with_native_task_review_setup(NativeTaskReviewCase {
-                commit_report: explicit_commit, ..Default::default()
-            },
-                move |services, _, worker, mut input| Box::pin(async move {
-                    if explicit_commit {
-                        let current = services.agent_action_service().project(&worker.actor.program_id).unwrap();
-                        let artifacts: Vec<String> = current.artifacts.iter().filter(|(_, artifact)| {
-                            artifact.claim_execution_id == worker.actor.execution_id
-                                && artifact.claim_generation == Some(1)
-                                && artifact.relates_to.contains(&input.task_ref)
-                        }).map(|(reference, _)| reference.clone()).collect();
-                        assert_eq!(artifacts.len(), 1);
-                        let content = current.artifacts[&artifacts[0]].content_ref.clone();
-                        input.deliverable = None;
-                        input.artifact_refs = artifacts;
-                        input.evidence_refs = vec![content];
-                    }
-                    input
-                }), move |services, review, donor| Box::pin(async move {
-                    let task_ref = match &review.action {
-                        AgentAction::TaskReview(input) => &input.task_ref,
-                        _ => unreachable!(),
-                    };
-                    let program = services.agent_action_service().project(&review.actor.program_id).unwrap();
-                    assert_eq!(program.tasks[task_ref].claim_generation, 1);
-                    let reference = &program.tasks[task_ref].artifact_refs[0];
-                    let artifact = &program.artifacts[reference];
-                    assert_eq!(artifact.claim_generation, Some(1));
-                    authenticate_publication_task_link(services.event_store(), &program,
-                        artifact, task_ref, &mut std::collections::BTreeMap::new()).unwrap();
-                    let content = services.artifact_store().resolve(&artifact.content_ref).unwrap();
-                    let history = services.session_history_reader();
-                    let readers = super::super::ResultContentReaders {
-                        artifacts: Some(services.artifact_store().as_ref()), history: history.as_deref(), process_inputs: None,
-                    };
-                    let resolved = resolve_result_metadata(services.event_store(), &program,
-                        reference, &content, None, readers).unwrap();
-                    resolved.origin.require_strong().unwrap();
-                    assert_eq!(resolved.producers.len(), 1);
-                    let producer = &resolved.producers[0];
-                    let packet = producer.packet.as_ref().unwrap();
-                    assert_eq!(packet.attempt, 1);
-                    assert_eq!(artifact.claim_execution_id.as_deref(), Some(packet.graph_id()));
-                    assert_ne!(review.actor.execution_id.as_deref(), Some(packet.graph_id()));
-                    let call = if explicit_commit { "native-first-claim-artifact" } else { "native-submit" };
-                    let tool = if explicit_commit { "artifact_commit" } else { "task_submit" };
-                    let completed: Vec<_> = services.event_store()
-                        .list_stream(&format!("session:{}", packet.session_id())).unwrap()
-                        .into_iter().filter(|event| event.kind == "tool.invocation.completed"
-                            && event.payload["tool_call_id"] == call && event.payload["tool_name"] == tool).collect();
-                    assert_eq!(completed.len(), 1);
-                    assert_eq!(completed[0].activity_binding().unwrap().agent_run_id.as_deref(), Some(packet.run_id()));
-                    let publications: Vec<AgentActionEnvelope> = services.event_store()
-                        .list_stream(&format!("agentic-program:{}", program.program_id)).unwrap()
-                        .into_iter().filter_map(|event| serde_json::from_value(event.payload["envelope"].clone()).ok())
-                        .filter(|envelope: &AgentActionEnvelope| envelope.actor.execution_id.as_deref() == Some(packet.graph_id()))
-                        .collect();
-                    assert!(publications.iter().any(|envelope| matches!(&envelope.action,
-                        AgentAction::TaskClaim(input) if &input.task_ref == task_ref)));
-                    assert!(publications.iter().any(|envelope| if explicit_commit {
-                        matches!(&envelope.action, AgentAction::ArtifactCommit(input)
-                            if input.content_ref == artifact.content_ref && input.relates_to.contains(task_ref))
-                    } else {
-                        matches!(&envelope.action, AgentAction::TaskSubmit(input)
-                            if &input.task_ref == task_ref && input.artifact_refs.is_empty()
-                                && input.deliverable.as_ref().and_then(|deliverable| deliverable.resolved_content_ref.as_deref())
-                                    == Some(artifact.content_ref.as_str()))
-                    }));
-                    assert_eq!(donor.verification.input_set.as_ref().unwrap().version, 2);
-                    for generation in [0, 2] {
-                        let mut wrong = program.clone();
-                        wrong.artifacts.get_mut(reference).unwrap().claim_generation = Some(generation);
-                        let error = resolve_result_metadata(services.event_store(), &wrong,
-                            reference, &content, None, readers).err().expect("nonmatching generation must fail");
-                        assert_eq!(error, "result publication does not match its original physical packet/claim");
-                    }
-                    assert_eq!(services.agent_action_service().project(&program.program_id).unwrap(), program);
-                })).await;
-        }
-    }
 
     #[test]
     fn r1_bounded_history_desc_keyset_preserves_deep_source_proof() {
@@ -5878,7 +6080,7 @@ mod tests {
                         .unwrap_or_else(|| panic!("event {defect}"));
                         if defect.starts_with("effects") {
                             assert_eq!(
-                                rejected, "result producer effect has no original governed plan",
+                                rejected.to_string(), "result producer effect has no original governed plan",
                                 "event {defect}"
                             );
                         }
@@ -5931,236 +6133,340 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn r1_proof_legacy_raw_metadata_never_mints_strong_origin() {
-        crate::agentic::execution::reviewed_goal_fixture::with_native_raw_owner_fixture_for_test(|services, original| async move {
-        let history = services.session_history_reader().unwrap();
-        let readers = super::super::ResultContentReaders {
-            artifacts: Some(services.artifact_store().as_ref()),
-            history: Some(history.as_ref()),
-            process_inputs: None,
+
+    /// The #17 re-dispatch shape, judged on the durable dispatch record.
+    ///
+    /// A re-dispatched Task keeps publishing its artifact under the execution
+    /// that produced it: the business claim generation is one ahead of the
+    /// dispatch generation that authorized the claim, while the producer
+    /// packet's physical attempt stays 1. Judging those two namespaces
+    /// against each other refused every such artifact, so the alignment is
+    /// read from the dispatch action - the only writer of that generation,
+    /// durable in the same Program stream this judgment already holds. A
+    /// claim whose dispatch record cannot be found is refused, and a refused
+    /// judgment writes nothing durable.
+    #[test]
+    fn a1_claim_generation_aligns_with_the_dispatch_that_produced_the_artifact() {
+        use harness_contract::agent::{AgenticExecutionBinding, AgenticExecutionFocus};
+        use harness_contract::agent::{
+            AgentBindingSnapshot, AgentCapability, AgentDataLease, AgentDefinitionId,
+            AgentDefinitionRevisionRef, AgentExecutorPolicy, AgentInstanceRef, AgentModelPolicy,
+            CognitiveReadScope, CognitiveWriteMode,
         };
-        let events = services
-            .event_store()
-            .list_stream(&original.stream_id)
-            .unwrap();
-        let task = result_tool_plan(&events, &original).unwrap();
-        let mut cuts = std::collections::BTreeMap::new();
-        let strong = original_tool_body(
-            services.event_store(),
-            readers,
-            &original,
-            task,
-            &mut cuts,
-            None,
-        )
-        .unwrap()
-        .unwrap();
-        assert!(
-            matches!(&strong.origin, ResultOrigin::StrongRaw { anchors } if anchors.len() == 1)
-        );
-        assert!(strong.origin.require_strong().is_ok());
-        let mut legacy_fixture = original.clone();
-        legacy_fixture
-            .payload
-            .as_object_mut()
-            .unwrap()
-            .remove("runtime_raw_content_v1");
-        assert!(legacy_fixture
-            .payload
-            .get("output_ref")
-            .is_none_or(serde_json::Value::is_null));
-        let recovered = original_tool_body(
-            services.event_store(),
-            readers,
-            &legacy_fixture,
-            task,
-            &mut cuts,
-            None,
-        )
-        .unwrap()
-        .unwrap();
-        assert_eq!(recovered.bytes, strong.bytes);
-        assert!(observed_raw_selector_conflict(
-            readers,
-            &original,
-            &recovered.content.as_ref().unwrap().selector
-        ));
-        assert!(matches!(
-            &recovered.origin,
-            ResultOrigin::LegacyWeak | ResultOrigin::LegacyIncomplete
-        ));
-        let error = recovered.origin.require_strong().unwrap_err();
-        assert!(!error.starts_with("review result has no Runtime-resolved producer:"));
-        assert_eq!(
-            services
-                .event_store()
-                .list_stream(&original.stream_id)
-                .unwrap(),
-            events
-        );
-        let no_session = super::super::ResultContentReaders {
-            artifacts: readers.artifacts,
+        use harness_contract::agent_action::{
+            AgentAction, AgentActionEnvelope, AgentActorKind, AgentAttemptMode,
+            ArtifactCommitInput, OriginalAgentExecution, TaskAttemptDispatchInput,
+        };
+        use harness_contract::context::ChildExecutionBudgetReservation;
+        use harness_contract::execution_graph::{
+            ExecutionGraph, ExecutionGraphLineage, ExecutionNodeKind, ExecutionNodeSpec,
+        };
+
+        let store = std::sync::Arc::new(crate::RuntimeEventStore::for_test());
+        let program_id = "a1-program";
+        let session = "a1-session";
+        let turn = "a1-turn";
+        let graph_id = "a1-graph";
+        let node_id = "a1-node";
+        let run_id = "run:a1-graph";
+        let worker = "a1-worker";
+        let task_ref = "task:a1";
+        let artifact_ref = "artifact:a1-result";
+        let content_ref = "artifact://a1-content";
+        let program_stream = format!("agentic-program:{program_id}");
+        let readers = || super::super::ResultContentReaders {
+            artifacts: None,
             history: None,
             process_inputs: None,
         };
-        assert!(original_tool_body(
-            services.event_store(),
-            no_session,
-            &legacy_fixture,
-            task,
-            &mut cuts,
-            None
-        )
-        .is_err());
-        assert_eq!(
-            original_tool_body(
-                services.event_store(),
-                no_session,
-                &original,
-                task,
-                &mut cuts,
-                None
-            )
-            .unwrap()
-            .unwrap()
-            .bytes,
-            strong.bytes
+        let content = ArtifactRef::durable(
+            content_ref,
+            "sha256:a1",
+            3,
+            "text/plain",
+            format!("session:{session}"),
         );
-        for (field, value) in [
-            ("version", serde_json::json!(2)),
-            ("tool_call_id", serde_json::json!("foreign-call")),
-            (
-                "ref_id",
-                serde_json::json!("tool://tool-raw-foreign-0123456789abcdef"),
+
+        // The physical producer: one AgentTask node of one registered graph,
+        // bound to the Program that published the artifact. Its attempt stays
+        // 1 across every re-dispatch of the Task.
+        let mut packet = AgentTaskPacket {
+            assignment: crate::test_support::agent_assignment(
+                None,
+                worker,
+                run_id,
+                task_ref,
+                session,
+                "mission:a1",
+                Some("team:a1"),
+                graph_id,
+                node_id,
             ),
-            ("visibility_scope", serde_json::json!("session:foreign")),
-            (
-                "sha256",
-                serde_json::json!(format!("sha256:{}", "0".repeat(64))),
+            attempt: 1,
+            expected_graph_revision: 1,
+            objective: "Read the original content".into(),
+            required_acceptance: Default::default(),
+            output_acceptance: Vec::new(),
+            acceptance: Vec::new(),
+            cohort_prompt_package: None,
+            constraints: Vec::new(),
+            context_refs: Vec::new(),
+            evidence_refs: Vec::new(),
+            resource_scopes: Vec::new(),
+            allowed_tools: Vec::new(),
+            allowed_skills: Vec::new(),
+            permission_ceiling: harness_contract::policy::PermissionMode::ReadOnly,
+            policy_revision: 1,
+            model_lease: "fixture".into(),
+            budget_lease: ChildExecutionBudgetReservation::single(
+                "a1-budget",
+                worker,
+                task_ref,
+                1024,
+                u64::MAX,
+                1,
             ),
-            ("byte_count", serde_json::json!(strong.bytes.len() + 1)),
-            ("selector", serde_json::json!("artifact://missing-raw-body")),
-            ("media_type", serde_json::json!("application/foreign")),
-        ] {
-            let mut invalid_fixture = original.clone();
-            invalid_fixture.payload["runtime_raw_content_v1"][field] = value;
-            assert!(
-                original_tool_body(
-                    services.event_store(),
-                    readers,
-                    &invalid_fixture,
-                    task,
-                    &mut cuts,
-                    None
+            deadline_at_ms: u64::MAX,
+            binding: None,
+            managed_invocation: None,
+            idempotency_key: "a1-packet".into(),
+            agentic_binding: None,
+        };
+        packet.agentic_binding = Some(AgenticExecutionBinding {
+            program_id: program_id.into(),
+            agent_id: worker.into(),
+            membership_id: "membership:a1".into(),
+            team_id: "team:a1".into(),
+            task_team_id: "team:a1".into(),
+            source_spec_revision: 1,
+            task_purpose: None,
+            focus: AgenticExecutionFocus::TaskExecute {
+                task_ref: task_ref.into(),
+            },
+        });
+        // The packet carries the binding Runtime compiled for it: the producer
+        // judgment refuses an unbound packet, and the digest is the one
+        // Runtime recomputes from the snapshot itself.
+        let mut binding = AgentBindingSnapshot {
+            binding_id: format!("binding:{worker}"),
+            definition_ref: AgentDefinitionRevisionRef {
+                definition_id: AgentDefinitionId::new(
+                    harness_contract::agent::DefinitionScope::Builtin,
+                    "cowd/test-agent",
                 )
-                .is_err(),
-                "{field}"
+                .unwrap(),
+                revision: 1,
+            },
+            definition_digest: "a".repeat(64),
+            instructions: "# A1\n\nRead the original content.\n".to_string(),
+            instance: AgentInstanceRef {
+                instance_id: format!("instance:{worker}"),
+                role_slot_id: None,
+            },
+            executor: AgentExecutorPolicy::CowdNative,
+            model_policy: AgentModelPolicy {
+                profile: "test".into(),
+                allowed_models: vec!["fast".into()],
+                fallback_allowed: true,
+            },
+            effective_capabilities: vec![AgentCapability::Read],
+            skill_refs: Vec::new(),
+            skill_tool_pins: None,
+            skill_tool_refs: None,
+            tool_contract_refs: Vec::new(),
+            data_lease: AgentDataLease {
+                session_id: session.into(),
+                task_id: task_ref.into(),
+                team_id: Some("team:a1".into()),
+                read_scopes: vec![CognitiveReadScope::Session],
+                write_mode: CognitiveWriteMode::None,
+                fact_boundaries: Vec::new(),
+                fact_refs: Vec::new(),
+                matrix_snapshot_refs: Vec::new(),
+            },
+            release: None,
+            evaluation: None,
+            display: None,
+            binding_digest: String::new(),
+        };
+        binding.binding_digest = crate::agent::binding::recompute_binding_digest(&binding)
+            .expect("the fixture binding digest recomputes");
+        packet.binding = Some(binding);
+        let mut graph = ExecutionGraph::new("A1 producer graph");
+        graph.id = graph_id.into();
+        graph.lineage = Some(ExecutionGraphLineage {
+            session_id: session.into(),
+            turn_id: turn.into(),
+            root_task_id: task_ref.into(),
+            task_id: task_ref.into(),
+            generation: 1,
+        });
+        let mut node = ExecutionNodeSpec::new(
+            ExecutionNodeKind::AgentTask,
+            "agent_task",
+            serde_json::to_string(&packet).unwrap(),
+        );
+        node.id = node_id.into();
+        graph.nodes.push(node);
+        crate::ExecutionCommitService::new(std::sync::Arc::clone(&store))
+            .register_graph(graph)
+            .unwrap();
+
+        let worker_actor = AgentActorBinding {
+            original_execution: Some(OriginalAgentExecution {
+                graph_id: graph_id.into(),
+                node_id: node_id.into(),
+                attempt: 1,
+            }),
+            objective_id: "a1-objective".into(),
+            program_id: program_id.into(),
+            session_id: session.into(),
+            turn_id: turn.into(),
+            root_execution_id: Some("a1-root".into()),
+            required_team_count: 0,
+            exact_team_count: None,
+            objective_summary: "A1 fixture".into(),
+            model_lease: "fixture".into(),
+            permission_ceiling: Some(harness_contract::policy::PermissionMode::ReadOnly),
+            resource_scopes: Vec::new(),
+            actor_id: worker.into(),
+            kind: AgentActorKind::Agent,
+            execution_id: Some(graph_id.into()),
+            team_id: Some("team:a1".into()),
+            agent_id: Some(worker.into()),
+        };
+        let append_action = |action_id: &str,
+                            actor: &AgentActorBinding,
+                            action: AgentAction,
+                            entity_ref: Option<&str>| {
+            let mut payload = serde_json::Map::new();
+            payload.insert(
+                "envelope".into(),
+                serde_json::to_value(&AgentActionEnvelope {
+                    action_id: action_id.into(),
+                    actor: actor.clone(),
+                    expected_revision: None,
+                    action,
+                })
+                .unwrap(),
+            );
+            if let Some(entity_ref) = entity_ref {
+                payload.insert("entity_ref".into(), entity_ref.into());
+            }
+            store
+                .append(crate::RuntimeEventInput {
+                    stream_id: program_stream.clone(),
+                    scope: crate::RuntimeEventScope::Program,
+                    kind: "agentic.action_applied".into(),
+                    status: Some("applied".into()),
+                    actor: Some(actor.actor_id.clone()),
+                    refs: Vec::new(),
+                    payload: serde_json::Value::Object(payload),
+                })
+                .unwrap()
+        };
+        append_action(
+            "a1-commit",
+            &worker_actor,
+            AgentAction::ArtifactCommit(ArtifactCommitInput {
+                content_ref: content_ref.into(),
+                kind: "report".into(),
+                title: "A1 result".into(),
+                relates_to: Vec::new(),
+            }),
+            Some(artifact_ref),
+        );
+        let mut supervisor = worker_actor.clone();
+        supervisor.actor_id = "runtime.program-supervisor".into();
+        supervisor.kind = AgentActorKind::Supervisor;
+        supervisor.execution_id = Some(graph_id.into());
+        supervisor.agent_id = None;
+        supervisor.team_id = None;
+        supervisor.original_execution = None;
+        append_action(
+            "a1-dispatch",
+            &supervisor,
+            AgentAction::TaskAttemptDispatch(TaskAttemptDispatchInput {
+                task_ref: task_ref.into(),
+                execution_id: graph_id.into(),
+                agent_ref: worker.into(),
+                membership_id: "membership:a1".into(),
+                mode: AgentAttemptMode::Execute,
+                generation: 1,
+            }),
+            None,
+        );
+
+        let revision = store.stream_revision(&program_stream).unwrap();
+        let mut program = AgenticProgramProjection::empty(program_id, "a1-objective");
+        program.session_id = session.into();
+        program.turn_id = turn.into();
+        program.root_execution_id = Some("a1-root".into());
+        program.revision = revision;
+        program.artifacts.insert(
+            artifact_ref.into(),
+            crate::agentic::program::AgenticArtifactProjection {
+                artifact_ref: artifact_ref.into(),
+                content_ref: content_ref.into(),
+                kind: "report".into(),
+                title: "A1 result".into(),
+                relates_to: Vec::new(),
+                committed_by: worker.into(),
+                claim_execution_id: Some(graph_id.into()),
+                claim_generation: Some(2),
+            },
+        );
+
+        // Positive: the claim generation is one ahead of the dispatch
+        // generation that authorized it, under a producer packet whose
+        // physical attempt is 1.
+        let resolved =
+            resolve_result_metadata(&store, &program, artifact_ref, &content, None, readers())
+                .expect("the re-dispatched Task's artifact must pass on the dispatch equation");
+        assert_eq!(resolved.producers.len(), 1);
+        assert_eq!(resolved.producers[0].actor, worker);
+        assert_eq!(resolved.producers[0].execution, format!("agent-run:{run_id}"));
+
+        // Negative: a generation the dispatch did not authorize is refused.
+        // Generation 1 is the value the retired raw comparison accepted, so
+        // this also proves the judgment did not simply stop checking.
+        for generation in [1_u64, 3] {
+            let mut wrong = program.clone();
+            wrong
+                .artifacts
+                .get_mut(artifact_ref)
+                .unwrap()
+                .claim_generation = Some(generation);
+            assert_eq!(
+                resolve_result_metadata(&store, &wrong, artifact_ref, &content, None, readers())
+                    .err()
+                    .expect("a claim generation the dispatch did not authorize must be rejected").to_string(),
+                "result publication does not match its original physical packet/claim",
+                "claim generation {generation} must be rejected"
             );
         }
-        let mut presentation_fixture = original.clone();
-        presentation_fixture.payload["output_ref"] = serde_json::json!({
-            "sha256":"f".repeat(64), "byte_count":1,
-        });
-        presentation_fixture.payload["output_preview"] =
-            serde_json::json!("different presentation");
-        presentation_fixture.payload["output_byte_count"] = serde_json::json!(22);
-        assert_eq!(
-            original_tool_body(
-                services.event_store(),
-                readers,
-                &presentation_fixture,
-                task,
-                &mut cuts,
-                None
-            )
-            .unwrap()
-            .unwrap()
-            .bytes,
-            strong.bytes
-        );
-        let mut staged_conflict = original.clone();
-        let foreign = format!(
-            "tool://tool-raw-{}-{}",
-            original.payload["tool_call_id"].as_str().unwrap(),
-            "f".repeat(64)
-        );
-        staged_conflict.payload["full_output_ref"] = serde_json::json!(foreign);
-        staged_conflict.payload["runtime_raw_content_v1"]["ref_id"] =
-            staged_conflict.payload["full_output_ref"].clone();
-        assert!(original_tool_body(
-            services.event_store(),
-            readers,
-            &staged_conflict,
-            task,
-            &mut cuts,
-            None
-        )
-        .is_err());
-        services.shutdown_maintenance().await;
-        }).await;
-    }
 
-    #[test]
-    fn legacy_input_bridge_requires_verified_full_input_under_both_hashes() {
-        let input = serde_json::json!({"media_type": "原始输入".repeat(128)});
-        let encoded = serde_json::to_string(&input).unwrap();
-        let mut owner = DurableRuntimeEvent {
-            event_id: "unit-input-identity".into(),
-            stream_id: "unit:legacy-input".into(),
-            sequence: 1,
-            scope: crate::RuntimeEventScope::Tool,
-            kind: "unit.input_identity".into(),
-            status: None,
-            actor: None,
-            refs: Vec::new(),
-            payload: serde_json::json!({
-                "tool_call_id":"legacy-call",
-                "input_hash":crate::tool_invocation::stable_hash(&encoded),
-            }),
-            created_at_ms: 0,
-            commit_cursor: 1,
-            transaction_id: "unit-input-identity".into(),
-            transaction_index: 0,
-            schema_version: 1,
-            idempotency_key: None,
-        };
-        let task = serde_json::json!({"normalized_input":input});
-        let payload = serde_json::json!({
-            "input_hash":format!("{:016x}", model_protocol::fingerprint::stable_hash_bytes(encoded.as_bytes())),
-            "source_evidence_ref":"runtime-tool:legacy-call",
-            "native_staged_artifact":false,
-        });
-        for preview in [
-            None,
-            Some("partial"),
-            Some(encoded.as_str()),
-            Some("different input"),
-        ] {
-            owner.payload["input_preview"] = serde_json::to_value(preview).unwrap();
-            assert!(raw_input_matches_owner(&payload, &owner, Some(&task)));
-            let mut wrong = payload.clone();
-            wrong["input_hash"] = serde_json::json!("0000000000000000");
-            assert!(!raw_input_matches_owner(&wrong, &owner, Some(&task)));
-        }
-        owner.payload["input_preview"] = serde_json::Value::Null;
-        assert!(!raw_input_matches_owner(&payload, &owner, None));
-        let wrong_task = serde_json::json!({"normalized_input":{"media_type":"different"}});
-        assert!(!raw_input_matches_owner(
-            &payload,
-            &owner,
-            Some(&wrong_task)
-        ));
-        owner.payload["input_preview"] = serde_json::json!(encoded);
-        assert!(raw_input_matches_owner(&payload, &owner, None));
-        let mut wrong_source = payload.clone();
-        wrong_source["source_evidence_ref"] = serde_json::json!("runtime-tool:foreign");
-        assert!(!raw_input_matches_owner(&wrong_source, &owner, Some(&task)));
-        let mut staged = payload.clone();
-        staged["native_staged_artifact"] = serde_json::json!(true);
-        assert!(!raw_input_matches_owner(&staged, &owner, Some(&task)));
-        staged["input_hash"] = owner.payload["input_hash"].clone();
-        assert!(raw_input_matches_owner(&staged, &owner, Some(&task)));
+        // Negative: an execution the Program stream holds no dispatch record
+        // for is refused fail-closed...
+        let mut foreign = program.clone();
+        foreign
+            .artifacts
+            .get_mut(artifact_ref)
+            .unwrap()
+            .claim_execution_id = Some("a1-foreign-graph".into());
+        assert_eq!(
+            resolve_result_metadata(&store, &foreign, artifact_ref, &content, None, readers())
+                .err()
+                .expect("a claim execution with no dispatch record must be rejected").to_string(),
+            "result publication does not match its original physical packet/claim"
+        );
+        // ...and the refusal leaves the Program stream exactly as it was: no
+        // receipt, no settlement, nothing durable.
+        assert_eq!(
+            store.stream_revision(&program_stream).unwrap(),
+            revision,
+            "a refused publication must not write a receipt"
+        );
     }
 
     #[tokio::test]
@@ -6223,11 +6529,28 @@ mod tests {
             ),
         )
         .unwrap();
+        let program_before_worker = actions.project("metadata-program").unwrap();
         let worker = apply("metadata-worker", root_actor.clone(), AgentAction::AgentInvite(
             serde_json::from_value(serde_json::json!({
                 "team_ref":team, "role":"producer", "mission":"Read original content", "required_capabilities":["read"]
             })).unwrap()
         )).unwrap();
+        let program_after_worker = actions.project("metadata-program").unwrap();
+        assert!(program_after_worker.revision > program_before_worker.revision);
+        assert_eq!(
+            result_program_at_cut(&store, "metadata-program", program_before_worker.revision).unwrap(),
+            program_before_worker,
+        );
+        let program_stream = "agentic-program:metadata-program";
+        let opened = store.list_stream_after(program_stream, 0, 1, 1, 1024 * 1024)
+            .unwrap().into_iter().next().unwrap();
+        let cached_owner = actions.project_snapshot_bounded(
+            "metadata-program", program_before_worker.revision, &opened, None,
+            |after, through| store.list_stream_after(program_stream, after, through, 100, 1024 * 1024),
+            |error| error.to_string(),
+        ).unwrap();
+        assert_eq!(cached_owner.as_ref(), &program_before_worker);
+        assert!(result_program_at_cut(&store, "metadata-program", program_after_worker.revision + 1).is_err());
         let task = apply(
             "metadata-task",
             root_actor.clone(),
@@ -6543,6 +6866,7 @@ mod tests {
                     error: None,
                     evidence_ref: "metadata-original-read".into(),
                     observed_evidence: vec![],
+                    pending_agent_batch: None,
                 },
                 &descriptor,
                 &scope,
@@ -6675,7 +6999,7 @@ mod tests {
                     .err()
                     .expect("foreign claim generation must be rejected");
             assert_eq!(
-                error,
+                error.to_string(),
                 "result publication does not match its original physical packet/claim"
             );
         }
@@ -7152,6 +7476,7 @@ mod tests {
                 error: None,
                 evidence_ref: "root-history-result".into(),
                 observed_evidence: vec![],
+                pending_agent_batch: None,
             };
             if read {
                 commits
@@ -7265,6 +7590,19 @@ mod tests {
         store.bind_artifact_store(artifacts.clone()).unwrap();
         let commits =
             ExecutionCommitService::new(store.clone()).with_artifact_store(artifacts.clone());
+        // Give the original commit owner the same live Session policy and
+        // Runtime stores; the terminal must keep its real authority checks.
+        let services = crate::RuntimeServices::builder(workspace.path().join("runtime-home"), workspace.path())
+            .runtime_event_store(store.clone())
+            .artifact_store(artifacts.clone())
+            .task_aggregate_service(std::sync::Arc::new(crate::TaskAggregateService::for_test()))
+            .build().unwrap();
+        services.publish_session_execution_policy(
+            "scope2-session",
+            crate::permissions::SessionExecutionPolicyControl::new(
+                harness_contract::policy::PermissionMode::DangerFullAccess,
+            ),
+        );
         let mut graph = ExecutionGraph::new("original bounded process history");
         graph.id = "scope2-graph".into();
         graph.lineage = Some(ExecutionGraphLineage {
@@ -7343,6 +7681,10 @@ mod tests {
                 "execute_code",
                 input.clone(),
             );
+            let live_policy = services.session_execution_policy("scope2-session")
+                .expect("original live Session policy");
+            assert_eq!(request.policy_revision, live_policy.revision);
+            request.sandbox_posture = live_policy.sandbox_posture;
             let mut step = request.step_binding.as_ref().unwrap().clone();
             step.origin.call_id = format!("bounded-version-{version}");
             request.tool_use_id = step.origin.call_id.clone();
@@ -7354,12 +7696,38 @@ mod tests {
             request.step_binding = Some(step);
             request.observation_wave_sequence = version;
             let effect = request.compiled_invocation.as_ref().unwrap().effect.clone();
-            crate::bound_tool_batch::scope_admission_tests::authorize_bounded_fixture(
-                &host,
-                &mut request,
-                store.clone(),
-                harness_contract::policy::PermissionMode::DangerFullAccess,
-            );
+            // This test exercises the real frame lock, not the separate human
+            // approval fixture. Use the ordinary policy's original signed lease.
+            let mode = harness_contract::policy::PermissionMode::DangerFullAccess;
+            let policy = crate::PermissionPolicy::new(mode);
+            let authorization_request = crate::AuthorizationRequest {
+                principal_id: "bounded-fixture-358".into(),
+                capability: request.tool_name.clone(),
+                input: request.input.clone(),
+                idempotency_key: request.idempotency_key.clone(),
+                effect: effect.clone(),
+                parent_ceiling: mode,
+                parent_lease_id: None,
+                policy_revision: request.policy_revision,
+                recovery_scope: request.governed_plan_id.clone(),
+                context: crate::PermissionContext::default(),
+                safe_alternatives: vec![],
+            };
+            let evaluated = crate::AuthorizationNegotiator::new()
+                .assess_effective(&policy, &authorization_request);
+            assert_eq!(evaluated.assessment.path,
+                harness_contract::policy::AuthorizationPath::PolicyAutoGrant);
+            let signed = evaluated.assessment.lease.clone()
+                .expect("ordinary policy must issue a signed lease");
+            assert!(crate::AuthorizationNegotiator::verify_lease_signature(&signed));
+            let authorization = crate::ToolPolicy.authorize(
+                &evaluated.effective, &evaluated.assessment,
+                &request.idempotency_key, signed, 30,
+            ).unwrap().authorization;
+            host.pin_snapshot().validate_authorization(
+                &authorization, &request.tool_name, &input,
+            ).unwrap();
+            request.authorization = Some(authorization);
             let (locks, _) =
                 crate::bound_tool_batch::bound_effect_lock_requests(&resolver, &effect).unwrap();
             let _lease = manager.acquire(locks, None).await.unwrap();
@@ -7394,11 +7762,15 @@ mod tests {
             let admission = commits
                 .admit_bounded_process(&request, &effect, &prepared, &bundle)
                 .unwrap();
+            let authority = crate::tool_host::BoundedProcessAuthority::bind(
+                services.clone(), request.clone(),
+            ).unwrap();
+            assert!(authority.shares_store(&commits));
+            authority.check(&request).unwrap();
             let completed = prepared.run(admission, &tools::ToolExecutionCancellation::new());
-            let outcome = commits
-                .commit_bounded_process(&request, &effect, completed, &artifacts)
-                .await
-                .unwrap();
+            let outcome = authority.with_commit_context(
+                commits.commit_bounded_process(&request, &effect, completed, &artifacts),
+            ).await.unwrap();
             assert_eq!(outcome.observed_evidence.len(), 1);
             let primary = store
                 .event_by_idempotency_key(
@@ -7632,5 +8004,164 @@ mod tests {
             }
         )
         .is_err());
+        services.shutdown_execution().await;
+        services.shutdown_maintenance().await;
+    }
+
+    /// 030 T7 control ①: a busy Session. The result package's closing cut fence is
+    /// self-consistency inside the pinned cut, not equality with the live head,
+    /// because every read here is bounded by that cut and cannot have cited the
+    /// events that arrived after it.
+    #[test]
+    fn t7_a_session_that_kept_appending_leaves_the_package_consistent() {
+        let store = crate::RuntimeEventStore::for_test();
+        let busy = "session:busy-t7";
+        let append = |key: &str| crate::RuntimeEventInput {
+            stream_id: busy.into(),
+            scope: crate::RuntimeEventScope::Session,
+            kind: "test.session-append".into(),
+            status: None,
+            actor: None,
+            refs: vec![],
+            payload: serde_json::json!({"key": key}),
+        };
+        for key in ["one", "two", "three"] {
+            store.append(append(key)).unwrap();
+        }
+        let mut cuts = std::collections::BTreeMap::new();
+        cuts.insert(busy.to_string(), store.stream_revision(busy).unwrap());
+        assert_eq!(cuts[busy], 3);
+        // The Session keeps growing while this review is still resolving.
+        for key in ["four", "five"] {
+            store.append(append(key)).unwrap();
+        }
+        super::verify_result_package_cuts(&store, "artifact:t7", &cuts)
+            .expect("growth above the pinned cut cites nothing this review read");
+        assert_eq!(cuts[busy], 3, "the fence does not chase the head: the cut stays put");
+        super::verify_result_package_cuts(&store, "artifact:t7", &cuts)
+            .expect("the fence is idempotent while the aggregate keeps appending");
+    }
+
+    /// 030 T7 control ②: the movement this fence must still refuse, with the
+    /// sentence it has always produced.
+    #[test]
+    fn t7_true_drift_is_still_refused_with_the_original_sentence() {
+        let store = crate::RuntimeEventStore::for_test();
+        let judged = "agentic-program:judged-t7";
+        let append = || crate::RuntimeEventInput {
+            stream_id: judged.into(),
+            scope: crate::RuntimeEventScope::Session,
+            kind: "test.judged-append".into(),
+            status: None,
+            actor: None,
+            refs: vec![],
+            payload: serde_json::json!({}),
+        };
+        store.append(append()).unwrap();
+        store.append(append()).unwrap();
+        let mut cuts = std::collections::BTreeMap::new();
+        cuts.insert(judged.to_string(), 2);
+        // The object under review itself moved: never a busy aggregate.
+        store.append(append()).unwrap();
+        let error = super::verify_result_package_cuts(&store, "artifact:t7", &cuts)
+            .expect_err("growth of a judged source is refused, not rebuilt around");
+        // 032 K4b (A2): code equality replaces the verbatim sentence equality;
+        // the drift facts and the rebuild instruction stay individually pinned.
+        assert_eq!(
+            super::super::reason_code::reason_code_of(&error.to_string()),
+            Some(super::super::reason_code::ReviewRefusalCode::ResultMetadataChangedAfterEnumeration),
+            "true growth is refused under its own named code: {error}"
+        );
+        assert!(error.is_program_advanced(), "the original source fence must supply the typed cause");
+        assert!(
+            error.contains("result=artifact:t7 source=agentic-program:judged-t7 expected=2 observed=3"),
+            "the refusal still carries the drift facts: {error}"
+        );
+        assert!(
+            error.contains("rebuild the review"),
+            "the refusal still carries its instruction: {error}"
+        );
+        // A pinned cut above the durable head is a fabricated window or a
+        // truncated stream, on every source class.
+        for source in [judged, "session:busy-t7"] {
+            let mut beyond = std::collections::BTreeMap::new();
+            beyond.insert(source.to_string(), 9_999);
+            assert!(
+                super::verify_result_package_cuts(&store, "artifact:t7", &beyond).is_err(),
+                "a pinned cut above the head must still refuse: {source}"
+            );
+        }
+    }
+
+    /// 030 T7: both closing fences share one judgment, so the source classes and
+    /// movement directions decide identically for them.
+    #[test]
+    fn t7_the_shared_judgment_covers_every_source_class_and_movement() {
+        for source in [
+            "session:one",
+            "execution-lineage:one",
+            "agentic-graph:one",
+            "session-ingress-graph:one",
+        ] {
+            assert!(super::result_cut_remains_consistent(source, 4, 4), "{source} unchanged");
+            assert!(super::result_cut_remains_consistent(source, 4, 5), "{source} aggregate growth");
+            assert!(!super::result_cut_remains_consistent(source, 4, 3), "{source} backwards");
+        }
+        for source in [
+            "agentic-program:one",
+            "goal:one",
+            "execution-effect:one",
+            "execution-agent-receipts:graph:node:1",
+            "artifact:one",
+        ] {
+            assert!(super::result_cut_remains_consistent(source, 4, 4), "{source} unchanged");
+            assert!(!super::result_cut_remains_consistent(source, 4, 5), "{source} judged growth");
+            assert!(!super::result_cut_remains_consistent(source, 4, 3), "{source} backwards");
+        }
+    }
+
+    /// 030 T7: merging the actual-input phase publishes the later cut - a published
+    /// cut must never sit below a revision this review read - and still refuses a
+    /// cut that shrank or a judged source that moved.
+    #[test]
+    fn t7_the_actual_input_merge_publishes_the_later_cut_only_for_aggregates() {
+        let aggregate = "session:merge-t7";
+        let mut cuts = std::collections::BTreeMap::new();
+        cuts.insert(aggregate.to_string(), 2_458);
+        let mut actual = std::collections::BTreeMap::new();
+        actual.insert(aggregate.to_string(), 2_482);
+        super::merge_actual_input_cuts(&mut cuts, &actual)
+            .expect("a busy Session's later cut covers both phases' reads");
+        assert_eq!(cuts[aggregate], 2_482);
+        let mut shrunk = std::collections::BTreeMap::new();
+        shrunk.insert(aggregate.to_string(), 2_000);
+        assert_eq!(
+            super::merge_actual_input_cuts(&mut cuts, &shrunk)
+                .expect_err("a cut that moved backwards is a replaced stream"),
+            "actual result input source moved during enumeration"
+        );
+        assert_eq!(cuts[aggregate], 2_482, "a refused merge rewrites nothing");
+        // Atomicity across entries: the foldable entry sorts first, so a
+        // half-folded map would show its new value even though the merge refused.
+        let foldable = "agentic-graph:merge-t7";
+        let mut pair = std::collections::BTreeMap::new();
+        pair.insert(foldable.to_string(), 6_u64);
+        pair.insert(aggregate.to_string(), 2_482_u64);
+        let mut incoming = std::collections::BTreeMap::new();
+        incoming.insert(foldable.to_string(), 9_u64);
+        incoming.insert(aggregate.to_string(), 2_400_u64);
+        assert!(super::merge_actual_input_cuts(&mut pair, &incoming).is_err());
+        assert_eq!(pair[foldable], 6, "a refused merge does not fold the entry before it");
+        assert_eq!(pair[aggregate], 2_482);
+        let judged = "execution-effect:merge-t7";
+        let mut judged_cuts = std::collections::BTreeMap::new();
+        judged_cuts.insert(judged.to_string(), 4);
+        let mut judged_actual = std::collections::BTreeMap::new();
+        judged_actual.insert(judged.to_string(), 5);
+        assert_eq!(
+            super::merge_actual_input_cuts(&mut judged_cuts, &judged_actual)
+                .expect_err("the object under review moving still refuses"),
+            "actual result input source moved during enumeration"
+        );
     }
 }

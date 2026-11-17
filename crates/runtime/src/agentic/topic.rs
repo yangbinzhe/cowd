@@ -26,19 +26,30 @@ pub(crate) fn apply_message_publish(
             if Some(attempt.agent_id.as_str()) != envelope.actor.agent_id.as_deref()
                 || attempt.agent_id != envelope.actor.actor_id
                 || attempt.mode != harness_contract::agent_action::AgentAttemptMode::Execute
-                || attempt.generation != task.claim_generation
+                || attempt.generation.checked_add(1) != Some(task.claim_generation)
+                || task.claim_renewal_streak != 0
                 || !matches!(
                     task.status,
                     super::program::AgenticTaskStatus::Published
                         | super::program::AgenticTaskStatus::Rework
+                        | super::program::AgenticTaskStatus::Claimed
                 )
             {
                 return None;
             }
+            let attempt_generation = attempt.generation;
             // Validation bound this message to the publisher's unclaimed
             // opportunity. Settle in the SAME journal transition as the
             // reason, before followup dispatch, with no self-cancellation wait.
             task.active_attempts.remove(execution_id);
+            task.claimant = None;
+            task.claim_execution_id = None;
+            task.claimed_at_ms = None;
+            task.lease_expires_at_ms = None;
+            task.claim_renewal_streak = 0;
+            task.claim_generation = attempt_generation;
+            task.status = super::program::AgenticTaskStatus::Published;
+            return Some(attempt_generation);
         }
         Some(task.claim_generation)
     });

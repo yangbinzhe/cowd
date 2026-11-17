@@ -2,7 +2,7 @@
 #[cfg(test)]
 use crate::agentic::execution::reviewed_goal_fixture::diagnostic_1120 as obs1120;
 use crate::agentic::program::AgenticProgramProjection;
-use crate::{ExpectedStreamRevision, RuntimeEventStore};
+use crate::{ExpectedStreamRevision, RuntimeEventScope, RuntimeEventStore};
 use harness_contract::core::{ExecutionModifier, ExecutionPolicyGate, TaskRisk};
 use harness_contract::goal::GoalContract;
 use harness_contract::tool::{ToolEffectDescriptor, ToolEffectKind};
@@ -21,6 +21,7 @@ pub(crate) struct ProofInputSnapshot {
     pub task_refs: Vec<String>,
     pub artifact_refs: Vec<String>,
     pub reviewer_execution_refs: BTreeSet<String>,
+    pub(super) reviewer_packet: Option<harness_contract::agent::AgentTaskPacket>,
     pub retiring_optional_task_refs: BTreeSet<String>,
     pub semantic_digest: String,
     pub policy_digest: String,
@@ -30,9 +31,94 @@ pub(crate) struct ProofInputSnapshot {
     /// It is a CANDIDATE that every entry re-binds against the durable
     /// evidence; a snapshot without one exempts nothing.
     pub current_review_effect_key: Option<String>,
+    /// The required writes this review settled as terminally failed.
+    ///
+    /// Each one names the call that ran and failed. A settled pending write
+    /// is never a satisfied requirement, and never an effect that did not
+    /// happen: the conclusion carries these by name.
+    pub terminal_failures: Vec<serde_json::Value>,
+    pub(super) dependency_frame: ConclusionMaterialDependencies,
+    pub(super) pre_authenticated_session_source: Option<ExpectedStreamRevision>,
+}
+
+/// The actual dependencies independently recovered for this proof, not a
+/// list supplied by a caller. Its outer prepared proof binds store and use.
+pub(crate) struct ConclusionMaterialDependencies {
+    session_source: ExpectedStreamRevision,
+    historical_session_cut: Option<u64>,
+    session_id: String,
+    turn_id: String,
+    review_targets: Vec<harness_contract::goal::ProofEffectTarget>,
+    file_dependencies: Vec<ActualFileDependency>,
+    immutable_inputs: Vec<ActualImmutableInput>,
+    material_events: Vec<harness_contract::goal::ProofInputEvent>,
+    canonical_facts: Vec<serde_json::Value>,
+}
+
+impl ConclusionMaterialDependencies {
+    #[cfg(test)]
+    pub(super) fn empty_for_coverage_test() -> Self {
+        Self { session_source: ExpectedStreamRevision { stream_id: String::new(), expected_revision: 0 }, historical_session_cut: None,
+            session_id: String::new(), turn_id: String::new(),
+            review_targets: Vec::new(), file_dependencies: Vec::new(), immutable_inputs: Vec::new(), material_events: Vec::new(), canonical_facts: Vec::new() }
+    }
+    pub(crate) fn session_source(&self) -> &ExpectedStreamRevision { &self.session_source }
+    pub(crate) fn historical_session_cut(&self) -> Option<u64> { self.historical_session_cut }
+    pub(crate) fn review_targets(&self) -> &[harness_contract::goal::ProofEffectTarget] { &self.review_targets }
+    pub(crate) fn material_events(&self) -> &[harness_contract::goal::ProofInputEvent] { &self.material_events }
+    pub(crate) fn canonical_facts(&self) -> &[serde_json::Value] { &self.canonical_facts }
+    pub(crate) fn file_dependencies(&self) -> impl Iterator<Item = (&harness_contract::goal::ProofEffectTarget, u64, u64, &str, &str)> {
+        self.file_dependencies.iter().map(|d| (&d.target, d.acquisition_cursor, d.consumer_cursor,
+            d.consumer_call_key.as_str(), d.source_sha256.as_str()))
+    }
+    pub(crate) fn protected_files(&self) -> impl Iterator<Item = (&harness_contract::goal::ProofEffectTarget, &str, u64)> {
+        self.file_dependencies.iter().map(|d| (&d.target, d.source_sha256.as_str(), d.source_bytes))
+    }
+    pub(crate) fn immutable_inputs(&self) -> impl Iterator<Item = (&harness_contract::context::ArtifactRef, &str, u64)> {
+        self.immutable_inputs.iter().map(|d| (&d.content, d.reference.as_str(), d.acquisition_cursor))
+    }
+
+    // Original material cuts and current mutable controls are kept separate.
+}
+
+/// A bounded historical Session view, not a current authorization or tail.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct HistoricalSessionCut {
+    source: ExpectedStreamRevision,
+    observed_revision: u64,
+}
+impl HistoricalSessionCut {
+    pub(super) fn source(&self) -> &ExpectedStreamRevision { &self.source }
+    pub(super) fn observed_revision(&self) -> u64 { self.observed_revision }
+
+    /// The only producer of a historical Session cut. It reads the exact
+    /// `session:{session_id}` head from the store itself: a caller can name
+    /// only the material cut its original ProofInputSet was assembled
+    /// against, never report a head. A cut above the durable head is either
+    /// a fabricated window or a truncated stream and is refused.
+    pub(crate) fn for_live_material(
+        store: &crate::RuntimeEventStore,
+        session_id: &str,
+        cut: u64,
+    ) -> Result<Self, String> {
+        let session_source = format!("session:{session_id}");
+        let head = store
+            .stream_revision(&session_source)
+            .map_err(|error| error.to_string())?;
+        if cut > head {
+            return Err(format!(
+                "review Session material cut is beyond head; source={session_source} cut={cut} head={head}"
+            ));
+        }
+        Ok(Self {
+            source: ExpectedStreamRevision { stream_id: session_source, expected_revision: cut },
+            observed_revision: head,
+        })
+    }
 }
 
 impl ProofInputSnapshot {
+    pub(crate) fn dependency_frame(&self) -> &ConclusionMaterialDependencies { &self.dependency_frame }
     pub(crate) fn reviewer_matches(
         &self,
         program: &AgenticProgramProjection,
@@ -93,6 +179,65 @@ impl CompletionAdmissionContext {
     }
 }
 
+
+/// Reuse the original Goal owner's sealed proof/coverage preparation when
+/// the same completion reaches its checked commit. The caller must first
+/// verify the prepared seal against this store and Program projection.
+pub(crate) fn completion_admission_context_from_prepared(
+    program: &AgenticProgramProjection,
+    envelope: &harness_contract::agent_action::AgentActionEnvelope,
+    prepared: &crate::execution_core::goal::PreparedProgramConclusion,
+) -> Result<Option<CompletionAdmissionContext>, String> {
+    use harness_contract::agent_action::AgentAction;
+    let AgentAction::ObjectiveCompleteRequest(input) = &envelope.action else { return Ok(None); };
+    if input.blocked || !program.tasks.values().any(|task| {
+        task.status == crate::agentic::program::AgenticTaskStatus::CancelRequested
+            && task.pending_retirement == Some(crate::agentic::program::AgenticTaskRetirement::Withdrawn)
+    }) { return Ok(None); }
+    if envelope.actor.program_id != program.program_id || envelope.actor.objective_id != program.objective_id
+        || envelope.actor.session_id != program.session_id || envelope.actor.turn_id != program.turn_id
+        || envelope.actor.root_execution_id != program.root_execution_id
+        || prepared.goal.session_id != program.session_id {
+        return Err("prepared completion context owner differs".into());
+    }
+    let request = program.completion_request.as_ref().ok_or("prepared completion request missing")?;
+    if request.action_id != envelope.action_id || request.requested_by != envelope.actor.actor_id
+        || request.result_refs != input.result_refs || request.evidence_refs != input.evidence_refs
+        || request.unresolved != input.unresolved {
+        return Err("prepared completion context request differs".into());
+    }
+    let conditions = super::required_review_conditions(&prepared.goal);
+    if conditions.is_empty() { return Err("prepared completion context has no required reviews".into()); }
+    let mut excluded: Option<BTreeSet<String>> = None;
+    let mut used = BTreeSet::new();
+    for condition in conditions {
+        let review = prepared.goal.reviews.iter().rev().find(|review| review.criterion_ref == condition)
+            .ok_or("prepared completion review missing")?;
+        let proof = review.verification.as_ref().ok_or("prepared completion review proof missing")?;
+        let (index, verified) = prepared.verified_proofs().iter().enumerate()
+            .find(|(index, verified)| !used.contains(index) && verified.condition() == condition
+                && verified.proof().matches_proof(proof))
+            .ok_or("prepared completion review is not sealed")?;
+        used.insert(index);
+        let retired = &verified.snapshot().retiring_optional_task_refs;
+        excluded = Some(match excluded {
+            None => retired.clone(),
+            Some(previous) => previous.intersection(retired).cloned().collect(),
+        });
+    }
+    if used.len() != prepared.verified_proofs().len() { return Err("prepared completion has unused proofs".into()); }
+    Ok(Some(CompletionAdmissionContext {
+        program_digest: super::proof_value_digest(program),
+        request_digest: super::proof_value_digest(input),
+        envelope_digest: super::proof_value_digest(envelope),
+        goal_id: prepared.goal.id.clone(),
+        goal_revision: prepared.expected_stream_revision,
+        goal_spec_revision: prepared.goal.spec_revision,
+        goal_spec_digest: prepared.goal.spec_digest.clone(),
+        excluded_tasks: excluded.ok_or("prepared completion review set missing")?,
+        sources: prepared.source_frame.sources().cloned().collect(),
+    }))
+}
 
 pub(crate) fn completion_admission_context(
     store: &std::sync::Arc<RuntimeEventStore>,
@@ -215,7 +360,8 @@ pub(crate) fn completion_admission_context(
                     .is_some_and(|inputs| inputs.version == 2)
             })
             .ok_or_else(|| format!("completion context requires latest v2 proof:{condition}"))?;
-        super::validate_explicit_process_evidence(store, proof, &review.evidence_refs)?;
+        super::validate_explicit_process_evidence(store, proof, &review.evidence_refs)
+            .map_err(|error| error.to_string())?;
         let snapshot = validate_applied_proof_inputs(store, program, Some(&goal), proof, readers)?;
         super::validate_review_coverage(
             &goal, program, review, &results, &review.evidence_refs, &snapshot,
@@ -292,6 +438,188 @@ pub(crate) fn validate_applied_proof_inputs(
     })
 }
 
+/// Operation-local conclusion witness produced only by the original proof
+/// and call owners. Historical material cuts remain distinct from live heads.
+#[derive(Clone, PartialEq)]
+pub(crate) struct VerifiedConclusionProof {
+    carrier: crate::DurableRuntimeEvent,
+    original_proof: harness_contract::goal::ObjectiveReviewVerification,
+    proof_digest: String,
+    historical_cuts: std::collections::BTreeMap<String, u64>,
+    current_heads: Vec<ExpectedStreamRevision>,
+    historical_calls: Vec<super::AuthenticatedHistoricalPolicyCall>,
+}
+impl VerifiedConclusionProof {
+    pub(crate) fn matches_proof(&self, proof: &harness_contract::goal::ObjectiveReviewVerification) -> bool {
+        &self.original_proof == proof
+    }
+    pub(crate) fn frame_digest(&self) -> String {
+        let calls = self.historical_calls.iter().map(super::AuthenticatedHistoricalPolicyCall::binding_digest).collect::<Vec<_>>();
+        super::proof_value_digest(&(&self.carrier, &self.proof_digest, &self.historical_cuts, &self.current_heads, calls))
+    }
+    pub(crate) fn current_heads(&self) -> &[ExpectedStreamRevision] { &self.current_heads }
+    /// These are evidence of already completed calls, never authority for the
+    /// Supervisor's subsequent Goal/Program conclusion write.
+    pub(crate) fn authenticated_historical_calls(&self) -> &[super::AuthenticatedHistoricalPolicyCall] { &self.historical_calls }
+}
+
+pub(crate) fn validate_applied_proof_for_conclusion(
+    store: &std::sync::Arc<RuntimeEventStore>, program: &AgenticProgramProjection,
+    goal: &GoalContract, proof: &harness_contract::goal::ObjectiveReviewVerification,
+    readers: super::ResultContentReaders<'_>,
+) -> Result<(ProofInputSnapshot, VerifiedConclusionProof), String> {
+    with_authenticated_applied_review(store, program, proof, |identity| {
+        let super::current_review::ReviewActionIdentity::Applied(applied) = identity else {
+            return Err("conclusion requires an original applied review".into());
+        };
+        let inputs = proof.input_set.as_ref().ok_or("review original input cuts missing")?;
+        let session_source = format!("session:{}", program.session_id);
+        let pre_tail = match inputs.source_revisions.get(&session_source) {
+            // The producer passes the original Program's Session id and the
+            // original ProofInputSet's cut; the head is the constructor's
+            // store read, never a caller report.
+            Some(cut) => Some(HistoricalSessionCut::for_live_material(
+                store, &program.session_id, *cut,
+            )?),
+            None => None,
+        };
+        let snapshot = validate_proof_inputs_for_action_with_tail(store, program, Some(goal), proof, readers, Some(identity), pre_tail.as_ref())?;
+        let mut matching = applied.program_events.iter().filter(|event|
+            event.payload["envelope"]["action_id"].as_str() == Some(applied.action_id));
+        let carrier = matching.next().ok_or("original review carrier missing")?.clone();
+        if matching.next().is_some() { return Err("original review carrier ambiguous".into()); }
+        let envelope: harness_contract::agent_action::AgentActionEnvelope = serde_json::from_value(carrier.payload["envelope"].clone())
+            .map_err(|_| "original review envelope malformed")?;
+        let mut historical_cuts = inputs.source_revisions.clone();
+        for (source, revision) in &proof.result_source_revisions {
+            if historical_cuts.insert(source.clone(), *revision).is_some_and(|old| old != *revision) {
+                return Err("review original cuts conflict".into());
+            }
+        }
+        let context = super::current_review::CurrentReviewContext {
+            action_id: &envelope.action_id, action: &envelope.action, actor: &envelope.actor,
+        };
+        let call = if let Some(packet) = snapshot.reviewer_packet.as_ref() {
+            let mut witness_cuts = historical_cuts.clone();
+            let expected_witness_cuts = witness_cuts.clone();
+            let call = super::current_review::authenticate_process_review_policy_call(store, program, packet, &context, &mut witness_cuts)?
+                .ok_or("original Process review call unavailable")?;
+            if witness_cuts != expected_witness_cuts { return Err("original review material cuts changed".into()); }
+            call
+        } else if carrier.payload.get("member_admission").is_some() {
+            super::current_review::authenticate_original_root_member_review(store, &carrier, &context, &historical_cuts)?
+        } else {
+            super::current_review::authenticate_original_single_review(store, &carrier, &context, &historical_cuts)?
+        };
+        let mut heads = std::collections::BTreeMap::new();
+        let approval_stream = call.approval().map(|approval| format!("approval:{}", approval.approval_id()));
+        for source in snapshot.sources.iter().chain(call.current_fences()) {
+            // The historical approval cut remains in the proof. Its current
+            // control is reconstructed below by its original owner, not by
+            // reusing that historical revision as a current fence.
+            if approval_stream.as_deref() == Some(source.stream_id.as_str()) { continue; }
+            if heads.insert(source.stream_id.clone(), source.expected_revision).is_some_and(|old| old != source.expected_revision) {
+                return Err("review current source heads conflict".into());
+            }
+        }
+        if let Some(cut) = &pre_tail {
+            if heads.get(&cut.source.stream_id) != Some(&cut.observed_revision) {
+                return Err("Session material head changed during proof validation".into());
+            }
+        }
+        // Keep exact existing material controls, rather than treating all
+        // Session activity as a material change. Artifact pins and the
+        // original Process owner's File leases survive the checked append.
+        let dependencies = &snapshot.dependency_frame;
+        let frame = readers.process_inputs;
+        let file_is_guarded = |dependency: &ActualFileDependency| frame.is_some_and(|frame|
+            frame.retains_exact_file(&dependency.target, &dependency.source_sha256, None));
+        let pinned_artifact = |content: &harness_contract::context::ArtifactRef| frame.is_some_and(|frame|
+            content.selector.starts_with("artifact://") && frame.retains_exact_artifact(content));
+        let guarded_file_content = |reference: &str, digest: &str, bytes: u64| {
+            dependencies.file_dependencies.iter().any(|dependency|
+                dependency.target.path.workspace_relative_path == reference
+                    && dependency.source_sha256.trim_start_matches("sha256:") == digest.trim_start_matches("sha256:")
+                    && frame.is_some_and(|frame| frame.retains_exact_file(&dependency.target, digest, Some(bytes))))
+        };
+        let materials_guarded = !proof.effect_source_refs.iter().any(|source| source == &session_source)
+            && !call.current_fences().iter().any(|source| source.stream_id == session_source)
+            && !proof.reads.is_empty()
+            && dependencies.file_dependencies.iter().all(file_is_guarded)
+            && dependencies.review_targets.iter().all(|target| dependencies.file_dependencies.iter()
+                .any(|dependency| dependency.target == *target && file_is_guarded(dependency)))
+            && inputs.result_refs.iter().chain(inputs.artifact_refs.iter())
+                .all(|reference| proof.reads.iter().any(|read| &read.result_ref == reference))
+            && dependencies.immutable_inputs.iter().all(|input| pinned_artifact(&input.content)
+                || guarded_file_content(&input.reference, &input.content.sha256, input.content.bytes))
+            && proof.reads.iter().all(|read| frame.is_some_and(|frame|
+                frame.retains_pinned_read(&read.content_ref, &read.sha256, read.bytes))
+                || guarded_file_content(&read.content_ref, &read.sha256, read.bytes));
+        if pre_tail.is_none() && materials_guarded {
+            // The same original material decision applies when there was no
+            // pre-existing tail: do not turn later protocol activity into a
+            // material dependency solely because A saw no prior growth.
+            heads.remove(&session_source);
+        }
+        if let Some(cut) = &pre_tail {
+            if materials_guarded {
+                heads.remove(&cut.source.stream_id);
+            } else if cut.observed_revision != cut.source.expected_revision {
+                #[cfg(feature = "test-fixtures")]
+                if std::env::var_os("COWD_RC_TRACE_COMPLETION").is_some() {
+                    let effect_sources_clear = !proof.effect_source_refs.iter().any(|source| source == &session_source);
+                    let call_fences_clear = !call.current_fences().iter().any(|source| source.stream_id == session_source);
+                    let files_guarded = dependencies.file_dependencies.iter().all(file_is_guarded);
+                    let targets_guarded = dependencies.review_targets.iter().all(|target| dependencies.file_dependencies.iter().any(|item| item.target == *target && file_is_guarded(item)));
+                    let refs_covered = inputs.result_refs.iter().chain(inputs.artifact_refs.iter()).all(|reference| proof.reads.iter().any(|read| &read.result_ref == reference));
+                    let immutable_guarded = dependencies.immutable_inputs.iter().all(|input| pinned_artifact(&input.content) || guarded_file_content(&input.reference, &input.content.sha256, input.content.bytes));
+                    let reads_guarded = proof.reads.iter().all(|read| frame.is_some_and(|frame| frame.retains_pinned_read(&read.content_ref, &read.sha256, read.bytes)) || guarded_file_content(&read.content_ref, &read.sha256, read.bytes));
+                    let failed_files: Vec<_> = dependencies.file_dependencies.iter().enumerate().filter_map(|(i, item)| (!file_is_guarded(item)).then_some(i)).take(16).collect();
+                    let failed_targets: Vec<_> = dependencies.review_targets.iter().enumerate().filter_map(|(i, target)| (!dependencies.file_dependencies.iter().any(|item| item.target == *target && file_is_guarded(item))).then_some(i)).take(16).collect();
+                    let failed_refs: Vec<_> = inputs.result_refs.iter().chain(inputs.artifact_refs.iter()).enumerate().filter_map(|(i, reference)| (!proof.reads.iter().any(|read| &read.result_ref == reference)).then_some(i)).take(16).collect();
+                    let failed_immutable: Vec<_> = dependencies.immutable_inputs.iter().enumerate().filter_map(|(i, input)| (!(pinned_artifact(&input.content) || guarded_file_content(&input.reference, &input.content.sha256, input.content.bytes))).then_some(i)).take(16).collect();
+                    let failed_reads: Vec<_> = proof.reads.iter().enumerate().filter_map(|(i, read)| (!(frame.is_some_and(|frame| frame.retains_pinned_read(&read.content_ref, &read.sha256, read.bytes)) || guarded_file_content(&read.content_ref, &read.sha256, read.bytes))).then_some(i)).take(16).collect();
+                    let read_matches: Vec<_> = proof.reads.iter().take(16).map(|read| {
+                        let selected = dependencies.immutable_inputs.iter().filter(|input| input.content.selector == read.content_ref).collect::<Vec<_>>();
+                        (selected.len(), selected.iter().filter(|input| input.content.sha256 == read.sha256).count(), selected.iter().filter(|input| input.content.bytes == read.bytes).count(), selected.iter().filter(|input| pinned_artifact(&input.content)).count(), frame.is_some_and(|frame| frame.retains_pinned_read(&read.content_ref, &read.sha256, read.bytes)))
+                    }).collect();
+                    crate::execution_core::graph::k05_trace_emit(format!("REVIEW_MATERIAL_GUARD effect_sources_clear={effect_sources_clear} call_fences_clear={call_fences_clear} reads_present={} files_guarded={files_guarded} targets_guarded={targets_guarded} refs_covered={refs_covered} immutable_guarded={immutable_guarded} reads_guarded={reads_guarded} file_count={} target_count={} immutable_count={} read_count={} failed_files={failed_files:?} failed_refs={failed_refs:?} failed_targets={failed_targets:?} failed_immutable={failed_immutable:?} failed_reads={failed_reads:?} read_matches={read_matches:?}", !proof.reads.is_empty(), dependencies.file_dependencies.len(), dependencies.review_targets.len(), dependencies.immutable_inputs.len(), proof.reads.len()));
+                }
+                return Err("review material lacks an exact retained Artifact or File guard".into());
+            }
+
+        }
+        // Only a grant independently bound to this original review is a
+        // candidate for current approval control. A consumed or naturally
+        // expired once-grant is historical; an explicit revocation of this
+        // exact grant is not silently treated as one of those cases.
+        if let Some(approval) = call.approval() {
+            let current = crate::ApprovalQueue::capture_proof_control_from_store(
+                store, &program.session_id, approval.approval_id(),
+            )?;
+            if &current.request().context != approval.context() {
+                return Err("review approval current owner context differs".into());
+            }
+            let mut grants = current.grants().iter().filter(|grant|
+                grant.grant_id == approval.grant_id() && grant.approval_id == approval.approval_id());
+            let grant = grants.next().ok_or("review original approval grant is missing")?;
+            if grants.next().is_some() || grant.revoked_at_ms.is_some()
+                || grant.status == harness_contract::policy::approval::ApprovalGrantStatus::Revoked {
+                return Err("review original approval grant revoked or ambiguous".into());
+            }
+            let source = current.source();
+            if heads.insert(source.stream_id.clone(), source.expected_revision).is_some_and(|old| old != source.expected_revision) {
+                return Err("review approval current control conflicts with other source".into());
+            }
+        }
+        let current_heads = heads.into_iter().map(|(stream_id, expected_revision)|
+            ExpectedStreamRevision { stream_id, expected_revision }).collect();
+        let frame = VerifiedConclusionProof { carrier, original_proof: proof.clone(), proof_digest: super::proof_value_digest(proof),
+            historical_cuts, current_heads, historical_calls: vec![call] };
+        Ok((snapshot, frame))
+    })
+}
+
 /// Authenticate once from the original durable action, then consume its
 /// borrowed identity synchronously. Neither a stored proof key nor a failed
 /// live invocation can enter this persisted-review boundary.
@@ -319,7 +647,7 @@ fn with_authenticated_applied_review<T>(
     let envelope: harness_contract::agent_action::AgentActionEnvelope =
         serde_json::from_value(original.payload["envelope"].clone())
             .map_err(|_| "original applied review envelope missing")?;
-    if original.scope != crate::RuntimeEventScope::Program
+    if original.scope != RuntimeEventScope::Program
         || original.schema_version != 1
         || envelope.actor.program_id != program.program_id
         || envelope.actor.objective_id != program.objective_id
@@ -370,6 +698,18 @@ pub(crate) fn validate_proof_inputs_for_action(
     readers: super::ResultContentReaders<'_>,
     current_review: Option<super::current_review::ReviewActionIdentity<'_>>,
 ) -> Result<ProofInputSnapshot, String> {
+    validate_proof_inputs_for_action_with_tail(store, program, goal, proof, readers, current_review, None)
+}
+
+fn validate_proof_inputs_for_action_with_tail(
+    store: &std::sync::Arc<RuntimeEventStore>,
+    program: &AgenticProgramProjection,
+    goal: Option<&GoalContract>,
+    proof: &harness_contract::goal::ObjectiveReviewVerification,
+    readers: super::ResultContentReaders<'_>,
+    current_review: Option<super::current_review::ReviewActionIdentity<'_>>,
+    pre_tail: Option<&HistoricalSessionCut>,
+) -> Result<ProofInputSnapshot, String> {
     #[cfg(test)]
     let _observer = obs1120::Frame::enter(serde_json::json!({
         "callsite":format!("{}:{}", std::panic::Location::caller().file(), std::panic::Location::caller().line()),
@@ -394,14 +734,16 @@ pub(crate) fn validate_proof_inputs_for_action(
         })
         .transpose()?
         .flatten();
-    let snapshot = proof_input_snapshot_for_action(
+    let snapshot = proof_input_snapshot_for_phase(
         store,
         &current,
         current_goal.as_ref().map(|projection| &projection.goal),
         proof,
+        None,
         readers,
         current_review,
-    )?;
+        pre_tail,
+    ).map_err(|error| error.to_string())?;
     if let Some(projection) = &current_goal {
         if !snapshot.sources.iter().any(|source| {
             source.stream_id == format!("goal:{}", projection.goal.id)
@@ -451,132 +793,6 @@ pub(crate) fn validate_proof_inputs_for_action(
     Ok(snapshot)
 }
 
-pub(crate) fn committed_proof_sources(
-    store: &std::sync::Arc<RuntimeEventStore>,
-    goal: &GoalContract,
-    readers: super::ResultContentReaders<'_>,
-) -> Result<Vec<ExpectedStreamRevision>, String> {
-    let mut sources = std::collections::BTreeMap::new();
-    let program = goal
-        .execution_binding
-        .as_ref()
-        .map(|binding| {
-            crate::AgentActionService::new(std::sync::Arc::clone(store))
-                .project(&binding.agentic_program_id)
-        })
-        .transpose()
-        .map_err(|error| error.to_string())?;
-    let program = program
-        .as_ref()
-        .ok_or("committed A has no Program binding")?;
-    if goal
-        .user_intent_criterion_id
-        .as_deref()
-        .is_none_or(str::is_empty)
-    {
-        return Err("committed A missing original intent condition".into());
-    }
-    for condition in super::required_review_conditions(goal) {
-        let review = goal
-            .reviews
-            .iter()
-            .rev()
-            .find(|review| review.criterion_ref == condition)
-            .ok_or_else(|| format!("committed A missing required review {condition}"))?;
-        let proof = review
-            .verification
-            .as_ref()
-            .ok_or_else(|| format!("committed A missing verification {condition}"))?;
-        let inputs = proof
-            .input_set
-            .as_ref()
-            .ok_or_else(|| format!("committed A unsupported required review {condition}"))?;
-        super::validate_explicit_process_evidence(store, proof, &review.evidence_refs)?;
-        let mut results = review.result_refs.clone();
-        if goal.user_intent_criterion_id.as_ref() == Some(&condition) {
-            let request = program
-                .completion_request
-                .as_ref()
-                .ok_or("committed A missing completion request")?;
-            results.extend(crate::execution_core::goal::delivered_result_refs(
-                program,
-                goal,
-                &request.result_refs,
-            ));
-        }
-        for obligation in goal
-            .obligations
-            .iter()
-            .filter(|obligation| obligation.required && obligation.obligation_id == condition)
-        {
-            results.extend(obligation.artifact_refs.iter().cloned());
-        }
-        let snapshot = with_authenticated_applied_review(store, program, proof, |identity| {
-            proof_input_snapshot_for_phase(
-                store,
-                program,
-                Some(goal),
-                proof,
-                Some(&inputs.acceptance_policy_digest),
-                readers,
-                Some(identity),
-            )
-        })?;
-        super::validate_review_coverage(
-            goal, program, review, &results, &review.evidence_refs, &snapshot,
-        ).map_err(|error| format!("committed A review {condition}: {error}"))?;
-        if snapshot.semantic_digest != inputs.semantic_digest
-            || snapshot.work_digest != proof.work_manifest_digest
-            || proof.effect_manifest_digest.as_deref() != Some(snapshot.effects.digest.as_str())
-        {
-            return Err("committed A relevant effect or material changed; delivery requires authorized recovery".into());
-        }
-        for source in snapshot.sources {
-            if sources
-                .insert(source.stream_id, source.expected_revision)
-                .is_some_and(|previous| previous != source.expected_revision)
-            {
-                return Err("committed A current dependency cut changed".into());
-            }
-        }
-        for source in inputs.source_revisions.keys() {
-            let current = store
-                .stream_revision(source)
-                .map_err(|error| error.to_string())?;
-            if sources
-                .insert(source.clone(), current)
-                .is_some_and(|previous| previous != current)
-            {
-                return Err("committed A source changed between required reviews".into());
-            }
-        }
-        for material in &inputs.material_events {
-            verify_material_event(store, material, &mut sources)?;
-        }
-        for (source, expected) in &proof.result_source_revisions {
-            if sources.get(source) != Some(expected) {
-                return Err("committed A approval/result source changed; delivery requires authorized recovery".into());
-            }
-        }
-    }
-    for (source, expected) in &sources {
-        if store
-            .stream_revision(source)
-            .map_err(|error| error.to_string())?
-            != *expected
-        {
-            return Err("committed A source moved while preparing B".into());
-        }
-    }
-    Ok(sources
-        .into_iter()
-        .map(|(stream_id, expected_revision)| ExpectedStreamRevision {
-            stream_id,
-            expected_revision,
-        })
-        .collect())
-}
-
 #[derive(Clone, Copy)]
 enum PinnedEventProjection {
     Effects,
@@ -607,26 +823,48 @@ fn pinned_stream_events(
     since_cursor: u64,
     projection: PinnedEventProjection,
 ) -> Result<Vec<crate::DurableRuntimeEvent>, String> {
+    pinned_stream_events_with_cut(store, source, sources, since_cursor, projection, None)
+}
+
+fn pinned_stream_events_with_cut(
+    store: &RuntimeEventStore,
+    source: &str,
+    sources: &mut std::collections::BTreeMap<String, u64>,
+    since_cursor: u64,
+    projection: PinnedEventProjection,
+    authenticated_tail: Option<&HistoricalSessionCut>,
+) -> Result<Vec<crate::DurableRuntimeEvent>, String> {
     let revision = store
         .stream_revision(source)
         .map_err(|error| error.to_string())?;
-    if sources
-        .insert(source.into(), revision)
-        .is_some_and(|previous| previous != revision)
-    {
-        return Err("proof source changed during validation".into());
+    if let Some(previous) = sources.insert(source.into(), revision) {
+        // Growth on a shared aggregate stream is another actor appending while
+        // this proof reads; anything else that moved - including a head that
+        // went backwards - is still a change of the source under proof.
+        if revision < previous
+            || (revision != previous && !super::repin_accepts_moved_head(source, previous, revision))
+        {
+            return Err("proof source changed during validation".into());
+        }
     }
     let mut events = Vec::new();
-    let mut through = revision;
+    let mut through = match authenticated_tail {
+        Some(tail) if tail.source.stream_id == source && tail.observed_revision == revision
+            && tail.source.expected_revision <= revision => tail.source.expected_revision,
+        Some(_) => return Err("original Session material tail does not match current source".into()),
+        None => revision,
+    };
     loop {
         let page = store.list_stream_before(source, through, 64, 1024 * 1024)?;
         if page.is_empty() {
+            if authenticated_tail.is_some() && through > 0 {
+                return Err("original Session material page incomplete".into());
+            }
             break;
         }
-        if store
-            .stream_revision(source)
-            .map_err(|error| error.to_string())?
-            != revision
+        let current = store.stream_revision(source).map_err(|error| error.to_string())?;
+        if current < revision
+            || (current != revision && !super::repin_accepts_moved_head(source, revision, current))
         {
             return Err("proof source changed while paging; retry current inputs".into());
         }
@@ -639,6 +877,15 @@ fn pinned_stream_events(
                 expected = expected
                     .checked_sub(1)
                     .ok_or("receipt-index structural sequence underflow")?;
+            }
+        }
+        if authenticated_tail.is_some() {
+            let mut expected = through;
+            for event in &page {
+                if event.stream_id != source || event.sequence != expected {
+                    return Err("original Session material page sequence differs".into());
+                }
+                expected = expected.checked_sub(1).ok_or("original Session sequence underflow")?;
             }
         }
         through = page
@@ -713,10 +960,9 @@ fn pinned_stream_events(
     if matches!(projection, PinnedEventProjection::ReceiptIndexEffects) && through != 0 {
         return Err("receipt-index structural history is incomplete".into());
     }
-    if store
-        .stream_revision(source)
-        .map_err(|error| error.to_string())?
-        != revision
+    let current = store.stream_revision(source).map_err(|error| error.to_string())?;
+    if current < revision
+        || (current != revision && !super::repin_accepts_moved_head(source, revision, current))
     {
         return Err("proof source changed at final page boundary; retry current inputs".into());
     }
@@ -779,12 +1025,12 @@ pub(crate) fn verify_nested_read(
 ) -> Result<Option<VerifiedNestedRead>, String> {
     use crate::context_evidence::{ReadDeliveryRecipient, ReadDeliveryTransport, ReadExtent};
     if event.kind != "context.nested_read_model_observed" || event.schema_version != 1
-        || event.scope != crate::RuntimeEventScope::Session || event.actor.as_deref() != Some("conversation_runtime")
+        || event.scope != RuntimeEventScope::Session || event.actor.as_deref() != Some("conversation_runtime")
         || event.status.as_deref() != Some("confirmed") || event.payload["schema_version"] != 1 { return Ok(None); }
     let payload = &event.payload;
     let material = nested_parent_material(payload)?;
     let seal = &material.acquisition;
-    if seal.tool_name != "tool_orchestrate" || seal.session_id != session || seal.step.turn_id != turn
+    if !matches!(seal.tool_name.as_str(), "tool_orchestrate" | "grep_search") || seal.session_id != session || seal.step.turn_id != turn
         || event.stream_id != format!("session:{session}") { return Ok(None); }
     let ReadDeliveryTransport::NativeProviderContinuation { raw_ref, .. } = &material.transport else { return Ok(None); };
     let owner_event = match (&material.recipient, packet) {
@@ -802,10 +1048,10 @@ pub(crate) fn verify_nested_read(
                 || seal.node_id != packet.node_id() || seal.attempt != packet.attempt
                 || seal.step.run_ref.as_deref() != Some(packet.run_id())
                 || seal.step.actor_ref.as_deref() != Some(packet.agent_id())
-                || !packet.allowed_tools.contains(&"tool_orchestrate".to_string())
-                || !packet.allowed_tools.contains(&"read_file".to_string())
-                || !packet.binding.as_ref().is_some_and(|b| b.tool_contract_refs.contains(&"tool_orchestrate".to_string())
-                    && b.tool_contract_refs.contains(&"read_file".to_string())) { return Ok(None); }
+                || !packet.allowed_tools.contains(&seal.tool_name)
+                || !packet.allowed_tools.iter().any(|t| Some(t.as_str()) == payload["child"]["tool_name"].as_str())
+                || !packet.binding.as_ref().is_some_and(|b| b.tool_contract_refs.contains(&seal.tool_name)
+                    && b.tool_contract_refs.iter().any(|t| Some(t.as_str()) == payload["child"]["tool_name"].as_str())) { return Ok(None); }
             None
         }
         _ => return Ok(None),
@@ -862,10 +1108,12 @@ pub(crate) fn verify_nested_read(
     let children = primary.payload[crate::context_evidence::CHILD_READ_ACQUISITIONS_FIELD].as_array().ok_or("nested children absent")?;
     if children.iter().filter(|candidate| *candidate == child).count() != 1 || child["schema_version"] != 1
         || child["parent_tool_use_id"] != seal.invocation_id || child["parent_idempotency_key"] != key
-        || child["parent_descriptor_hash"] != descriptor.descriptor_hash || child["tool_name"] != "read_file" { return Err("nested child is foreign".into()); }
+        || child["parent_descriptor_hash"] != descriptor.descriptor_hash
+        || !matches!(child["tool_name"].as_str(), Some("read_file" | "grep_search")) { return Err("nested child is foreign".into()); }
     let step_index = child["step_index"].as_u64().ok_or("nested step missing")?;
     let position = child["position"].as_u64().ok_or("nested position missing")?;
-    if children.iter().filter(|other| other["step_index"] == step_index && other["position"] == position).count() != 1 { return Err("ambiguous nested position".into()); }
+    if children.iter().filter(|other| other["step_index"] == step_index && other["position"] == position
+        && other["batch_index"] == child["batch_index"] && other["window_index"] == child["window_index"]).count() != 1 { return Err("ambiguous nested position".into()); }
     let original_input = primary.payload["original_input"].as_str().ok_or("nested original input absent")?;
     let source_input = payload["source_input"].as_str().ok_or("nested source input absent")?;
     if crate::context_evidence::read_sha256(original_input.as_bytes()) != seal.input_sha256
@@ -881,9 +1129,32 @@ pub(crate) fn verify_nested_read(
         || primary.payload["replay"]["invocation"]["origin"] != seal.origin
         || primary.payload["replay"]["invocation"]["invocation_id"] != seal.invocation_id
     { return Err("nested original compiled input mismatch".into()); }
+    let target = if child["tool_name"] == "grep_search" {
+        if child["parent_tool_name"] != seal.tool_name || !crate::context_evidence::grep_original_input_matches(&parent_input, child) {
+            return Err("grep original input mismatch".into());
+        }
+        let effect: harness_contract::tool::ToolEffectDescriptor = serde_json::from_value(child["effect"].clone()).map_err(|e| e.to_string())?;
+        let scope = serde_json::from_value(primary.payload["resolved_effect_scope"].clone()).map_err(|e| e.to_string())?;
+        if seal.tool_name == "grep_search" && child["batch_index"].is_number() {
+            crate::context_evidence::grep_read_target_for_parent(&scope, child, &parent_input, &descriptor)
+                .ok_or("grep original target unknown")?
+        } else if seal.tool_name == "tool_orchestrate" {
+            crate::context_evidence::grep_read_target_for_composite(&scope, child, &parent_input, &descriptor)
+                .ok_or("grep composite original target unknown")?
+        } else {
+            if !effect.scopes.iter().all(|s| descriptor.scopes.contains(s)) { return Err("grep original scope mismatch".into()); }
+            crate::context_evidence::grep_read_target(&scope, child).ok_or("grep original target unknown")?
+        }
+    } else {
     let step = parent_input["steps"].as_array().and_then(|steps| steps.get(step_index as usize)).ok_or("nested step absent")?;
-    let call = step["calls"].as_array().and_then(|calls| calls.get(position as usize)).ok_or("nested call absent")?;
-    if step["id"] != child["step_id"] || step["op"] != "batch" || call["tool"] != "read_file" || call["input"] != child["input"]
+    let call = match step["op"].as_str() {
+        Some("call") if position == 0 => step,
+        Some("batch") => step["calls"].as_array().and_then(|calls| calls.get(position as usize)).ok_or("nested call absent")?,
+        _ => return Err("nested call shape unsupported".into()),
+    };
+    if step["id"] != child["step_id"] || parent_input["steps"].as_array().is_none_or(|steps|
+        steps.iter().filter(|candidate| candidate["id"] == step["id"]).count() != 1)
+        || call["tool"] != "read_file" || call["input"] != child["input"]
         || crate::context_evidence::read_sha256(&serde_json::to_vec(&child["input"]).map_err(|e| e.to_string())?) != child["input_sha256"] { return Err("nested original input mismatch".into()); }
     let effect: harness_contract::tool::ToolEffectDescriptor = serde_json::from_value(child["effect"].clone()).map_err(|e| e.to_string())?;
     if effect.tool_id != "read_file" || effect.effect_kind != harness_contract::tool::ToolEffectKind::Read || effect.scopes.len() != 1
@@ -891,12 +1162,15 @@ pub(crate) fn verify_nested_read(
     let scope: harness_contract::goal::ProofEffectScope = serde_json::from_value(primary.payload["resolved_effect_scope"].clone()).map_err(|e| e.to_string())?;
     let mut targets = scope.targets.iter().filter(|target| target.declared_scope == effect.scopes[0]);
     let target = targets.next().ok_or("nested child scope absent")?.clone();
-    if !scope.complete || targets.next().is_some() || !target.exact || !target.alias_checked
+    if (!scope.complete && !crate::context_evidence::original_read_file_domain(&descriptor, &scope))
+        || targets.next().is_some() || !target.exact || !target.alias_checked
         || target.access_mode != harness_contract::context::WorkspaceAccessMode::Read
         || target.coverage != harness_contract::context::EvidenceCoverageKind::ScopedContent
         || target.declared_scope.resource != harness_contract::policy::PermissionResource::File
         || target.declared_scope.operation != harness_contract::policy::PermissionOperation::Read
         || target.path.object_kind != harness_contract::context::WorkspaceObjectKind::File { return Err("nested child scope invalid".into()); }
+        target
+    };
     let body: crate::context_evidence::ReadBodySeal = serde_json::from_value(child["body"].clone()).map_err(|e| e.to_string())?;
     let extent: ReadExtent = serde_json::from_value(payload["delivered_extent"].clone()).map_err(|e| e.to_string())?;
     let ReadExtent::FileLines {start_line,line_count,total_lines,ends_with_newline,body_sha256,body_bytes,source_omitted} = &extent else { return Err("nested extent invalid".into()); };
@@ -1147,7 +1421,7 @@ pub(crate) fn review_delivery_snapshot(
     program: &AgenticProgramProjection,
     packet: Option<&harness_contract::agent::AgentTaskPacket>,
     selected: Option<&[harness_contract::goal::ProofInputEvent]>,
-) -> Result<ReviewDeliverySnapshot, String> {
+) -> Result<ReviewDeliverySnapshot, super::results::ReviewEvidenceError> {
     let stream = format!("session:{}", program.session_id);
     let mut sources = std::collections::BTreeMap::new();
     let events = match selected {
@@ -1179,7 +1453,7 @@ pub(crate) fn review_delivery_snapshot_from_events(
     packet: Option<&harness_contract::agent::AgentTaskPacket>,
     events: Vec<crate::DurableRuntimeEvent>,
     sources: std::collections::BTreeMap<String, u64>,
-) -> Result<ReviewDeliverySnapshot, String> {
+) -> Result<ReviewDeliverySnapshot, super::results::ReviewEvidenceError> {
     read_delivery_snapshot_for_scope(
         reader,
         &program.session_id,
@@ -1201,7 +1475,7 @@ pub(crate) fn read_delivery_snapshot_for_scope(
     packet: Option<&harness_contract::agent::AgentTaskPacket>,
     events: Vec<crate::DurableRuntimeEvent>,
     mut sources: std::collections::BTreeMap<String, u64>,
-) -> Result<ReviewDeliverySnapshot, String> {
+) -> Result<ReviewDeliverySnapshot, super::results::ReviewEvidenceError> {
     use crate::context_evidence::{
         ReadDeliveryGrade, ReadDeliveryTransport, NATIVE_DELIVERY_KIND, PROCESS_DELIVERY_KIND,
         READ_ACQUISITION_FIELD,
@@ -1220,7 +1494,7 @@ pub(crate) fn read_delivery_snapshot_for_scope(
             PROCESS_DELIVERY_KIND => ("runtime.process_jsonl", "sent"),
             _ => continue,
         };
-        if event.scope != crate::RuntimeEventScope::Session
+        if event.scope != RuntimeEventScope::Session
             || event.schema_version != 1
             || event.actor.as_deref() != Some(expected.0)
             || event.status.as_deref() != Some(expected.1)
@@ -1277,7 +1551,7 @@ pub(crate) fn read_delivery_snapshot_for_scope(
             || receipt.kind != "execution.agent_tool.receipt"
             || primary.actor.as_deref() != Some("governed_tool")
             || receipt.actor != primary.actor
-            || primary.scope != crate::RuntimeEventScope::ExecutionNode
+            || primary.scope != RuntimeEventScope::ExecutionNode
             || receipt.scope != primary.scope
             || primary.transaction_id != receipt.transaction_id
             || primary.commit_cursor != receipt.commit_cursor
@@ -1518,7 +1792,7 @@ impl crate::RuntimeServices {
         let accepted = run(event.clone(), primary.clone(), index.clone(), packet).unwrap();
         assert_eq!(accepted.reads.len(), 1);
         assert_eq!(accepted.reads[0].material, material);
-        let refused = |label: &str, result: Result<ReviewDeliverySnapshot, String>| {
+        let refused = |label: &str, result: Result<ReviewDeliverySnapshot, super::results::ReviewEvidenceError>| {
             assert!(
                 result.is_err()
                     || result
@@ -1527,7 +1801,7 @@ impl crate::RuntimeServices {
                 "{label}: a foreign delivery entered the consumer read set"
             );
         };
-        let physical_error = |label: &str, result: Result<ReviewDeliverySnapshot, String>| {
+        let physical_error = |label: &str, result: Result<ReviewDeliverySnapshot, super::results::ReviewEvidenceError>| {
             let error = result
                 .err()
                 .unwrap_or_else(|| panic!("{label}: receipt forgery accepted"));
@@ -1848,7 +2122,7 @@ pub(crate) fn root_file_acquisition(
     store: &RuntimeEventStore,
     owner: &crate::DurableRuntimeEvent,
     sources: &mut std::collections::BTreeMap<String, u64>,
-) -> Result<(crate::DurableRuntimeEvent, crate::DurableRuntimeEvent), String> {
+) -> Result<(crate::DurableRuntimeEvent, crate::DurableRuntimeEvent), super::results::ReviewEvidenceError> {
     use crate::context_evidence::{RootReadOwner, READ_ACQUISITION_FIELD};
     let binding = owner
         .activity_binding()
@@ -1889,7 +2163,7 @@ pub(crate) fn root_file_acquisition(
             }
             if plan.sequence >= owner.sequence
                 || plan.actor.as_deref() != Some("conversation_runtime")
-                || plan.scope != crate::RuntimeEventScope::Tool
+                || plan.scope != RuntimeEventScope::Tool
                 || plan.status.as_deref() != Some("planned")
                 || !plan.refs.iter().any(|reference| {
                     reference.kind == "execution" && reference.id == binding.root_execution_id
@@ -1973,7 +2247,7 @@ pub(crate) fn root_file_acquisition(
         || index.kind != "execution.agent_tool.receipt"
         || primary.actor.as_deref() != Some("governed_tool")
         || index.actor != primary.actor
-        || primary.scope != crate::RuntimeEventScope::ExecutionNode
+        || primary.scope != RuntimeEventScope::ExecutionNode
         || index.scope != primary.scope
         || primary.status.as_deref() != Some("completed")
         || index.status.as_deref() != Some("completed")
@@ -2258,7 +2532,7 @@ fn r1_581_actual_read_phase_keeps_discovery_exact_and_revalidates_existing_cuts(
         store
             .append(crate::RuntimeEventInput {
                 stream_id: source.into(),
-                scope: crate::RuntimeEventScope::Session,
+                scope: RuntimeEventScope::Session,
                 kind: "runtime.phase581.metadata".into(),
                 status: None,
                 actor: Some("phase581_test_not_business_authority".into()),
@@ -2275,7 +2549,7 @@ fn r1_581_actual_read_phase_keeps_discovery_exact_and_revalidates_existing_cuts(
     let original = std::collections::BTreeMap::from([(source.to_string(), 1)]);
     assert!(actual_input_snapshot(&store, &program, &[], readers, Some(&original)).is_err());
     let current =
-        actual_input_snapshot_for_phase(&store, &program, &[], readers, Some(&original), true)
+        actual_input_snapshot_for_phase(&store, &program, &[], readers, Some(&original), true, None)
             .unwrap();
     assert_eq!(current.sources.get(source), Some(&2));
     for invalid in [
@@ -2289,6 +2563,7 @@ fn r1_581_actual_read_phase_keeps_discovery_exact_and_revalidates_existing_cuts(
             readers,
             Some(&invalid),
             true,
+            None,
         )
         .is_err());
     }
@@ -2391,6 +2666,7 @@ pub(super) struct ActualFileDependency {
     pub consumer_cursor: u64,
     pub consumer_call_key: String,
     pub source_sha256: String,
+    pub source_bytes: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
@@ -2411,11 +2687,21 @@ impl ActualImmutableInput {
         packet: Option<&harness_contract::agent::AgentTaskPacket>,
         readers: super::ResultContentReaders<'_>,
         actual: &mut ActualInputSnapshot,
-    ) -> Result<Self, String> {
+    ) -> Result<Self, super::results::ReviewEvidenceError> {
         let acquisition = crate::context_evidence::decode_read_acquisition(
             &primary.payload[crate::context_evidence::READ_ACQUISITION_FIELD],
         )
         .map_err(str::to_string)?;
+        // The acquisition is owned by its original physical producer, not by
+        // the consumer whose proof happens to discover it. Recover the packet
+        // from the original graph owner when this is an AgentTask acquisition;
+        // the existing packet, receipt and ticket checks below remain decisive.
+        let original_packet = if packet.is_none() && acquisition.step.run_ref.is_some() {
+            Some(super::results::result_packet(store, &acquisition.graph_id, program, &mut actual.sources)?)
+        } else {
+            None
+        };
+        let packet = packet.or(original_packet.as_ref());
         let intent = &primary.payload["replay"]["invocation"]["intent"];
         if intent["invocation_id"] != acquisition.invocation_id
             || intent["tool_name"] != acquisition.tool_name
@@ -2430,7 +2716,7 @@ impl ActualImmutableInput {
         if primary.kind != "execution.read.receipt"
             || primary.schema_version != 1
             || primary.actor.as_deref() != Some("governed_tool")
-            || primary.scope != crate::RuntimeEventScope::ExecutionNode
+            || primary.scope != RuntimeEventScope::ExecutionNode
             || primary.status.as_deref() != Some("completed")
             || index.kind != "execution.agent_tool.receipt"
             || index.schema_version != 2
@@ -2573,7 +2859,13 @@ impl ActualImmutableInput {
                 || acquisition.step.execution_id.as_deref() != Some(acquisition.graph_id.as_str())
                 || acquisition.step.run_ref.is_some()
             {
-                return Err("immutable acquisition has no authenticated root producer".into());
+                return Err(format!(
+                    "immutable acquisition has no authenticated root producer: call={} primary={} selected={} primary_match={} step_graph_match={} run_ref_present={}",
+                    acquisition.invocation_id, primary.event_id, original.event_id,
+                    original.event_id == primary.event_id,
+                    acquisition.step.execution_id.as_deref() == Some(acquisition.graph_id.as_str()),
+                    acquisition.step.run_ref.is_some(),
+                ).into());
             }
         }
         for original in super::results::process_ticket_start(store, &acquisition.graph_id,
@@ -2626,6 +2918,11 @@ impl ActualImmutableInput {
                 && packet.is_none_or(|packet| !packet.resource_scopes.contains(&content.visibility_scope)))
         {
             return Err("immutable acquisition conflicts with original content or grant".into());
+        }
+        if source_selector.starts_with("artifact://") {
+            if let Some(frame) = readers.process_inputs {
+                frame.retain_artifact(readers.artifacts.ok_or("immutable acquisition Artifact owner unavailable")?, &content)?;
+            }
         }
         let mut reference = requested.to_string();
         if let super::identity::MaterialIdentity::Publication(publication) = &requested_identity {
@@ -2800,10 +3097,15 @@ fn complete_actual_file_windows(
             return Ok(window.dependency);
         }
     }
-    Err(
-        "proof_actual_input_extent_unsupported: actual File input lacks complete original windows"
-            .into(),
+    Err(crate::agentic::fact_admission::refusal(
+        harness_contract::refusal_codes::FactAdmissionCode::ScopeIncomplete,
+        "proof_actual_input_extent_unsupported: actual File input lacks complete original windows",
+        &[crate::agentic::fact_admission::StrategyGap {
+            strategy: harness_contract::refusal_codes::FactAdmissionStrategy::Nested,
+            missing: "the composite's File window does not cover the original body".to_string(),
+        }],
     )
+    .into())
 }
 
 fn require_actual_materials(
@@ -2873,25 +3175,274 @@ pub(super) fn read_original_scope(
     .map(Some)
 }
 
-fn collect_actual_acquisition(
+/// Authenticate the original directory-discovery result as a historical
+/// operation. It never proves file contents or the current directory state.
+fn original_glob_discovery(
+    primary: &crate::DurableRuntimeEvent,
+    descriptor: &ToolEffectDescriptor,
+    input: Option<&serde_json::Value>,
+) -> Result<Option<serde_json::Value>, String> {
+    if primary.payload["tool_name"] != "glob_search" {
+        return Ok(None);
+    }
+    if descriptor.tool_id != "glob_search" || descriptor.effect_kind != ToolEffectKind::Read
+        || descriptor.uses_network || descriptor.spawns_process
+        || descriptor.mutates_packages || descriptor.mutates_system
+        || primary.payload["outcome_truncated"] == true
+    {
+        return Err("original discovery has invalid effect or incomplete output".into());
+    }
+    let scope = super::results::require_original_effect_scope(
+        &primary.payload["resolved_effect_scope"], descriptor,
+    )?;
+    if !crate::context_evidence::original_read_file_domain(descriptor, &scope) {
+        return Err("original discovery File domain is incomplete".into());
+    }
+    let input = input.ok_or("original discovery input unavailable")?;
+    let output = primary.payload["outcome"]["output"].as_str()
+        .ok_or("original discovery output unavailable")?;
+    let value: serde_json::Value = serde_json::from_str(output)
+        .map_err(|_| "original discovery output is not JSON")?;
+    let complete = validate_original_glob_pages(input, &value)?;
+    Ok(Some(serde_json::json!({"scope":scope, "sha256":crate::context_evidence::read_sha256(output.as_bytes()),
+        "bytes":output.len(), "reported_scan_complete":complete})))
+}
+
+fn validate_original_glob_pages(input: &serde_json::Value, value: &serde_json::Value) -> Result<bool, String> {
+    let patterns = match input.get("patterns") {
+        Some(value) => value.as_array().filter(|items| !items.is_empty())
+            .ok_or("original discovery patterns invalid")?.iter().collect::<Vec<_>>(),
+        None => vec![input],
+    };
+    let pages: Vec<&serde_json::Value> = if input.get("patterns").is_some() {
+        let results = value["results"].as_array().ok_or("original discovery batch missing")?;
+        if value["type"] != "glob_search" || results.len() != patterns.len()
+            || value["count"].as_u64() != Some(results.len() as u64)
+        { return Err("original discovery batch differs from request".into()); }
+        let mut pages = Vec::with_capacity(results.len());
+        for (position, result) in results.iter().enumerate() {
+            if result["index"].as_u64() != Some(position as u64)
+                || result["status"] != "success" || !result["error"].is_null()
+            { return Err("original discovery batch member unavailable".into()); }
+            pages.push(result.get("output").ok_or("original discovery page missing")?);
+        }
+        pages
+    } else { vec![value] };
+    let mut complete = true;
+    for (pattern, page) in patterns.iter().zip(pages) {
+        if page.get("content").is_some() || page.get("file").is_some() {
+            return Err("original discovery output is not directory metadata".into());
+        }
+        let page: tools::file_ops::GlobSearchOutput = serde_json::from_value(page.clone())
+            .map_err(|_| "original discovery page invalid")?;
+        if pattern.get("pattern").and_then(|value| value.as_str()) != Some(page.pattern.as_str())
+            || page.num_files != page.filenames.len()
+            || (page.scan_complete && (page.truncated || !page.omissions.is_empty()
+                || page.continuation_cursor.is_some() || page.next_request.is_some()))
+            || page.coverage["consistency"] != "live_filesystem"
+        { return Err("original discovery page disagrees with request or coverage".into()); }
+        complete &= page.scan_complete;
+    }
+    Ok(complete)
+}
+
+/// Recover only original child reads whose parent receipt and accepted model
+/// delivery can both be authenticated. Missing or dynamic children stay unknown.
+fn collect_actual_nested_acquisitions(
     store: &std::sync::Arc<RuntimeEventStore>,
-    program: &AgenticProgramProjection,
     primary: &crate::DurableRuntimeEvent,
     index: &crate::DurableRuntimeEvent,
+    original_input: Option<&serde_json::Value>,
     session_events: &[crate::DurableRuntimeEvent],
     boundary: &super::results::ResultInputBoundary,
     readers: super::ResultContentReaders<'_>,
     actual: &mut ActualInputSnapshot,
     windows: &mut std::collections::BTreeMap<String, Vec<ActualFileWindow>>,
-) -> Result<(), String> {
-    use crate::context_evidence::{ReadExtent, READ_ACQUISITION_FIELD};
+) -> Result<bool, String> {
+    use crate::context_evidence::{ReadExtent, CHILD_READ_ACQUISITIONS_FIELD};
+    if primary.payload["tool_name"] != "tool_orchestrate" { return Ok(false); }
+    let children = primary.payload[CHILD_READ_ACQUISITIONS_FIELD].as_array()
+        .ok_or("original composite child acquisitions unavailable")?;
+    if children.is_empty() || primary.payload[CHILD_READ_ACQUISITIONS_FIELD] != index.payload[CHILD_READ_ACQUISITIONS_FIELD]
+        || primary.payload["child_read_acquisitions_complete"] != true
+        || index.payload["child_read_acquisitions_complete"] != true
+        || primary.payload["outcome_truncated"] == true {
+        return Err("original composite child acquisitions incomplete".into());
+    }
+    let descriptor = super::results::receipt_effect_descriptor(primary)?;
+    let scope = super::results::require_original_effect_scope(&primary.payload["resolved_effect_scope"], &descriptor)?;
+    if !crate::context_evidence::original_read_file_domain(&descriptor, &scope) {
+        return Err("original composite File domain is incomplete".into());
+    }
+    let input = original_input.ok_or("original composite input unavailable")?;
+    let raw_input = primary.payload["original_input"].as_str().ok_or("original composite input absent")?;
+    let stored: serde_json::Value = harness_contract::step::parse_strict_json(raw_input)
+        .map_err(|_| "original composite input invalid")?;
+    if &stored != input || primary.payload["input_sha256"] != crate::context_evidence::read_sha256(raw_input.as_bytes()) {
+        return Err("original composite input identity changed".into());
+    }
+    let steps = input["steps"].as_array().ok_or("original composite steps missing")?;
+    let raw_output = primary.payload["outcome"]["output"].as_str().ok_or("original composite output missing")?;
+    let output: serde_json::Value = serde_json::from_str(raw_output).map_err(|_| "original composite output invalid")?;
+    let trace = output["calls"].as_array().ok_or("original composite trace missing")?;
+    if trace.len() != steps.len() { return Err("original composite trace incomplete".into()); }
+    let mut expected = std::collections::BTreeSet::new();
+    let mut ids = std::collections::BTreeSet::new();
+    for (step_index, step) in steps.iter().enumerate() {
+        let id = step["id"].as_str().filter(|id| !id.is_empty()).ok_or("original composite step identity missing")?;
+        if !ids.insert(id) || trace[step_index]["stepId"] != id || trace[step_index]["status"] != "ok"
+            || trace[step_index]["op"] != step["op"] {
+            return Err("original composite trace identity mismatch".into());
+        }
+        let calls: Vec<&serde_json::Value> = match step["op"].as_str() {
+            Some("call") => vec![step],
+            Some("batch") => step["calls"].as_array().ok_or("original composite batch missing")?.iter().collect(),
+            _ => return Err("original composite dynamic step is unproven".into()),
+        };
+        if trace[step_index]["calls"].as_u64() != Some(calls.len() as u64) {
+            return Err("original composite execution count mismatch".into());
+        }
+        for (position, call) in calls.iter().enumerate() {
+            match call["tool"].as_str() {
+                Some("read_file" | "grep_search") => { expected.insert((step_index as u64, position as u64)); }
+                Some("glob_search") => {
+                    let member = if step["op"] == "call" {
+                        &output["steps"][id]
+                    } else {
+                        let alias = call["as"].as_str().map(str::to_string)
+                            .unwrap_or_else(|| format!("glob_search[{position}]"));
+                        if calls.iter().enumerate().filter(|(i, item)| {
+                            item["as"].as_str().map(str::to_string).unwrap_or_else(||
+                                format!("{}[{i}]", item["tool"].as_str().unwrap_or(""))) == alias
+                        }).count() != 1 { return Err("original composite discovery alias is ambiguous".into()); }
+                        &output["steps"][id][&alias]
+                    };
+                    let member = if step["on_error"] == "collect" && step["op"] == "batch" {
+                        if member["ok"] != true { return Err("original composite discovery failed".into()); }
+                        &member["output"]
+                    } else { member };
+                    let member_input = call.get("input").ok_or("original composite discovery input missing")?;
+                    let complete = validate_original_glob_pages(member_input, member)?;
+                    let _ = complete; // Historical discovery; not a completeness proof.
+                }
+                _ => return Err("original composite child operation is unproven".into()),
+            }
+        }
+    }
+    let mut observed = std::collections::BTreeSet::new();
+    let mut child_positions = std::collections::BTreeSet::new();
+    let mut reader = super::read_source::StoreReadSource(store.as_ref());
+    for child in children {
+        let step = child["step_index"].as_u64().ok_or("original child step missing")?;
+        let position = child["position"].as_u64().ok_or("original child position missing")?;
+        let (batch, window) = match child["tool_name"].as_str() {
+            Some("read_file") if child["batch_index"].is_null() && child["window_index"].is_null() => (None, None),
+            Some("grep_search") => (child["batch_index"].as_u64(), Some(child["window_index"].as_u64()
+                .ok_or("original child window missing")?)),
+            _ => return Err("original composite child kind unknown".into()),
+        };
+        if !expected.contains(&(step, position)) || !child_positions.insert((step, position, batch, window)) {
+            return Err("original composite child is foreign or duplicated".into());
+        }
+        let mut confirmed = None;
+        for event in session_events.iter().filter(|event|
+            event.kind == "context.nested_read_model_observed"
+                && event.commit_cursor < boundary.cursor
+                && event.payload["parent_event_id"] == primary.event_id
+                && event.payload["child"] == *child) {
+            let turn = event.payload["parent"]["step"]["turn_id"].as_str()
+                .ok_or("nested original turn missing")?;
+            let root = boundary.producer.strip_prefix("root-execution:");
+            if let Some(read) = verify_nested_read(&mut reader, event, &program_session(primary)?, turn,
+                root, boundary.packet.as_ref(), &mut actual.sources)? {
+                confirmed = Some(read);
+                break;
+            }
+        }
+        let read = confirmed.ok_or("original composite child delivery unavailable")?;
+        let ReadExtent::FileLines {start_line, line_count, total_lines, source_omitted, ..} = &read.extent else {
+            return Err("original composite child is not a File window".into());
+        };
+        if *start_line == 0 || (*source_omitted && *start_line == 1 && line_count == total_lines) {
+            return Err("original composite child window invalid".into());
+        }
+        let begin = start_line.checked_sub(1).ok_or("nested window underflow")?;
+        let end = begin.checked_add(*line_count).ok_or("nested window overflow")?;
+        let dependency = ActualFileDependency {
+            target: read.target, acquisition_cursor: primary.commit_cursor,
+            consumer_cursor: boundary.cursor, consumer_call_key: boundary.call_key.clone(),
+            source_sha256: read.body.source_sha256, source_bytes: read.body.source_bytes,
+        };
+        if let Some(frame) = readers.process_inputs.filter(|frame| frame.has_original_file_workspace()) {
+            frame.retain_original_file(&dependency.target, &dependency.source_sha256, dependency.source_bytes)?;
+        }
+        let key = super::proof_value_digest(&serde_json::json!([
+            dependency.target, boundary.call_key, dependency.source_sha256, dependency.source_bytes, total_lines
+        ]));
+        windows.entry(key).or_default().push(ActualFileWindow { begin, end, total: *total_lines, dependency });
+        retain_actual_material(&mut actual.material_events, &read.event);
+        observed.insert((step, position));
+    }
+    if observed != expected { return Err("original composite child coverage incomplete".into()); }
+    Ok(true)
+}
+
+#[cfg(test)]
+pub(crate) fn collect_actual_nested_from_original_host_for_test(
+    store: &std::sync::Arc<RuntimeEventStore>, primary: &crate::DurableRuntimeEvent,
+    index: &crate::DurableRuntimeEvent, session_events: &[crate::DurableRuntimeEvent],
+    input: &str, root: &str,
+) -> Result<Vec<String>, String> {
+    let last_delivery = session_events.iter().filter(|event|
+        event.kind == "context.nested_read_model_observed"
+            && event.payload["parent_event_id"] == primary.event_id)
+        .map(|event| event.commit_cursor).max().ok_or("actual child delivery missing")?;
+    let graph_events = store.list_stream(root).map_err(|error| error.to_string())?;
+    let consumer = session_events.iter().chain(graph_events.iter())
+        .filter(|event| event.commit_cursor > last_delivery)
+        .min_by_key(|event| event.commit_cursor).ok_or("actual continuation boundary missing")?;
+    let boundary = super::results::ResultInputBoundary {
+        producer: format!("root-execution:{root}"), packet: None, step: None,
+        cursor: consumer.commit_cursor, call_key: "original-host-test-consumer".into(),
+        source: harness_contract::goal::ProofInputEvent {
+            stream_id: consumer.stream_id.clone(), sequence: consumer.sequence,
+            event_id: consumer.event_id.clone(), payload_digest: super::proof_value_digest(&consumer.payload),
+        },
+    };
+    let mut actual = ActualInputSnapshot {
+        file_dependencies: Vec::new(), immutable_inputs: Vec::new(),
+        sources: std::collections::BTreeMap::new(), material_events: Vec::new(), canonical_facts: Vec::new(),
+    };
+    let mut windows = std::collections::BTreeMap::new();
+    let input: serde_json::Value = harness_contract::step::parse_strict_json(input)
+        .map_err(|error| error.to_string())?;
+    if !collect_actual_nested_acquisitions(store, primary, index, Some(&input), session_events,
+        &boundary, super::ResultContentReaders::default(), &mut actual, &mut windows)? {
+        return Err("original composite was not processed".into());
+    }
+    let mut paths = windows.into_values().map(complete_actual_file_windows)
+        .map(|result| result.map(|dependency| dependency.target.path.workspace_relative_path))
+        .collect::<Result<Vec<_>, _>>()?;
+    paths.sort();
+    Ok(paths)
+}
+
+fn program_session(primary: &crate::DurableRuntimeEvent) -> Result<String, String> {
+    primary.payload["replay"]["session_id"].as_str().filter(|id| !id.is_empty())
+        .map(str::to_string).ok_or_else(|| "original composite session missing".into())
+}
+
+pub(super) fn verify_actual_read_pair(
+    primary: &crate::DurableRuntimeEvent,
+    index: &crate::DurableRuntimeEvent,
+) -> Result<ToolEffectDescriptor, String> {
     let descriptor = super::results::receipt_effect_descriptor(primary)?;
     if primary.kind != "execution.read.receipt"
         || primary.schema_version != 1
         || crate::ExecutionCommitService::receipt_observation_sequence(&index).is_none()
         || primary.actor.as_deref() != Some("governed_tool")
         || primary.actor != index.actor
-        || primary.scope != crate::RuntimeEventScope::ExecutionNode
+        || primary.scope != RuntimeEventScope::ExecutionNode
         || primary.scope != index.scope
         || index.kind != "execution.agent_tool.receipt"
         || primary.transaction_id != index.transaction_id
@@ -2911,9 +3462,75 @@ fn collect_actual_acquisition(
         || primary.payload["resolved_effect_scope"] != index.payload["resolved_effect_scope"]
         || primary.payload["outcome"]["status"] != "executed"
         || primary.payload["outcome"]["error"].as_str().is_some()
-        || primary.commit_cursor >= boundary.cursor
         || descriptor.effect_kind != ToolEffectKind::Read
     {
+        return Err("actual input does not authenticate one strictly earlier acquisition".into());
+    }
+    Ok(descriptor)
+}
+
+// These candidates describe only what the original verifier established.
+// Verification errors remain hard errors and cannot become missing strategies.
+enum AcquisitionCandidate {
+    Proven(harness_contract::refusal_codes::FactAdmissionStrategy),
+    Missing(Vec<crate::agentic::fact_admission::StrategyOutcome>),
+}
+
+fn collect_actual_acquisition(
+    store: &std::sync::Arc<RuntimeEventStore>,
+    program: &AgenticProgramProjection,
+    primary: &crate::DurableRuntimeEvent,
+    index: &crate::DurableRuntimeEvent,
+    original_input: Option<&serde_json::Value>,
+    session_events: &[crate::DurableRuntimeEvent],
+    boundary: &super::results::ResultInputBoundary,
+    readers: super::ResultContentReaders<'_>,
+    actual: &mut ActualInputSnapshot,
+    windows: &mut std::collections::BTreeMap<String, Vec<ActualFileWindow>>,
+) -> Result<(), super::results::ReviewEvidenceError> {
+    // Both production callers propagate any failure and discard their entire
+    // local snapshot. Until this decision succeeds it cannot become a proof.
+    let result = (|| {
+        let candidate = collect_actual_acquisition_candidate(
+            store, program, primary, index, original_input, session_events, boundary,
+            readers, actual, windows,
+        )?;
+        let outcomes = match candidate {
+            AcquisitionCandidate::Proven(strategy) => vec![crate::agentic::fact_admission::StrategyOutcome::admitted(strategy)],
+            AcquisitionCandidate::Missing(outcomes) => outcomes,
+        };
+        crate::agentic::fact_admission::require(
+            &outcomes,
+            harness_contract::refusal_codes::FactAdmissionCode::Unproven,
+            "proof_actual_input_extent_unsupported: actual read lacks an original physical extent",
+        )?;
+        Ok(())
+    })();
+    if result.is_err() {
+        tracing::warn!(sources = actual.sources.len(), material_events = actual.material_events.len(),
+            canonical_facts = actual.canonical_facts.len(), window_groups = windows.len(),
+            disposition = "incomplete_snapshot_not_published",
+            frame_cleanup = if readers.process_inputs.is_some() { "owned_by_frame" } else { "no_frame" },
+            "review acquisition rejected before snapshot publication");
+    }
+    result
+}
+
+fn collect_actual_acquisition_candidate(
+    store: &std::sync::Arc<RuntimeEventStore>,
+    program: &AgenticProgramProjection,
+    primary: &crate::DurableRuntimeEvent,
+    index: &crate::DurableRuntimeEvent,
+    original_input: Option<&serde_json::Value>,
+    session_events: &[crate::DurableRuntimeEvent],
+    boundary: &super::results::ResultInputBoundary,
+    readers: super::ResultContentReaders<'_>,
+    actual: &mut ActualInputSnapshot,
+    windows: &mut std::collections::BTreeMap<String, Vec<ActualFileWindow>>,
+) -> Result<AcquisitionCandidate, super::results::ReviewEvidenceError> {
+    use crate::context_evidence::{ReadExtent, READ_ACQUISITION_FIELD};
+    let descriptor = verify_actual_read_pair(primary, index)?;
+    if primary.commit_cursor >= boundary.cursor {
         return Err("actual input does not authenticate one strictly earlier acquisition".into());
     }
     for event in [primary, index] {
@@ -2921,9 +3538,63 @@ fn collect_actual_acquisition(
         retain_actual_material(&mut actual.material_events, event);
     }
     let seal_value = &primary.payload[READ_ACQUISITION_FIELD];
+    if primary.payload["tool_name"].as_str() == Some("read_ref") {
+        let input = match (original_input, seal_value.is_null()) {
+            (Some(input), _) => Some(input),
+            (None, true) => return Err("unsealed read_ref original input unavailable".into()),
+            (None, false) => None,
+        };
+        if let Some(input) = input {
+            if crate::agentic::action_invocation::read_ref_directory_input(input)?.is_some() {
+                if !seal_value.is_null() {
+                    return Err("directory metadata has an unexpected acquisition seal".into());
+                }
+                // Directory state is metadata, not immutable artifact material.
+                return Ok(AcquisitionCandidate::Proven(harness_contract::refusal_codes::FactAdmissionStrategy::Directory));
+            }
+        }
+    }
     if seal_value.is_null() {
-        if !immutable_receipt_without_workspace_extent(primary, &descriptor)? {
-            return Err("proof_actual_input_extent_unsupported: actual read lacks an original physical extent".into());
+        // 034 GB-1 (batch 1): the three proof strategies are asked in the
+        // fixed order, and the gate records which one answered. When none
+        // did, the refusal carries what each of them was missing - one
+        // refusal, a complete diagnosis - and keeps the fragmented gate's
+        // original wording verbatim at its head.
+        // The nested strategy answers first and, when it does, the fact is
+        // in: the gate records that answer and the read is admitted. (Losing
+        // this early return would let a nested acquisition fall through to
+        // the immutable judgment and be refused by a gate it already
+        // answered.)
+        if collect_actual_nested_acquisitions(store, primary, index, original_input, session_events,
+            boundary, readers, actual, windows)? {
+            actual.canonical_facts.push(serde_json::json!({
+                "grade":"acquired_nested", "producer":boundary.producer,
+                "consumer":boundary.call_key, "consumer_cursor":boundary.cursor,
+                "acquisition_cursor":primary.commit_cursor, "source":primary.event_id,
+                "index":index.event_id,
+            }));
+            return Ok(AcquisitionCandidate::Proven(harness_contract::refusal_codes::FactAdmissionStrategy::Nested));
+        }
+        // Primary and index remain in the audited material set above. A
+        // discovery page proves neither file contents nor current absence.
+        if original_glob_discovery(primary, &descriptor, original_input)?.is_some() {
+            return Ok(AcquisitionCandidate::Proven(harness_contract::refusal_codes::FactAdmissionStrategy::Discovery));
+        }
+        if !immutable_receipt_without_workspace_extent(primary, &descriptor, original_input)? {
+            return Ok(AcquisitionCandidate::Missing(vec![
+                    crate::agentic::fact_admission::StrategyOutcome::missing(
+                        harness_contract::refusal_codes::FactAdmissionStrategy::Nested,
+                        "the composite's child acquisitions do not cover this read",
+                    ),
+                    crate::agentic::fact_admission::StrategyOutcome::missing(
+                        harness_contract::refusal_codes::FactAdmissionStrategy::Discovery,
+                        "the read is not a discovery page",
+                    ),
+                    crate::agentic::fact_admission::StrategyOutcome::missing(
+                        harness_contract::refusal_codes::FactAdmissionStrategy::Immutable,
+                        "the read named a workspace path and its receipt carries no acquisition seal",
+                    ),
+                ]));
         }
         let output = primary.payload["outcome"]["output"]
             .as_str()
@@ -2941,7 +3612,7 @@ fn collect_actual_acquisition(
             "scope":primary.payload["resolved_effect_scope"],
             "sha256":crate::context_evidence::read_sha256(output.as_bytes()), "bytes":output.len(),
         }));
-        return Ok(());
+        return Ok(AcquisitionCandidate::Proven(harness_contract::refusal_codes::FactAdmissionStrategy::Immutable));
     }
     let seal =
         crate::context_evidence::decode_read_acquisition(seal_value).map_err(str::to_string)?;
@@ -2994,17 +3665,29 @@ fn collect_actual_acquisition(
             source_omitted,
             ..
         } => {
-            let scope = scope
-                .as_ref()
-                .ok_or("actual File input lacks original scope v2")?;
+            let scope = scope.as_ref().ok_or_else(|| {
+                crate::agentic::fact_admission::refusal(
+                    harness_contract::refusal_codes::FactAdmissionCode::ScopeIncomplete,
+                    "actual File input lacks original scope v2",
+                    &[crate::agentic::fact_admission::StrategyGap {
+                        strategy: harness_contract::refusal_codes::FactAdmissionStrategy::Immutable,
+                        missing: "the receipt carries no scope for the body it claims".to_string(),
+                    }],
+                )
+            })?;
             if !scope.complete
                 || *start_line == 0
                 || *source_omitted && *start_line == 1 && line_count == total_lines
             {
-                return Err(
-                    "proof_actual_input_extent_unsupported: original File body is incomplete"
-                        .into(),
-                );
+                return Err(crate::agentic::fact_admission::refusal(
+                    harness_contract::refusal_codes::FactAdmissionCode::ScopeIncomplete,
+                    "proof_actual_input_extent_unsupported: original File body is incomplete",
+                    &[crate::agentic::fact_admission::StrategyGap {
+                        strategy: harness_contract::refusal_codes::FactAdmissionStrategy::Immutable,
+                        missing: "the File body the seal covers is incomplete".to_string(),
+                    }],
+                )
+                .into());
             }
             let targets = scope
                 .targets
@@ -3017,7 +3700,15 @@ fn collect_actual_acquisition(
                 })
                 .collect::<Vec<_>>();
             if targets.len() != 1 {
-                return Err("proof_actual_input_extent_unsupported: actual File has no unique original canonical target".into());
+                            return Err(crate::agentic::fact_admission::refusal(
+                                harness_contract::refusal_codes::FactAdmissionCode::ScopeIncomplete,
+                                "proof_actual_input_extent_unsupported: actual File has no unique original canonical target",
+                                &[crate::agentic::fact_admission::StrategyGap {
+                                    strategy: harness_contract::refusal_codes::FactAdmissionStrategy::Immutable,
+                                    missing: "the scope names no unique exact File target".to_string(),
+                                }],
+                            )
+                            .into());
             }
             let begin = start_line
                 .checked_sub(1)
@@ -3031,7 +3722,11 @@ fn collect_actual_acquisition(
                 consumer_cursor: boundary.cursor,
                 consumer_call_key: boundary.call_key.clone(),
                 source_sha256: seal.body.source_sha256.clone(),
+                source_bytes: seal.body.source_bytes,
             };
+            if let Some(frame) = readers.process_inputs.filter(|frame| frame.has_original_file_workspace()) {
+                frame.retain_original_file(&dependency.target, &dependency.source_sha256, dependency.source_bytes)?;
+            }
             let identity = super::proof_value_digest(&serde_json::json!([
                 dependency.target,
                 boundary.call_key,
@@ -3050,22 +3745,29 @@ fn collect_actual_acquisition(
             let input = ActualImmutableInput::from_acquisition(
                 store, program, primary, index, session_events,
                 boundary.packet.as_ref(), readers, actual,
-            )?;
+            ).map_err(|error| {
+                if error.to_string().starts_with("immutable acquisition has no authenticated root producer") {
+                    super::results::ReviewEvidenceError::from(format!("{error}; caller=actual_boundary producer={:?} packet_present={}",
+                        boundary.producer, boundary.packet.is_some()))
+                } else { error }
+            })?;
             if !actual.immutable_inputs.contains(&input) {
                 actual.immutable_inputs.push(input);
             }
         }
     }
-    Ok(())
+    // This admits only the original authenticated acquisition (a window for
+    // FileLines); complete_actual_file_windows still decides full coverage.
+    Ok(AcquisitionCandidate::Proven(harness_contract::refusal_codes::FactAdmissionStrategy::Sealed))
 }
 
-fn authenticate_unsealed_delegated_input(
+pub(super) fn authenticate_unsealed_delegated_input(
     store: &std::sync::Arc<RuntimeEventStore>,
     primary: &crate::DurableRuntimeEvent,
     index: &crate::DurableRuntimeEvent,
     packet: &harness_contract::agent::AgentTaskPacket,
     actual: &mut ActualInputSnapshot,
-) -> Result<serde_json::Value, String> {
+) -> Result<serde_json::Value, super::results::ReviewEvidenceError> {
     use harness_contract::step::CallSource;
     let key = primary.payload["idempotency_key"]
         .as_str()
@@ -3356,65 +4058,6 @@ fn authenticate_actual_consumer(
     Ok(())
 }
 
-#[cfg(test)]
-tokio::task_local! {
-    static ACTUAL_READ_SOURCE_FAULT: &'static str;
-}
-
-#[cfg(test)]
-fn actual_read_source_fault(primary: &mut crate::DurableRuntimeEvent) {
-    if primary.payload["tool_name"] == "evidence_retrieve" {
-        let _ = ACTUAL_READ_SOURCE_FAULT.try_with(|fault| match *fault {
-            "artifact-body" => {
-                primary.payload["outcome"]["output"] = serde_json::json!("changed original body")
-            }
-            "artifact-hash" => {
-                primary.payload[crate::context_evidence::READ_ACQUISITION_FIELD]["body"]
-                    ["source_sha256"] = serde_json::json!("sha256:foreign")
-            }
-            "artifact-chunk" => {
-                primary.payload[crate::context_evidence::READ_ACQUISITION_FIELD]["body"]["extent"]
-                    ["chunks"][0]["body_sha256"] = serde_json::json!("sha256:foreign")
-            }
-            "artifact-source" => {
-                primary.payload[crate::context_evidence::READ_ACQUISITION_FIELD]["body"]
-                    ["source_ref"] = serde_json::json!("artifact://foreign")
-            }
-            "artifact-producer" => {
-                primary.payload[crate::context_evidence::READ_ACQUISITION_FIELD]["step"]
-                    ["run_ref"] = serde_json::json!("foreign-run")
-            }
-            "artifact-attempt" => {
-                primary.payload[crate::context_evidence::READ_ACQUISITION_FIELD]["attempt"] =
-                    serde_json::json!(99)
-            }
-            _ => {}
-        });
-        return;
-    }
-    if primary.payload["tool_name"] != "tool_search" {
-        return;
-    }
-    let _ = ACTUAL_READ_SOURCE_FAULT.try_with(|fault| match *fault {
-        "session" => primary.payload["replay"]["session_id"] = serde_json::json!("foreign-session"),
-        "run" => {
-            primary.payload["replay"]["origin"]["source"] =
-                serde_json::json!({"kind":"process","worker_id":"foreign-run","sequence":1})
-        }
-        "step" => {
-            primary.payload["replay"]["origin"]["origin_step_id"] =
-                serde_json::json!("foreign-step")
-        }
-        "call" => primary.payload["replay"]["call_id"] = serde_json::json!("foreign-call"),
-        "input" => primary.payload["input_sha256"] = serde_json::json!("sha256:foreign-input"),
-        "compiled" => {
-            primary.payload["replay"]["invocation"]["invocation_id"] =
-                serde_json::json!("foreign-compiled-call")
-        }
-        _ => {}
-    });
-}
-
 fn remember_primary_content(
     contents: &mut std::collections::BTreeMap<String, harness_contract::context::ArtifactRef>,
     identity: &str,
@@ -3446,7 +4089,18 @@ pub(super) fn primary_producer_immutable_inputs(
     producers: &[super::results::ResultProducer],
     readers: super::ResultContentReaders<'_>,
     expected_cuts: Option<&std::collections::BTreeMap<String, u64>>,
-) -> Result<ActualInputSnapshot, String> {
+) -> Result<ActualInputSnapshot, super::results::ReviewEvidenceError> {
+    primary_producer_immutable_inputs_with_tail(store, program, producers, readers, expected_cuts, None)
+}
+
+fn primary_producer_immutable_inputs_with_tail(
+    store: &std::sync::Arc<RuntimeEventStore>,
+    program: &AgenticProgramProjection,
+    producers: &[super::results::ResultProducer],
+    readers: super::ResultContentReaders<'_>,
+    expected_cuts: Option<&std::collections::BTreeMap<String, u64>>,
+    session_tail: Option<&HistoricalSessionCut>,
+) -> Result<ActualInputSnapshot, super::results::ReviewEvidenceError> {
     let mut actual = ActualInputSnapshot {
         file_dependencies: Vec::new(),
         immutable_inputs: Vec::new(),
@@ -3455,7 +4109,13 @@ pub(super) fn primary_producer_immutable_inputs(
         canonical_facts: Vec::new(),
     };
     let source = format!("session:{}", program.session_id);
-    let events = super::results::result_source_events(store, &source, &mut actual.sources)?;
+    let events = match session_tail {
+        Some(tail) if tail.source.stream_id == source =>
+            super::results::result_source_events_at_session_cut(store, &source, &mut actual.sources,
+                tail.source.expected_revision, tail.observed_revision)?,
+        Some(_) => return Err("primary acquisition Session tail belongs to another source".into()),
+        None => super::results::result_source_events(store, &source, &mut actual.sources)?,
+    };
     let cut = match expected_cuts {
         Some(cuts) => *cuts
             .get(&source)
@@ -3536,7 +4196,12 @@ pub(super) fn primary_producer_immutable_inputs(
                 producer.packet.as_ref(),
                 readers,
                 &mut actual,
-            )?;
+            ).map_err(|error| {
+                if error.to_string().starts_with("immutable acquisition has no authenticated root producer") {
+                    super::results::ReviewEvidenceError::from(format!("{error}; caller=primary_producer producer={:?} packet_present={}",
+                        producer.execution, producer.packet.is_some()))
+                } else { error }
+            })?;
             if !actual.immutable_inputs.contains(&content) {
                 actual.immutable_inputs.push(content);
             }
@@ -3568,9 +4233,12 @@ mod primary_material_621_tests {
         let mut contents = std::collections::BTreeMap::new();
         remember_primary_content(&mut contents, "artifact:summary", &first).unwrap();
         remember_primary_content(&mut contents, "artifact:file", &second).unwrap();
-        assert_eq!(contents.len(), 2);
+        let expected = std::collections::BTreeMap::from([
+            ("artifact:summary".to_string(), first.clone()), ("artifact:file".to_string(), second.clone()),
+        ]);
+        assert_eq!(contents, expected);
         remember_primary_content(&mut contents, "artifact:summary", &first).unwrap();
-        assert_eq!(contents.len(), 2);
+        assert_eq!(contents, expected);
         assert!(remember_primary_content(&mut contents, "artifact:summary", &second).is_err());
         let mut changed = first.clone();
         changed.sha256 = "sha256:changed".into();
@@ -3779,7 +4447,7 @@ fn other_required_review_is_native(
         AgentAction, AgentActionEnvelope, ObjectiveReviewDecision,
     };
     if event.stream_id != format!("agentic-program:{}", program.program_id)
-        || event.scope != crate::RuntimeEventScope::Program
+        || event.scope != RuntimeEventScope::Program
         || event.schema_version != 1
         || event.kind != "agentic.action_applied"
         || event.status.as_deref() != Some("applied")
@@ -3916,8 +4584,8 @@ pub(super) fn actual_input_snapshot(
     boundaries: &[super::results::ResultInputBoundary],
     readers: super::ResultContentReaders<'_>,
     expected_cuts: Option<&std::collections::BTreeMap<String, u64>>,
-) -> Result<ActualInputSnapshot, String> {
-    actual_input_snapshot_for_phase(store, program, boundaries, readers, expected_cuts, false)
+) -> Result<ActualInputSnapshot, super::results::ReviewEvidenceError> {
+    actual_input_snapshot_for_phase(store, program, boundaries, readers, expected_cuts, false, None)
 }
 
 pub(super) fn actual_input_snapshot_for_phase(
@@ -3927,7 +4595,8 @@ pub(super) fn actual_input_snapshot_for_phase(
     readers: super::ResultContentReaders<'_>,
     expected_cuts: Option<&std::collections::BTreeMap<String, u64>>,
     allow_history_growth: bool,
-) -> Result<ActualInputSnapshot, String> {
+    session_tail: Option<&HistoricalSessionCut>,
+) -> Result<ActualInputSnapshot, super::results::ReviewEvidenceError> {
     let mut actual = ActualInputSnapshot {
         file_dependencies: Vec::new(),
         immutable_inputs: Vec::new(),
@@ -3949,8 +4618,13 @@ pub(super) fn actual_input_snapshot_for_phase(
             .push(serde_json::json!({"grade":"bounded_process_history","execution":run}));
     }
     let session = format!("session:{}", program.session_id);
-    let session_events =
-        super::results::result_source_events(store, &session, &mut actual.sources)?;
+    let session_events = match session_tail {
+        Some(tail) if tail.source.stream_id == session =>
+            super::results::result_source_events_at_session_cut(store, &session, &mut actual.sources,
+                tail.source.expected_revision, tail.observed_revision)?,
+        Some(_) => return Err("original Session material tail belongs to another source".into()),
+        None => super::results::result_source_events(store, &session, &mut actual.sources)?,
+    };
     let mut seen_boundaries = BTreeSet::new();
     let mut windows = std::collections::BTreeMap::new();
     for boundary in boundaries {
@@ -3996,7 +4670,15 @@ pub(super) fn actual_input_snapshot_for_phase(
                 }
                 if event.payload["outcome"]["status"] != "executed" {
                     if event.payload["outcome"]["tool_name"] == "read_file" {
-                        return Err("proof_actual_input_extent_unsupported: failed File read is not an existence proof".into());
+                                    return Err(crate::agentic::fact_admission::refusal(
+                                        harness_contract::refusal_codes::FactAdmissionCode::Unproven,
+                                        "proof_actual_input_extent_unsupported: failed File read is not an existence proof",
+                                        &[crate::agentic::fact_admission::StrategyGap {
+                                            strategy: harness_contract::refusal_codes::FactAdmissionStrategy::Nested,
+                                            missing: "the File read failed, so it proves no existence".to_string(),
+                                        }],
+                                    )
+                                    .into());
                     }
                     continue;
                 }
@@ -4015,33 +4697,57 @@ pub(super) fn actual_input_snapshot_for_phase(
                     .event_by_idempotency_key(&primary_source, &format!("{key}:read-receipt"))
                     .map_err(|error| error.to_string())?
                     .ok_or("actual input original primary disappeared")?;
-                #[cfg(test)]
-                let primary = {
-                    let mut original = primary;
-                    actual_read_source_fault(&mut original);
-                    original
-                };
-                if !event.payload[crate::context_evidence::READ_ACQUISITION_FIELD].is_null() {
+                // 033 S8 (one owner for the seal decision): the effect
+                // receipt (the primary) owns the acquisition - it carries the
+                // body and the outcome. The observation twin must agree with
+                // it. A pair that disagrees is refused by name instead of
+                // being routed silently into the other gate, where the read
+                // had no home: sealed on one side, unsealed on the other.
+                let primary_sealed =
+                    !primary.payload[crate::context_evidence::READ_ACQUISITION_FIELD].is_null();
+                let twin_sealed =
+                    !event.payload[crate::context_evidence::READ_ACQUISITION_FIELD].is_null();
+                if primary_sealed != twin_sealed {
+                    return Err(crate::agentic::fact_admission::refusal(
+                        harness_contract::refusal_codes::FactAdmissionCode::PairDisagrees,
+                        "proof_actual_input_extent_unsupported: the read pair disagrees about its acquisition seal",
+                        &[],
+                    )
+                    .into());
+                }
+                let original_input = if primary_sealed {
                     super::results::authenticate_read_input(
                         store,
                         &event,
                         packet,
                         &mut actual.sources,
                     )?;
+                    // A sealed read is judged by its acquisition; its target
+                    // identity is not consulted, so no original input is
+                    // needed here.
+                    None
                 } else {
-                    authenticate_unsealed_delegated_input(
+                    // G-c: a delegated member's read carries its original
+                    // input in the authenticated child request, and that is
+                    // where the same target-identity predicate reads it from.
+                    // The program Session stream holds no governed plan task
+                    // for a member's read, so looking there attributed every
+                    // member read to the declared capability face - which is
+                    // what refused a read of a durable record.
+                    Some(authenticate_unsealed_delegated_input(
                         store,
                         &primary,
                         &event,
                         packet,
                         &mut actual,
-                    )?;
-                }
+                    )?)
+                };
                 collect_actual_acquisition(
                     store,
                     program,
                     &primary,
                     &event,
+                    original_input.as_ref(),
                     &session_events,
                     boundary,
                     readers,
@@ -4070,7 +4776,15 @@ pub(super) fn actual_input_snapshot_for_phase(
                     continue;
                 }
                 if event.payload["is_error"] == true || event.payload["status"] != "completed" {
-                    return Err("proof_actual_input_extent_unsupported: failed root read has no input extent".into());
+                                return Err(crate::agentic::fact_admission::refusal(
+                                    harness_contract::refusal_codes::FactAdmissionCode::Unproven,
+                                    "proof_actual_input_extent_unsupported: failed root read has no input extent",
+                                    &[crate::agentic::fact_admission::StrategyGap {
+                                        strategy: harness_contract::refusal_codes::FactAdmissionStrategy::Nested,
+                                        missing: "the root read failed, so it carries no input extent".to_string(),
+                                    }],
+                                )
+                                .into());
                 }
                 let task = super::results::result_tool_plan(&session_events, event)?
                     .ok_or("actual root input original plan missing")?;
@@ -4080,11 +4794,14 @@ pub(super) fn actual_input_snapshot_for_phase(
                 let index = if !value.is_null() {
                     let seal = crate::context_evidence::decode_read_acquisition(value)
                         .map_err(str::to_string)?;
-                    super::results::pin_result_source(
+                    super::results::pin_result_source_ticketed(
                         store,
+                        &super::results::node_review_ref(&seal.graph_id, &seal.node_id),
+                        seal.attempt,
                         &seal.index_stream,
                         &mut actual.sources,
-                    )?;
+                    )
+                    .map_err(super::results::ReviewEvidenceError::from_repin)?;
                     store
                         .event_by_idempotency_key(&seal.index_stream, &seal.index_key)
                         .map_err(|error| error.to_string())?
@@ -4099,7 +4816,14 @@ pub(super) fn actual_input_snapshot_for_phase(
                         "execution-agent-receipts:{}:{node}:{attempt}",
                         owner.root_execution_id
                     );
-                    super::results::pin_result_source(store, &source, &mut actual.sources)?;
+                    super::results::pin_result_source_ticketed(
+                        store,
+                        &super::results::node_review_ref(&owner.root_execution_id, node),
+                        attempt,
+                        &source,
+                        &mut actual.sources,
+                    )
+                    .map_err(super::results::ReviewEvidenceError::from_repin)?;
                     let key = primary.payload["idempotency_key"]
                         .as_str()
                         .ok_or("actual root read identity missing")?;
@@ -4128,6 +4852,7 @@ pub(super) fn actual_input_snapshot_for_phase(
                     program,
                     &primary,
                     &index,
+                    Some(&task["normalized_input"]),
                     &session_events,
                     boundary,
                     readers,
@@ -4172,7 +4897,7 @@ pub(super) fn actual_input_snapshot_for_phase(
             return Err(format!(
                 "actual input source cut is missing or changed; rebuild the complete review: source={source:?}, expected={:?}, observed={revision}, allow_history_growth={allow_history_growth}",
                 expected_cuts.and_then(|cuts| cuts.get(source).copied()),
-            ));
+            ).into());
         }
         let current = store
             .stream_revision(source)
@@ -4180,7 +4905,7 @@ pub(super) fn actual_input_snapshot_for_phase(
         if current != *revision {
             return Err(format!(
                 "actual input source cut is missing or changed; rebuild the complete review: source={source:?}, observed={revision}, current={current}",
-            ));
+            ).into());
         }
     }
     Ok(actual)
@@ -4324,7 +5049,7 @@ fn authenticated_process_for_key(
     store: &std::sync::Arc<RuntimeEventStore>,
     key: &str,
     sources: &mut std::collections::BTreeMap<String, u64>,
-) -> Result<Option<super::results::AuthenticatedProcessExecution>, String> {
+) -> Result<Option<super::results::AuthenticatedProcessExecution>, super::results::ReviewEvidenceError> {
     let source = format!("execution-effect:{key}");
     let Some(intent) = store
         .event_by_idempotency_key(&source, &format!("{key}:intent"))
@@ -4349,7 +5074,7 @@ fn admitted_intent_scope(
     store: &RuntimeEventStore,
     event: &crate::DurableRuntimeEvent,
     sources: &mut std::collections::BTreeMap<String, u64>,
-) -> Result<harness_contract::goal::ProofEffectScope, String> {
+) -> Result<harness_contract::goal::ProofEffectScope, super::results::ReviewEvidenceError> {
     let key = event.payload["idempotency_key"]
         .as_str()
         .ok_or("effect intent lacks original identity")?;
@@ -4389,14 +5114,15 @@ fn admitted_intent_scope(
         &intent.payload["resolved_effect_scope"],
         &descriptor,
     )
+    .map_err(Into::into)
 }
 
-fn authenticate_settled_effect(
+pub(super) fn authenticate_settled_effect(
     store: &std::sync::Arc<RuntimeEventStore>,
     intent: &crate::DurableRuntimeEvent,
     receipt: &crate::DurableRuntimeEvent,
     sources: &mut std::collections::BTreeMap<String, u64>,
-) -> Result<ToolEffectDescriptor, String> {
+) -> Result<ToolEffectDescriptor, super::results::ReviewEvidenceError> {
     let key = intent.payload["idempotency_key"]
         .as_str()
         .ok_or("effect identity missing")?;
@@ -4451,21 +5177,61 @@ fn authenticate_settled_effect(
     Ok(descriptor)
 }
 
+/// Whether the original input of a read addresses the workspace.
+///
+/// The governed read that produced a receipt names what it read, and the
+/// product already classifies model-facing references
+/// (`harness_contract::refs::Address`): `file://` and `dir://` address the
+/// workspace, while `tool://`, `artifact://`, `fact://` and the other record
+/// schemes address durable records that carry no workspace extent. A legacy
+/// bare identifier is resolved by the directory and may name a workspace
+/// path, so it stays on the workspace side. `Ok(None)` means the input names
+/// no reference at all - the read was not a reference read.
+fn original_read_target(input: &serde_json::Value) -> Result<Option<bool>, String> {
+    use harness_contract::refs::Address;
+    let Some(reference) = input.get("reference").and_then(|value| value.as_str()) else {
+        return Ok(None);
+    };
+    let address = Address::parse(reference)
+        .map_err(|error| format!("original read reference is not parseable: {error}"))?;
+    Ok(Some(matches!(
+        address,
+        Address::File(_) | Address::Dir(_) | Address::Bare(_)
+    )))
+}
+
 fn immutable_receipt_without_workspace_extent(
     primary: &crate::DurableRuntimeEvent,
     descriptor: &ToolEffectDescriptor,
+    original_input: Option<&serde_json::Value>,
 ) -> Result<bool, String> {
     if !primary.payload[crate::context_evidence::READ_ACQUISITION_FIELD].is_null()
         || descriptor.effect_kind != ToolEffectKind::Read
-        || descriptor
-            .scopes
-            .iter()
-            .any(|scope| scope.resource == harness_contract::policy::PermissionResource::File)
         || descriptor.uses_network
         || descriptor.spawns_process
         || descriptor.mutates_packages
         || descriptor.mutates_system
     {
+        return Ok(false);
+    }
+    // What the read actually hit, not what the tool declared: a read whose
+    // original input names a workspace path always needs an acquisition
+    // seal, while a read that named a durable record carries no workspace
+    // extent even though the unified read facade declares a File capability.
+    // When the original input cannot be resolved the declared capability face
+    // still decides, and that fallback is the stricter legacy judgment.
+    let declared_workspace_face = descriptor
+        .scopes
+        .iter()
+        .any(|scope| scope.resource == harness_contract::policy::PermissionResource::File);
+    let read_a_workspace_path = match original_input {
+        Some(input) => match original_read_target(input)? {
+            Some(target) => target,
+            None => declared_workspace_face,
+        },
+        None => declared_workspace_face,
+    };
+    if read_a_workspace_path {
         return Ok(false);
     }
     if primary.payload["outcome"]["status"] != "executed"
@@ -4488,7 +5254,7 @@ pub(super) fn original_material_scope(
     store: &std::sync::Arc<RuntimeEventStore>,
     event: &crate::DurableRuntimeEvent,
     sources: &mut std::collections::BTreeMap<String, u64>,
-) -> Result<Option<harness_contract::goal::ProofEffectScope>, String> {
+) -> Result<Option<harness_contract::goal::ProofEffectScope>, super::results::ReviewEvidenceError> {
     if event.kind == "tool.invocation.completed" {
         let session = event.stream_id.clone();
         let events = super::results::result_source_events(store, &session, sources)?;
@@ -4496,7 +5262,11 @@ pub(super) fn original_material_scope(
             .ok_or("physical material lacks its original governed plan")?;
         let primary = super::results::original_tool_primary(store, event, task, sources)?;
         let descriptor = super::results::receipt_effect_descriptor(&primary)?;
-        if immutable_receipt_without_workspace_extent(&primary, &descriptor)? {
+        if immutable_receipt_without_workspace_extent(
+            &primary,
+            &descriptor,
+            Some(&task["normalized_input"]),
+        )? {
             return Ok(None);
         }
         if !primary.payload[crate::context_evidence::READ_ACQUISITION_FIELD].is_null() {
@@ -4504,7 +5274,7 @@ pub(super) fn original_material_scope(
                 &primary.payload[crate::context_evidence::READ_ACQUISITION_FIELD],
             )
             .map_err(str::to_string)?;
-            return read_original_scope(&primary, &descriptor, &seal);
+            return Ok(read_original_scope(&primary, &descriptor, &seal)?);
         }
         if primary.payload["resolved_effect_scope"].is_null()
             && descriptor.effect_kind == ToolEffectKind::Read
@@ -4523,7 +5293,8 @@ pub(super) fn original_material_scope(
             &primary.payload["resolved_effect_scope"],
             &descriptor,
         )
-        .map(Some);
+        .map(Some)
+        .map_err(Into::into);
     }
     let key = event.payload["idempotency_key"]
         .as_str()
@@ -4544,7 +5315,10 @@ pub(super) fn original_material_scope(
         return Err("physical material primary/index disagree".into());
     }
     let descriptor = super::results::receipt_effect_descriptor(&primary)?;
-    if immutable_receipt_without_workspace_extent(&primary, &descriptor)? {
+    // This branch reaches the primary through the agent receipt stream and
+    // holds no plan task, so the original input cannot be resolved here: the
+    // declared capability face decides, which is the stricter judgment.
+    if immutable_receipt_without_workspace_extent(&primary, &descriptor, None)? {
         return Ok(None);
     }
     if primary.payload["resolved_effect_scope"].is_null() {
@@ -4552,13 +5326,26 @@ pub(super) fn original_material_scope(
             &primary.payload[crate::context_evidence::READ_ACQUISITION_FIELD],
         )
         .map_err(str::to_string)?;
-        return read_original_scope(&primary, &descriptor, &seal);
+        return Ok(read_original_scope(&primary, &descriptor, &seal)?);
     }
     super::results::require_original_effect_scope(
         &primary.payload["resolved_effect_scope"],
         &descriptor,
     )
     .map(Some)
+    .map_err(Into::into)
+}
+
+fn require_discovered_graph_genesis(
+    store: &RuntimeEventStore,
+    graph_id: &str,
+    discovery_cursor: u64,
+) -> Result<(), String> {
+    let genesis = store.list_stream_after(graph_id, 0, 1, 1, 4 * 1024 * 1024)?;
+    if genesis.first().is_none_or(|event| event.commit_cursor > discovery_cursor) {
+        return Err("proof physical lineage changed during discovery; retry current inputs".into());
+    }
+    Ok(())
 }
 
 /// Build a proof snapshot as a RECORD: no live action, so no exemption is
@@ -4570,7 +5357,8 @@ pub(crate) fn proof_input_snapshot(
     proof: &harness_contract::goal::ObjectiveReviewVerification,
     readers: super::ResultContentReaders<'_>,
 ) -> Result<ProofInputSnapshot, String> {
-    proof_input_snapshot_for_phase(store, program, goal, proof, None, readers, None)
+    proof_input_snapshot_for_phase(store, program, goal, proof, None, readers, None, None)
+        .map_err(|error| error.to_string())
 }
 
 /// Build a proof snapshot against the LIVE action being applied.
@@ -4581,8 +5369,308 @@ pub(crate) fn proof_input_snapshot_for_action(
     proof: &harness_contract::goal::ObjectiveReviewVerification,
     readers: super::ResultContentReaders<'_>,
     current_review: Option<super::current_review::ReviewActionIdentity<'_>>,
-) -> Result<ProofInputSnapshot, String> {
-    proof_input_snapshot_for_phase(store, program, goal, proof, None, readers, current_review)
+) -> Result<ProofInputSnapshot, super::results::ReviewEvidenceError> {
+    proof_input_snapshot_for_phase(store, program, goal, proof, None, readers, current_review, None)
+}
+
+/// What one receipt's outcome says about the required write it settles.
+///
+/// The set is closed: the two statuses the existing settled rule owns, the
+/// one this review settles as a terminal failure, and nothing else. A status
+/// outside the set is named, never guessed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OutcomeClass {
+    /// The write succeeded, or was blocked before it ran.
+    Succeeded,
+    /// The write ran and failed.
+    Failed,
+    /// There is no receipt yet: the write is still in flight.
+    InFlight,
+}
+
+fn terminal_outcome_class(status: Option<&str>) -> Result<OutcomeClass, String> {
+    match status {
+        Some("executed" | "blocked_permission") => Ok(OutcomeClass::Succeeded),
+        Some("failed") => Ok(OutcomeClass::Failed),
+        Some(status) => Err(format!("outcome status {status} is not one this review can read")),
+        None => Ok(OutcomeClass::InFlight),
+    }
+}
+
+/// Whether one call carries the durable fact of its own refusal.
+///
+/// The twin is written by the writer that refused the call, on that call's
+/// own effect stream, in one transaction with the program event it names.
+/// It is read the way the consumer reads it: the twin names the program
+/// event, the two share one transaction and one commit cursor, and the
+/// receipt names both.
+///
+/// A single call's twin is addressed by the call's own effect key. A batch
+/// member's twin lives on the batch's outer effect stream and is addressed
+/// by that outer key, because the member's own key names no member index
+/// there.
+fn refused_call_is_settled(
+    store: &std::sync::Arc<RuntimeEventStore>,
+    key: &str,
+    sources: &mut std::collections::BTreeMap<String, u64>,
+) -> Result<TerminalFactRead, super::results::ReviewEvidenceError> {
+    let mut candidates = vec![(key.to_string(), format!("agentic-single:{key}"))];
+    if let Some((outer, index)) = member_outer_and_index(key) {
+        candidates.push((outer, format!("agentic-member:{index}")));
+    }
+    for (stream_key, idempotency_key) in candidates {
+        let stream = format!("execution-effect:{}", stream_key);
+        super::results::pin_result_source(store, &stream, sources)
+            .map_err(|error| error.with_prefix("refusal twin source read failed: "))?;
+        // A read that fails is not a miss: it is named, and the caller keeps
+        // the call pending. Only a stream that holds no twin is a miss.
+        let Some(twin) = store
+            .event_by_idempotency_key(&stream, &idempotency_key)
+            .map_err(|error| format!("refusal twin read failed: {error}"))?
+        else {
+            continue;
+        };
+        if twin.kind != "agentic.batch_member.index"
+            || twin.scope != RuntimeEventScope::ExecutionNode
+            || twin.actor.as_deref() != Some("runtime.agentic_action")
+            || twin.status.as_deref() != Some("committed")
+            || twin.schema_version != 1
+            || twin.payload["outer_key"] != stream_key
+            || twin.payload["program_event_kind"] != "agentic.completion_rejected"
+        {
+            return Ok(TerminalFactRead::Unprovable(format!(
+                "refusal twin on {stream} does not have the refusal shape"
+            )));
+        }
+        // A member's twin is read through its batch's outer key, so the
+        // member it stands for has to be checked here: the member ordinal in
+        // this intent's own key, and the member identity the twin names.
+        if let Some((_, index)) = member_outer_and_index(key) {
+            // The member index is read, not guessed: a value this review
+            // cannot read is named, and never read as "another member".
+            let member_index = match twin.payload["member_index"].as_u64() {
+                Some(value) => value.to_string(),
+                None => {
+                    return Ok(TerminalFactRead::Unprovable(format!(
+                        "refusal twin on {stream} names no member index"
+                    )));
+                }
+            };
+            if member_index != index
+                || twin.payload["member_identity"]
+                    .as_str()
+                    .filter(|identity| !identity.is_empty())
+                    .is_none()
+            {
+                return Ok(TerminalFactRead::Unprovable(format!(
+                    "refusal twin on {stream} stands for another member than this intent"
+                )));
+            }
+        }
+        let Some(program_stream) = twin.payload["program_stream"].as_str() else {
+            return Ok(TerminalFactRead::Unprovable(
+                "refusal twin names no program event stream".into(),
+            ));
+        };
+        let Some(program_key) = twin.payload["program_event_key"].as_str() else {
+            return Ok(TerminalFactRead::Unprovable(
+                "refusal twin names no program event key".into(),
+            ));
+        };
+        let Some(program) = store
+            .event_by_idempotency_key(program_stream, program_key)
+            .map_err(|error| format!("refusal program event read failed: {error}"))?
+        else {
+            return Ok(TerminalFactRead::Unprovable(
+                "refusal twin names a program event that is not there".into(),
+            ));
+        };
+        if program.kind != "agentic.completion_rejected"
+            || program.scope != RuntimeEventScope::Program
+            || program.status.as_deref() != Some("rejected")
+            || program.schema_version != 1
+            || program.transaction_id != twin.transaction_id
+            || program.commit_cursor != twin.commit_cursor
+        {
+            return Ok(TerminalFactRead::Unprovable(
+                "refusal twin and its program event are not one transaction".into(),
+            ));
+        }
+        let Some(receipt) = store
+            .original_transaction_receipt(&twin.transaction_id)
+            .map_err(|error| format!("refusal transaction receipt read failed: {error}"))?
+        else {
+            return Ok(TerminalFactRead::Unprovable(
+                "refusal twin has no transaction receipt".into(),
+            ));
+        };
+        if !receipt.event_ids.contains(&twin.event_id)
+            || !receipt.event_ids.contains(&program.event_id)
+        {
+            return Ok(TerminalFactRead::Unprovable(
+                "refusal transaction receipt does not name both events".into(),
+            ));
+        }
+        return Ok(TerminalFactRead::Found {
+            cursor: twin.commit_cursor,
+        });
+    }
+    Ok(TerminalFactRead::NotFound)
+}
+
+/// What one candidate family says about a call's terminal fact.
+///
+/// `NotFound` is "this family holds nothing here"; `Unprovable` is "this
+/// family holds something that cannot be read as the fact". The two are
+/// never the same: only `Found` may settle a call, and `Unprovable` keeps
+/// the call pending under a named reason.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TerminalFactRead {
+    NotFound,
+    Unprovable(String),
+    Found { cursor: u64 },
+}
+
+/// A batch member's own key names its batch's outer key and its member
+/// index: `{outer}:{index}`. The index is the trailing number, so the
+/// outer key is everything before the last colon.
+fn member_outer_and_index(key: &str) -> Option<(String, String)> {
+    let (outer, index) = key.rsplit_once(':')?;
+    if index.is_empty() || !index.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    Some((outer.to_string(), index.to_string()))
+}
+
+/// How one required write's own durable facts answer whether it is settled.
+///
+/// Two families can answer it, and they answer different questions: a
+/// refusal twin says the call was refused before it took effect, a terminal
+/// receipt says the call ran and failed. When both are present for the same
+/// call, the facts contradict each other, and the contradiction is named -
+/// neither fact is used to settle the call, and neither is silently
+/// preferred.
+///
+/// This is the decision the review makes for one required write, lifted out
+/// of the collection so that it can be read - and witnessed - on its own.
+enum RequiredWriteSettlement {
+    /// The call was refused before it took effect: its refusal twin is the
+    /// terminal fact, and the review settles the call on it.
+    Refused { cursor: u64 },
+    /// The call ran and failed. The named failure carries it: never a
+    /// satisfied requirement, and never an effect that did not happen.
+    Failed { failure: serde_json::Value },
+    /// The call is still pending: nothing terminal settles it.
+    Pending,
+    /// The refusal fact cannot be read as this call's fact.
+    UnreadableRefusal { reason: String },
+    /// The two terminal facts contradict each other for the same call.
+    Contradiction {
+        refusal_cursor: Option<u64>,
+        receipt_cursor: Option<u64>,
+    },
+    /// A terminal failure has no receipt to name.
+    MissingReceipt,
+}
+
+/// Decide one required write's fate from its own durable facts.
+///
+/// The decision set is exactly the one the review has always made: a
+/// terminal receipt settles a call that ran, a refusal twin settles a call
+/// that was refused before it took effect, a call that ran and failed is
+/// carried as its own named failure, and a call with no terminal fact stays
+/// pending. Nothing here widens what settles a write: a call whose refusal
+/// fact cannot be read stays pending under a name, and a refusal fact and a
+/// terminal receipt for the same call contradict each other.
+fn required_write_settlement(
+    store: &std::sync::Arc<RuntimeEventStore>,
+    identity: &str,
+    intent_payload: &serde_json::Value,
+    receipt: Option<(&serde_json::Value, u64)>,
+    terminally_failed: bool,
+    sources: &mut std::collections::BTreeMap<String, u64>,
+) -> Result<RequiredWriteSettlement, super::results::ReviewEvidenceError> {
+    let candidate = required_write_settlement_candidate(
+        store, identity, intent_payload, receipt, terminally_failed, sources,
+    )?;
+    use crate::agentic::fact_admission::StrategyOutcome;
+    use harness_contract::refusal_codes::{FactAdmissionCode, FactAdmissionStrategy};
+    let outcome = match &candidate {
+        RequiredWriteSettlement::Refused { .. } => StrategyOutcome::admitted(FactAdmissionStrategy::SettledRefusal),
+        RequiredWriteSettlement::Pending => StrategyOutcome::missing(FactAdmissionStrategy::SettledRefusal, "no original refusal twin"),
+        RequiredWriteSettlement::Failed { .. } => StrategyOutcome::missing(FactAdmissionStrategy::SettledRefusal, "the original call failed"),
+        RequiredWriteSettlement::UnreadableRefusal { .. } => StrategyOutcome::missing(FactAdmissionStrategy::SettledRefusal, "the refusal twin is unreadable"),
+        RequiredWriteSettlement::Contradiction { .. } => StrategyOutcome::missing(FactAdmissionStrategy::SettledRefusal, "terminal facts contradict"),
+        RequiredWriteSettlement::MissingReceipt => StrategyOutcome::missing(FactAdmissionStrategy::SettledRefusal, "the failed call has no receipt"),
+    };
+    let decision = crate::agentic::fact_admission::admit(
+        &[outcome], FactAdmissionCode::Unproven, "original required write refusal is unproven",
+    );
+    match (&candidate, decision.code) {
+        (RequiredWriteSettlement::Refused { .. }, FactAdmissionCode::Admitted) => Ok(candidate),
+        (RequiredWriteSettlement::Refused { .. }, _) => Err(decision.refusal_message().into()),
+        (_, FactAdmissionCode::Admitted) => Err("non-refusal write was incorrectly admitted as a refusal".into()),
+        // Missing refusal is not an error by itself: preserve the original
+        // pending, failed, unreadable and contradictory settlement states.
+        _ => Ok(candidate),
+    }
+}
+
+fn required_write_settlement_candidate(
+    store: &std::sync::Arc<RuntimeEventStore>,
+    identity: &str,
+    intent_payload: &serde_json::Value,
+    receipt: Option<(&serde_json::Value, u64)>,
+    terminally_failed: bool,
+    sources: &mut std::collections::BTreeMap<String, u64>,
+) -> Result<RequiredWriteSettlement, super::results::ReviewEvidenceError> {
+    let refusal_cursor = match refused_call_is_settled(store, identity, sources)? {
+        TerminalFactRead::Found { cursor } => Some(cursor),
+        // Nothing here: this family does not speak for the call. The call
+        // stays pending, as it was.
+        TerminalFactRead::NotFound => None,
+        // Something here that cannot be read as the fact: the call stays
+        // pending under a named reason, and it is never treated as if it
+        // needed no handling.
+        TerminalFactRead::Unprovable(reason) => {
+            return Ok(RequiredWriteSettlement::UnreadableRefusal { reason });
+        }
+    };
+    if refusal_cursor.is_some() && terminally_failed {
+        return Ok(RequiredWriteSettlement::Contradiction {
+            refusal_cursor,
+            receipt_cursor: receipt.map(|(_, cursor)| cursor),
+        });
+    }
+    if terminally_failed {
+        // The conclusion is this required write's own named failure: it ran
+        // and it failed. It is recorded as such - never as a satisfied
+        // requirement, and never as an effect that did not happen.
+        let Some((receipt_payload, receipt_cursor)) = receipt else {
+            return Ok(RequiredWriteSettlement::MissingReceipt);
+        };
+        return Ok(RequiredWriteSettlement::Failed {
+            failure: serde_json::json!({
+                "grade": "required_write_terminally_failed",
+                "effect_key": identity,
+                "tool_use_id": intent_payload["tool_use_id"],
+                "tool_name": intent_payload["tool_name"],
+                "failure_class": "terminal_failure",
+                "error": receipt_payload["outcome"]["error"],
+                "receipt_cursor": receipt_cursor,
+            }),
+        });
+    }
+    // E-s: a call that was admitted and then refused leaves a durable twin
+    // on its own effect stream, written in one transaction with the program
+    // event that names it. That twin is the call's terminal fact, so the
+    // review settles the call as refused instead of waiting for a receipt
+    // that will never come. Only the call that carries its own twin is
+    // settled: no other admitted write is.
+    if let Some(cursor) = refusal_cursor {
+        return Ok(RequiredWriteSettlement::Refused { cursor });
+    }
+    Ok(RequiredWriteSettlement::Pending)
 }
 
 fn proof_input_snapshot_for_phase(
@@ -4593,7 +5681,13 @@ fn proof_input_snapshot_for_phase(
     accepted_policy_digest: Option<&str>,
     readers: super::ResultContentReaders<'_>,
     current_review: Option<super::current_review::ReviewActionIdentity<'_>>,
-) -> Result<ProofInputSnapshot, String> {
+    pre_tail: Option<&HistoricalSessionCut>,
+) -> Result<ProofInputSnapshot, super::results::ReviewEvidenceError> {
+    // The named failures this review settles: each required write that ran
+    // and failed, with the facts that name it. They are carried to the
+    // review's conclusion; they are never a satisfied requirement and never
+    // an effect that did not happen.
+    let mut terminal_failures: Vec<serde_json::Value> = Vec::new();
     let inputs = proof.input_set.as_ref().ok_or("missing v2 proof inputs")?;
     if inputs.version != 2 {
         return Err("unsupported ProofInputSet version".into());
@@ -4673,7 +5767,7 @@ fn proof_input_snapshot_for_phase(
             return Err(format!(
                 "proof Program source changed; retry current inputs; {}",
                 super::describe_source_advance(store, &program_source, pinned)
-            ));
+            ).into());
         }
     }
     sources.insert(program_source, program_revision);
@@ -4751,12 +5845,13 @@ fn proof_input_snapshot_for_phase(
             .commit_cursor;
         start_cursor = start_cursor.min(cursor);
     }
-    let session_events = pinned_stream_events(
+    let session_events = pinned_stream_events_with_cut(
         store,
         &session,
         &mut sources,
         start_cursor,
         PinnedEventProjection::EffectsAndPlans,
+        pre_tail,
     )?;
     let strategy = session_events.iter().find(|event| {
         event.kind.starts_with("runtime.strategy.")
@@ -4861,15 +5956,7 @@ fn proof_input_snapshot_for_phase(
         if !visited.insert(graph_id.clone()) {
             continue;
         }
-        let genesis = store.list_stream_after(&graph_id, 0, 1, 1, 4 * 1024 * 1024)?;
-        if genesis
-            .first()
-            .is_none_or(|event| event.commit_cursor > discovery_cursor)
-        {
-            return Err(
-                "proof physical lineage changed during discovery; retry current inputs".into(),
-            );
-        }
+        require_discovered_graph_genesis(store, &graph_id, discovery_cursor)?;
         let graph = graphs.load(&graph_id).map_err(|error| error.to_string())?;
         if graph
             .lineage
@@ -5519,6 +6606,10 @@ fn proof_input_snapshot_for_phase(
     // cannot borrow the review's exemption. Keep the current revision in the
     // original CAS even when this exact retirement has no semantic effect.
     let mut absorbed_graph_sources = std::collections::BTreeMap::new();
+    // Graph continuations can be planned after the review's material cut.
+    // Keep those original plan records separate from proof material; only the
+    // graph owner authenticates a plan selected by a continuation node.
+    let mut graph_plan_events = None;
     for (source, pinned) in &inputs.source_revisions {
         if !visited.contains(source) {
             continue;
@@ -5533,17 +6624,27 @@ fn proof_input_snapshot_for_phase(
             .as_ref()
             .is_none_or(|packet| packet.graph_id() != source)
         {
+            if graph_plan_events.is_none() {
+                let mut plans = session_events.clone();
+                if let Some(cut) = pre_tail {
+                    let later = crate::execution_core::goal::assessment::read_bounded_event_tail(
+                        store, &cut.source.stream_id, cut.source.expected_revision, cut.observed_revision,
+                    ).map_err(|error| error.to_string())?;
+                    plans.extend(later.into_iter().filter(|event| event.kind == "tool.execution_plan.created"));
+                }
+                graph_plan_events = Some(plans);
+            }
             if !super::current_review::graph_tail_preserves_work(
                 store,
                 source,
                 *pinned,
                 current,
-                &session_events,
+                graph_plan_events.as_deref().expect("graph plan view initialized"),
             )? {
                 return Err(format!(
                     "proof foreign graph work changed; {}",
                     super::describe_source_advance(store, source, *pinned)
-                ));
+                ).into());
             }
             // Parent model/ToolBatch continuations are execution trace. Their
             // real effects and immutable material are checked below; a raw
@@ -5570,7 +6671,7 @@ fn proof_input_snapshot_for_phase(
             return Err(format!(
                 "proof graph source changed outside its own review retirement; {}",
                 super::describe_source_advance(store, source, *pinned)
-            ));
+            ).into());
         }
         absorbed_graph_sources.insert(source.clone(), *pinned);
     }
@@ -5643,6 +6744,7 @@ fn proof_input_snapshot_for_phase(
             Some(&inputs.source_revisions),
             readers,
             !inputs.semantic_digest.is_empty(),
+            pre_tail,
         )?;
         if metadata.kind != read.result_kind {
             return Err(
@@ -5725,12 +6827,13 @@ fn proof_input_snapshot_for_phase(
                         .into(),
                 );
             }
-            let acquired = primary_producer_immutable_inputs(
+            let acquired = primary_producer_immutable_inputs_with_tail(
                 store,
                 program,
                 &metadata.producers,
                 readers,
                 Some(&inputs.source_revisions),
+                pre_tail,
             )?;
             require_actual_materials(&acquired.material_events, &inputs.material_events)?;
             for (source, revision) in acquired.sources {
@@ -5791,6 +6894,7 @@ fn proof_input_snapshot_for_phase(
                     Some(&inputs.source_revisions),
                     readers,
                     !inputs.semantic_digest.is_empty(),
+                    pre_tail,
                 )?;
                 input.validate_dependency(program, &reference, &recovered)?;
                 recovered.origin.require_strong()?;
@@ -5891,6 +6995,7 @@ fn proof_input_snapshot_for_phase(
             Some(&inputs.source_revisions),
             readers,
             !inputs.semantic_digest.is_empty(),
+            pre_tail,
         )?;
         pending_metadata.push((reference, metadata));
     }
@@ -5925,6 +7030,7 @@ fn proof_input_snapshot_for_phase(
         readers,
         Some(&inputs.source_revisions),
         !inputs.semantic_digest.is_empty(),
+        pre_tail,
     )?;
     if !inputs.required_scope_complete || actual.required_scopes() != inputs.required_scopes {
         return Err(
@@ -5957,13 +7063,19 @@ fn proof_input_snapshot_for_phase(
         let current = store
             .stream_revision(source)
             .map_err(|error| error.to_string())?;
-        if current != *revision && absorbed_graph_sources.get(source) != Some(revision) {
+        let authenticated_session_growth = pre_tail.is_some_and(|tail|
+            tail.source.stream_id == *source && tail.source.expected_revision == *revision
+                && tail.observed_revision == current);
+        if current != *revision && absorbed_graph_sources.get(source) != Some(revision)
+            && !authenticated_session_growth {
             return Err("proof external decision source changed".into());
         }
-        sources.insert(source.clone(), current);
+        if sources.insert(source.clone(), current).is_some_and(|previous| previous != current) {
+            return Err("proof source changed during validation; retry current inputs".into());
+        }
     }
     if !physical_unknown.is_empty() {
-        return Err(format!("effect_review_pending: opaque Process history may intersect required work: {physical_unknown:?}"));
+        return Err(format!("effect_review_pending: opaque Process history may intersect required work: {physical_unknown:?}").into());
     }
     let mut required_effects = std::collections::BTreeMap::new();
     required_effects.insert(
@@ -6086,6 +7198,37 @@ fn proof_input_snapshot_for_phase(
                     Some("executed" | "blocked_permission")
                 )
             });
+            // The status table is one closed set, and the same outcome status
+            // is never answered differently in two places: `executed` and
+            // `blocked_permission` belong to the existing settled rule,
+            // `failed` belongs to this arm, and any other status is named
+            // rather than guessed.
+            let terminally_failed = match terminal_outcome_class(
+                receipts
+                    .get(identity)
+                    .and_then(|receipt| receipt.payload["outcome"]["status"].as_str()),
+            ) {
+                Ok(class) => match class {
+                    // The existing settled rule owns these two.
+                    OutcomeClass::Succeeded => false,
+                    // A call that ran and failed is terminal too: the
+                    // authenticator above has proved that this receipt
+                    // settles this very intent. Such a write is not
+                    // satisfied - it failed - but it is no longer pending,
+                    // so the review must not wait for a receipt that will
+                    // never come.
+                    OutcomeClass::Failed => settled_descriptor.is_some(),
+                    // No receipt at all: the call is still in flight.
+                    OutcomeClass::InFlight => false,
+                },
+                // A receipt whose status this review cannot read is not a
+                // miss and not a failure: it stays pending under a name.
+                Err(reason) => {
+                    return Err(format!(
+                        "effect_review_pending: required write outcome status is not one this review can read; source={source} identity={identity} reason={reason}",
+                    ).into());
+                }
+            };
             // The exemption is the reviewer's OWN admitted call: the intent
             // has to be the one Runtime admitted for THIS graph, node and
             // attempt. The receipt index stream names all three, so an intent
@@ -6119,12 +7262,65 @@ fn proof_input_snapshot_for_phase(
                     continue;
                 }
                 ReviewWriteOutcome::Blocked => {
-                    return Err(format!(
-                        "effect_review_pending: unknown required or possibly intersecting delegated write; source={source} identity={identity} tool={} required={required} disjoint={disjoint} receipt_present={} current_review={:?}",
-                        intent.payload["tool_name"].as_str().unwrap_or("unknown"),
-                        receipts.contains_key(identity),
-                        current_review_effect_key,
-                    ));
+                    // Two terminal facts can answer this call, and they answer
+                    // different questions: a refusal twin says the call was
+                    // refused before it took effect, a terminal receipt says
+                    // the call ran and failed. The decision is the one the
+                    // review has always made, read here from the call's own
+                    // durable facts.
+                    let receipt = receipts.get(identity);
+                    let settlement = required_write_settlement(
+                        store,
+                        identity,
+                        &intent.payload,
+                        receipt.map(|receipt| (&receipt.payload, receipt.commit_cursor)),
+                        terminally_failed,
+                        &mut sources,
+                    )?;
+                    match settlement {
+                        RequiredWriteSettlement::Refused { .. } => {
+                            // The call carries its own refusal twin: it was
+                            // refused before it took effect, so it is settled.
+                            continue;
+                        }
+                        RequiredWriteSettlement::Failed { failure } => {
+                            // The named failure: this required write ran and
+                            // it failed. It is carried, never counted as
+                            // satisfied and never as an effect that did not
+                            // happen.
+                            terminal_failures.push(failure);
+                            continue;
+                        }
+                        RequiredWriteSettlement::UnreadableRefusal { reason } => {
+                            return Err(format!(
+                                "effect_review_pending: required write refusal fact is not readable; source={source} identity={identity} reason={reason}",
+                            ).into());
+                        }
+                        RequiredWriteSettlement::Contradiction {
+                            refusal_cursor,
+                            receipt_cursor,
+                        } => {
+                            return Err(format!(
+                                "effect_review_pending: refused and terminally failed facts contradict for the same call; effect_key={identity} intent_transaction={} refusal_cursor={:?} receipt_cursor={:?}",
+                                intent.transaction_id,
+                                refusal_cursor,
+                                receipt_cursor,
+                            ).into());
+                        }
+                        RequiredWriteSettlement::MissingReceipt => {
+                            return Err(format!(
+                                "effect_review_pending: required write failure has no receipt to name; source={source} identity={identity}",
+                            ).into());
+                        }
+                        RequiredWriteSettlement::Pending => {
+                            return Err(format!(
+                                "effect_review_pending: unknown required or possibly intersecting delegated write; source={source} identity={identity} tool={} required={required} disjoint={disjoint} receipt_present={} current_review={:?}",
+                                intent.payload["tool_name"].as_str().unwrap_or("unknown"),
+                                receipts.contains_key(identity),
+                                current_review_effect_key,
+                            ).into());
+                        }
+                    }
                 }
                 ReviewWriteOutcome::Settled => {}
             }
@@ -6310,7 +7506,7 @@ fn proof_input_snapshot_for_phase(
         if !pending.is_empty() {
             return Err(format!(
                 "effect_review_pending: root writes must settle before acceptance; pending={pending:?}; terminal={completed:?}",
-            ));
+            ).into());
         }
     }
     #[cfg(test)]
@@ -6373,13 +7569,13 @@ fn proof_input_snapshot_for_phase(
                 return Err(format!(
                     "proof_actual_input_stale_before_use: {} acquisition={} consumer={} write={cursor}",
                     target.path.workspace_relative_path, dependency.acquisition_cursor, dependency.consumer_cursor,
-                ));
+                ).into());
             }
             if *cursor >= dependency.acquisition_cursor && *cursor >= read_cursor {
                 return Err(format!(
                     "review_requires_effect_observation: {} original_acquisition={} complete_reviewer_read={read_cursor} write={cursor}",
                     target.path.workspace_relative_path, dependency.acquisition_cursor,
-                ));
+                ).into());
             }
         }
     }
@@ -6401,7 +7597,7 @@ fn proof_input_snapshot_for_phase(
             return Err(format!(
                 "review_requires_effect_observation: business output {} needs a complete later independent File read",
                 target.path.workspace_relative_path,
-            ));
+            ).into());
         }
     }
     strip_authenticated_runtime_control_effects(
@@ -6428,7 +7624,7 @@ fn proof_input_snapshot_for_phase(
             return Err(format!(
                 "proof source changed during validation; retry current inputs; source={source} expected={revision} actual={actual_revision} phase=final_source_fence; {}",
                 super::describe_source_advance(store, source, *revision)
-            ));
+            ).into());
         }
     }
     let session_revision = *sources
@@ -6441,11 +7637,22 @@ fn proof_input_snapshot_for_phase(
             expected_revision,
         })
         .collect::<Vec<_>>();
+    let dependency_frame = ConclusionMaterialDependencies {
+        session_source: ExpectedStreamRevision { stream_id: session.clone(), expected_revision: session_revision },
+        historical_session_cut: inputs.source_revisions.get(&session).copied(),
+        session_id: program.session_id.clone(), turn_id: program.turn_id.clone(),
+        review_targets,
+        file_dependencies: actual.file_dependencies.clone(),
+        immutable_inputs: actual.immutable_inputs.clone(),
+        material_events: actual.material_events.clone(),
+        canonical_facts: actual.canonical_facts.clone(),
+    };
     Ok(ProofInputSnapshot {
         work_digest,
         task_refs,
         artifact_refs,
         reviewer_execution_refs,
+        reviewer_packet: reviewer_delivery_packet.clone(),
         retiring_optional_task_refs: candidates
             .into_iter()
             .filter(|task| {
@@ -6465,6 +7672,9 @@ fn proof_input_snapshot_for_phase(
         },
         sources,
         current_review_effect_key,
+        terminal_failures,
+        dependency_frame,
+        pre_authenticated_session_source: pre_tail.map(|tail| tail.source.clone()),
     })
 }
 
@@ -6474,10 +7684,10 @@ fn authenticated_delegated_plan_settled(
     events: &[crate::DurableRuntimeEvent],
     packet: &harness_contract::agent::AgentTaskPacket,
     sources: &mut std::collections::BTreeMap<String, u64>,
-) -> Result<Option<std::collections::BTreeMap<String, serde_json::Value>>, String> {
+) -> Result<Option<std::collections::BTreeMap<String, serde_json::Value>>, super::results::ReviewEvidenceError> {
     if plan.actor.as_deref() != Some("conversation_runtime")
         || plan.schema_version != 1
-        || plan.scope != crate::RuntimeEventScope::Tool
+        || plan.scope != RuntimeEventScope::Tool
         || plan.status.as_deref() != Some("planned")
         || plan.stream_id != format!("session:{}", packet.session_id())
     {
@@ -6512,7 +7722,7 @@ fn authenticated_delegated_plan_settled(
                 .map_err(|_| "delegated callback plan lacks its original Step")?;
         if terminal.actor.as_deref() != Some("conversation_runtime")
             || terminal.schema_version != 1
-            || terminal.scope != crate::RuntimeEventScope::Tool
+            || terminal.scope != RuntimeEventScope::Tool
             || terminal.status.as_deref() != Some("completed")
             || terminal.stream_id != plan.stream_id
             || terminal.commit_cursor < plan.commit_cursor
@@ -6828,7 +8038,7 @@ pub(crate) fn effect_review_snapshot(
     program: &AgenticProgramProjection,
     goal: Option<&GoalContract>,
     effect_sources: &[String],
-) -> Result<RootReviewPolicySnapshot, String> {
+) -> Result<RootReviewPolicySnapshot, super::results::ReviewEvidenceError> {
     let stream_id = format!("session:{}", program.session_id);
     // A review that cites delegated effect sources is scoped to those streams.
     // The root Session stream is written by active coordinators and is not part
@@ -7135,7 +8345,7 @@ mod tests {
         let store = RuntimeEventStore::for_test();
         let plan = |tool_name: &str, effect_kind: &str| crate::RuntimeEventInput {
             stream_id: "session:review-control-plan".into(),
-            scope: crate::RuntimeEventScope::Session,
+            scope: RuntimeEventScope::Session,
             kind: "tool.execution_plan.created".into(),
             status: Some("planned".into()),
             actor: Some("conversation_runtime".into()),
@@ -7271,7 +8481,7 @@ mod tests {
             event_id: "plan-event".into(),
             stream_id: "session:delegated".into(),
             sequence: 4,
-            scope: crate::RuntimeEventScope::Tool,
+            scope: RuntimeEventScope::Tool,
             kind: "tool.execution_plan.created".into(),
             status: Some("planned".into()),
             actor: Some("conversation_runtime".into()),
@@ -7431,6 +8641,1789 @@ mod tests {
         ));
     }
     #[test]
+    fn physical_lineage_genesis_arriving_after_discovery_requires_fresh_cut() {
+        use harness_contract::execution_graph::{ExecutionGraph, ExecutionGraphLineage};
+        let store = std::sync::Arc::new(RuntimeEventStore::for_test());
+        let graph_id = "late-discovered-graph";
+        let cut = store.durable_commit_cursor().unwrap();
+        let writer = std::sync::Arc::clone(&store);
+        store.inject_read_fault_once(graph_id.into(), "list_stream_after", 1, move |_| {
+            let mut graph = ExecutionGraph::new("late graph at discovery boundary");
+            graph.id = graph_id.into();
+            graph.lineage = Some(ExecutionGraphLineage {
+                session_id: "lineage-session".into(), turn_id: "lineage-turn".into(),
+                root_task_id: "lineage-root".into(), task_id: "lineage-task".into(), generation: 1,
+            });
+            crate::ExecutionCommitService::new(writer).register_graph(graph).unwrap();
+        });
+        let error = require_discovered_graph_genesis(&store, graph_id, cut).unwrap_err();
+        assert_eq!(error, "proof physical lineage changed during discovery; retry current inputs");
+        let fresh_cut = store.durable_commit_cursor().unwrap();
+        assert!(fresh_cut > cut);
+        require_discovered_graph_genesis(&store, graph_id, fresh_cut)
+            .expect("the same durable genesis is visible at a fresh discovery cut");
+    }
+
+    #[test]
+    fn pinned_stream_rejects_final_page_boundary_race_then_reads_stable_cut() {
+        let store = RuntimeEventStore::for_test();
+        // A source the review itself judges: growth on it is the object under
+        // proof moving, so the fence stays an equality fence. The reviewed
+        // Session stream is a shared aggregate stream and is covered by
+        // `pinned_stream_accepts_shared_aggregate_growth_while_paging`.
+        let source = "agentic-program:actual-final-page-race";
+        let append = |store: &RuntimeEventStore| {
+            store.append(crate::RuntimeEventInput {
+                stream_id: source.into(), scope: RuntimeEventScope::Session,
+                kind: "test.source-advance".into(), status: None, actor: None,
+                refs: vec![], payload: serde_json::json!({}),
+            }).unwrap();
+        };
+        append(&store);
+        // The second revision read verifies the last non-empty page. Advance
+        // after it returns, so only the final page-boundary fence detects it.
+        store.inject_read_fault_once(source.into(), "stream_revision", 2, move |store| append(store));
+        let error = pinned_stream_events(
+            &store, source, &mut std::collections::BTreeMap::new(), 0,
+            PinnedEventProjection::Effects,
+        ).unwrap_err();
+        assert_eq!(error, "proof source changed at final page boundary; retry current inputs");
+        let mut stable_sources = std::collections::BTreeMap::new();
+        pinned_stream_events(&store, source, &mut stable_sources, 0, PinnedEventProjection::Effects)
+            .expect("a new read after the source stops advancing must succeed");
+        assert_eq!(stable_sources[source], 2);
+    }
+
+    #[test]
+    fn pinned_stream_rejects_real_paging_race_then_reads_stable_cut() {
+        let store = RuntimeEventStore::for_test();
+        // See `pinned_stream_rejects_final_page_boundary_race_then_reads_stable_cut`:
+        // a judged source keeps the equality fence.
+        let source = "agentic-program:actual-paging-race";
+        let append = |store: &RuntimeEventStore| {
+            store.append(crate::RuntimeEventInput {
+                stream_id: source.into(), scope: RuntimeEventScope::Session,
+                kind: "test.source-advance".into(), status: None, actor: None,
+                refs: vec![], payload: serde_json::json!({}),
+            }).unwrap();
+        };
+        append(&store);
+        store.inject_read_fault_once(source.into(), "list_stream_before", 1, move |store| append(store));
+        let error = pinned_stream_events(
+            &store, source, &mut std::collections::BTreeMap::new(), 0,
+            PinnedEventProjection::Effects,
+        ).unwrap_err();
+        assert_eq!(error, "proof source changed while paging; retry current inputs");
+        let mut stable_sources = std::collections::BTreeMap::new();
+        pinned_stream_events(&store, source, &mut stable_sources, 0, PinnedEventProjection::Effects)
+            .expect("a fresh read after the source stops advancing must succeed");
+        assert_eq!(stable_sources[source], 2);
+    }
+
+    /// A reader whose head is scripted, so a re-pin can observe a source that
+    /// grew or moved backwards without a concurrent writer.
+    struct ScriptedHead {
+        heads: std::collections::VecDeque<u64>,
+    }
+    impl super::super::read_source::ReadAuthSource for ScriptedHead {
+        fn stream_revision(&mut self, _: &str) -> Result<u64, String> {
+            Ok(self.heads.pop_front().expect("scripted head"))
+        }
+        fn event_by_idempotency_key(&mut self, _: &str, _: &str)
+            -> Result<Option<crate::DurableRuntimeEvent>, String> {
+            Ok(None)
+        }
+        fn list_stream_after(&mut self, _: &str, _: u64, _: u64, _: usize, _: usize)
+            -> Result<Vec<crate::DurableRuntimeEvent>, String> {
+            Ok(Vec::new())
+        }
+        fn transaction_stream_revision_exact(&mut self, _: &str, _: &str)
+            -> Result<Option<crate::CommittedStreamRevision>, String> {
+            Ok(None)
+        }
+        fn resolve_graph_record(&mut self, _: &crate::DurableRuntimeEvent)
+            -> Result<serde_json::Value, String> {
+            Ok(serde_json::Value::Null)
+        }
+    }
+
+    /// The re-pin judgment itself. Growth on a shared aggregate stream is
+    /// admissible; a head that moved backwards never is; and a source this
+    /// review judges keeps its equality fence.
+    #[test]
+    fn repin_admits_only_shared_aggregate_growth() {
+        let pin = |reader: &mut ScriptedHead,
+                   source: &str,
+                   cuts: &mut std::collections::BTreeMap<String, u64>| {
+            super::super::results::pin_result_source_with_reader(reader, source, cuts)
+        };
+        let mut session_cuts = std::collections::BTreeMap::new();
+        let mut grown_session = ScriptedHead { heads: [5_u64, 7].into() };
+        assert_eq!(pin(&mut grown_session, "session:one", &mut session_cuts).unwrap(), 5);
+        assert_eq!(pin(&mut grown_session, "session:one", &mut session_cuts).unwrap(), 7);
+        assert_eq!(session_cuts["session:one"], 7);
+
+        let mut lineage_cuts = std::collections::BTreeMap::new();
+        let mut grown_lineage = ScriptedHead { heads: [5_u64, 7].into() };
+        assert_eq!(pin(&mut grown_lineage, "execution-lineage:one", &mut lineage_cuts).unwrap(), 5);
+        assert_eq!(pin(&mut grown_lineage, "execution-lineage:one", &mut lineage_cuts).unwrap(), 7);
+        assert_eq!(lineage_cuts["execution-lineage:one"], 7);
+
+        let mut judged_cuts = std::collections::BTreeMap::new();
+        let mut grown_judged = ScriptedHead { heads: [5_u64, 7].into() };
+        pin(&mut grown_judged, "agentic-program:one", &mut judged_cuts).unwrap();
+        let drift = pin(&mut grown_judged, "agentic-program:one", &mut judged_cuts).unwrap_err();
+        // 032 K4b (A2): identity is the code, not the wording; the facts the
+        // old verbatim assertion pinned are still asserted individually.
+        assert_eq!(
+            super::super::reason_code::reason_code_of(&drift.to_string()),
+            Some(super::super::reason_code::ReviewRefusalCode::ResultSourceChangedDuringResolution),
+            "the drift refusal is named by its own code: {drift}"
+        );
+        assert!(
+            drift.contains("source=agentic-program:one expected=5 actual=7"),
+            "the projection still carries the window facts: {drift}"
+        );
+        assert!(
+            drift.contains("phase=result_source_pin"),
+            "the projection still carries its phase: {drift}"
+        );
+
+        let mut backwards_cuts = std::collections::BTreeMap::new();
+        let mut backwards = ScriptedHead { heads: [5_u64, 3].into() };
+        pin(&mut backwards, "session:one", &mut backwards_cuts).unwrap();
+        let error = pin(&mut backwards, "session:one", &mut backwards_cuts).unwrap_err();
+        assert!(error.contains("phase=result_source_pin"), "{error}");
+        assert!(error.contains("moved backwards"), "{error}");
+        assert!(error.contains("expected=5 actual=3"), "{error}");
+    }
+
+    /// G-c skeleton: the delegated member fixture, end to end at function
+    /// level. Asserts the member's read authenticates and carries the
+    /// original input the same target-identity predicate reads.
+    ///
+    /// The fixture is the mechanical part: a content-addressed child graph
+    /// holding the bound request, its lineage registration, and the
+    /// primary/index receipt pair on the streams the member path reads.
+    #[test]
+    fn g_c_member_read_end_to_end() {
+        let store = std::sync::Arc::new(crate::RuntimeEventStore::for_test());
+        let session = "gc-session";
+        let turn = "gc-turn";
+        let graph_id = "gc-graph";
+        let node_id = "gc-node";
+        let run_id = "run:gc-graph";
+        let worker = "gc-worker";
+        let principal = "gc-principal";
+        let call_id = "gc-call";
+        let step_id = "gc-step";
+
+        let mut packet = harness_contract::agent::AgentTaskPacket {
+            assignment: crate::test_support::agent_assignment(
+                None,
+                worker,
+                run_id,
+                "task:gc",
+                session,
+                "mission:gc",
+                Some("team:gc"),
+                graph_id,
+                node_id,
+            ),
+            attempt: 1,
+            expected_graph_revision: 1,
+            objective: "Read the durable record".into(),
+            required_acceptance: Default::default(),
+            output_acceptance: Vec::new(),
+            acceptance: Vec::new(),
+            cohort_prompt_package: None,
+            constraints: Vec::new(),
+            context_refs: Vec::new(),
+            evidence_refs: Vec::new(),
+            resource_scopes: Vec::new(),
+            allowed_tools: vec!["read_ref".into()],
+            allowed_skills: Vec::new(),
+            permission_ceiling: harness_contract::policy::PermissionMode::ReadOnly,
+            policy_revision: 1,
+            model_lease: "fixture".into(),
+            budget_lease: harness_contract::context::ChildExecutionBudgetReservation::single(
+                "gc-budget",
+                worker,
+                "task:gc",
+                1024,
+                4_000_000_000_000,
+                1,
+            ),
+            deadline_at_ms: 4_000_000_000_000,
+            binding: None,
+            managed_invocation: None,
+            idempotency_key: "gc-packet".into(),
+            agentic_binding: None,
+        };
+        packet.agentic_binding = Some(harness_contract::agent::AgenticExecutionBinding {
+            program_id: "gc-program".into(),
+            agent_id: worker.into(),
+            membership_id: "membership:gc".into(),
+            team_id: "team:gc".into(),
+            task_team_id: "team:gc".into(),
+            source_spec_revision: 1,
+            task_purpose: None,
+            focus: harness_contract::agent::AgenticExecutionFocus::TaskExecute {
+                task_ref: "task:gc".into(),
+            },
+        });
+
+        // Producer paths can refer to the same physical packet more than once.
+        let source = format!("execution-agent-receipts:{}:{}:{}", packet.graph_id(), packet.node_id(), packet.attempt);
+        let identical = vec![packet.clone(), packet.clone()];
+        assert!(super::super::directory_read_packet(&identical, &source).is_ok());
+        assert!(super::super::directory_read_packet(&identical, "execution-agent-receipts:missing").is_err());
+        let mut changed = packet.clone();
+        changed.objective.push_str(" changed");
+        assert!(super::super::directory_read_packet(&[packet.clone(), changed], &source).is_err());
+        let mut later = packet.clone();
+        later.attempt += 1;
+        assert!(super::super::directory_read_packet(&[later], &source).is_err());
+
+        // The member's own read: a unified read of a durable record.
+        let input = serde_json::json!({"reference": "artifact://art-gc"});
+        let input_text = serde_json::to_string(&input).unwrap();
+        let step: crate::step_snapshot::StepCallBinding = serde_json::from_value(
+            serde_json::json!({
+                "origin": {
+                    "origin_step_id": step_id,
+                    "call_id": call_id,
+                    "catalog_digest": "gc-catalog",
+                    "source": {"kind": "provider", "attempt_id": "gc-attempt"},
+                },
+                "snapshot": {
+                    "contract_version": 1,
+                    "identity": {
+                        "step_id": step_id,
+                        "session_id": session,
+                        // The packet's admitted turn, which the member path
+                        // binds the Step identity to.
+                        "turn_id": packet.assignment.execution_identity.turn_id().unwrap_or(turn),
+                        "execution_id": run_id,
+                        // The packet's admitted principal, not a name of our
+                        // own choosing: the member path binds the Step
+                        // identity to it.
+                        "actor_ref": packet.assignment.execution_identity.principal_id(),
+                        "run_ref": run_id,
+                        "attempt": 1,
+                        "goal_ref": null,
+                        "program_ref": null,
+                        "task_ref": null,
+                        "build_ref": "gc-fixture",
+                    },
+                    "provider_attempt": {
+                        "attempt_id": "gc-attempt",
+                        "origin_step_id": step_id,
+                        "model_profile_digest": "gc-profile",
+                        "request_digest": "gc-request",
+                    },
+                    "catalog_digest": "gc-catalog",
+                    "tools": [],
+                    "related_revisions": {},
+                    "context_refs": [],
+                    "expires_at_ms": 4_000_000_000_000i64,
+                },
+            }),
+        )
+        .unwrap();
+        let key = step.effect_idempotency_key();
+        let payload_digest =
+            harness_contract::step::canonical_digest("tool-effect-payload", &input).unwrap();
+        let input_sha256 = crate::context_evidence::read_sha256(input_text.as_bytes());
+
+        // The descriptor the unified read facade declares: a File capability
+        // face whatever the read actually named.
+        let effect = ToolEffectDescriptor {
+            tool_id: "read_ref".into(),
+            descriptor_hash: "gc-descriptor".into(),
+            effect_kind: ToolEffectKind::Read,
+            idempotency: harness_contract::tool::ToolIdempotency::Idempotent,
+            scopes: vec![harness_contract::policy::PermissionScope {
+                resource: harness_contract::policy::PermissionResource::File,
+                operation: harness_contract::policy::PermissionOperation::Read,
+                target: Some(".".into()),
+            }],
+            required_permission: harness_contract::tool::ToolPermissionMode::ReadOnly,
+            approval_class: harness_contract::tool::ToolApprovalClass::None,
+            uses_network: false,
+            spawns_process: false,
+            mutates_packages: false,
+            mutates_system: false,
+            assessment: Default::default(),
+        };
+        let lease = harness_contract::policy::AuthorizationLease {
+            lease_id: "gc-lease".into(),
+            principal_id: principal.into(),
+            parent_lease_id: None,
+            capability: "read_ref".into(),
+            scopes: effect.scopes.clone(),
+            ceiling: harness_contract::policy::PermissionMode::ReadOnly,
+            issued_at_ms: 0,
+            expires_at_ms: 4_000_000_000_000,
+            max_uses: 1,
+            remaining_uses: 1,
+            idempotency_key: "gc-lease-key".into(),
+            policy_revision: 1,
+            effect_descriptor_hash: effect.descriptor_hash.clone(),
+            signature: "gc-signature".into(),
+            status: harness_contract::policy::AuthorizationLeaseStatus::Active,
+        };
+        let authorization = harness_contract::tool::ToolExecutionAuthorization {
+            request_id: "gc-request".into(),
+            tool_id: "read_ref".into(),
+            descriptor_hash: effect.descriptor_hash.clone(),
+            policy_revision: 1,
+            scope: effect.scopes[0].clone(),
+            authorization_lease: lease,
+            timeout_lease: "gc-timeout".into(),
+            idempotency_key: None,
+        };
+        let invocation = harness_contract::tool::GovernedToolInvocation {
+            origin: Some(step.origin.clone()),
+            contract_version: 1,
+            invocation_id: call_id.into(),
+            intent: harness_contract::tool::ToolIntent {
+                invocation_id: call_id.into(),
+                tool_name: "read_ref".into(),
+                normalized_input: input.clone(),
+            },
+            effect: effect.clone(),
+            resource_demand: Default::default(),
+            explicit_dependencies: Vec::new(),
+            compiled_dependencies: Vec::new(),
+            catalog_revision: 1,
+            descriptor_set_hash: "gc-descriptor-set".into(),
+            idempotency_key: key.clone(),
+        };
+        let request: crate::tool_host::RuntimeToolExecutionRequest =
+            serde_json::from_value(serde_json::json!({
+                "compiled_invocation": invocation,
+                "step_binding": step,
+                "governed_plan_id": "gc-plan",
+                "governed_plan_revision": 1,
+                "observation_wave_sequence": 1,
+                "idempotency_key": key,
+                "tool_use_id": call_id,
+                "tool_name": "read_ref",
+                "input": input_text,
+                "category": "read_only",
+                "authorization": authorization,
+                "session_id": session,
+                "sandbox_posture": "workspace_write_sandbox",
+                "policy_revision": 1,
+                "authorized_scopes": [],
+                "parent_execution": {
+                    "execution_id": graph_id,
+                    "node_id": node_id,
+                },
+                "parent_execution_attempt": packet.attempt,
+            }))
+            .unwrap();
+
+        // The parent graph the packet was admitted under: the real member
+        // path loads it before it reads the member's receipts.
+        let mut parent_graph = harness_contract::execution_graph::ExecutionGraph::new("gc parent");
+        parent_graph.id = graph_id.into();
+        parent_graph.lineage = Some(harness_contract::execution_graph::ExecutionGraphLineage {
+            session_id: session.into(),
+            turn_id: packet
+                .assignment
+                .execution_identity
+                .turn_id()
+                .unwrap_or(turn)
+                .to_string(),
+            root_task_id: "task:gc".into(),
+            task_id: "task:gc".into(),
+            generation: 1,
+        });
+        let mut parent_node = harness_contract::execution_graph::ExecutionNodeSpec::new(
+            harness_contract::execution_graph::ExecutionNodeKind::AgentTask,
+            "agent_task",
+            serde_json::to_string(&packet).unwrap(),
+        );
+        parent_node.id = node_id.into();
+        parent_graph.nodes.push(parent_node);
+        crate::ExecutionCommitService::new(std::sync::Arc::clone(&store))
+            .register_graph(parent_graph)
+            .unwrap();
+
+        // The bound child graph, named by the digest of its own payload.
+        // The bound payload is the production persisted encoding, not raw
+        // JSON: the decoder reads exactly what the encoder wrote.
+        let bound_text = crate::execution_core::graph::executors::agent_tool::encode_bound_agent_tool(
+            worker,
+            run_id,
+            request,
+        )
+        .unwrap();
+        let bound_digest = format!("{:x}", {
+            use sha2::Digest;
+            sha2::Sha256::digest(bound_text.as_bytes())
+        });
+        let child_graph_id = format!("agent-tool-batch:{bound_digest}");
+        let child_node_id = format!("agent-tool:{bound_digest}");
+        let mut child = harness_contract::execution_graph::ExecutionGraph::new("gc child");
+        child.id = child_graph_id.clone();
+        child.parent_execution = Some(harness_contract::execution_graph::ExecutionParentBinding {
+            execution_id: graph_id.into(),
+            node_id: node_id.into(),
+        });
+        child.lineage = Some(harness_contract::execution_graph::ExecutionGraphLineage {
+            session_id: session.into(),
+            turn_id: packet
+                .assignment
+                .execution_identity
+                .turn_id()
+                .unwrap_or(turn)
+                .to_string(),
+            root_task_id: "task:gc".into(),
+            task_id: "task:gc".into(),
+            generation: 1,
+        });
+        let mut child_node = harness_contract::execution_graph::ExecutionNodeSpec::new(
+            harness_contract::execution_graph::ExecutionNodeKind::ToolBatch,
+            "tool_batch",
+            bound_text.clone(),
+        );
+        child_node.id = child_node_id.clone();
+        child.nodes.push(child_node);
+        crate::ExecutionCommitService::new(std::sync::Arc::clone(&store))
+            .register_graph(child)
+            .unwrap();
+        store
+            .append(crate::RuntimeEventInput {
+                stream_id: format!("execution-lineage:{graph_id}"),
+                scope: RuntimeEventScope::Relation,
+                kind: "execution.lineage.child_registered.v1".into(),
+                status: Some("registered".into()),
+                actor: Some("execution_commit_service".into()),
+                refs: vec![],
+                payload: serde_json::json!({
+                    "parent_execution_id": graph_id,
+                    "parent_node_id": node_id,
+                    "child_execution_id": child_graph_id,
+                    "child_objective": "gc child",
+                }),
+            })
+            .unwrap();
+
+        // The primary/index receipt pair on the streams the member path reads.
+        let outcome = serde_json::json!({
+            "status": "executed",
+            "tool_use_id": call_id,
+            "tool_name": "read_ref",
+            "output": "durable record body",
+        });
+        // The replay carries the compiled invocation with its normalized
+        // input withheld, exactly as the producer stores it.
+        let mut stored_invocation = invocation.clone();
+        stored_invocation.intent.normalized_input = serde_json::Value::Null;
+        let stored_invocation = serde_json::to_value(&stored_invocation).unwrap();
+        let replay = serde_json::json!({
+            "session_id": session,
+            "parent_execution": {"execution_id": graph_id, "node_id": node_id},
+            "origin": step.origin,
+            "call_id": call_id,
+            "invocation": stored_invocation,
+            "payload_digest": payload_digest,
+        });
+        let primary_payload = serde_json::json!({
+            "idempotency_key": key,
+            "tool_use_id": call_id,
+            "tool_name": "read_ref",
+            "input_sha256": input_sha256,
+            "outcome": outcome.clone(),
+            "replay": replay,
+        });
+        let index_payload = serde_json::json!({
+            "idempotency_key": key,
+            "effect_kind": "read",
+            "outcome": outcome,
+            "authorized_scopes": [],
+            "effect_scope": authorization.scope,
+            "sequence": 1,
+        });
+        let receipt = store
+            .append_transaction(crate::AppendTransactionRequest {
+                transaction_id: format!("gc-receipt:{key}"),
+                expected_streams: vec![
+                    crate::ExpectedStreamRevision {
+                        stream_id: format!("execution-effect:{key}"),
+                        expected_revision: 0,
+                    },
+                    crate::ExpectedStreamRevision {
+                        stream_id: format!(
+                            "execution-agent-receipts:{graph_id}:{node_id}:{}",
+                            packet.attempt
+                        ),
+                        expected_revision: 0,
+                    },
+                ],
+                events: vec![
+                    crate::RuntimeTransactionEventInput {
+                        event: crate::RuntimeEventInput {
+                            stream_id: format!("execution-effect:{key}"),
+                            scope: RuntimeEventScope::ExecutionNode,
+                            kind: "execution.read.receipt".into(),
+                            status: Some("completed".into()),
+                            actor: Some("governed_tool".into()),
+                            refs: vec![],
+                            payload: primary_payload,
+                        },
+                        idempotency_key: Some(format!("{key}:read-receipt")),
+                        schema_version: 1,
+                    },
+                    crate::RuntimeTransactionEventInput {
+                        event: crate::RuntimeEventInput {
+                            stream_id: format!(
+                                "execution-agent-receipts:{graph_id}:{node_id}:{}",
+                                packet.attempt
+                            ),
+                            scope: RuntimeEventScope::ExecutionNode,
+                            kind: "execution.agent_tool.receipt".into(),
+                            status: Some("completed".into()),
+                            actor: Some("governed_tool".into()),
+                            refs: vec![],
+                            payload: index_payload,
+                        },
+                        idempotency_key: Some(format!("agent-tool-receipt:{key}")),
+                        schema_version: 1,
+                    },
+                ],
+            })
+            .unwrap();
+        let _ = receipt;
+        let events = store
+            .list_stream(&format!("execution-effect:{key}"))
+            .unwrap();
+        let primary = events
+            .iter()
+            .find(|event| event.kind == "execution.read.receipt")
+            .unwrap()
+            .clone();
+        let index = store
+            .list_stream(&format!(
+                "execution-agent-receipts:{graph_id}:{node_id}:{}",
+                packet.attempt
+            ))
+            .unwrap()
+            .iter()
+            .find(|event| event.kind == "execution.agent_tool.receipt")
+            .unwrap()
+            .clone();
+
+        verify_actual_read_pair(&primary, &index).expect("original Read pair");
+        let mut foreign = index.clone();
+        foreign.transaction_id.push_str("-foreign");
+        assert!(verify_actual_read_pair(&primary, &foreign).is_err());
+        let mut changed = index.clone();
+        changed.payload["outcome"]["status"] = serde_json::json!("failed");
+        assert!(verify_actual_read_pair(&primary, &changed).is_err());
+
+        // The member path authenticates the read's original input from the
+        // child request, and that input is what the shared predicate reads.
+        let mut actual = ActualInputSnapshot {
+            file_dependencies: Vec::new(),
+            immutable_inputs: Vec::new(),
+            sources: std::collections::BTreeMap::new(),
+            material_events: Vec::new(),
+            canonical_facts: Vec::new(),
+        };
+        let member_input = authenticate_unsealed_delegated_input(
+            &store,
+            &primary,
+            &index,
+            &packet,
+            &mut actual,
+        )
+        .expect("the member read authenticates its original input");
+        assert_eq!(member_input["reference"], "artifact://art-gc");
+
+        let body = serde_json::json!({
+            "outcome": {"status": "executed", "output": "original body"},
+            "outcome_truncated": false,
+        });
+        let receipt_of = |payload: &serde_json::Value| {
+            store
+                .append(crate::RuntimeEventInput {
+                    stream_id: "session:gc-sealed".into(),
+                    scope: RuntimeEventScope::ExecutionNode,
+                    kind: "execution.read.receipt".into(),
+                    status: Some("completed".into()),
+                    actor: Some("governed_tool".into()),
+                    refs: vec![],
+                    payload: payload.clone(),
+                })
+                .unwrap()
+        };
+
+        // G-c-P1: the member's read of a durable record carries no workspace
+        // extent, so the actual-input acquisition settles with the immutable
+        // receipt fact instead of being refused.
+        //
+        // The settlement runs through the member path itself. The boundary
+        // names the consumer event that path authenticates, so the assertion
+        // witnesses the wiring that reads the member's original input - not
+        // the shared predicate alone.
+        let mut program = AgenticProgramProjection::empty("gc-program", "gc-objective");
+        program.session_id = session.into();
+        let consumer = store
+            .append(crate::RuntimeEventInput {
+                stream_id: format!("session:{session}"),
+                scope: RuntimeEventScope::ExecutionNode,
+                kind: "execution.effect.intent".into(),
+                status: Some("completed".into()),
+                actor: Some("governed_tool".into()),
+                refs: vec![],
+                payload: serde_json::json!({
+                    "idempotency_key": key,
+                    "replay": {
+                        "origin": step.origin,
+                        "session_id": session,
+                        "call_id": call_id,
+                        "parent_execution": {"execution_id": graph_id, "node_id": node_id},
+                    },
+                }),
+            })
+            .unwrap();
+        let boundary = super::super::results::ResultInputBoundary {
+            producer: format!("agent-run:{run_id}"),
+            packet: Some(packet.clone()),
+            step: None,
+            cursor: consumer.commit_cursor,
+            call_key: key.clone(),
+            source: harness_contract::goal::ProofInputEvent {
+                stream_id: consumer.stream_id.clone(),
+                sequence: consumer.sequence,
+                event_id: consumer.event_id.clone(),
+                payload_digest: super::super::proof_value_digest(&consumer.payload),
+            },
+        };
+        let mut windows = std::collections::BTreeMap::new();
+        crate::agentic::fact_admission::take_test_admissions();
+        let settled = super::actual_input_snapshot_for_phase(
+            &store,
+            &program,
+            std::slice::from_ref(&boundary),
+            super::super::ResultContentReaders {
+                artifacts: None,
+                history: None,
+                process_inputs: None,
+            },
+            None,
+            false,
+            None,
+        )
+        .expect("a member read of a durable record has no workspace extent");
+        assert!(crate::agentic::fact_admission::take_test_admissions().contains(
+            &harness_contract::refusal_codes::FactAdmissionStrategy::Immutable),
+            "the original immutable read must pass the admission gate");
+        assert!(
+            settled
+                .canonical_facts
+                .iter()
+                .any(|fact| fact["grade"] == "acquired_immutable_receipt"),
+            "the member read of a durable record settles as an immutable receipt: {:?}",
+            settled.canonical_facts
+        );
+
+        // Classifier-only controls; original request authentication is exercised above.
+        for (input, should_succeed) in [
+            (Some(serde_json::json!({"reference":"task://task:gc"})), true),
+            (Some(serde_json::json!({"reference":"task://"})), false),
+            (None, false),
+        ] {
+            let mut classified = ActualInputSnapshot {
+                file_dependencies: Vec::new(), immutable_inputs: Vec::new(),
+                sources: std::collections::BTreeMap::new(), material_events: Vec::new(), canonical_facts: Vec::new(),
+            };
+            let mut classified_windows = std::collections::BTreeMap::new();
+            let result = collect_actual_acquisition(&store, &program, &primary, &index,
+                input.as_ref(), &[], &boundary,
+                super::super::ResultContentReaders { artifacts: None, history: None, process_inputs: None },
+                &mut classified, &mut classified_windows);
+            assert_eq!(result.is_ok(), should_succeed);
+            assert!(classified.immutable_inputs.is_empty() && classified.canonical_facts.is_empty());
+            assert!(classified_windows.is_empty());
+        }
+
+        // G-c-N2: the same member read, judged as a workspace path, is still
+        // refused - the extension did not turn a workspace read into a record.
+        let mut refused = ActualInputSnapshot {
+            file_dependencies: Vec::new(),
+            immutable_inputs: Vec::new(),
+            sources: std::collections::BTreeMap::new(),
+            material_events: Vec::new(),
+            canonical_facts: Vec::new(),
+        };
+        let capture = super::super::t1_frame_cleanup_tests::EventCapture::default();
+        let trace_events = std::sync::Arc::clone(&capture.0);
+        let rejection = tracing::subscriber::with_default(capture, || collect_actual_acquisition(
+                &store,
+                &program,
+                &primary,
+                &index,
+                Some(&serde_json::json!({"reference": "file://workspace/report.txt"})),
+                &[],
+                &boundary,
+                super::super::ResultContentReaders {
+                    artifacts: None,
+                    history: None,
+                    process_inputs: None,
+                },
+                &mut refused,
+                &mut windows,
+            ))
+            .unwrap_err();
+        let trace = trace_events.lock().unwrap().join("\n");
+        assert!(trace.contains("incomplete_snapshot_not_published") && trace.contains("no_frame"));
+        assert!(!trace.contains("file://workspace/report.txt"));
+
+        // The same rejected acquisition with an original frame must remain
+        // an error; the frame, not a published snapshot, owns its cleanup.
+        let before_events = store.all_events(10_000).unwrap();
+        let frame = super::super::ProcessInputFrame::without_process_verifier();
+        let capture = super::super::t1_frame_cleanup_tests::EventCapture::default();
+        let frame_trace = std::sync::Arc::clone(&capture.0);
+        let mut with_frame = ActualInputSnapshot {
+            file_dependencies: Vec::new(), immutable_inputs: Vec::new(),
+            sources: std::collections::BTreeMap::new(), material_events: Vec::new(), canonical_facts: Vec::new(),
+        };
+        let mut frame_windows = std::collections::BTreeMap::new();
+        let frame_error = tracing::subscriber::with_default(capture, || collect_actual_acquisition(
+            &store, &program, &primary, &index,
+            Some(&serde_json::json!({"reference": "file://workspace/report.txt"})), &[], &boundary,
+            super::super::ResultContentReaders { artifacts: None, history: None, process_inputs: Some(&frame) },
+            &mut with_frame, &mut frame_windows,
+        )).unwrap_err();
+        assert_eq!(frame_error.to_string(), rejection.to_string());
+        assert!(frame_error.review_ticket("t1-control", 1).is_none());
+        assert!(rejection.review_ticket("t1-control", 1).is_none());
+        assert!(with_frame.canonical_facts.is_empty() && frame_windows.is_empty());
+        assert_eq!(store.all_events(10_000).unwrap().len(), before_events.len(), "a refused local snapshot publishes no event");
+        let frame_trace = frame_trace.lock().unwrap().join("\n");
+        assert!(frame_trace.contains("incomplete_snapshot_not_published") && frame_trace.contains("owned_by_frame"));
+        assert!(!frame_trace.contains("file://workspace/report.txt"));
+        // 034 GB-1 (batch 1 acceptance): the fragmented gate's original
+        // wording stays verbatim inside the gate's envelope; the envelope adds
+        // the code and what each proof strategy was missing.
+        assert!(
+            rejection.starts_with(
+                "proof_actual_input_extent_unsupported: actual read lacks an original physical extent"
+            ),
+            "the original refusal wording stays verbatim at the head: {rejection}"
+        );
+        assert!(rejection.contains("code=fact_unproven"), "{rejection}");
+        for strategy in ["nested", "discovery", "immutable"] {
+            assert!(
+                rejection.contains(&format!("{strategy}(missing=")),
+                "the diagnosis names every strategy: {rejection}"
+            );
+        }
+        assert!(
+            refused.canonical_facts.is_empty(),
+            "a refused member read settles nothing"
+        );
+
+        // A directory discovery is an authenticated historical operation,
+        // never a FileLines dependency or immutable content.
+        let mut discovery_effect = effect.clone();
+        discovery_effect.tool_id = "glob_search".into();
+        let mut target = actual_dependency_fixture().target;
+        target.path.object_kind = harness_contract::context::WorkspaceObjectKind::Directory;
+        target.exact = false;
+        target.alias_checked = false;
+        target.physical_identity = None;
+        target.declared_scope = discovery_effect.scopes[0].clone();
+        let scope = harness_contract::goal::ProofEffectScope {
+            version: 2, descriptor_hash: discovery_effect.descriptor_hash.clone(),
+            complete: true, targets: vec![target],
+            scope_purposes: vec![harness_contract::goal::ProofEffectScopePurpose {
+                declared_scope: discovery_effect.scopes[0].clone(),
+                purpose: harness_contract::goal::ProofEffectPurpose::InputRead,
+            }],
+        };
+        let page = serde_json::json!({"basePath":".", "pattern":"*.rs", "scanComplete":true,
+            "durationMs":1, "numFiles":1, "filenames":["a.rs"], "truncated":false,
+            "coverage":{"consistency":"live_filesystem"}});
+        let mut glob_primary = primary.clone();
+        let mut glob_index = index.clone();
+        glob_primary.payload["tool_name"] = serde_json::json!("glob_search");
+        glob_primary.payload["effect"] = serde_json::to_value(&discovery_effect).unwrap();
+        glob_primary.payload["replay"]["invocation"]["effect"] = serde_json::to_value(&discovery_effect).unwrap();
+        glob_primary.payload["outcome"]["tool_name"] = serde_json::json!("glob_search");
+        glob_primary.payload["outcome"]["output"] = serde_json::json!(page.to_string());
+        glob_primary.payload["outcome_truncated"] = serde_json::json!(false);
+        glob_primary.payload["resolved_effect_scope"] = serde_json::to_value(&scope).unwrap();
+        glob_index.payload["outcome"] = glob_primary.payload["outcome"].clone();
+        glob_index.payload["effect"] = glob_primary.payload["effect"].clone();
+        glob_index.payload["resolved_effect_scope"] = glob_primary.payload["resolved_effect_scope"].clone();
+        let mut discovery_actual = ActualInputSnapshot {
+            file_dependencies: Vec::new(), immutable_inputs: Vec::new(),
+            sources: std::collections::BTreeMap::new(), material_events: Vec::new(), canonical_facts: Vec::new(),
+        };
+        let mut discovery_windows = std::collections::BTreeMap::new();
+        let discovery_input = serde_json::json!({"pattern":"*.rs"});
+        crate::agentic::fact_admission::take_test_admissions();
+        collect_actual_acquisition(&store, &program, &glob_primary, &glob_index,
+            Some(&discovery_input), &[], &boundary,
+            super::super::ResultContentReaders { artifacts: None, history: None, process_inputs: None },
+            &mut discovery_actual, &mut discovery_windows).expect("original discovery is authenticated");
+        assert!(crate::agentic::fact_admission::take_test_admissions().iter().any(|strategy| strategy.code() == "discovery"),
+            "authenticated discovery must pass the admission gate");
+        assert!(discovery_actual.canonical_facts.is_empty());
+        assert_eq!(discovery_actual.material_events.len(), 2);
+        assert!(discovery_windows.is_empty());
+        assert!(discovery_actual.immutable_inputs.is_empty());
+        assert!(original_glob_discovery(&glob_primary, &discovery_effect,
+            Some(&serde_json::json!({"pattern":"different"}))).is_err());
+        glob_primary.payload["outcome_truncated"] = serde_json::json!(true);
+        assert!(original_glob_discovery(&glob_primary, &discovery_effect, Some(&discovery_input)).is_err());
+
+        // A composite without the original complete child ledger cannot be
+        // treated as an empty or successful acquisition.
+        let mut incomplete_primary = primary.clone();
+        incomplete_primary.payload["tool_name"] = serde_json::json!("tool_orchestrate");
+        incomplete_primary.payload[crate::context_evidence::CHILD_READ_ACQUISITIONS_FIELD] =
+            serde_json::json!([{"step_index":0,"position":0}]);
+        incomplete_primary.payload["child_read_acquisitions_complete"] = serde_json::json!(false);
+        let mut incomplete_index = index.clone();
+        incomplete_index.payload[crate::context_evidence::CHILD_READ_ACQUISITIONS_FIELD] =
+            incomplete_primary.payload[crate::context_evidence::CHILD_READ_ACQUISITIONS_FIELD].clone();
+        incomplete_index.payload["child_read_acquisitions_complete"] = serde_json::json!(false);
+        assert!(collect_actual_nested_acquisitions(&store, &incomplete_primary, &incomplete_index,
+            None, &[], &boundary, super::super::ResultContentReaders {
+                artifacts: None, history: None, process_inputs: None,
+            }, &mut discovery_actual, &mut discovery_windows).is_err());
+        assert!(discovery_windows.is_empty());
+
+        // G-c-N3: the red lines. A read that carries an acquisition seal is
+        // judged by that seal, never as an immutable receipt; and a read whose
+        // original input cannot be resolved keeps the stricter declared
+        // capability judgment rather than being waved through.
+        let sealed = serde_json::json!({
+            "outcome": {"status": "executed", "output": "original body"},
+            "outcome_truncated": false,
+            "read_acquisition_v1": {"seal": "present"},
+        });
+        assert!(
+            !super::immutable_receipt_without_workspace_extent(
+                &receipt_of(&sealed),
+                &effect,
+                Some(&member_input),
+            )
+            .unwrap(),
+            "a sealed read is judged by its acquisition, not as an immutable receipt"
+        );
+        assert!(
+            !super::immutable_receipt_without_workspace_extent(&receipt_of(&body), &effect, None)
+                .unwrap(),
+            "an unresolved original input keeps the declared capability judgment"
+        );
+    }
+
+    /// E-s: the refusal twin is addressed by the call's own effect key, and
+    /// a batch member's twin by the batch's outer key, because the member's
+    /// own key names no member index on that stream.
+    ///
+    /// The twin settles the call only when it names the program event it
+    /// belongs to and the two share one transaction and one receipt.
+    /// The outcome status set is closed: the two statuses the existing
+    /// settled rule owns, the one this review settles as a terminal failure,
+    /// and nothing else. A status outside the set is named, never guessed.
+    #[test]
+    fn f24_the_outcome_status_table_is_a_closed_set() {
+        assert!(matches!(
+            super::terminal_outcome_class(Some("executed")),
+            Ok(super::OutcomeClass::Succeeded)
+        ));
+        assert!(matches!(
+            super::terminal_outcome_class(Some("blocked_permission")),
+            Ok(super::OutcomeClass::Succeeded)
+        ));
+        assert!(matches!(
+            super::terminal_outcome_class(Some("failed")),
+            Ok(super::OutcomeClass::Failed)
+        ));
+        assert!(matches!(
+            super::terminal_outcome_class(None),
+            Ok(super::OutcomeClass::InFlight)
+        ));
+        // Anything outside the set is named, not guessed.
+        let unknown = super::terminal_outcome_class(Some("partial")).unwrap_err();
+        assert!(unknown.contains("partial"), "{unknown}");
+    }
+
+    /// The refusal twin is addressed by the call's own effect key, and a
+    /// batch member's twin by the batch's outer key, because the member's
+    /// own key names no member index on that stream.
+    ///
+    /// A member's twin must also stand for this intent's own member: read
+    /// through the outer key, another member's twin is not this call's fact.
+    #[test]
+    fn f24_the_refusal_twin_is_addressed_by_effect_key_and_by_outer_key() {
+        let store = std::sync::Arc::new(RuntimeEventStore::for_test());
+        let write = |store: &std::sync::Arc<RuntimeEventStore>,
+                     stream_key: &str,
+                     outer_key: &str,
+                     idem: &str,
+                     member_index: serde_json::Value,
+                     member_identity: serde_json::Value| {
+            let program_stream = "agentic-program:f24-program";
+            store
+                .append_transaction(crate::AppendTransactionRequest {
+                    transaction_id: format!("f24-refusal:{idem}"),
+                    // The writer declares the current revision of every
+                    // stream it writes, the way the rejection writer does;
+                    // the store refuses a transaction that does not.
+                    expected_streams: vec![
+                        crate::ExpectedStreamRevision {
+                            stream_id: "agentic-program:f24-program".to_string(),
+                            expected_revision: store
+                                .stream_revision("agentic-program:f24-program")
+                                .expect("program stream revision"),
+                        },
+                        crate::ExpectedStreamRevision {
+                            stream_id: format!("execution-effect:{stream_key}"),
+                            expected_revision: store
+                                .stream_revision(&format!("execution-effect:{stream_key}"))
+                                .expect("effect stream revision"),
+                        },
+                    ],
+                    events: vec![
+                        crate::RuntimeTransactionEventInput {
+                            event: crate::RuntimeEventInput {
+                                stream_id: program_stream.to_string(),
+                                scope: RuntimeEventScope::Program,
+                                kind: "agentic.completion_rejected".into(),
+                                status: Some("rejected".into()),
+                                actor: Some("runtime.agentic_action".into()),
+                                refs: vec![],
+                                payload: serde_json::json!({
+                                    "program_id": "f24-program",
+                                    "request_action_id": stream_key,
+                                    "code": "call_refused_after_admission",
+                                }),
+                            },
+                            // One refusal fact, one program event key.
+                            idempotency_key: Some(format!("completion-rejected:{idem}")),
+                            schema_version: 1,
+                        },
+                        crate::RuntimeTransactionEventInput {
+                            event: crate::RuntimeEventInput {
+                                stream_id: format!("execution-effect:{stream_key}"),
+                                scope: RuntimeEventScope::ExecutionNode,
+                                kind: "agentic.batch_member.index".into(),
+                                status: Some("committed".into()),
+                                actor: Some("runtime.agentic_action".into()),
+                                refs: vec![],
+                                payload: serde_json::json!({
+                                    "outer_key": outer_key,
+                                    "member_index": member_index,
+                                    "member_identity": member_identity,
+                                    "ticket": serde_json::Value::Null,
+                                    "program_stream": program_stream,
+                                    "program_event_kind": "agentic.completion_rejected",
+                                    "program_event_key": format!("completion-rejected:{idem}"),
+                                    "program_event_index": 0,
+                                }),
+                            },
+                            idempotency_key: Some(idem.to_string()),
+                            schema_version: 1,
+                        },
+                    ],
+                })
+                .expect("the refusal fact");
+        };
+        // A single call's twin: addressed by the call's own effect key.
+        let key = "f24-effect-key";
+        write(
+            &store,
+            key,
+            key,
+            &format!("agentic-single:{key}"),
+            serde_json::Value::Null,
+            serde_json::Value::Null,
+        );
+        assert!(
+            matches!(
+                super::refused_call_is_settled(&store, key, &mut std::collections::BTreeMap::new())
+                    .expect("settled"),
+                super::TerminalFactRead::Found { .. }
+            ),
+            "a single call's twin settles it by its own effect key"
+        );
+        // A call with no twin of its own is a miss, not a failure.
+        assert!(
+            matches!(
+                super::refused_call_is_settled(
+                    &store,
+                    "f24-effect-key-absent",
+                    &mut std::collections::BTreeMap::new(),
+                )
+                .expect("miss"),
+                super::TerminalFactRead::NotFound
+            ),
+            "a call without a twin of its own is a miss"
+        );
+        // A batch member's twin: addressed by the batch's outer key.
+        let outer = "f24-outer-key";
+        let member = format!("{outer}:7");
+        write(
+            &store,
+            outer,
+            outer,
+            "agentic-member:7",
+            serde_json::json!(7),
+            serde_json::json!("f24-member-identity"),
+        );
+        // A twin that sits under another member's index but names this
+        // member's ordinal is not this intent's fact either.
+        write(
+            &store,
+            outer,
+            outer,
+            "agentic-member:8",
+            serde_json::json!(7),
+            serde_json::json!("f24-member-identity"),
+        );
+        assert!(
+            store
+                .event_by_idempotency_key(
+                    &format!("execution-effect:{member}"),
+                    "agentic-member:7",
+                )
+                .expect("member stream lookup")
+                .is_none(),
+            "the member's own key names no member index on the outer stream"
+        );
+        assert!(
+            matches!(
+                super::refused_call_is_settled(&store, &member, &mut std::collections::BTreeMap::new())
+                    .expect("settled"),
+                super::TerminalFactRead::Found { .. }
+            ),
+            "a batch member's twin settles it by the batch's outer key"
+        );
+        // A member with no twin of its own is a miss.
+        let other = format!("{outer}:9");
+        assert!(
+            matches!(
+                super::refused_call_is_settled(&store, &other, &mut std::collections::BTreeMap::new())
+                    .expect("read"),
+                super::TerminalFactRead::NotFound
+            ),
+            "a member with no twin of its own is a miss"
+        );
+        // A twin that names another member is not this intent's fact.
+        let other = format!("{outer}:8");
+        assert!(
+            matches!(
+                super::refused_call_is_settled(&store, &other, &mut std::collections::BTreeMap::new())
+                    .expect("read"),
+                super::TerminalFactRead::Unprovable(_)
+            ),
+            "another member's twin is not this intent's fact"
+        );
+    }
+
+    /// Write one refusal fact: the program event that names the refusal and
+    /// the twin on the call's own effect stream, in one transaction, the way
+    /// the rejection writer writes them.
+    fn f24_write_refusal_twin(
+        store: &std::sync::Arc<RuntimeEventStore>,
+        key: &str,
+        twin_idem: &str,
+        outer_key: &str,
+        member_index: serde_json::Value,
+        member_identity: serde_json::Value,
+    ) {
+        let program_stream = "agentic-program:f24-consume";
+        store
+            .append_transaction(crate::AppendTransactionRequest {
+                transaction_id: format!("f24-consume-refusal:{twin_idem}"),
+                expected_streams: vec![
+                    crate::ExpectedStreamRevision {
+                        stream_id: program_stream.to_string(),
+                        expected_revision: store
+                            .stream_revision(program_stream)
+                            .expect("program stream revision"),
+                    },
+                    crate::ExpectedStreamRevision {
+                        stream_id: format!("execution-effect:{key}"),
+                        expected_revision: store
+                            .stream_revision(&format!("execution-effect:{key}"))
+                            .expect("effect stream revision"),
+                    },
+                ],
+                events: vec![
+                    crate::RuntimeTransactionEventInput {
+                        event: crate::RuntimeEventInput {
+                            stream_id: program_stream.to_string(),
+                            scope: RuntimeEventScope::Program,
+                            kind: "agentic.completion_rejected".into(),
+                            status: Some("rejected".into()),
+                            actor: Some("runtime.agentic_action".into()),
+                            refs: vec![],
+                            payload: serde_json::json!({
+                                "program_id": "f24-consume",
+                                "request_action_id": key,
+                                "code": "call_refused_after_admission",
+                            }),
+                        },
+                        idempotency_key: Some(format!("completion-rejected:{twin_idem}")),
+                        schema_version: 1,
+                    },
+                    crate::RuntimeTransactionEventInput {
+                        event: crate::RuntimeEventInput {
+                            stream_id: format!("execution-effect:{key}"),
+                            scope: RuntimeEventScope::ExecutionNode,
+                            kind: "agentic.batch_member.index".into(),
+                            status: Some("committed".into()),
+                            actor: Some("runtime.agentic_action".into()),
+                            refs: vec![],
+                            payload: serde_json::json!({
+                                "outer_key": outer_key,
+                                "member_index": member_index,
+                                "member_identity": member_identity,
+                                "ticket": serde_json::Value::Null,
+                                "program_stream": program_stream,
+                                "program_event_kind": "agentic.completion_rejected",
+                                "program_event_key": format!("completion-rejected:{twin_idem}"),
+                                "program_event_index": 0,
+                            }),
+                        },
+                        idempotency_key: Some(twin_idem.to_string()),
+                        schema_version: 1,
+                    },
+                ],
+            })
+            .expect("the refusal fact");
+    }
+
+    /// E-s: a required write that was admitted and then refused is settled by
+    /// its own refusal twin, so the review stops waiting for a receipt that
+    /// will never come.
+    #[test]
+    fn f24_a_refused_required_write_is_settled_by_its_own_twin() {
+        let store = std::sync::Arc::new(RuntimeEventStore::for_test());
+        let key = "f24-consume-effect-key";
+        f24_write_refusal_twin(
+            &store,
+            key,
+            &format!("agentic-single:{key}"),
+            key,
+            serde_json::Value::Null,
+            serde_json::Value::Null,
+        );
+        let intent_payload = serde_json::json!({
+            "tool_use_id": "f24-consume-call",
+            "tool_name": "task_review",
+        });
+        crate::agentic::fact_admission::take_test_admissions();
+        let settlement = super::required_write_settlement(
+            &store,
+            key,
+            &intent_payload,
+            None,
+            false,
+            &mut std::collections::BTreeMap::new(),
+        )
+        .expect("the settlement decision");
+        assert!(crate::agentic::fact_admission::take_test_admissions().iter().any(|strategy| strategy.code() == "settled_refusal"),
+            "the authenticated refusal must pass the admission gate");
+        assert!(
+            matches!(settlement, super::RequiredWriteSettlement::Refused { .. }),
+            "a required write that carries its own refusal twin is settled by it"
+        );
+    }
+
+    /// A required write with no refusal twin of its own stays pending: the
+    /// refusal family does not speak for it.
+    #[test]
+    fn f24_a_required_write_without_a_twin_stays_pending() {
+        let store = std::sync::Arc::new(RuntimeEventStore::for_test());
+        let intent_payload = serde_json::json!({
+            "tool_use_id": "f24-absent-call",
+            "tool_name": "task_review",
+        });
+        let settlement = super::required_write_settlement(
+            &store,
+            "f24-absent-effect-key",
+            &intent_payload,
+            None,
+            false,
+            &mut std::collections::BTreeMap::new(),
+        )
+        .expect("the settlement decision");
+        assert!(
+            matches!(settlement, super::RequiredWriteSettlement::Pending),
+            "a required write with no terminal fact of its own stays pending"
+        );
+    }
+
+    /// A required write that ran and failed is carried as its own named
+    /// failure - never as a satisfied requirement - and the name is plain
+    /// readable.
+    #[test]
+    fn f24_a_terminally_failed_required_write_carries_its_named_failure() {
+        let store = std::sync::Arc::new(RuntimeEventStore::for_test());
+        let intent_payload = serde_json::json!({
+            "tool_use_id": "f24-failed-call",
+            "tool_name": "task_review",
+        });
+        let receipt_payload = serde_json::json!({
+            "outcome": {
+                "status": "failed",
+                "error": "Runtime did not execute 'task_review': the objective requirement was not met",
+            },
+        });
+        let settlement = super::required_write_settlement(
+            &store,
+            "f24-failed-effect-key",
+            &intent_payload,
+            Some((&receipt_payload, 4242u64)),
+            true,
+            &mut std::collections::BTreeMap::new(),
+        )
+        .expect("the settlement decision");
+        let failure = match settlement {
+            super::RequiredWriteSettlement::Failed { failure } => failure,
+            _ => panic!("a required write that ran and failed carries its named failure"),
+        };
+        assert_eq!(failure["grade"], "required_write_terminally_failed");
+        assert_eq!(failure["effect_key"], "f24-failed-effect-key");
+        assert_eq!(failure["tool_use_id"], "f24-failed-call");
+        assert_eq!(failure["tool_name"], "task_review");
+        assert_eq!(failure["failure_class"], "terminal_failure");
+        assert_eq!(failure["receipt_cursor"], 4242);
+        // The name is plain readable: the error text appears as it was.
+        let plain = failure["error"].as_str().unwrap_or_default().to_string();
+        assert!(
+            plain.contains("the objective requirement was not met"),
+            "the named failure carries the error text"
+        );
+    }
+
+    #[test]
+    fn f24_a_settlement_unreadable_contradictory_and_missing_receipt_remain_distinct() {
+        let intent = serde_json::json!({"tool_use_id":"f24-control", "tool_name":"task_review"});
+        let receipt = serde_json::json!({"outcome":{"status":"failed", "error":"original failure"}});
+        let check = |store: &std::sync::Arc<RuntimeEventStore>, key: &str, supplied, failed| {
+            super::required_write_settlement(store, key, &intent, supplied, failed,
+                &mut std::collections::BTreeMap::new()).expect("original settlement decision")
+        };
+        let missing = std::sync::Arc::new(RuntimeEventStore::for_test());
+        crate::agentic::fact_admission::take_test_admissions();
+        assert!(matches!(check(&missing, "f24-missing-receipt", None, true),
+            super::RequiredWriteSettlement::MissingReceipt));
+        assert!(crate::agentic::fact_admission::take_test_admissions().is_empty());
+
+        let unreadable = std::sync::Arc::new(RuntimeEventStore::for_test());
+        let foreign = "f24-foreign";
+        f24_write_refusal_twin(&unreadable, foreign, &format!("agentic-single:{foreign}"),
+            "different-owner", serde_json::Value::Null, serde_json::Value::Null);
+        crate::agentic::fact_admission::take_test_admissions();
+        match check(&unreadable, foreign, None, false) {
+            super::RequiredWriteSettlement::UnreadableRefusal { reason } =>
+                assert!(reason.contains("does not have the refusal shape")),
+            _ => panic!("foreign refusal twin must remain unreadable"),
+        }
+        assert!(crate::agentic::fact_admission::take_test_admissions().is_empty());
+
+        let contradictory = std::sync::Arc::new(RuntimeEventStore::for_test());
+        let own = "f24-contradiction";
+        f24_write_refusal_twin(&contradictory, own, &format!("agentic-single:{own}"),
+            own, serde_json::Value::Null, serde_json::Value::Null);
+        crate::agentic::fact_admission::take_test_admissions();
+        match check(&contradictory, own, Some((&receipt, 42)), true) {
+            super::RequiredWriteSettlement::Contradiction { refusal_cursor, receipt_cursor } => {
+                assert!(refusal_cursor.is_some());
+                assert_eq!(receipt_cursor, Some(42));
+            }
+            _ => panic!("contradictory terminal facts must remain contradictory"),
+        }
+        assert!(crate::agentic::fact_admission::take_test_admissions().is_empty());
+    }
+
+    /// A node effect is not a call's terminal fact: it carries no outcome.
+    #[test]
+    fn f24_a_node_effect_is_not_a_settlement_fact() {
+        let store = std::sync::Arc::new(RuntimeEventStore::for_test());
+        store
+            .append(crate::RuntimeEventInput {
+                stream_id: "execution-node-effect:abc123:1".into(),
+                scope: RuntimeEventScope::ExecutionNode,
+                kind: "execution.node_effect".into(),
+                status: Some("committed".into()),
+                actor: Some("runtime.model_step".into()),
+                refs: vec![],
+                payload: serde_json::json!({"replan": "retry", "result": "none"}),
+            })
+            .expect("node effect");
+        assert!(
+            store
+                .event_by_idempotency_key(
+                    "execution-node-effect:abc123:1",
+                    "agentic-single:node-effect-key",
+                )
+                .expect("node effect lookup")
+                .is_none(),
+            "a node effect carries no outcome and is no settlement fact"
+        );
+    }
+
+    /// G-c: a delegated member's read is judged by the original input its
+    /// authenticated child request carries, not by the capability face the
+    /// unified read facade declares.
+    ///
+    /// The member path reads that input from the child request it already
+    /// authenticated (the same canonical digest binding the receipt carries),
+    /// so a member reading a durable record has no workspace extent while a
+    /// member reading a workspace path still needs its acquisition seal.
+    #[test]
+    fn g_c_member_read_target_decides_whether_the_read_has_a_workspace_extent() {
+        let store = RuntimeEventStore::for_test();
+        let receipt = |payload: serde_json::Value| {
+            store
+                .append(crate::RuntimeEventInput {
+                    stream_id: "session:g-c-member-read".into(),
+                    scope: RuntimeEventScope::ExecutionNode,
+                    kind: "execution.read.receipt".into(),
+                    status: Some("completed".into()),
+                    actor: Some("governed_tool".into()),
+                    refs: vec![],
+                    payload,
+                })
+                .unwrap()
+        };
+        let descriptor = |scopes: Vec<harness_contract::policy::PermissionScope>| ToolEffectDescriptor {
+            tool_id: "read_ref".into(),
+            descriptor_hash: "g-c-read-ref-descriptor".into(),
+            effect_kind: ToolEffectKind::Read,
+            idempotency: harness_contract::tool::ToolIdempotency::Idempotent,
+            scopes,
+            required_permission: harness_contract::tool::ToolPermissionMode::ReadOnly,
+            approval_class: harness_contract::tool::ToolApprovalClass::None,
+            uses_network: false,
+            spawns_process: false,
+            mutates_packages: false,
+            mutates_system: false,
+            assessment: Default::default(),
+        };
+        let file_face = vec![harness_contract::policy::PermissionScope {
+            resource: harness_contract::policy::PermissionResource::File,
+            operation: harness_contract::policy::PermissionOperation::Read,
+            target: Some(".".into()),
+        }];
+        let body = serde_json::json!({
+            "outcome": {"status": "executed", "output": "original body"},
+            "outcome_truncated": false,
+        });
+        // The member's authenticated child request input, the shape the member
+        // path now feeds to the same predicate the root path uses.
+        let member_input = |reference: &str| {
+            Some(serde_json::json!({"reference": reference}))
+        };
+
+        // A member reading a durable record: no workspace extent.
+        assert!(
+            super::immutable_receipt_without_workspace_extent(
+                &receipt(body.clone()),
+                &descriptor(file_face.clone()),
+                member_input("artifact://art_74d37ca7").as_ref(),
+            )
+            .unwrap(),
+            "a member read of a durable record has no workspace extent"
+        );
+        assert!(
+            super::immutable_receipt_without_workspace_extent(
+                &receipt(body.clone()),
+                &descriptor(file_face.clone()),
+                member_input("tool://tool-raw-chatcmpl-tool-a815fdd23125e201").as_ref(),
+            )
+            .unwrap(),
+            "a member read of a tool raw record has no workspace extent"
+        );
+        // A member reading a workspace path still needs its acquisition seal.
+        for target in ["file://workspace/report.txt", "dir://workspace"] {
+            assert!(
+                !super::immutable_receipt_without_workspace_extent(
+                    &receipt(body.clone()),
+                    &descriptor(file_face.clone()),
+                    member_input(target).as_ref(),
+                )
+                .unwrap(),
+                "{target} is a workspace read and keeps its seal requirement"
+            );
+        }
+        // A member read whose child request cannot be authenticated keeps the
+        // stricter declared capability judgment: Unknown is not turned into a
+        // pass.
+        assert!(
+            !super::immutable_receipt_without_workspace_extent(
+                &receipt(body.clone()),
+                &descriptor(file_face.clone()),
+                None,
+            )
+            .unwrap(),
+            "an unauthenticated member read keeps the declared capability judgment"
+        );
+    }
+
+    /// G: the read's own original input decides whether that read carries a
+    /// workspace extent, not the capability face the tool declares.
+    ///
+    /// The unified read facade declares a File capability whatever it reads,
+    /// so the declared face refused every durable record a reviewer must
+    /// read. A read whose original input names a workspace path still needs
+    /// an acquisition seal; a read that named a durable record has no
+    /// workspace extent at all.
+    #[test]
+    fn g_read_target_decides_whether_a_read_has_a_workspace_extent() {
+        let store = RuntimeEventStore::for_test();
+        let receipt = |payload: serde_json::Value| {
+            store
+                .append(crate::RuntimeEventInput {
+                    stream_id: "session:g-read-target".into(),
+                    scope: RuntimeEventScope::ExecutionNode,
+                    kind: "execution.read.receipt".into(),
+                    status: Some("completed".into()),
+                    actor: Some("governed_tool".into()),
+                    refs: vec![],
+                    payload,
+                })
+                .unwrap()
+        };
+        let descriptor = |scopes: Vec<harness_contract::policy::PermissionScope>| ToolEffectDescriptor {
+            tool_id: "read_ref".into(),
+            descriptor_hash: "g-read-ref-descriptor".into(),
+            effect_kind: ToolEffectKind::Read,
+            idempotency: harness_contract::tool::ToolIdempotency::Idempotent,
+            scopes,
+            required_permission: harness_contract::tool::ToolPermissionMode::ReadOnly,
+            approval_class: harness_contract::tool::ToolApprovalClass::None,
+            uses_network: false,
+            spawns_process: false,
+            mutates_packages: false,
+            mutates_system: false,
+            assessment: Default::default(),
+        };
+        let file_face = vec![harness_contract::policy::PermissionScope {
+            resource: harness_contract::policy::PermissionResource::File,
+            operation: harness_contract::policy::PermissionOperation::Read,
+            target: Some(".".into()),
+        }];
+        let body = serde_json::json!({
+            "outcome": {"status": "executed", "output": "original body"},
+            "outcome_truncated": false,
+        });
+        let record = serde_json::json!({"reference": "tool://tool-raw-abc"});
+        let workspace_file = serde_json::json!({"reference": "file://workspace/report.txt"});
+        let workspace_dir = serde_json::json!({"reference": "dir://workspace"});
+        let bare = serde_json::json!({"reference": "legacy-identifier"});
+        let unknown = serde_json::json!({"reference": "nope://unknown-scheme"});
+
+        // A durable record read through the unified facade: the declared File
+        // capability is not what the read hit, and it has no workspace extent.
+        assert!(
+            super::immutable_receipt_without_workspace_extent(
+                &receipt(body.clone()),
+                &descriptor(file_face.clone()),
+                Some(&record),
+            )
+            .unwrap(),
+            "a read that named a durable record has no workspace extent"
+        );
+        // A workspace path is still a workspace read and still needs the seal.
+        for (target, input) in [
+            ("file://workspace/report.txt", &workspace_file),
+            ("dir://workspace", &workspace_dir),
+        ] {
+            assert!(
+                !super::immutable_receipt_without_workspace_extent(
+                    &receipt(body.clone()),
+                    &descriptor(file_face.clone()),
+                    Some(input),
+                )
+                .unwrap(),
+                "{target} is a workspace read and has no immutable extent"
+            );
+        }
+        // A legacy bare identifier is resolved by the directory and may name
+        // a workspace path, so it stays on the workspace side.
+        assert!(
+            !super::immutable_receipt_without_workspace_extent(
+                &receipt(body.clone()),
+                &descriptor(file_face.clone()),
+                Some(&bare),
+            )
+            .unwrap(),
+            "a bare identifier may name a workspace path"
+        );
+        // Without a resolved original input the declared face still decides:
+        // the fallback is the stricter legacy judgment, never a relaxation.
+        assert!(
+            !super::immutable_receipt_without_workspace_extent(
+                &receipt(body.clone()),
+                &descriptor(file_face.clone()),
+                None,
+            )
+            .unwrap(),
+            "an unresolved original input keeps the declared capability judgment"
+        );
+        // A tool that declares no File capability keeps its legacy judgment.
+        assert!(
+            super::immutable_receipt_without_workspace_extent(
+                &receipt(body.clone()),
+                &descriptor(Vec::new()),
+                Some(&record),
+            )
+            .unwrap(),
+            "a record read by a non-File tool is still an immutable receipt"
+        );
+        // A reference that cannot be parsed fails explicitly; it never falls
+        // back to treating the read as an immutable receipt.
+        assert!(
+            super::immutable_receipt_without_workspace_extent(
+                &receipt(body.clone()),
+                &descriptor(file_face.clone()),
+                Some(&unknown),
+            )
+            .is_err(),
+            "an unparseable original reference must fail explicitly"
+        );
+        // The body and the seal rules are untouched by the target judgment.
+        assert_eq!(
+            super::immutable_receipt_without_workspace_extent(
+                &receipt(serde_json::json!({
+                    "outcome": {"status": "executed", "output": "original body"},
+                    "outcome_truncated": true,
+                })),
+                &descriptor(file_face.clone()),
+                Some(&record),
+            )
+            .unwrap_err(),
+            "actual immutable receipt lacks its complete original acquired body"
+        );
+        assert!(
+            !super::immutable_receipt_without_workspace_extent(
+                &receipt(serde_json::json!({
+                    "outcome": {"status": "executed", "output": "original body"},
+                    "read_acquisition_v1": {"seal": "present"},
+                })),
+                &descriptor(file_face.clone()),
+                Some(&record),
+            )
+            .unwrap(),
+            "a sealed read is judged by its acquisition, not as an immutable receipt"
+        );
+    }
+
+    /// A shared aggregate stream growing while the proof pages is another
+    /// actor appending, not the material under proof changing: the pinned
+    /// window is read unchanged and the read succeeds.
+    #[test]
+    fn pinned_stream_accepts_shared_aggregate_growth_while_paging() {
+        let store = RuntimeEventStore::for_test();
+        for source in [
+            "session:shared-aggregate-growth",
+            "execution-lineage:shared-aggregate-growth",
+        ] {
+            let append = |store: &RuntimeEventStore| {
+                store
+                    .append(crate::RuntimeEventInput {
+                        stream_id: source.into(),
+                        scope: RuntimeEventScope::Session,
+                        kind: "test.source-advance".into(),
+                        status: None,
+                        actor: None,
+                        refs: vec![],
+                        payload: serde_json::json!({}),
+                    })
+                    .unwrap();
+            };
+            append(&store);
+            store.inject_read_fault_once(
+                source.into(),
+                "stream_revision",
+                2,
+                move |store| append(store),
+            );
+            let mut sources = std::collections::BTreeMap::new();
+            pinned_stream_events(&store, source, &mut sources, 0, PinnedEventProjection::Effects)
+                .expect("concurrent appends to a shared aggregate stream must not read as a source change");
+            assert_eq!(sources[source], 1, "the proof keeps the head it was assembled against");
+        }
+    }
+
+    /// The Session cut read keeps the authenticated head as a cut point, not
+    /// as the head the stream must still be at: an append that lands while the
+    /// original material is read leaves the cut valid and the window unchanged.
+    #[test]
+    fn session_cut_read_accepts_an_append_that_lands_while_reading() {
+        let store = RuntimeEventStore::for_test();
+        let source = "session:cut-growth";
+        let append = |store: &RuntimeEventStore| {
+            store
+                .append(crate::RuntimeEventInput {
+                    stream_id: source.into(),
+                    scope: RuntimeEventScope::Session,
+                    kind: "test.source-advance".into(),
+                    status: None,
+                    actor: None,
+                    refs: vec![],
+                    payload: serde_json::json!({}),
+                })
+                .unwrap();
+        };
+        append(&store);
+        append(&store);
+        store.inject_read_fault_once(
+            source.into(),
+            "list_stream_after",
+            1,
+            move |store| append(store),
+        );
+        let mut cuts = std::collections::BTreeMap::new();
+        let events = super::super::results::result_source_events_at_session_cut(
+            &store,
+            source,
+            &mut cuts,
+            2,
+            2,
+        )
+        .expect("a concurrent append must not invalidate the authenticated Session cut");
+        assert_eq!(events.len(), 2, "the read window stops at the historical cut");
+        assert_eq!(cuts[source], 3, "the cut records the head the read ended at");
+    }
+
+    /// Review-cut closing control: the named producer keeps the head
+    /// authoritative. `for_live_material` reads the exact Session stream
+    /// itself, so a future cut is refused and a caller's claim about a head
+    /// the store never had resolves against the store's head, not the claim.
+    /// The struct carries no other constructor and its observed head is
+    /// write-private, so there is nothing a caller could self-report.
+    #[test]
+    fn for_live_material_reads_the_store_head_and_refuses_future_cuts() {
+        let store = RuntimeEventStore::for_test();
+        let append = |store: &RuntimeEventStore| {
+            store
+                .append(crate::RuntimeEventInput {
+                    stream_id: "session:cut-producer".into(),
+                    scope: RuntimeEventScope::Session,
+                    kind: "test.source-advance".into(),
+                    status: None,
+                    actor: None,
+                    refs: vec![],
+                    payload: serde_json::json!({}),
+                })
+                .unwrap();
+        };
+        append(&store);
+        append(&store);
+        let cut = HistoricalSessionCut::for_live_material(&store, "cut-producer", 2)
+            .expect("the material cut at the durable head is the normal case");
+        assert_eq!(cut.source().stream_id, "session:cut-producer");
+        assert_eq!(cut.source().expected_revision, 2);
+        assert_eq!(cut.observed_revision(), 2, "the head is the store's read, not a report");
+        let error = HistoricalSessionCut::for_live_material(&store, "cut-producer", 5)
+            .expect_err("a cut above the head must not resolve, whatever the caller claims");
+        assert!(
+            error.contains("beyond head") && error.contains("cut=5") && error.contains("head=2"),
+            "{error}"
+        );
+        append(&store);
+        let grown = HistoricalSessionCut::for_live_material(&store, "cut-producer", 3)
+            .expect("the new durable head admits the new material cut");
+        assert_eq!(grown.observed_revision(), 3);
+        let error = HistoricalSessionCut::for_live_material(&store, "cut-producer", 4)
+            .expect_err("a future cut after growth is still refused");
+        assert!(error.contains("head=3"), "{error}");
+        // A Session stream the store has never seen has head 0: the empty
+        // historical window is a legitimate cut, anything above it is not.
+        let absent = HistoricalSessionCut::for_live_material(&store, "cut-absent", 0)
+            .expect("an empty historical window is a legitimate cut");
+        assert_eq!(absent.observed_revision(), 0);
+        let error = HistoricalSessionCut::for_live_material(&store, "cut-absent", 1)
+            .expect_err("a cut above an absent stream's head is refused");
+        assert!(error.contains("head=0"), "{error}");
+    }
+
+    /// T1a-R2: the rebuild window keeps the live-material discipline. The head
+    /// comes from the store, a Session material cut above the durable head is
+    /// still refused after a rebuild, and growth inside the rebuilt window is
+    /// refused again instead of being absorbed into the window.
+    #[test]
+    fn t1a_the_rebuild_window_keeps_the_live_material_discipline() {
+        let store = RuntimeEventStore::for_test();
+        let append = |store: &RuntimeEventStore, stream: &str, scope| {
+            store
+                .append(crate::RuntimeEventInput {
+                    stream_id: stream.into(),
+                    scope,
+                    kind: "test.source-advance".into(),
+                    status: None,
+                    actor: None,
+                    refs: vec![],
+                    payload: serde_json::json!({}),
+                })
+                .unwrap();
+        };
+        let receipts = "execution-agent-receipts:t1a-rebuild:agent:1";
+        let session = "session:t1a-rebuild";
+        let review = "agentic-graph:t1a-rebuild/agent:1";
+        for _ in 0..2 {
+            append(&store, receipts, RuntimeEventScope::ExecutionNode);
+        }
+        for _ in 0..3 {
+            append(&store, session, RuntimeEventScope::Session);
+        }
+        let mut cuts = std::collections::BTreeMap::new();
+        assert_eq!(
+            super::super::results::pin_result_source(&store, receipts, &mut cuts)
+                .expect("the first pin reads the durable head"),
+            2
+        );
+        append(&store, receipts, RuntimeEventScope::ExecutionNode);
+        let rejection = super::super::pin_result_source_ticketed(
+            &store, review, 1, receipts, &mut cuts,
+        )
+        .expect_err("growth on the receipts stream is refused");
+        let ticket = rejection.ticket().expect("window refusal").clone();
+        assert_eq!((ticket.pinned_cut(), ticket.observed_head()), (2, 3));
+        assert_eq!(
+            super::super::repin_at_fresh_head(&store, review, 1, &ticket, &mut cuts)
+                .expect("the store itself opens the rebuild window"),
+            3
+        );
+        assert_eq!(cuts[receipts], 3);
+        // The rebuilt review still cites through the material-cut rule: a cut
+        // above the durable head is refused whatever the caller claims.
+        let error = HistoricalSessionCut::for_live_material(&store, "t1a-rebuild", 4)
+            .expect_err("a material cut above the head stays refused after a rebuild");
+        assert!(error.contains("head=3"), "{error}");
+        let cut = HistoricalSessionCut::for_live_material(&store, "t1a-rebuild", 3)
+            .expect("the durable head admits its own material cut");
+        assert_eq!(cut.observed_revision(), 3, "the head is the store's read, not a report");
+        // Growth after the window opened is refused again, never absorbed.
+        append(&store, receipts, RuntimeEventScope::ExecutionNode);
+        let second_rejection = super::super::pin_result_source_ticketed(
+            &store, review, 1, receipts, &mut cuts,
+        )
+        .expect_err("growth inside the rebuilt window is refused");
+        let second = second_rejection.ticket().expect("window refusal").clone();
+        assert_eq!((second.pinned_cut(), second.observed_head()), (3, 4));
+        assert_eq!(second.lineage(), ticket.lineage(), "one review, two refusals");
+        assert_eq!(cuts[receipts], 3, "the refused growth does not move the window");
+    }
+
+    #[test]
     fn pinned_delivery_projection_preserves_confirmations_across_pages_without_effects() {
         let store = RuntimeEventStore::for_test();
         let source = "session:projection-only";
@@ -7444,7 +10437,7 @@ mod tests {
             let event = store
                 .append(crate::RuntimeEventInput {
                     stream_id: source.into(),
-                    scope: crate::RuntimeEventScope::Session,
+                    scope: RuntimeEventScope::Session,
                     kind: kind.into(),
                     status: None,
                     actor: Some("projection_unit_fixture_not_delivery_authority".into()),
@@ -7483,7 +10476,11 @@ mod tests {
     #[test]
     fn pinned_delivery_empty_source_keeps_its_original_cut() {
         let store = RuntimeEventStore::for_test();
-        let source = "session:empty-projection";
+        // A source the review itself judges: a cut that no longer matches its
+        // head is refused. The reviewed Session stream is a shared aggregate
+        // stream, where an append that lands between two reads is admissible
+        // (`pinned_stream_accepts_shared_aggregate_growth_while_paging`).
+        let source = "agentic-program:empty-projection";
         let mut sources = std::collections::BTreeMap::new();
         assert!(pinned_stream_events(
             &store,
@@ -7498,7 +10495,7 @@ mod tests {
         store
             .append(crate::RuntimeEventInput {
                 stream_id: source.into(),
-                scope: crate::RuntimeEventScope::Session,
+                scope: RuntimeEventScope::Session,
                 kind: "projection_fixture.unrelated_note".into(),
                 status: None,
                 actor: Some("projection_unit_fixture".into()),
@@ -7749,7 +10746,7 @@ mod tests {
                 coverage:harness_contract::context::EvidenceCoverageKind::ScopedContent,
                 exact:true, physical_identity:Some("physical:input".into()), alias_checked:true,
             },
-            acquisition_cursor:10, consumer_cursor:20, consumer_call_key:"consumer".into(), source_sha256:"original-preimage".into(),
+            acquisition_cursor:10, consumer_cursor:20, consumer_call_key:"consumer".into(), source_sha256:"original-preimage".into(), source_bytes: 0,
         }
     }
 
@@ -7854,7 +10851,7 @@ mod tests {
         let mut primary = store
             .append(crate::RuntimeEventInput {
                 stream_id: "execution-effect:immutable".into(),
-                scope: crate::RuntimeEventScope::ExecutionNode,
+                scope: RuntimeEventScope::ExecutionNode,
                 kind: "execution.read.receipt".into(),
                 status: Some("completed".into()),
                 actor: Some("governed_tool".into()),
@@ -8004,133 +11001,9 @@ mod tests {
         assert_eq!(scope.targets.len(), 1);
     }
 
-    async fn real_selected_material_chain_647(mode: u8) {
-        use crate::agentic::execution::reviewed_goal_fixture::{
-            with_native_task_review_setup, NativeTaskReviewCase,
-        };
-        use harness_contract::agent_action::{AgentAction, AgentActionEnvelope, AgentActionStatus};
-        let material = std::sync::Arc::new(std::sync::Mutex::new(None));
-        let retained = std::sync::Arc::clone(&material);
-        with_native_task_review_setup(
-            NativeTaskReviewCase::default(),
-            move |services, _, worker, input| {
-                Box::pin(async move {
-                    let content = services.artifact_store().write_bytes(
-                        harness_contract::context::ArtifactWriteDescriptor {
-                            media_type: "text/plain".into(),
-                            visibility_scope: format!("session:{}", worker.actor.session_id),
-                            expected_bytes: None, original_name: None,
-                        }, b"647 actual distinct derived material, not a raw summary alias",
-                    ).await.unwrap();
-                    let publication = services.submit_agent_action(&AgentActionEnvelope {
-                        action_id: "647-derived-material".into(), actor: worker.actor.clone(),
-                        expected_revision: None,
-                        action: AgentAction::ArtifactCommit(serde_json::from_value(serde_json::json!({
-                            "content_ref":content.selector,"kind":"note",
-                            "title":"An opaque independent material identity","relates_to":[]
-                        })).unwrap()),
-                    }).await.unwrap();
-                    assert_eq!(publication.status, AgentActionStatus::Applied, "{publication:?}");
-                    if mode != 2 {
-                        acquire_original_native_body(&services, &worker, "evidence_retrieve",
-                            "647-producer-reads-derived-material",
-                            serde_json::json!({"evidence_ref":content.selector})).await;
-                    }
-                    *retained.lock().unwrap() = Some((content, publication.changed_refs[0].clone()));
-                    input
-                })
-            },
-            move |services, envelope, donor| {
-                Box::pin(async move {
-                    let (content, derived_ref) = material.lock().unwrap().take().unwrap();
-                    let program = services.agent_action_service()
-                        .project(&envelope.actor.program_id).unwrap();
-                    let history = services.session_history_reader();
-                    let readers = super::super::ResultContentReaders {
-                        artifacts: Some(services.artifact_store().as_ref()),
-                        history: history.as_deref(), process_inputs: None,
-                    };
-                    let goal = services.goal_store().get(&format!("goal:{}",
-                        envelope.actor.root_execution_id.as_ref().unwrap())).unwrap().unwrap();
-                    let mut recovered = Vec::new();
-                    for read in &donor.verification.reads {
-                        let selected = harness_contract::context::ArtifactRef::durable(
-                            &read.content_ref, &read.sha256, read.bytes,
-                            "application/octet-stream", format!("session:{}", program.session_id),
-                        );
-                        recovered.push(super::super::results::resolve_result_metadata(
-                            services.event_store(), &program, &read.result_ref,
-                            &selected, None, readers).unwrap());
-                    }
-                    assert!(!recovered.is_empty());
-                    assert_eq!(recovered.iter().any(|result| result.primary_inputs.iter().any(|input| input.content == content)),
-                        mode != 2, "only the selected producer's real acquisition may close D");
-                    let (_, actual) = real_review_actual_inputs(&services, &program, &donor.verification);
-                    assert!(actual.required_scopes().iter().any(|target|
-                        target.path.workspace_relative_path == "review-effect.txt"));
-                    assert!(actual.canonical_facts.iter().any(|fact|
-                        fact["grade"] == "acquired"
-                            && fact["acquisition"]["body"]["extent"]["kind"] == "file_lines"
-                            && fact["scope"]["scope_purposes"].as_array().is_some_and(|purposes|
-                                purposes.iter().any(|purpose| purpose["purpose"] == "input_read"))));
-                    proof_input_snapshot(services.event_store(), &program, Some(&goal),
-                        &donor.verification, readers).unwrap();
-                    let selected = &donor.verification.reads[0];
-                    let original = vec![selected.result_ref.clone(), selected.content_ref.clone(),
-                        derived_ref.clone(), content.selector.clone()];
-                    let aliases = super::super::canonical_review_result_refs(&program, &original).unwrap();
-                    assert_eq!(aliases.len(), 2);
-                    assert!(aliases.contains(&derived_ref));
-                    assert_ne!(selected.content_ref, content.selector);
-                    assert_eq!(original[0], selected.result_ref);
-                    assert_eq!(original[2], derived_ref);
-                    if mode == 1 {
-                        let mut omitted = donor.verification.clone();
-                        omitted.input_set.as_mut().unwrap().required_scopes.clear();
-                        assert!(proof_input_snapshot(services.event_store(), &program,
-                            Some(&goal), &omitted, readers).is_err());
-                        let primary = actual.material_events.iter().find(|material|
-                            verify_material_event(services.event_store(), material,
-                                &mut std::collections::BTreeMap::new()).is_ok_and(|event|
-                                    event.kind == "execution.read.receipt"
-                                        && event.payload[crate::context_evidence::READ_ACQUISITION_FIELD]
-                                            ["body"]["extent"]["kind"] == "file_lines")).unwrap();
-                        let mut omitted = donor.verification.clone();
-                        omitted.input_set.as_mut().unwrap().material_events.retain(|material|
-                            material.event_id != primary.event_id);
-                        assert!(proof_input_snapshot(services.event_store(), &program,
-                            Some(&goal), &omitted, readers).is_err());
-                        for result in &recovered {
-                            let mut cuts = donor.verification.input_set.as_ref().unwrap().source_revisions.clone();
-                            cuts.remove(&format!("session:{}", program.session_id));
-                            assert!(primary_producer_immutable_inputs(services.event_store(), &program,
-                                &result.producers, readers, Some(&cuts)).is_err());
-                        }
-                        let mut changed = program.clone();
-                        changed.artifacts.get_mut(&derived_ref).unwrap().content_ref =
-                            selected.content_ref.clone();
-                        assert!(proof_input_snapshot(services.event_store(), &changed,
-                            Some(&goal), &donor.verification, readers).is_err());
-                    }
-                })
-            },
-        ).await;
-    }
 
-    #[tokio::test]
-    async fn r1_647_selected_real_producer_material_reaches_protected_file_input() {
-        real_selected_material_chain_647(0).await;
-    }
 
-    #[tokio::test]
-    async fn r1_647_real_primary_chain_rejects_omitted_acquisition_cut_scope_and_retargeting() {
-        real_selected_material_chain_647(1).await;
-    }
 
-    #[tokio::test]
-    async fn r1_647_same_producer_unread_material_is_not_a_primary_alias() {
-        real_selected_material_chain_647(2).await;
-    }
 
     async fn acquire_original_native_body(
         services: &std::sync::Arc<crate::RuntimeServices>,
@@ -8343,885 +11216,12 @@ mod tests {
         (boundaries, actual)
     }
 
-    #[tokio::test]
-    async fn r1_actual_collector_recovers_omitted_inputs_and_rejects_foreign_unsealed_identity_through_final_proof(
-    ) {
-        use crate::agentic::execution::reviewed_goal_fixture::{
-            with_native_task_review_setup, NativeTaskReviewCase,
-        };
-        with_native_task_review_setup(
-            NativeTaskReviewCase {
-                complete_goal: true,
-                ..Default::default()
-            },
-            |services, _, worker, input| {
-                Box::pin(async move {
-                    acquire_original_native_body(
-                        &services,
-                        &worker,
-                        "tool_search",
-                        "actual-input-catalog-body",
-                        serde_json::json!({"query":"read_file"}),
-                    )
-                    .await;
-                    let artifact = services
-                        .artifact_store()
-                        .write_bytes(
-                            harness_contract::context::ArtifactWriteDescriptor {
-                                media_type: "text/plain".into(),
-                                visibility_scope: format!("session:{}", worker.actor.session_id),
-                                expected_bytes: None,
-                                original_name: None,
-                            },
-                            b"real immutable producer input",
-                        )
-                        .await
-                        .unwrap();
-                    acquire_original_native_body(
-                        &services,
-                        &worker,
-                        "evidence_retrieve",
-                        "actual-input-immutable-body",
-                        serde_json::json!({"evidence_ref":artifact.selector}),
-                    )
-                    .await;
-                    input
-                })
-            },
-            |services, envelope, donor| {
-                Box::pin(async move {
-                    let program = services
-                        .agent_action_service()
-                        .project(&envelope.actor.program_id)
-                        .unwrap();
-                    let goal = services
-                        .goal_store()
-                        .get(&format!(
-                            "goal:{}",
-                            envelope.actor.root_execution_id.as_ref().unwrap()
-                        ))
-                        .unwrap()
-                        .unwrap();
-                    let history = services.session_history_reader();
-                    let readers = super::super::ResultContentReaders {
-                        artifacts: Some(services.artifact_store().as_ref()),
-                        history: history.as_deref(),
-                        process_inputs: None,
-                    };
-                    let (boundaries, actual) =
-                        real_review_actual_inputs(&services, &program, &donor.verification);
-                    assert!(!actual.file_dependencies.is_empty());
-                    assert!(actual
-                        .canonical_facts
-                        .iter()
-                        .any(|fact| fact["grade"] == "acquired_immutable_receipt"));
-                    assert!(actual
-                        .canonical_facts
-                        .iter()
-                        .any(|fact| fact["grade"] == "acquired"
-                            && fact["acquisition"]["body"]["extent"]["kind"] == "artifact_chunks"
-                            && fact["scope"]["complete"] == false
-                            && fact["scope"]["targets"]
-                                .as_array()
-                                .is_some_and(Vec::is_empty)));
-                    proof_input_snapshot(
-                        services.event_store(),
-                        &program,
-                        Some(&goal),
-                        &donor.verification,
-                        readers,
-                    )
-                    .unwrap();
-                    let session_events = services
-                        .event_store()
-                        .list_stream(&format!("session:{}", program.session_id))
-                        .unwrap();
-                    let publication = session_events
-                        .iter()
-                        .find(|event| {
-                            event.kind == "tool.invocation.completed"
-                                && event.payload["tool_call_id"] == "native-publication-small"
-                        })
-                        .unwrap();
-                    let task =
-                        super::super::results::result_tool_plan(&session_events, publication)
-                            .unwrap()
-                            .unwrap();
-                    let primary = super::super::results::original_tool_primary(
-                        services.event_store(),
-                        publication,
-                        task,
-                        &mut Default::default(),
-                    )
-                    .unwrap();
-                    let body: serde_json::Value = serde_json::from_str(
-                        primary.payload["outcome"]["output"].as_str().unwrap(),
-                    )
-                    .unwrap();
-                    let source = body["content_ref"].as_str().unwrap();
-                    let content = services.artifact_store().resolve(source).unwrap();
-                    let early = super::super::results::resolve_result_metadata(
-                        services.event_store(),
-                        &program,
-                        source,
-                        &content,
-                        None,
-                        readers,
-                    )
-                    .unwrap();
-                    let early_inputs = actual_input_snapshot(
-                        services.event_store(),
-                        &program,
-                        &early.input_boundaries,
-                        readers,
-                        None,
-                    )
-                    .unwrap();
-                    let catalog = actual
-                        .material_events
-                        .iter()
-                        .find(|material| {
-                            let event = verify_material_event(
-                                services.event_store(),
-                                material,
-                                &mut Default::default(),
-                            )
-                            .unwrap();
-                            event.kind == "execution.read.receipt"
-                                && event.payload["tool_name"] == "tool_search"
-                        })
-                        .unwrap();
-                    assert!(!early_inputs
-                        .canonical_facts
-                        .iter()
-                        .any(|fact| fact["source"] == catalog.event_id));
-                    assert!(actual
-                        .canonical_facts
-                        .iter()
-                        .any(|fact| fact["source"] == catalog.event_id));
-                    let primary_ids = actual
-                        .material_events
-                        .iter()
-                        .filter(|material| {
-                            verify_material_event(
-                                services.event_store(),
-                                material,
-                                &mut Default::default(),
-                            )
-                            .unwrap()
-                            .kind
-                                == "execution.read.receipt"
-                        })
-                        .map(|material| material.event_id.clone())
-                        .collect::<BTreeSet<_>>();
-                    let index_ids = actual
-                        .material_events
-                        .iter()
-                        .filter(|material| {
-                            let event = verify_material_event(
-                                services.event_store(),
-                                material,
-                                &mut Default::default(),
-                            )
-                            .unwrap();
-                            event.kind == "execution.agent_tool.receipt"
-                                && event.payload["effect_kind"] == "read"
-                        })
-                        .map(|material| material.event_id.clone())
-                        .collect::<BTreeSet<_>>();
-                    assert!(!primary_ids.is_empty() && !index_ids.is_empty());
-                    for mode in ["primary", "index", "both", "both-empty-scopes"] {
-                        let mut proof = donor.verification.clone();
-                        let inputs = proof.input_set.as_mut().unwrap();
-                        inputs.material_events.retain(|material| {
-                            !(mode != "index" && primary_ids.contains(&material.event_id)
-                                || mode != "primary" && index_ids.contains(&material.event_id))
-                        });
-                        if mode == "both-empty-scopes" {
-                            inputs.required_scopes.clear();
-                        }
-                        assert!(
-                            proof_input_snapshot(
-                                services.event_store(),
-                                &program,
-                                Some(&goal),
-                                &proof,
-                                readers
-                            )
-                            .is_err(),
-                            "{mode}"
-                        );
-                        let mut rejected = envelope.clone();
-                        rejected.action_id = format!("actual-input-omission:{mode}");
-                        let cursor = services.event_store().durable_commit_cursor().unwrap();
-                        let before = services.goal_store().get(&goal.id).unwrap().unwrap();
-                        let applied = services
-                            .agent_action_service()
-                            .apply_verified_review(&rejected, &proof)
-                            .unwrap();
-                        assert_eq!(
-                            applied.status,
-                            harness_contract::agent_action::AgentActionStatus::Rejected,
-                            "{mode}"
-                        );
-                        assert_eq!(
-                            services.event_store().durable_commit_cursor().unwrap(),
-                            cursor
-                        );
-                        assert_eq!(
-                            services.goal_store().get(&goal.id).unwrap().unwrap(),
-                            before
-                        );
-                    }
-                    for fault in [
-                        "session",
-                        "run",
-                        "step",
-                        "call",
-                        "input",
-                        "compiled",
-                        "artifact-body",
-                        "artifact-hash",
-                        "artifact-chunk",
-                        "artifact-source",
-                        "artifact-producer",
-                        "artifact-attempt",
-                    ] {
-                        ACTUAL_READ_SOURCE_FAULT
-                            .scope(fault, async {
-                                assert!(
-                                    actual_input_snapshot(
-                                        services.event_store(),
-                                        &program,
-                                        &boundaries,
-                                        readers,
-                                        None
-                                    )
-                                    .is_err(),
-                                    "{fault}"
-                                );
-                                assert!(
-                                    proof_input_snapshot(
-                                        services.event_store(),
-                                        &program,
-                                        Some(&goal),
-                                        &donor.verification,
-                                        readers
-                                    )
-                                    .is_err(),
-                                    "{fault}"
-                                );
-                            })
-                            .await;
-                    }
-                    for boundary in &boundaries {
-                        let mut forged = boundary.clone();
-                        forged.call_key.push_str(":other-consumer");
-                        assert!(actual_input_snapshot(
-                            services.event_store(),
-                            &program,
-                            &[forged],
-                            readers,
-                            None
-                        )
-                        .is_err());
-                        let mut forged = boundary.clone();
-                        forged.cursor += 1;
-                        assert!(actual_input_snapshot(
-                            services.event_store(),
-                            &program,
-                            &[forged],
-                            readers,
-                            None
-                        )
-                        .is_err());
-                    }
-                    let accepted = services
-                        .agent_action_service()
-                        .apply_verified_review(&envelope, &donor.verification)
-                        .unwrap();
-                    assert_eq!(
-                        accepted.status,
-                        harness_contract::agent_action::AgentActionStatus::Applied,
-                        "{accepted:?}"
-                    );
-                })
-            },
-        )
-        .await;
-    }
 
-    async fn original_root_same_bytes_write(
-        services: &std::sync::Arc<crate::RuntimeServices>,
-        actor: &harness_contract::agent_action::AgentActorBinding,
-        call: &str,
-    ) -> u64 {
-        let root = actor.root_execution_id.as_deref().unwrap();
-        let node = format!("{root}:model");
-        let graph = crate::agentic::execution::reviewed_goal_fixture::bind_review_fixture_root(
-            services, services.commit_service(),
-            services.graph_state_store().load(root).unwrap(), &node,
-        );
-        let owner = services
-            .event_store()
-            .latest_for_stream(&format!("{root}:node:{node}"))
-            .unwrap()
-            .unwrap()
-            .activity_binding()
-            .unwrap();
-        let attempt = graph.recovery_cursor.node_attempts[&node];
-        let host = services.tool_execution_host().unwrap();
-        let lease = host.pin_step_catalog().unwrap();
-        let definitions = lease
-            .snapshot()
-            .catalog
-            .definitions(None)
-            .into_iter()
-            .filter(|definition| definition.name == "edit")
-            .map(|definition| crate::ProviderToolDefinition {
-                name: definition.name,
-                description: definition.description,
-                input_schema: definition.input_schema,
-            })
-            .collect::<Vec<_>>();
-        let identity = serde_json::from_value(serde_json::json!({
-            "step_id":format!("original-root-input-test:{}",uuid::Uuid::new_v4()),
-            "session_id":owner.session_id,"turn_id":owner.turn_id,"execution_id":root,
-            "actor_ref":actor.actor_id,"attempt":attempt,"build_ref":"original-c-review-fixture",
-        }))
-        .unwrap();
-        let step = std::sync::Arc::new(
-            crate::step_snapshot::BoundStep::bind(
-                identity,
-                lease.clone(),
-                &definitions,
-                &serde_json::json!({}),
-                &serde_json::json!({}),
-                Default::default(),
-                9_007_199_254_740_991,
-            )
-            .unwrap(),
-        );
-        let binding = crate::step_snapshot::StepCallBinding::provider(step, call);
-        let content =
-            std::fs::read_to_string(services.workspace_root().join("review-effect.txt")).unwrap();
-        let input =
-            serde_json::json!({"action":"write","path":"review-effect.txt","content":content});
-        let invocation = binding
-            .prepare_invocation(Some(lease), "edit", &input)
-            .unwrap();
-        let mut request = crate::RuntimeToolExecutionRequest::from_tool_request(
-            &crate::tool_dispatch::ToolRequest {
-                tool_use_id: call.into(),
-                tool_name: "edit".into(),
-                input: input.to_string(),
-                depends_on: vec![],
-            },
-        );
-        request.session_id = Some(owner.session_id.clone());
-        request.governed_plan_id = root.into();
-        request.governed_plan_revision = 1;
-        request.observation_wave_sequence = 50_000;
-        request.policy_revision = 1;
-        request.idempotency_key = binding.effect_idempotency_key();
-        request.compiled_invocation = Some(invocation.clone());
-        request.step_binding = Some(binding);
-        let policy = crate::PermissionPolicy::new(PermissionMode::WorkspaceWrite);
-        request.sandbox_posture = policy.execution_policy_control().snapshot().sandbox_posture;
-        let assessed = crate::AuthorizationNegotiator::new().assess_effective(
-            &policy,
-            &crate::AuthorizationRequest {
-                principal_id: actor.actor_id.clone(),
-                capability: "edit".into(),
-                input: request.input.clone(),
-                idempotency_key: call.into(),
-                effect: invocation.effect.clone(),
-                parent_ceiling: PermissionMode::WorkspaceWrite,
-                parent_lease_id: None,
-                policy_revision: request.policy_revision,
-                recovery_scope: root.into(),
-                context: crate::PermissionContext::default(),
-                safe_alternatives: vec![],
-            },
-        );
-        request.authorization = Some(
-            crate::ToolPolicy
-                .authorize(
-                    &assessed.effective,
-                    &assessed.assessment,
-                    call,
-                    assessed.assessment.lease.clone().unwrap(),
-                    30,
-                )
-                .unwrap()
-                .authorization,
-        );
-        let (locks, _) = crate::bound_tool_batch::bound_effect_lock_requests(
-            services.path_identity_resolver(),
-            &invocation.effect,
-        )
-        .unwrap();
-        let _locks = services.scope_locks().acquire(locks, None).await.unwrap();
-        let scope = crate::bound_tool_batch::admitted_effect_scope(
-            &request,
-            &invocation.effect,
-            host.pin_step_catalog(),
-            services.path_identity_resolver(),
-        )
-        .unwrap();
-        let root_context = crate::CowdExecutionContext {
-            execution_id: root.into(),
-            session_id: owner.session_id.clone(),
-            turn_id: owner.turn_id.clone(),
-        };
-        services
-            .commit_service()
-            .begin_root_tool_effect(
-                &request,
-                &invocation.effect,
-                &root_context,
-                &scope,
-                &owner,
-                attempt,
-            )
-            .unwrap();
-        let outcome = host.execute_runtime_tool(&request).await;
-        assert_eq!(
-            outcome.status,
-            crate::RuntimeToolExecutionStatus::Executed,
-            "{outcome:?}"
-        );
-        services
-            .commit_service()
-            .commit_tool_effect(&request, &invocation.effect, &outcome)
-            .unwrap();
-        let receipt = services
-            .event_store()
-            .event_by_idempotency_key(
-                &format!("execution-effect:{}", request.idempotency_key),
-                &format!("{}:receipt", request.idempotency_key),
-            )
-            .unwrap()
-            .unwrap();
-        super::super::results::authenticate_root_receipt_owner(
-            services.event_store(),
-            &receipt,
-            &mut Default::default(),
-        )
-        .unwrap();
-        receipt.commit_cursor
-    }
 
-    #[tokio::test]
-    async fn r1_actual_collector_separates_preuse_consumer_from_real_reacquisition_and_reaches_goal(
-    ) {
-        use crate::agentic::execution::reviewed_goal_fixture::{
-            with_native_task_review_setup, NativeTaskReviewCase,
-        };
-        use harness_contract::agent_action::{
-            AgentAction, AgentActionEnvelope, ArtifactCommitInput,
-        };
-        let facts = std::sync::Arc::new(std::sync::Mutex::new(None));
-        let setup_facts = facts.clone();
-        with_native_task_review_setup(
-            NativeTaskReviewCase {
-                complete_goal: true,
-                commit_report: true,
-                ..Default::default()
-            },
-            move |services, root, worker, mut input| {
-                Box::pin(async move {
-                    let program = services
-                        .agent_action_service()
-                        .project(&worker.actor.program_id)
-                        .unwrap();
-                    let original = program
-                        .artifacts
-                        .values()
-                        .find(|artifact| {
-                            artifact.claim_execution_id == worker.actor.execution_id
-                                && artifact.relates_to.contains(&input.task_ref)
-                        })
-                        .unwrap()
-                        .content_ref
-                        .clone();
-                    let write = original_root_same_bytes_write(
-                        &services,
-                        &root.actor,
-                        "actual-preuse-write",
-                    )
-                    .await;
-                    let publish = |id: &str| AgentActionEnvelope {
-                        action_id: id.into(),
-                        actor: worker.actor.clone(),
-                        expected_revision: None,
-                        action: AgentAction::ArtifactCommit(ArtifactCommitInput {
-                            content_ref: original.clone(),
-                            kind: "report".into(),
-                            title: id.into(),
-                            relates_to: vec![input.task_ref.clone()],
-                        }),
-                    };
-                    let stale = services
-                        .submit_agent_action(&publish("actual-preuse-stale-consumer"))
-                        .await
-                        .unwrap();
-                    assert_eq!(
-                        stale.status,
-                        harness_contract::agent_action::AgentActionStatus::Applied
-                    );
-                    acquire_original_native_body(
-                        &services,
-                        &worker,
-                        "read_file",
-                        "actual-reacquired-before-use",
-                        serde_json::json!({"path":"review-effect.txt","complete":true}),
-                    )
-                    .await;
-                    let fresh = services
-                        .submit_agent_action(&publish("actual-preuse-fresh-consumer"))
-                        .await
-                        .unwrap();
-                    assert_eq!(
-                        fresh.status,
-                        harness_contract::agent_action::AgentActionStatus::Applied
-                    );
-                    input.artifact_refs = fresh.changed_refs.clone();
-                    input.deliverable = None;
-                    // The stale and fresh consumers commit the same original
-                    // content, so a content-level evidence ref is genuinely
-                    // ambiguous across their artifacts (the product refuses it,
-                    // correctly). Cite the fresh consumer's exact artifact.
-                    input.evidence_refs = fresh.changed_refs.clone();
-                    *setup_facts.lock().unwrap() = Some((
-                        stale.changed_refs[0].clone(),
-                        fresh.changed_refs[0].clone(),
-                        write,
-                    ));
-                    input
-                })
-            },
-            move |services, envelope, donor| {
-                Box::pin(async move {
-                    let (stale, fresh, write) = facts.lock().unwrap().clone().unwrap();
-                    let program = services
-                        .agent_action_service()
-                        .project(&envelope.actor.program_id)
-                        .unwrap();
-                    let history = services.session_history_reader();
-                    let readers = super::super::ResultContentReaders {
-                        artifacts: Some(services.artifact_store().as_ref()),
-                        history: history.as_deref(),
-                        process_inputs: None,
-                    };
-                    for (reference, after) in [(&stale, false), (&fresh, true)] {
-                        let content = services
-                            .artifact_store()
-                            .resolve(&program.artifacts[reference].content_ref)
-                            .unwrap();
-                        let metadata = super::super::results::resolve_result_metadata(
-                            services.event_store(),
-                            &program,
-                            reference,
-                            &content,
-                            None,
-                            readers,
-                        )
-                        .unwrap();
-                        let actual = actual_input_snapshot(
-                            services.event_store(),
-                            &program,
-                            &metadata.input_boundaries,
-                            readers,
-                            None,
-                        )
-                        .unwrap();
-                        assert!(actual
-                            .file_dependencies
-                            .iter()
-                            .any(|dependency| dependency.consumer_cursor > write
-                                && (dependency.acquisition_cursor > write) == after));
-                    }
-                    let error = services
-                        .independent_result_review(&envelope.actor, &program, &[stale], None)
-                        .await
-                        .err()
-                        .expect(
-                            "the real earlier consumer cannot use a later producer reacquisition",
-                        );
-                    assert!(
-                        error.contains("cites results outside Task")
-                            || error.contains("proof_actual_input_stale_before_use"),
-                        "{error}"
-                    );
-                    let goal = services
-                        .goal_store()
-                        .get(&format!(
-                            "goal:{}",
-                            envelope.actor.root_execution_id.as_ref().unwrap()
-                        ))
-                        .unwrap()
-                        .unwrap();
-                    proof_input_snapshot(
-                        services.event_store(),
-                        &program,
-                        Some(&goal),
-                        &donor.verification,
-                        readers,
-                    )
-                    .unwrap();
-                    let applied = services
-                        .agent_action_service()
-                        .apply_verified_review(&envelope, &donor.verification)
-                        .unwrap();
-                    assert_eq!(
-                        applied.status,
-                        harness_contract::agent_action::AgentActionStatus::Applied,
-                        "{applied:?}"
-                    );
-                })
-            },
-        )
-        .await;
-    }
 
-    #[tokio::test]
-    async fn r1_actual_collector_rejects_real_write_after_independent_read_without_faking_postimage(
-    ) {
-        use crate::agentic::execution::reviewed_goal_fixture::{
-            with_native_task_review_async, NativeTaskReviewCase,
-        };
-        with_native_task_review_async(NativeTaskReviewCase::default(),|services,envelope,_donor| Box::pin(async move {
-            let before = services.goal_store().get(&format!("goal:{}",envelope.actor.root_execution_id.as_ref().unwrap())).unwrap().unwrap();
-            original_root_same_bytes_write(&services,&envelope.actor,"actual-after-reviewer-read").await;
-            let program = services.agent_action_service().project(&envelope.actor.program_id).unwrap();
-            let references = match &envelope.action {
-                harness_contract::agent_action::AgentAction::TaskReview(input) => program.tasks[&input.task_ref].artifact_refs.clone(),
-                _ => unreachable!(),
-            };
-            let error = services.independent_result_review(&envelope.actor,&program,&references,None).await.err()
-                .expect("a fresh collector must reject old independent File observations after a real write");
-            assert!(error.contains("review_requires_effect_observation"),"{error}");
-            assert!(services.submit_agent_action(&envelope).await.is_err());
-            assert_eq!(services.goal_store().get(&before.id).unwrap().unwrap(),before);
-            assert!(program.tasks.values().any(|task|task.status == crate::AgenticTaskStatus::Submitted));
-        })).await;
-    }
 
-    /// The applied review is exempt; a SECOND unfinished review in the same
-    /// run is not.
-    ///
-    /// This is the business path: the real native task review, the real
-    /// Program, the real proof. The applied review settles its own call
-    /// (that is the self-dependency the exemption exists for), and a second
-    /// review of the same reviewer that is still in flight keeps the review
-    /// from accepting until it lands.
-    ///
-    /// The second review is INJECTED as a second planned review call of the
-    /// same reviewer - the real business fixture, with one extra durable plan
-    /// - not two genuinely concurrent model calls.
-    #[tokio::test]
-    async fn r1_a_second_unfinished_review_in_the_same_run_blocks_the_applied_review() {
-        use crate::agentic::execution::reviewed_goal_fixture::{
-            with_native_task_review_async, NativeTaskReviewCase,
-        };
-        for second_review in [false, true] {
-            with_native_task_review_async(
-                NativeTaskReviewCase {
-                    complete_goal: !second_review,
-                    ..NativeTaskReviewCase::default()
-                },
-                move |services, envelope, donor| Box::pin(async move {
-                    let program = services
-                        .agent_action_service()
-                        .project(&envelope.actor.program_id)
-                        .unwrap();
-                    let task_ref = match &envelope.action {
-                        harness_contract::agent_action::AgentAction::TaskReview(input) => {
-                            input.task_ref.clone()
-                        }
-                        _ => unreachable!(),
-                    };
-                    if second_review {
-                        // A second review call of the SAME reviewer, still in
-                        // flight: it has its own Step and its own effect
-                        // identity, so it is not the call the applied review
-                        // is performing.
-                        let reviewer_run = donor
-                            .verification
-                            .reviewer_execution_id
-                            .strip_prefix("agent-run:")
-                            .expect("a delegated reviewer")
-                            .to_string();
-                        let store = services.event_store();
-                        let events = store
-                            .list_stream(&format!("session:{}", program.session_id))
-                            .unwrap();
-                        let original = events
-                            .iter()
-                            .find(|event| event.kind == "tool.execution_plan.created")
-                            .expect("the reviewer's governed plan is durable");
-                        let mut payload = original.payload.clone();
-                        payload["plan_id"] =
-                            serde_json::json!(format!("r1-second-review:{}", uuid::Uuid::new_v4()));
-                        payload["tasks"] = serde_json::json!([{
-                            "tool_name": "task_review",
-                            "tool_call_id": "r1-second-review-call",
-                            "effect": {"effect_kind": "write"},
-                            "normalized_input": {
-                                "task_ref": task_ref,
-                                "decision": "accept",
-                                "reason": "a second review of the same Task",
-                                "evidence_refs": [],
-                            },
-                            "step_binding": {
-                                "origin": {
-                                    "origin_step_id": "r1-second-review-step",
-                                    "call_id": "r1-second-review-call",
-                                    "catalog_digest": "catalog",
-                                    "source": {"kind": "provider", "attempt_id": "attempt-1"},
-                                },
-                                "snapshot": {
-                                    "contract_version": 1,
-                                    "identity": {
-                                        "step_id": "r1-second-review-step",
-                                        "session_id": envelope.actor.session_id,
-                                        "turn_id": envelope.actor.turn_id,
-                                        "execution_id": reviewer_run,
-                                        "actor_ref": "runtime.agentic",
-                                        "run_ref": reviewer_run,
-                                        "build_ref": "build",
-                                    },
-                                    "provider_attempt": {
-                                        "attempt_id": "attempt-1",
-                                        "origin_step_id": "r1-second-review-step",
-                                        "model_profile_digest": "profile",
-                                        "request_digest": "request",
-                                    },
-                                    "catalog_digest": "catalog",
-                                    "tools": [],
-                                    "related_revisions": {},
-                                    "context_refs": [],
-                                    "expires_at_ms": 0,
-                                },
-                            },
-                        }]);
-                        store
-                            .append(crate::RuntimeEventInput {
-                                stream_id: original.stream_id.clone(),
-                                scope: original.scope,
-                                kind: original.kind.clone(),
-                                status: original.status.clone(),
-                                actor: original.actor.clone(),
-                                refs: original.refs.clone(),
-                                payload,
-                            })
-                            .unwrap();
-                    }
-                    let outcome = services.submit_agent_action(&envelope).await;
-                    if second_review {
-                        let error = outcome
-                            .err()
-                            .expect("a second unfinished review must block the applied review");
-                        assert!(
-                            error.contains("effect_review_pending"),
-                            "a second unfinished review in the same run must still block: {error}"
-                        );
-                        assert_eq!(
-                            services
-                                .agent_action_service()
-                                .project(&envelope.actor.program_id)
-                                .unwrap()
-                                .tasks[&task_ref]
-                                .status,
-                            crate::AgenticTaskStatus::Submitted
-                        );
-                    } else {
-                        let applied = outcome.expect("the applied review is applied");
-                        assert_eq!(
-                            applied.status,
-                            harness_contract::agent_action::AgentActionStatus::Applied,
-                            "{applied:?}"
-                        );
-                        assert_eq!(
-                            services
-                                .agent_action_service()
-                                .project(&envelope.actor.program_id)
-                                .unwrap()
-                                .tasks[&task_ref]
-                                .status,
-                            crate::AgenticTaskStatus::Accepted
-                        );
-                    }
-                }),
-            )
-            .await;
-        }
-    }
 
-    #[tokio::test]
-    async fn own877_real_task_review_rejects_pending_and_foreign_control_callback() {
-        use crate::agentic::execution::reviewed_goal_fixture::{
-            with_native_task_review_async, NativeTaskReviewCase,
-        };
-        for foreign in [false, true] {
-            with_native_task_review_async(NativeTaskReviewCase::default(),
-                move |services, envelope, _donor| Box::pin(async move {
-                    let program = services.agent_action_service().project(&envelope.actor.program_id).unwrap();
-                    let task_ref = match &envelope.action {
-                        harness_contract::agent_action::AgentAction::TaskReview(input) => &input.task_ref,
-                        _ => unreachable!(),
-                    };
-                    let before = services.goal_store().get(&format!("goal:{}",
-                        envelope.actor.root_execution_id.as_deref().unwrap())).unwrap().unwrap();
-                    let store = services.event_store();
-                    let events = store.list_stream(&format!("session:{}", program.session_id)).unwrap();
-                    let terminal = events.iter().find(|event|
-                        event.kind == "tool.invocation.completed"
-                            && event.payload["tool_call_id"] == "native-submit").unwrap();
-                    let original = events.iter().find(|event|
-                        event.kind == "tool.execution_plan.created"
-                            && event.payload["plan_id"] == terminal.payload["governed_plan_id"]).unwrap();
-                    let mut payload = original.payload.clone();
-                    let plan_id = format!("own877-unsettled-control:{}", uuid::Uuid::new_v4());
-                    payload["plan_id"] = serde_json::json!(plan_id);
-                    store.append(crate::RuntimeEventInput {
-                        stream_id: original.stream_id.clone(), scope: original.scope,
-                        kind: original.kind.clone(), status: original.status.clone(),
-                        actor: original.actor.clone(), refs: original.refs.clone(), payload,
-                    }).unwrap();
-                    if foreign {
-                        let mut payload = terminal.payload.clone();
-                        payload["governed_plan_id"] = serde_json::json!(plan_id);
-                        store.append(crate::RuntimeEventInput {
-                            stream_id: terminal.stream_id.clone(), scope: terminal.scope,
-                            kind: terminal.kind.clone(), status: terminal.status.clone(),
-                            actor: Some("foreign-runtime".into()), refs: terminal.refs.clone(), payload,
-                        }).unwrap();
-                    }
-                    let current = services.agent_action_service().project(&program.program_id).unwrap();
-                    let error = services.independent_result_review(&envelope.actor, &current,
-                        &current.tasks[task_ref].artifact_refs, None).await.err()
-                        .expect("an original control descriptor must not settle an unauthenticated or missing callback");
-                    assert!(error.contains("effect_review_pending"), "foreign={foreign}: {error}");
-                    assert!(services.submit_agent_action(&envelope).await.is_err());
-                    assert_eq!(services.goal_store().get(&before.id).unwrap().unwrap(), before);
-                    assert_eq!(services.agent_action_service().project(&program.program_id).unwrap()
-                        .tasks[task_ref].status, crate::AgenticTaskStatus::Submitted);
-                })).await;
-        }
-    }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn bounded_process_explicit_body_selection_preserves_all_versions_through_original_review_and_goal_cas(
-    ) {
-        crate::agentic::execution::reviewed_goal_fixture::exercise_bounded_process_reviewed_goal_283().await;
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn bounded_process_changed_full_input_after_review_is_rejected_at_actual_goal_cas() {
-        crate::agentic::execution::reviewed_goal_fixture::exercise_bounded_process_input_changed_before_final_290().await;
-    }
 }
 
 #[cfg(test)]
@@ -9233,252 +11233,13 @@ mod receipt_index_791_tests;
 mod own872_plan_owner_tests {
     use super::*;
 
-    #[tokio::test]
-    async fn own872_real_native_callback_missing_foreign_actor_and_owner_never_settle() {
-        crate::agentic::execution::reviewed_goal_fixture::with_native_raw_owner_fixture_for_test(
-            |services, owner| async move {
-                let binding = owner.activity_binding().unwrap();
-                let graph = services
-                    .graph_state_store()
-                    .load(&binding.root_execution_id)
-                    .unwrap();
-                let packet = graph
-                    .nodes
-                    .iter()
-                    .find_map(|node| {
-                        if node.kind
-                            != harness_contract::execution_graph::ExecutionNodeKind::AgentTask
-                        {
-                            return None;
-                        }
-                        serde_json::from_str::<harness_contract::agent::AgentTaskPacket>(
-                            &node.payload_ref,
-                        )
-                        .ok()
-                    })
-                    .unwrap();
-                let store = services.event_store();
-                let events = store.list_stream(&owner.stream_id).unwrap();
-                let mut checked = BTreeSet::new();
-                for plan in events
-                    .iter()
-                    .filter(|event| event.kind == "tool.execution_plan.created")
-                {
-                    let Some(tasks) = plan.payload["tasks"].as_array() else {
-                        continue;
-                    };
-                    for task in tasks.iter().filter(|task| {
-                        matches!(
-                            task["tool_name"].as_str(),
-                            Some("task_claim" | "task_submit")
-                        )
-                    }) {
-                        let packets = std::collections::BTreeMap::from([(
-                            packet.graph_id().to_string(),
-                            packet.clone(),
-                        )]);
-                        let roots = BTreeSet::new();
-                        if !events.iter().any(|event| {
-                            event.kind == "tool.invocation.completed"
-                                && event.payload["governed_plan_id"] == plan.payload["plan_id"]
-                                && event.activity_binding().is_some_and(|binding| {
-                                    binding.root_execution_id == packet.graph_id()
-                                })
-                        }) {
-                            continue;
-                        }
-                        let original =
-                            delegated_plan_callback_owner(plan, &events, &roots, &packets).unwrap();
-                        let effects = authenticated_delegated_plan_settled(
-                            store,
-                            plan,
-                            &events,
-                            original,
-                            &mut Default::default(),
-                        )
-                        .unwrap()
-                        .expect("the authenticated plan is settled");
-                        let original_task = plan.payload["tasks"]
-                            .as_array()
-                            .unwrap()
-                            .iter()
-                            .find(|original| original["tool_call_id"] == task["tool_call_id"])
-                            .unwrap();
-                        assert_eq!(
-                    effects.get(&format!(
-                        "{}:{}",
-                        plan.event_id,
-                        original_task["tool_call_id"].as_str().unwrap(),
-                    )),
-                    Some(original_task),
-                    "only the authenticated Task, never the whole Session plan, is an effect",
-                );
-                        let step: crate::step_snapshot::StepCallBinding =
-                            serde_json::from_value(original_task["step_binding"].clone()).unwrap();
-                        let key = step.effect_idempotency_key();
-                        let index_source = format!(
-                            "execution-agent-receipts:{}:{}:{}",
-                            packet.graph_id(),
-                            packet.node_id(),
-                            packet.attempt
-                        );
-                        let intent = store
-                            .event_by_idempotency_key(
-                                &index_source,
-                                &format!("agent-tool-intent:{key}"),
-                            )
-                            .unwrap()
-                            .unwrap();
-                        let receipt = store
-                            .event_by_idempotency_key(
-                                &index_source,
-                                &format!("agent-tool-receipt:{key}"),
-                            )
-                            .unwrap()
-                            .unwrap();
-                        admitted_intent_scope(store, &intent, &mut Default::default()).unwrap();
-                        let original = authenticate_settled_effect(
-                            store,
-                            &intent,
-                            &receipt,
-                            &mut Default::default(),
-                        )
-                        .unwrap();
-                        assert!(super::super::results::runtime_control_descriptor(&original));
-                        assert!(original.scopes.iter().all(|scope| scope.resource
-                            == harness_contract::policy::PermissionResource::Tool
-                            && scope.operation
-                                == harness_contract::policy::PermissionOperation::Control));
-                        let mut foreign_receipt = receipt.clone();
-                        foreign_receipt.payload["outcome"]["tool_name"] = serde_json::json!("edit");
-                        assert!(authenticate_settled_effect(
-                            store,
-                            &intent,
-                            &foreign_receipt,
-                            &mut Default::default(),
-                        )
-                        .is_err());
-                        assert!(task["step_binding"]["snapshot"]["identity"]["attempt"].is_null());
-                        for fault in ["foreign_attempt", "foreign_provider", "process_source"] {
-                            let mut invalid_plan = plan.clone();
-                            let task = invalid_plan.payload["tasks"]
-                                .as_array_mut()
-                                .unwrap()
-                                .iter_mut()
-                                .find(|changed| changed["tool_call_id"] == task["tool_call_id"])
-                                .unwrap();
-                            match fault {
-                                "foreign_attempt" => {
-                                    task["step_binding"]["snapshot"]["identity"]["attempt"] =
-                                        serde_json::json!(packet.attempt + 1)
-                                }
-                                "foreign_provider" => {
-                                    task["step_binding"]["origin"]["source"]["attempt_id"] =
-                                        serde_json::json!("foreign-provider-attempt")
-                                }
-                                "process_source" => {
-                                    task["step_binding"]["origin"]["source"] = serde_json::json!({
-                                        "kind":"process","worker_id":packet.run_id(),"sequence":1,
-                                    })
-                                }
-                                _ => unreachable!(),
-                            }
-                            let settled = delegated_plan_callback_owner(
-                                &invalid_plan,
-                                &events,
-                                &roots,
-                                &packets,
-                            )
-                            .map(|original| {
-                                authenticated_delegated_plan_settled(
-                                    store,
-                                    &invalid_plan,
-                                    &events,
-                                    original,
-                                    &mut Default::default(),
-                                )
-                            })
-                            .unwrap_or(Ok(None));
-                            assert!(!matches!(settled, Ok(Some(_))), "{fault}");
-                        }
-                        assert!(delegated_plan_callback_owner(
-                            plan,
-                            &events,
-                            &roots,
-                            &Default::default()
-                        )
-                        .is_none());
-                        let position = events
-                            .iter()
-                            .position(|terminal| {
-                                terminal.kind == "tool.invocation.completed"
-                                    && terminal.payload["governed_plan_id"]
-                                        == plan.payload["plan_id"]
-                                    && terminal.payload["tool_call_id"] == task["tool_call_id"]
-                            })
-                            .unwrap();
-                        for fault in [
-                            "missing", "actor", "owner", "run", "instance", "session", "turn",
-                            "schema", "scope", "status",
-                        ] {
-                            let mut invalid = events.clone();
-                            match fault {
-                                "missing" => {
-                                    invalid.remove(position);
-                                }
-                                "actor" => invalid[position].actor = Some("foreign".into()),
-                                "schema" => invalid[position].schema_version = 2,
-                                "scope" => {
-                                    invalid[position].scope = crate::RuntimeEventScope::Session
-                                }
-                                "status" => invalid[position].status = Some("running".into()),
-                                other => {
-                                    let field = match other {
-                                        "owner" => "root_execution_id",
-                                        "run" => "agent_run_id",
-                                        "instance" => "agent_instance_id",
-                                        "session" => "session_id",
-                                        "turn" => "turn_id",
-                                        _ => unreachable!(),
-                                    };
-                                    invalid[position].payload["_runtime_activity_binding"][field] =
-                                        serde_json::json!("foreign");
-                                }
-                            }
-                            let settled =
-                                delegated_plan_callback_owner(plan, &invalid, &roots, &packets)
-                                    .map(|original| {
-                                        authenticated_delegated_plan_settled(
-                                            store,
-                                            plan,
-                                            &invalid,
-                                            original,
-                                            &mut Default::default(),
-                                        )
-                                        .unwrap()
-                                        .is_some()
-                                    })
-                                    .unwrap_or(false);
-                            assert!(!settled, "{fault}");
-                        }
-                        checked.insert(task["tool_name"].as_str().unwrap().to_string());
-                    }
-                }
-                assert_eq!(
-                    checked,
-                    BTreeSet::from(["task_claim".to_string(), "task_submit".to_string()])
-                );
-            },
-        )
-        .await;
-    }
 
     #[test]
     fn own872_native_plan_owner_does_not_erase_unknown_or_pending_root_writes() {
         let store = crate::RuntimeEventStore::for_test();
         let mut plan = store.append(crate::RuntimeEventInput {
             stream_id: "session:own872".into(),
-            scope: crate::RuntimeEventScope::Tool,
+            scope: RuntimeEventScope::Tool,
             kind: "tool.execution_plan.created".into(),
             status: Some("planned".into()),
             actor: Some("conversation_runtime".into()),
@@ -9494,10 +11255,6 @@ mod own872_plan_owner_tests {
         assert!(delegated_plan_callback_owner(&plan, &[], &roots, &packets).is_none());
     }
 }
-
-#[cfg(test)]
-#[path = "policy_applied_carrier_tests.rs"]
-mod applied_carrier_tests;
 
 #[cfg(test)]
 mod read_auth_boundary_tests {
@@ -9701,7 +11458,7 @@ mod read_auth_boundary_tests {
                 &intent,
                 &mut BTreeMap::new()
             )
-            .unwrap_err(),
+            .unwrap_err().to_string(),
             "root effect does not authenticate its original Running owner/admission fence"
         );
         let mut wrong = reader.clone();
@@ -9712,7 +11469,7 @@ mod read_auth_boundary_tests {
                 &intent,
                 &mut BTreeMap::new()
             )
-            .unwrap_err(),
+            .unwrap_err().to_string(),
             "original root start graph content is invalid"
         );
         for op in ["revision", "key", "fence", "page", "body"] {
@@ -9724,7 +11481,7 @@ mod read_auth_boundary_tests {
                     &intent,
                     &mut BTreeMap::new()
                 )
-                .unwrap_err(),
+                .unwrap_err().to_string(),
                 format!("reader:{op}")
             );
             assert_eq!(wrong.calls.last(), Some(&op));
@@ -9737,7 +11494,7 @@ mod read_auth_boundary_tests {
                 &intent,
                 &mut BTreeMap::new()
             )
-            .unwrap_err(),
+            .unwrap_err().to_string(),
             "original root Running transition missing"
         );
     }
@@ -9811,7 +11568,7 @@ mod read_auth_boundary_tests {
                 &primary,
                 &mut BTreeMap::new()
             )
-            .unwrap_err(),
+            .unwrap_err().to_string(),
             "root receipt original real-node index missing"
         );
     }
@@ -9985,28 +11742,55 @@ mod read_auth_boundary_tests {
             r.payload["response"]["output"] = json!("wrong");
         }
         assert_eq!(
-            run(&mut wrong, &packet).err().unwrap(),
+            run(&mut wrong, &packet).err().unwrap().to_string(),
             "Process delivered body does not match its actual response"
         );
         let mut missing = reader.clone();
         missing.keys.remove(&("primary".into(), "read".into()));
         assert_eq!(
-            run(&mut missing, &packet).err().unwrap(),
+            run(&mut missing, &packet).err().unwrap().to_string(),
             "delivered read has no original primary receipt"
         );
         let mut changed = reader.clone();
         changed.moved = true;
         assert_eq!(
-            run(&mut changed, &packet).err().unwrap(),
+            run(&mut changed, &packet).err().unwrap().to_string(),
             "read delivery source moved during validation"
         );
         for op in ["key", "revision"] {
             let mut bad = reader.clone();
             bad.fault = Some(op);
             assert_eq!(
-                run(&mut bad, &packet).err().unwrap(),
+                run(&mut bad, &packet).err().unwrap().to_string(),
                 format!("reader:{op}")
             );
         }
     }
+
+    // Reuse the existing physical-delivery reader fixture. A different producer
+    // coordinate or selected primary receipt must not be accepted as this read.
+    #[test]
+    fn agent_delivery_rejects_foreign_producer_coordinates_and_primary() {
+        let (reader, program, packet, delivery) = agent();
+        let run = |reader: &mut Reader, event: DurableRuntimeEvent| {
+            review_delivery_snapshot_from_events(reader, &program, Some(&packet), vec![event], BTreeMap::new())
+        };
+        let mut good = reader.clone();
+        assert_eq!(run(&mut good, delivery.clone()).unwrap().reads.len(), 1);
+        for (field, value) in [("graph_id", json!("foreign-graph")), ("node_id", json!("foreign-node")),
+            ("attempt", json!(2)), ("session_id", json!("foreign-session"))] {
+            let mut changed = delivery.clone();
+            changed.payload["acquisition"][field] = value;
+            let mut source = reader.clone();
+            let result = run(&mut source, changed);
+            assert!(!matches!(result, Ok(snapshot) if !snapshot.reads.is_empty()), "foreign {field} accepted");
+        }
+        let mut substituted = reader.clone();
+        substituted.keys.get_mut(&(String::from("primary"), String::from("read"))).unwrap().event_id = "foreign-primary".into();
+        let result = run(&mut substituted, delivery);
+        assert!(!matches!(result, Ok(snapshot) if !snapshot.reads.is_empty()), "foreign primary accepted");
+    }
 }
+
+#[cfg(test)]
+mod s1_fixture;

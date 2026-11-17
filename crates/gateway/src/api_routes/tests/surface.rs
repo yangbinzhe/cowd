@@ -77,7 +77,7 @@
             serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
                 .unwrap();
         let pending = body["pending"].as_array().unwrap();
-        assert_eq!(pending.len(), 1);
+        assert!(matches!(pending.as_slice(), [item] if item["approval_id"] == "approval-filter:chat"));
         assert_eq!(pending[0]["approval_id"], "approval-filter:chat");
         assert_eq!(pending[0]["domain"], "execution");
         assert_eq!(pending[0]["blocks_execution"], true);
@@ -914,7 +914,7 @@
         assert!(json["tools"].as_array().unwrap().iter().any(|tool| {
             tool["capability_id"] == "service.local.docs.summarize_ref" && tool["plane"] == "service"
         }));
-        assert_eq!(json["tools"].as_array().unwrap().len(), 1);
+        assert!(matches!(json["tools"].as_array().unwrap().as_slice(), [tool] if tool["capability_id"] == "service.local.docs.summarize_ref" && tool["plane"] == "service"));
         for retired in ["service.local.docs.read", "service.local.docs.export"] {
             let response = app.clone().oneshot(
                 Request::builder()

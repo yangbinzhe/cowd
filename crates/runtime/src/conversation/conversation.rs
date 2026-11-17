@@ -22,9 +22,11 @@ pub(crate) mod frame_refusal;
 mod provider_plane;
 use provider_plane::TurnProviderState;
 #[path = "tool_plane.rs"]
-mod tool_plane;
+pub(crate) mod tool_plane;
 #[path = "turn_engine.rs"]
 mod turn_engine;
+pub(crate) use turn_engine::{capture_member_consumption, original_memory_authorization_identity, OriginalHostPreparedMember, OriginalReadRefTarget,
+    PreparedHostMemberAssessment, SharedPolicyOwner};
 
 /// T35: Lightweight cancellation token (tokio-util not available in dep tree).
 #[derive(Default, Debug)]
@@ -33,6 +35,7 @@ struct CancellationState {
     notify: tokio::sync::Notify,
     parents: Vec<CancellationToken>,
     signal_window: std::sync::Mutex<Option<(Instant, Instant)>>,
+    member_commit_controls: std::sync::Mutex<Vec<std::sync::Weak<MemberCommitControl>>>,
     /// Test-fixture only: where this scope was cancelled from.
     #[cfg(feature = "test-fixtures")]
     cancel_site: std::sync::Mutex<Option<String>>,
@@ -64,6 +67,124 @@ pub(crate) fn record_cancel_site(token_id: usize, site: &str) {
 pub(crate) fn cancel_sites() -> Vec<(usize, String)> {
     let slot = CANCEL_SITES.get_or_init(|| std::sync::Mutex::new(Vec::new()));
     slot.lock().map(|guard| guard.clone()).unwrap_or_default()
+}
+
+/// Shared original-turn input control. Signal and member transaction
+/// registration are serialized so control cannot race past registration.
+#[derive(Debug, Default)]
+pub(crate) struct OriginalTurnInputControl {
+    requested: AtomicBool,
+    approval_waiters: std::sync::atomic::AtomicUsize,
+    members: std::sync::Mutex<Vec<std::sync::Weak<MemberCommitControl>>>,
+}
+pub(crate) struct OriginalApprovalWait(Arc<OriginalTurnInputControl>);
+impl Drop for OriginalApprovalWait {
+    fn drop(&mut self) { self.0.approval_waiters.fetch_sub(1, Ordering::AcqRel); }
+}
+impl OriginalTurnInputControl {
+    pub(crate) fn begin_approval_wait(self: &Arc<Self>) -> OriginalApprovalWait {
+        self.approval_waiters.fetch_add(1, Ordering::AcqRel);
+        OriginalApprovalWait(Arc::clone(self))
+    }
+    pub(crate) fn signal_if_approval_waiting(&self) {
+        if self.approval_waiters.load(Ordering::Acquire) != 0 { self.signal(); }
+    }
+    pub(crate) fn load(&self, ordering: Ordering) -> bool { self.requested.load(ordering) }
+    pub(crate) fn swap(&self, value: bool, ordering: Ordering) -> bool { self.requested.swap(value, ordering) }
+    pub(crate) fn signal(&self) {
+        let mut members = self.members.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.requested.store(true, Ordering::Release);
+        members.retain(|weak| {
+            if let Some(control) = weak.upgrade() {
+                crate::RuntimeTransactionCommitControl::request_cancel(control.as_ref()); true
+            } else { false }
+        });
+    }
+    pub(crate) fn register(&self, control: &Arc<MemberCommitControl>) {
+        let mut members = self.members.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        members.retain(|weak| weak.strong_count() > 0);
+        members.push(Arc::downgrade(control));
+        if self.requested.load(Ordering::Acquire) {
+            crate::RuntimeTransactionCommitControl::request_cancel(control.as_ref());
+        }
+    }
+}
+
+/// Local decision for one member transaction; Unknown is retained until the
+/// original transaction owner resolves it. This does not authenticate Session
+/// ingress or replace the durable transaction source fence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MemberCommitState { Ready, Running, CancelRequested, Committing, Committed, RolledBack, Unknown }
+#[derive(Debug)]
+pub(crate) struct MemberCommitControl(std::sync::Mutex<MemberCommitState>);
+impl MemberCommitControl {
+    pub(crate) fn state(&self) -> MemberCommitState {
+        *self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    pub(crate) fn original_noncommit_reconciled(&self) -> Result<bool, String> {
+        self.0.lock().map(|state| *state == MemberCommitState::RolledBack)
+            .map_err(|_| "member transaction control unavailable".into())
+    }
+
+    /// Only the original checked owner may call this after authenticating the
+    /// same member's durable noncommit decision and receipt.
+    pub(crate) fn reconcile_original_noncommit(&self) -> Result<(), String> {
+        let mut state = self.0.lock().map_err(|_| "member transaction control unavailable")?;
+        match *state {
+            MemberCommitState::Unknown | MemberCommitState::Ready | MemberCommitState::CancelRequested => { *state = MemberCommitState::RolledBack; Ok(()) }
+            MemberCommitState::RolledBack => Ok(()),
+            _ => Err("member transaction control conflicts with noncommit".into()),
+        }
+    }
+}
+#[test]
+fn original_noncommit_reconciliation_preserves_running_and_committed_controls() {
+    for state in [MemberCommitState::Ready, MemberCommitState::CancelRequested, MemberCommitState::Unknown, MemberCommitState::RolledBack] {
+        let control = MemberCommitControl(std::sync::Mutex::new(state));
+        control.reconcile_original_noncommit().unwrap();
+        assert!(control.original_noncommit_reconciled().unwrap());
+    }
+    for state in [MemberCommitState::Running, MemberCommitState::Committing, MemberCommitState::Committed] {
+        let control = MemberCommitControl(std::sync::Mutex::new(state));
+        assert!(control.reconcile_original_noncommit().is_err());
+        assert_eq!(control.state(), state);
+    }
+}
+impl crate::RuntimeTransactionCommitControl for MemberCommitControl {
+    fn request_cancel(&self) -> bool {
+        let mut state = self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        match *state {
+            MemberCommitState::Ready | MemberCommitState::Running => { *state = MemberCommitState::CancelRequested; true }
+            MemberCommitState::CancelRequested => true,
+            _ => false,
+        }
+    }
+    fn begin(&self) -> Result<bool, String> {
+        let mut state = self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        match *state {
+            MemberCommitState::Ready => { *state = MemberCommitState::Running; Ok(true) }
+            MemberCommitState::CancelRequested => { *state = MemberCommitState::RolledBack; Ok(false) }
+            _ => Err("member transaction control already used".into()),
+        }
+    }
+    fn before_commit(&self) {}
+    fn commit_wins(&self) -> Result<bool, String> {
+        let mut state = self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        match *state {
+            MemberCommitState::Running => { *state = MemberCommitState::Committing; Ok(true) }
+            MemberCommitState::CancelRequested => Ok(false),
+            _ => Err("member transaction decision state invalid".into()),
+        }
+    }
+    fn finish(&self, outcome: crate::RuntimeTransactionOutcome) {
+        let mut state = self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        *state = match outcome {
+            crate::RuntimeTransactionOutcome::Committed if *state == MemberCommitState::Committing => MemberCommitState::Committed,
+            crate::RuntimeTransactionOutcome::RolledBack if matches!(*state, MemberCommitState::Ready | MemberCommitState::CancelRequested | MemberCommitState::Running) => MemberCommitState::RolledBack,
+            _ => MemberCommitState::Unknown,
+        };
+    }
 }
 
 #[derive(Clone, Default, Debug)]
@@ -125,6 +246,7 @@ impl CancellationToken {
         let _ = self.cancel_first_signal();
     }
 
+    #[cfg(feature = "test-fixtures")]
     pub(crate) fn last_cancel_site(&self) -> Option<String> {
         let own = self.0.cancel_site.lock().ok().and_then(|guard| guard.clone());
         let parents = self
@@ -144,6 +266,13 @@ impl CancellationToken {
     #[track_caller]
     pub(crate) fn cancel_first_signal(&self) -> bool {
         let began = Instant::now();
+        let mut controls = self.0.member_commit_controls.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        controls.retain(|weak| {
+            if let Some(control) = weak.upgrade() {
+                crate::RuntimeTransactionCommitControl::request_cancel(control.as_ref());
+                true
+            } else { false }
+        });
         if !self.0.cancelled.swap(true, Ordering::SeqCst) {
             #[cfg(feature = "test-fixtures")]
             {
@@ -164,6 +293,27 @@ impl CancellationToken {
             true
         } else {
             false
+        }
+    }
+
+    pub(crate) fn member_commit_control(&self) -> Arc<MemberCommitControl> {
+        let control = Arc::new(MemberCommitControl(std::sync::Mutex::new(MemberCommitState::Ready)));
+        self.register_member_commit_control(&control);
+        control
+    }
+
+    pub(crate) fn register_member_commit_control(&self, control: &Arc<MemberCommitControl>) {
+        let mut states = vec![self.0.clone()];
+        let mut visited = std::collections::BTreeSet::new();
+        while let Some(state) = states.pop() {
+            if !visited.insert(Arc::as_ptr(&state) as usize) { continue; }
+            let mut controls = state.member_commit_controls.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            controls.retain(|weak| weak.strong_count() > 0);
+            controls.push(Arc::downgrade(control));
+            if state.cancelled.load(Ordering::SeqCst) {
+                crate::RuntimeTransactionCommitControl::request_cancel(control.as_ref());
+            }
+            states.extend(state.parents.iter().map(|parent| Arc::clone(&parent.0)));
         }
     }
 
@@ -191,12 +341,13 @@ impl CancellationToken {
         }
     }
 
-    fn linked(turn: Self, step: Self) -> Self {
+    pub(crate) fn linked(turn: Self, step: Self) -> Self {
         Self(Arc::new(CancellationState {
             cancelled: AtomicBool::new(false),
             notify: tokio::sync::Notify::new(),
             parents: vec![turn, step],
             signal_window: std::sync::Mutex::new(None),
+            member_commit_controls: std::sync::Mutex::new(Vec::new()),
             #[cfg(feature = "test-fixtures")]
             cancel_site: std::sync::Mutex::new(None),
         }))
@@ -1249,22 +1400,6 @@ pub(crate) struct EarlyToolCandidate {
     pub ready_at_ms: u64,
 }
 
-#[cfg(test)]
-fn lifecycle_append_failure_set() -> &'static std::sync::Mutex<std::collections::BTreeSet<(String, String)>> {
-    static FAILURE: std::sync::OnceLock<std::sync::Mutex<std::collections::BTreeSet<(String, String)>>> = std::sync::OnceLock::new();
-    FAILURE.get_or_init(|| std::sync::Mutex::new(std::collections::BTreeSet::new()))
-}
-
-#[cfg(test)]
-pub(crate) fn arm_lifecycle_append_failure(session: &str, call: &str) {
-    lifecycle_append_failure_set().lock().unwrap().insert((session.into(), call.into()));
-}
-
-#[cfg(test)]
-fn take_lifecycle_append_failure(session: &str, call: &str) -> bool {
-    lifecycle_append_failure_set().lock().unwrap().remove(&(session.into(), call.into()))
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ToolLifecycleReuse {
     /// The actual early execution owner retained its record before publication.
@@ -1281,6 +1416,7 @@ pub(crate) enum ToolLifecycleReuse {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct EarlyToolExecutionReceipt {
+    pub original_source: Option<EarlyToolOriginalSource>,
     pub lifecycle: ToolLifecycleReuse,
     pub call: ModelToolCall,
     pub outcome: crate::RuntimeToolExecutionOutcome,
@@ -1289,17 +1425,68 @@ pub(crate) struct EarlyToolExecutionReceipt {
     pub completed_at_ms: u64,
 }
 
+/// Same-call transport captured before dispatch; it is not itself a receipt.
+#[derive(Debug, Clone)]
+pub(crate) struct EarlyToolOriginalSource {
+    pub ticket: crate::execution_core::NodeExecutionTicket,
+    pub request: Arc<crate::RuntimeToolExecutionRequest>,
+    pub completed_calls: Option<Vec<ModelToolCall>>,
+}
+
+impl PartialEq for EarlyToolOriginalSource {
+    fn eq(&self, other: &Self) -> bool {
+        self.ticket == other.ticket && Arc::ptr_eq(&self.request, &other.request)
+            && self.completed_calls == other.completed_calls
+    }
+}
+impl Eq for EarlyToolOriginalSource {}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct EarlyToolDeferral {
     pub tool_call_id: String,
     pub reason: String,
     pub ready_at_ms: u64,
+    pub(crate) original_undispatched: Option<Arc<EarlyToolUndispatched>>,
+    pub(crate) origin: EarlyToolDeferralOrigin,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EarlyToolDeferralOrigin {
+    GateDidNotSpawn,
+    OriginalWorker,
+}
+
+/// Original worker's pre-dispatch return and acknowledged authorization writes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct EarlyToolUndispatched {
+    pub(crate) ticket: crate::execution_core::NodeExecutionTicket,
+    pub(crate) call_id: String,
+    pub(crate) identity: crate::CausalItemIdentity,
+    pub(crate) authorization_events: Vec<crate::DurableRuntimeEvent>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum EarlyToolFailureKind {
+    AuthorizationCommitUnknown,
+    WorkerOutcomeUnknown,
+}
+
+/// Original identity and operation whose outcome could not be established.
+/// This is an infrastructure failure, never a policy refusal receipt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct EarlyToolFailure {
+    pub identity: crate::CausalItemIdentity,
+    pub tool_call_id: String,
+    pub owner_ticket: Option<crate::execution_core::NodeExecutionTicket>,
+    pub kind: EarlyToolFailureKind,
+    pub detail: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum EarlyToolDispatchResult {
     Executed(EarlyToolExecutionReceipt),
     Deferred(EarlyToolDeferral),
+    Failed(EarlyToolFailure),
 }
 
 pub(crate) type EarlyToolDispatchFuture =
@@ -1307,6 +1494,9 @@ pub(crate) type EarlyToolDispatchFuture =
 
 pub(crate) trait EarlyToolDispatcher: Send + Sync {
     fn dispatch(&self, candidate: EarlyToolCandidate) -> EarlyToolDispatchFuture;
+    fn confirms_original_undispatched(&self, _call_id: &str, _deferred: &EarlyToolDeferral) -> bool {
+        false
+    }
 }
 
 /// Append-only model-step plan used while Provider items are still arriving.
@@ -1873,6 +2063,7 @@ impl ModelStreamReducer {
             stop_reason: self.stop_reason,
             early_tool_receipts: Vec::new(),
             early_tool_deferrals: Vec::new(),
+            early_tool_failures: Vec::new(),
             response_completed_at_ms: now_ms(),
         }
     }
@@ -1966,6 +2157,7 @@ struct CollectedProviderStream {
     stop_reason: Option<String>,
     early_tool_receipts: Vec<EarlyToolExecutionReceipt>,
     early_tool_deferrals: Vec<EarlyToolDeferral>,
+    early_tool_failures: Vec<EarlyToolFailure>,
     response_completed_at_ms: u64,
 }
 
@@ -2041,19 +2233,19 @@ async fn consume_owned_provider_stream(
     use futures::FutureExt;
     let completion_bus = reducer.bus.clone();
     let model_step_id = reducer.model_step_id.clone();
-    let consumer = consume_provider_stream_inner(
+    let consumer = Box::pin(consume_provider_stream_inner(
         stream,
         cancellation,
         timeout_policy,
         reducer,
         early_dispatcher,
         transport_activity,
-    );
+    ));
     let (consumed, producer_result) = match execution {
-        Some(execution) => execution.drive(consumer).await,
+        Some(execution) => Box::pin(execution.drive(consumer)).await,
         None => (
-            std::panic::AssertUnwindSafe(consumer)
-                .catch_unwind()
+            Box::pin(std::panic::AssertUnwindSafe(consumer)
+                .catch_unwind())
                 .await
                 .map_err(|_| ()),
             Ok(ProviderLocalExit::Completed),
@@ -2119,6 +2311,7 @@ async fn consume_provider_stream_inner(
     let mut failure = None;
     let mut resource_result_class = crate::execution_core::graph::ResourceResultClass::Completed;
     let mut early_workers = Vec::new();
+    let mut early_worker_identities = Vec::new();
     let mut early_tool_deferrals = Vec::new();
     let mut tool_plan = ModelStepToolPlan::default();
     // Transport heartbeats only prove that the socket is alive. They must not
@@ -2282,6 +2475,7 @@ async fn consume_provider_stream_inner(
                             if reducer.early_tool_start_enabled() {
                                 if let Some(dispatcher) = &early_dispatcher {
                                     let dispatcher = Arc::clone(dispatcher);
+                                    early_worker_identities.push((candidate.call.id.clone(), candidate.identity.clone()));
                                     early_workers.push(tokio::spawn(async move {
                                         dispatcher.dispatch(candidate).await
                                     }));
@@ -2293,6 +2487,8 @@ async fn consume_provider_stream_inner(
                                         "provider early_tool_start gate is not performance-certified"
                                             .to_string(),
                                     ready_at_ms: candidate.ready_at_ms,
+                                    original_undispatched: None,
+                                    origin: EarlyToolDeferralOrigin::GateDidNotSpawn,
                                 });
                             }
                         }
@@ -2381,21 +2577,38 @@ async fn consume_provider_stream_inner(
         }
     };
     let mut early_tool_receipts = Vec::new();
-    for result in joined {
+    let mut early_tool_failures = Vec::new();
+    for (result, (tool_call_id, identity)) in joined.into_iter().zip(early_worker_identities) {
         match result {
-            Ok(EarlyToolDispatchResult::Executed(receipt)) => {
-                early_tool_receipts.push(receipt);
-            }
-            Ok(EarlyToolDispatchResult::Deferred(deferral)) => {
-                early_tool_deferrals.push(deferral);
-            }
-            Err(error) => {
-                tracing::warn!(%error, "early-safe tool worker failed to join");
-            }
+            Ok(EarlyToolDispatchResult::Executed(receipt)) => early_tool_receipts.push(receipt),
+            Ok(EarlyToolDispatchResult::Deferred(mut deferral)) => {
+                // Only the collector's no-spawn branch may assert that no
+                // worker existed; a worker cannot assert that about itself.
+                deferral.origin = EarlyToolDeferralOrigin::OriginalWorker;
+                if deferral.tool_call_id != tool_call_id
+                    || deferral.original_undispatched.as_ref().is_some_and(|original| {
+                        original.call_id != tool_call_id || original.identity != identity
+                    })
+                {
+                    early_tool_failures.push(EarlyToolFailure {
+                        identity, tool_call_id, owner_ticket: None,
+                        kind: EarlyToolFailureKind::WorkerOutcomeUnknown,
+                        detail: "original early worker deferral identity differs".into(),
+                    });
+                } else {
+                    early_tool_deferrals.push(deferral);
+                }
+            },
+            Ok(EarlyToolDispatchResult::Failed(failure)) => early_tool_failures.push(failure),
+            Err(error) => early_tool_failures.push(EarlyToolFailure {
+                identity, tool_call_id, owner_ticket: None,
+                kind: EarlyToolFailureKind::WorkerOutcomeUnknown, detail: error.to_string(),
+            }),
         }
     }
     collected.early_tool_receipts = early_tool_receipts;
     collected.early_tool_deferrals = early_tool_deferrals;
+    collected.early_tool_failures = early_tool_failures;
     collected.response_completed_at_ms = response_completed_at_ms;
     ProviderStreamRun {
         collected,
@@ -3206,6 +3419,55 @@ struct NativeToolSource {
     tool_owner: Option<harness_contract::projection::RuntimeActivityBinding>,
 }
 
+/// Original provider call retained by the turn producer, not reconstructed
+/// from a later tool request or model-visible refusal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OriginalRootCall {
+    call: ModelToolCall,
+    execution: crate::CowdExecutionContext,
+    owner: harness_contract::projection::RuntimeActivityBinding,
+}
+
+impl OriginalRootCall {
+    pub(crate) fn binding_value(&self) -> serde_json::Value {
+        serde_json::json!({"call_id":self.call.id,"tool_name":self.call.name,
+            "original_input":self.call.input,"step_binding":self.call.binding,
+            "depends_on":self.call.depends_on,"execution":self.execution,"owner":self.owner})
+    }
+    pub(crate) fn matches_owner(&self, context: &crate::CowdExecutionContext,
+        owner: &harness_contract::projection::RuntimeActivityBinding) -> bool {
+        &self.execution == context && &self.owner == owner
+    }
+    pub(crate) fn matches_workspace(&self, services: &crate::RuntimeServices) -> bool {
+        self.call.binding.as_ref().and_then(|binding| binding.resolve(None).ok())
+            .is_some_and(|step| step.lease().workspace_root() == services.workspace_root())
+    }
+    pub(crate) fn matches_request(&self, request: &crate::RuntimeToolExecutionRequest) -> bool {
+        let Some(binding) = request.step_binding.as_ref() else { return false; };
+        let Some(invocation) = request.compiled_invocation.as_ref() else { return false; };
+        let (Ok(original), Ok(effective)) = (harness_contract::step::parse_strict_json(&self.call.input),
+            harness_contract::step::parse_strict_json(&request.input)) else { return false; };
+        let Some(original_binding) = self.call.binding.as_ref() else { return false; };
+        let Ok(mut derived) = original_binding.prepare_invocation(None, &self.call.name, &original) else { return false; };
+        let explicit = invocation.explicit_dependencies.iter().map(|dependency| &dependency.depends_on).collect::<BTreeSet<_>>();
+        if explicit.len() != invocation.explicit_dependencies.len()
+            || explicit != self.call.depends_on.iter().collect::<BTreeSet<_>>()
+            || invocation.explicit_dependencies.iter().any(|edge| edge.invocation_id != self.call.id
+                || edge.reason != "model_explicit_dependency")
+            || invocation.compiled_dependencies.iter().any(|edge| edge.invocation_id != self.call.id) {
+            return false;
+        }
+        // Dependencies are authored by the original plan compiler after the
+        // pinned tool invocation is prepared; every other field is compared
+        // structurally with the invocation re-derived from that pinned Step.
+        derived.explicit_dependencies = invocation.explicit_dependencies.clone();
+        derived.compiled_dependencies = invocation.compiled_dependencies.clone();
+        self.call.id == request.tool_use_id && self.call.name == request.tool_name
+            && self.call.binding.as_ref() == Some(binding) && binding.effect_idempotency_key() == request.idempotency_key
+            && original == effective && effective == invocation.intent.normalized_input && &derived == invocation
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct NativeReadAcquisition {
     seal: crate::context_evidence::ReadAcquisitionSeal,
@@ -3234,6 +3496,16 @@ struct NativeWireReceipt {
 /// threads.
 #[async_trait::async_trait]
 pub trait ToolExecutor: Send + Sync + 'static {
+    /// Bind immutable bounded-process context from this executor's original
+    /// owner before both policy assessment and execution. This never grants a
+    /// capability; the bounded owner still validates the live lease.
+    fn bind_bounded_process_request(
+        &self,
+        _request: &mut crate::RuntimeToolExecutionRequest,
+    ) -> Result<(), ToolError> {
+        Ok(())
+    }
+
     fn bounded_process_authority(
         &self,
         _request: &crate::RuntimeToolExecutionRequest,
@@ -3257,6 +3529,21 @@ pub trait ToolExecutor: Send + Sync + 'static {
 
     fn pin_step_catalog(&self) -> Option<tools::ToolHostLease> {
         None
+    }
+
+    /// Rewrite one turn call's input onto the byte basis this executor will
+    /// actually execute on, before the governed plan describes the call's
+    /// effect. The default keeps the model's raw bytes: an executor that
+    /// executes the raw input keeps the plan, the authorization and the
+    /// closure identity on that same basis. An executor that rewrites the
+    /// input (the member path normalizes workspace-internal absolute resource
+    /// paths) must return the same bytes here, so the effect description, the
+    /// authorization descriptor, the planned payload and the closure identity
+    /// all name what executes. Err means the input cannot be normalized
+    /// deterministically; the caller refuses the call rather than admitting an
+    /// effect on an unreadable input.
+    fn normalize_turn_tool_input(&self, _tool_name: &str, input: &str) -> Result<String, ToolError> {
+        Ok(input.to_string())
     }
 
     fn prepare_step_catalog(
@@ -3289,20 +3576,6 @@ pub trait ToolExecutor: Send + Sync + 'static {
         receipt
     }
 
-    async fn recover_step_tool_receipt(
-        &self,
-        _call: &ModelToolCall,
-    ) -> Result<
-        Option<(
-            harness_contract::tool::GovernedToolInvocation,
-            crate::RuntimeToolExecutionOutcome,
-            u64,
-        )>,
-        ToolError,
-    > {
-        Ok(None)
-    }
-
     fn validate_step_tool_input(
         &self,
         binding: Option<&crate::step_snapshot::StepCallBinding>,
@@ -3310,10 +3583,11 @@ pub trait ToolExecutor: Send + Sync + 'static {
         input: &str,
     ) -> Result<String, ToolError> {
         let Some(binding) = binding else {
-            if self.pin_step_catalog().is_some() {
-                return Err(ToolError::new("production_tool_origin_required"));
+            if tool_name == "agent_action_batch" || harness_contract::agent_action::AGENT_ACTION_TOOL_IDS.contains(&tool_name) {
+                return Err(ToolError::new("original action Step binding missing"));
             }
-            return self.validate_tool_input(tool_name, input);
+            harness_contract::step::parse_strict_json(input).map_err(|error| ToolError::new(error.to_string()))?;
+            return Ok(input.to_string());
         };
         let step = binding
             .resolve(self.pin_step_catalog())
@@ -3331,48 +3605,68 @@ pub trait ToolExecutor: Send + Sync + 'static {
         serde_json::to_string(&value).map_err(|error| ToolError::new(error.to_string()))
     }
 
+    /// Compile each call against the same pinned catalogue retained in its
+    /// private call carrier; no later catalogue pin can substitute for it.
     fn prepare_step_invocations(
         &self,
         requests: &[crate::tool_dispatch::ToolRequest],
         calls: &[ModelToolCall],
-    ) -> Result<Vec<harness_contract::tool::GovernedToolInvocation>, ToolError> {
+        pinned: Option<&std::sync::Arc<tools::ToolHostLease>>,
+        original_executor: &std::sync::Arc<dyn ToolExecutor>,
+    ) -> Result<Vec<crate::governed_tool_plan::OriginalPinnedInvocation>, ToolError> {
+        if (self as *const Self as *const ()) != (original_executor.as_ref() as *const dyn ToolExecutor as *const ()) {
+            return Err(ToolError::new("original tool executor differs"));
+        }
         let mut invocations = Vec::with_capacity(requests.len());
         for request in requests {
-            let binding = calls
-                .iter()
-                .find(|call| call.id == request.tool_use_id)
-                .and_then(|call| call.binding.as_ref());
-            if let Some(binding) = binding {
-                let step = binding
-                    .resolve(self.pin_step_catalog())
-                    .map_err(|error| ToolError::new(error.to_string()))?;
-                let input = step
-                    .validate_call(
-                        &binding.origin,
-                        &binding.snapshot.identity.session_id,
-                        &request.tool_use_id,
-                        &request.tool_name,
-                        &request.input,
-                        chrono::Utc::now().timestamp_millis(),
-                    )
-                    .map_err(|error| ToolError::new(error.to_string()))?;
-                let mut invocation = step.lease().prepare_governed_invocation(
-                    &request.tool_use_id,
-                    &request.tool_name,
-                    &input,
-                    &request.depends_on,
-                );
-                invocation.origin = Some(binding.origin.clone());
-                invocations.push(invocation);
-            } else {
-                if self.pin_step_catalog().is_some() {
-                    return Err(ToolError::new("production_tool_origin_required"));
-                }
-                invocations
-                    .extend(self.prepare_governed_invocations(std::slice::from_ref(request)));
+            let mut matching = calls.iter().filter(|call| call.id == request.tool_use_id);
+            let call = matching.next().ok_or_else(|| ToolError::new("original tool call missing"))?;
+            if matching.next().is_some() || call.name != request.tool_name {
+                return Err(ToolError::new("original tool call identity mismatch"));
             }
+            let (lease, invocation) = if let Some(binding) = call.binding.as_ref() {
+                let pinned = pinned.ok_or_else(|| ToolError::new("original Step catalogue unavailable"))?;
+                let step = binding.resolve(Some(pinned.as_ref().clone())).map_err(|error| ToolError::new(error.to_string()))?;
+                let input = step.validate_call(&binding.origin, &binding.snapshot.identity.session_id,
+                    &request.tool_use_id, &request.tool_name, &request.input, chrono::Utc::now().timestamp_millis())
+                    .map_err(|error| ToolError::new(error.to_string()))?;
+                let mut invocation = step.lease().prepare_governed_invocation(&request.tool_use_id,
+                    &request.tool_name, &input, &request.depends_on);
+                invocation.origin = Some(binding.origin.clone());
+                (Some(std::sync::Arc::clone(pinned)), invocation)
+            } else {
+                if request.tool_name == "agent_action_batch" || harness_contract::agent_action::AGENT_ACTION_TOOL_IDS.contains(&request.tool_name.as_str()) {
+                    return Err(ToolError::new("original action Step binding missing"));
+                }
+                let input = harness_contract::step::parse_strict_json(&request.input).map_err(|error| ToolError::new(error.to_string()))?;
+                if let Some(pinned) = pinned {
+                    pinned.validate_input(&request.tool_name, &input).map_err(|error| ToolError::new(error.to_string()))?;
+                    (Some(std::sync::Arc::clone(pinned)), pinned.prepare_governed_invocation(&request.tool_use_id, &request.tool_name, &input, &request.depends_on))
+                } else {
+                    let validated = original_executor.validate_tool_input(&request.tool_name, &request.input)?;
+                    if harness_contract::step::parse_strict_json(&validated).map_err(|error| ToolError::new(error.to_string()))? != input {
+                        return Err(ToolError::new("native original input requires replan"));
+                    }
+                    let mut invocations = original_executor.prepare_governed_invocations(std::slice::from_ref(request));
+                    if invocations.len() != 1 { return Err(ToolError::new("native original invocation unavailable")); }
+                    (None, invocations.remove(0))
+                }
+            };
+            if invocation.invocation_id != call.id || invocation.intent.tool_name != call.name {
+                return Err(ToolError::new("pinned original invocation identity mismatch"));
+            }
+            invocations.push(crate::governed_tool_plan::OriginalPinnedInvocation::new(invocation, lease, std::sync::Arc::clone(original_executor)));
         }
         Ok(invocations)
+    }
+
+    /// Forward an original admitted single action; implementations without
+    /// the original owner cannot manufacture this capability.
+    async fn execute_root_action_with_invocation(
+        &self, _request: &crate::RuntimeToolExecutionRequest,
+        _capability: &crate::agentic::action_invocation::VerifiedActionInvocation,
+    ) -> Result<harness_contract::context::ToolOutputDraft, ToolError> {
+        Err(ToolError::new("unknown: original action carrier unsupported"))
     }
 
     async fn execute_step_authorized_invocation_output(
@@ -3690,12 +3984,376 @@ pub trait MemoryCallback: Send + Sync {
     fn on_memory_stats(&self, total_entries: usize, vector_count: usize, layers: Vec<String>);
 }
 
+/// An in-process carrier for the original owner's batch result. This is not
+/// serialized and is never an authorization or durable receipt by itself.
+#[derive(Clone)]
+pub struct PendingAgentBatch(
+    std::sync::Arc<PendingAgentBatchValue>,
+    Option<(crate::execution_core::NodeExecutionTicket, Vec<ModelToolCall>)>,
+    bool,
+);
+
+pub struct OriginalReplayedPartial {
+    pub(crate) replay: std::sync::Arc<crate::agentic::OriginalReplayedAction>,
+    /// Original verified physical receipt; the physical driver closes separately.
+    pub(crate) physical_receipt: Option<std::sync::Arc<crate::DurableRuntimeEvent>>,
+    /// Present only for an already-observed complete replay; never synthesized.
+    pub(crate) complete_request: Option<std::sync::Arc<crate::RuntimeToolExecutionRequest>>,
+}
+
+/// Same-call packet ceiling outcome retained by the existing node owner.
+/// Private fields are original in-process facts, never a new capability.
+pub struct OriginalPacketScopePending {
+    ticket: crate::execution_core::NodeExecutionTicket,
+    fact: std::sync::Arc<crate::agent_in_process_worker::OriginalPacketScopeDenial>,
+    request: std::sync::Arc<crate::RuntimeToolExecutionRequest>,
+    receipt: Option<std::sync::Arc<crate::execution_core::graph::CommittedCallRefusal>>,
+}
+impl OriginalPacketScopePending {
+    pub(crate) fn matches(&self, ticket: &crate::execution_core::NodeExecutionTicket,
+        store: &std::sync::Arc<crate::RuntimeEventStore>, call_id: &str) -> bool {
+        &self.ticket == ticket && self.fact.belongs_to(store) && self.request.tool_use_id == call_id
+            && crate::execution_core::graph::executors::agent_tool::validate_original_call_request(ticket, &self.request).is_ok()
+    }
+    pub(crate) fn fact(&self) -> &std::sync::Arc<crate::agent_in_process_worker::OriginalPacketScopeDenial> { &self.fact }
+    pub(crate) fn request(&self) -> &crate::RuntimeToolExecutionRequest { &self.request }
+    pub(crate) fn receipt(&self) -> Option<&std::sync::Arc<crate::execution_core::graph::CommittedCallRefusal>> { self.receipt.as_ref() }
+}
+
+pub struct OriginalBoundedAcquisitionPending {
+    ticket: crate::execution_core::NodeExecutionTicket,
+    fact: std::sync::Arc<crate::bound_tool_batch::OriginalBoundedAcquisitionFailure>,
+    receipt: Option<std::sync::Arc<crate::execution_core::graph::CommittedCallRefusal>>,
+}
+impl OriginalBoundedAcquisitionPending {
+    pub(crate) fn matches(&self, ticket: &crate::execution_core::NodeExecutionTicket,
+        store: &std::sync::Arc<crate::RuntimeEventStore>, call_id: &str) -> bool {
+        &self.ticket == ticket && self.fact.belongs_to(store) && self.fact.request().tool_use_id == call_id
+            && crate::execution_core::graph::executors::agent_tool::validate_original_call_request(ticket, self.fact.request()).is_ok()
+    }
+    pub(crate) fn fact(&self) -> &std::sync::Arc<crate::bound_tool_batch::OriginalBoundedAcquisitionFailure> { &self.fact }
+    pub(crate) fn receipt(&self) -> Option<&std::sync::Arc<crate::execution_core::graph::CommittedCallRefusal>> { self.receipt.as_ref() }
+}
+
+/// A boundary recorded by the original sequential producer, not a receipt or authorization.
+pub struct OriginalTerminalBatchBoundary {
+    pub(crate) sink: crate::ToolProgressSink,
+    pub(crate) publication: std::sync::Arc<crate::tool_host::OriginalStopPublication>,
+    pub(crate) index: usize,
+    pub(crate) total: usize,
+}
+
+pub enum PendingAgentBatchValue {
+    OriginalBoundedAcquisition(std::sync::Arc<OriginalBoundedAcquisitionPending>),
+    OriginalPacketScope(std::sync::Arc<OriginalPacketScopePending>),
+    OriginalReplay(OriginalReplayedPartial),
+    Prefix(crate::tool_host::AgentBatchCommittedPrefixRead),
+    Submission(crate::tool_host::OriginalMemberSubmitOutcome),
+    Recorded(Vec<(usize, std::sync::Arc<crate::tool_host::OriginalMemberSubmitOutcome>)>),
+    /// Same live owner-bound call transport, never a durable fact.
+    RecordedSink(crate::ToolProgressSink),
+    OriginalCall(std::sync::Arc<crate::tool_host::OriginalMemberCallCarrier>),
+    /// Direct original-owner publication, including current, previous and
+    /// failure when the original sink could not record the stop.
+    OriginalStopPublication(std::sync::Arc<crate::tool_host::OriginalStopPublication>),
+    /// Original sequential producer's terminal boundary; Runtime must authenticate it.
+    OriginalTerminalBoundary(OriginalTerminalBatchBoundary),
+    /// A separate unresolved phase, never evidence that a member may be settled.
+    UnresolvedContext,
+    /// Preserve an independently returned stop beside the same-call prefix.
+    WithCause { primary: PendingAgentBatch, cause: PendingAgentBatch },
+    Calls(Vec<(String, PendingAgentBatch)>),
+}
+
+impl PendingAgentBatch {
+    pub fn new(value: PendingAgentBatchValue) -> Self {
+        // Capture provenance at the original stop producer; it is still only
+        // a claim until the same sink and durable facts are authenticated.
+        let coordinate = match &value {
+            PendingAgentBatchValue::OriginalStopPublication(publication) => match publication.as_ref() {
+                crate::tool_host::OriginalStopPublication::Recorded(stop) =>
+                    Some((stop.coordinate().ticket().clone(), stop.coordinate().call_id().to_owned())),
+                _ => None,
+            },
+            PendingAgentBatchValue::RecordedSink(sink) => match sink.original_member_stop() {
+                crate::tool_host::OriginalStopRead::Available(Some(stop)) =>
+                    Some((stop.coordinate().ticket().clone(), stop.coordinate().call_id().to_owned())),
+                _ => None,
+            },
+            _ => None,
+        };
+        let pending = Self(std::sync::Arc::new(value), None, false);
+        match coordinate {
+            Some((ticket, call_id)) => pending.with_original_host_call_set(&ticket, &call_id),
+            None => pending,
+        }
+    }
+    /// Preserve the original node's complete call set without making it authority.
+    pub(crate) fn with_original_host_call_set(
+        mut self, ticket: &crate::execution_core::NodeExecutionTicket, call_id: &str,
+    ) -> Self {
+        let already_captured = self.2;
+        self.2 = true;
+        if ticket.executor_kind != "tool_batch" { self.1 = None; return self; }
+        let Ok((calls, _)) = crate::host::decode_tool_batch(&ticket.payload_ref) else { self.1 = None; return self };
+        let unique = calls.iter().map(|call| call.id.as_str()).collect::<std::collections::BTreeSet<_>>();
+        if !call_id.is_empty() && unique.len() == calls.len()
+            && calls.iter().filter(|call| call.id == call_id).count() == 1 {
+            match self.1.as_ref() {
+                Some((original, original_calls)) if original != ticket || original_calls != &calls => self.1 = None,
+                Some(_) => {},
+                None if !already_captured => self.1 = Some((ticket.clone(), calls)),
+                None => {},
+            }
+        } else {
+            self.1 = None;
+        }
+        self
+    }
+    pub(crate) fn original_host_call_set(
+        &self,
+    ) -> Option<(&crate::execution_core::NodeExecutionTicket, &[ModelToolCall])> {
+        self.1.as_ref().map(|(ticket, calls)| (ticket, calls.as_slice()))
+    }
+    /// Called at the original sequential loop's terminal return; does not authenticate a receipt.
+    pub fn original_terminal_boundary(
+        sink: crate::ToolProgressSink, publication: std::sync::Arc<crate::tool_host::OriginalStopPublication>,
+        index: usize, total: usize,
+    ) -> Result<Self, String> {
+        if total == 0 || total > 25 || index >= total { return Err("original terminal batch bounds differ".into()); }
+        let crate::tool_host::OriginalStopPublication::Recorded(stop) = publication.as_ref() else {
+            return Err("original terminal publication unresolved".into());
+        };
+        let crate::tool_host::OriginalStopRead::Available(Some(current)) = sink.original_member_stop() else {
+            return Err("original terminal stop unavailable".into());
+        };
+        let publications = sink.checked_original_stop_publications()?;
+        if publications.len() != 1 || !std::sync::Arc::ptr_eq(&publications[0], &publication)
+            || !std::sync::Arc::ptr_eq(stop, &current) || !stop.recorded_in_original_sink()
+            || !stop.belongs_to_original_sink(&sink) || stop.coordinate().index() != index
+            || !matches!(stop.reason(), crate::tool_host::OriginalBatchMemberStopReason::ConfirmedNoncommit(_)) {
+            return Err("original terminal publication differs".into());
+        }
+        let members = sink.checked_original_members()?;
+        if members.len() != index || members.iter().enumerate().any(|(expected, (actual, result))|
+            expected != *actual || !matches!(result.as_ref(), crate::tool_host::OriginalMemberSubmitOutcome::Committed(_))) {
+            return Err("original terminal prefix unavailable".into());
+        }
+        let ticket = stop.coordinate().ticket().clone();
+        let call_id = stop.coordinate().call_id().to_owned();
+        Ok(Self::new(PendingAgentBatchValue::OriginalTerminalBoundary(OriginalTerminalBatchBoundary {
+            sink, publication, index, total,
+        })).with_original_host_call_set(&ticket, &call_id))
+    }
+    pub fn value(&self) -> &PendingAgentBatchValue { &self.0 }
+    pub fn primary_value(&self) -> &PendingAgentBatchValue {
+        match self.value() {
+            PendingAgentBatchValue::WithCause { primary, .. } => primary.primary_value(),
+            value => value,
+        }
+    }
+    pub(crate) fn original_terminal_boundary_ref(&self) -> Option<&OriginalTerminalBatchBoundary> {
+        match self.value() {
+            PendingAgentBatchValue::OriginalTerminalBoundary(boundary) => Some(boundary),
+            PendingAgentBatchValue::WithCause { primary, cause } => match (primary.original_terminal_boundary_ref(), cause.original_terminal_boundary_ref()) {
+                (Some(_), Some(_)) => None,
+                (Some(boundary), None) | (None, Some(boundary)) => Some(boundary),
+                (None, None) => None,
+            },
+            _ => None,
+        }
+    }
+    pub(crate) fn same_original_terminal_carrier(
+        &self, request: &crate::RuntimeToolExecutionRequest, boundary: &OriginalTerminalBatchBoundary,
+    ) -> bool {
+        match self.value() {
+            PendingAgentBatchValue::WithCause { primary, cause } =>
+                primary.same_original_terminal_carrier(request, boundary) && cause.same_original_terminal_carrier(request, boundary),
+            PendingAgentBatchValue::OriginalTerminalBoundary(value) => {
+                let stop = value.publication.current();
+                std::ptr::eq(value, boundary)
+                    && value.sink.same_original_channels(&request.tool_progress)
+                    && value.index == stop.coordinate().index()
+                    && stop.coordinate().call_id() == request.tool_use_id
+                    && stop.coordinate().outer_key() == request.idempotency_key
+                    && stop.coordinate().step() == request.step_binding.as_ref()
+                    && serde_json::from_str::<serde_json::Value>(&request.input).ok()
+                        .and_then(|input| input.get("actions").and_then(serde_json::Value::as_array).map(Vec::len))
+                        == Some(value.total)
+            },
+            PendingAgentBatchValue::OriginalCall(carrier) => carrier.original_request() == request
+                && carrier.original_request().tool_progress.same_original_channels(&request.tool_progress),
+            PendingAgentBatchValue::RecordedSink(sink) => request.tool_progress.same_original_channels(sink),
+            PendingAgentBatchValue::Recorded(recorded) => {
+                let Ok(actual) = request.tool_progress.checked_original_members() else { return false; };
+                recorded.len() == actual.len() && recorded.iter().zip(&actual).all(|((i, a), (j, b))|
+                    i == j && std::sync::Arc::ptr_eq(a, b))
+            },
+            PendingAgentBatchValue::OriginalStopPublication(publication) => std::sync::Arc::ptr_eq(publication, &boundary.publication),
+            _ => false,
+        }
+    }
+    pub(crate) fn same_original_stop_carrier(
+        &self, request: &crate::RuntimeToolExecutionRequest,
+        publication: &std::sync::Arc<crate::tool_host::OriginalStopPublication>,
+    ) -> bool {
+        match self.value() {
+            PendingAgentBatchValue::WithCause { primary, cause } =>
+                primary.same_original_stop_carrier(request, publication)
+                    && cause.same_original_stop_carrier(request, publication),
+            PendingAgentBatchValue::OriginalCall(carrier) => carrier.original_request() == request
+                && carrier.original_request().tool_progress.same_original_channels(&request.tool_progress),
+            PendingAgentBatchValue::RecordedSink(sink) => request.tool_progress.same_original_channels(sink),
+            PendingAgentBatchValue::Recorded(recorded) => {
+                let Ok(actual) = request.tool_progress.checked_original_members() else { return false; };
+                recorded.len() == actual.len() && recorded.iter().zip(&actual).all(|((i, a), (j, b))|
+                    i == j && std::sync::Arc::ptr_eq(a, b))
+            },
+            PendingAgentBatchValue::OriginalStopPublication(original) => std::sync::Arc::ptr_eq(original, publication),
+            _ => false,
+        }
+    }
+    pub fn original_stop_publication(&self) -> Option<&std::sync::Arc<crate::tool_host::OriginalStopPublication>> {
+        match self.value() {
+            PendingAgentBatchValue::OriginalStopPublication(publication) => Some(publication),
+            PendingAgentBatchValue::OriginalTerminalBoundary(boundary) => Some(&boundary.publication),
+            PendingAgentBatchValue::OriginalCall(carrier) if carrier.stop_publications().len() == 1 =>
+                carrier.stop_publications().first(),
+            PendingAgentBatchValue::WithCause { primary, cause } =>
+                cause.original_stop_publication().or_else(|| primary.original_stop_publication()),
+            _ => None,
+        }
+    }
+
+    /// Visit every directly returned publication without flattening calls or
+    /// selecting one stop as the winner. The original node owner still has
+    /// to authenticate each publication and the original request sink.
+    pub fn visit_original_stop_publications(
+        &self,
+        visitor: &mut dyn FnMut(&std::sync::Arc<crate::tool_host::OriginalStopPublication>),
+    ) {
+        match self.value() {
+            PendingAgentBatchValue::OriginalStopPublication(publication) => visitor(publication),
+            PendingAgentBatchValue::OriginalTerminalBoundary(boundary) => visitor(&boundary.publication),
+            PendingAgentBatchValue::WithCause { primary, cause } => {
+                primary.visit_original_stop_publications(visitor);
+                cause.visit_original_stop_publications(visitor);
+            }
+            PendingAgentBatchValue::Calls(calls) => {
+                for (_, pending) in calls { pending.visit_original_stop_publications(visitor); }
+            }
+            _ => {}
+        }
+    }
+
+    pub(crate) fn with_unresolved_marker(self) -> Self {
+        if self.original_terminal_boundary_ref().is_some() {
+            Self::with_cause(self, Some(Self::new(PendingAgentBatchValue::UnresolvedContext)))
+        } else { self }
+    }
+    pub fn with_cause(primary: PendingAgentBatch, cause: Option<PendingAgentBatch>) -> Self {
+        match cause {
+            Some(cause) => {
+                let origin = match (&primary.1, &cause.1) {
+                    (Some(left), Some(right)) if left == right => Some(left.clone()),
+                    _ => None,
+                };
+                let mut result = Self::new(PendingAgentBatchValue::WithCause { primary, cause });
+                result.1 = origin;
+                result.2 = true;
+                result
+            },
+            None => primary,
+        }
+    }
+}
+impl std::fmt::Debug for PendingAgentBatch {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result { f.write_str("PendingAgentBatch(..)") }
+}
+// This equality only preserves ToolError value semantics for clones of the
+// same in-process carrier; it is never used to authenticate a fact.
+impl PartialEq for PendingAgentBatch {
+    fn eq(&self, other: &Self) -> bool { std::sync::Arc::ptr_eq(&self.0, &other.0) }
+}
+impl Eq for PendingAgentBatch {}
+
+/// Original in-process driver failure; identity equality never authenticates it.
+#[derive(Debug, Clone)]
+struct OriginalChildDriveError(std::sync::Arc<crate::execution_core::graph::ExecutionRunnerError>);
+impl PartialEq for OriginalChildDriveError {
+    fn eq(&self, other: &Self) -> bool { std::sync::Arc::ptr_eq(&self.0, &other.0) }
+}
+impl Eq for OriginalChildDriveError {}
+
+#[derive(Debug, Clone)]
+struct OriginalChildCloseError(std::sync::Arc<crate::execution_core::graph::NodeExecutorError>);
+impl PartialEq for OriginalChildCloseError {
+    fn eq(&self, other: &Self) -> bool { std::sync::Arc::ptr_eq(&self.0, &other.0) }
+}
+impl Eq for OriginalChildCloseError {}
+
+#[derive(Debug, Clone)]
+struct OriginalChildReceiptError(std::sync::Arc<crate::execution_core::graph::ExecutionCommitError>);
+impl PartialEq for OriginalChildReceiptError {
+    fn eq(&self, other: &Self) -> bool { std::sync::Arc::ptr_eq(&self.0, &other.0) }
+}
+impl Eq for OriginalChildReceiptError {}
+
+#[derive(Debug, Clone)]
+struct OriginalChildCancellationError(std::sync::Arc<crate::RuntimeServicesError>);
+impl PartialEq for OriginalChildCancellationError {
+    fn eq(&self, other: &Self) -> bool { std::sync::Arc::ptr_eq(&self.0, &other.0) }
+}
+impl Eq for OriginalChildCancellationError {}
+
+#[derive(Debug, Clone)]
+pub(crate) struct OriginalPacketScopeDenialHandle(std::sync::Arc<crate::agent_in_process_worker::OriginalPacketScopeDenial>);
+impl PartialEq for OriginalPacketScopeDenialHandle {
+    fn eq(&self, other: &Self) -> bool { std::sync::Arc::ptr_eq(&self.0, &other.0) }
+}
+impl Eq for OriginalPacketScopeDenialHandle {}
+
+#[derive(Debug, Clone)]
+pub(crate) struct OriginalPacketScopeReceiptHandle(std::sync::Arc<crate::execution_core::graph::CommittedCallRefusal>);
+impl PartialEq for OriginalPacketScopeReceiptHandle {
+    fn eq(&self, other: &Self) -> bool { std::sync::Arc::ptr_eq(&self.0, &other.0) }
+}
+impl Eq for OriginalPacketScopeReceiptHandle {}
+
+#[derive(Debug, Clone)]
+pub(crate) struct OriginalPacketScopeRequestHandle(std::sync::Arc<crate::RuntimeToolExecutionRequest>);
+impl PartialEq for OriginalPacketScopeRequestHandle {
+    fn eq(&self, other: &Self) -> bool { std::sync::Arc::ptr_eq(&self.0, &other.0) }
+}
+impl Eq for OriginalPacketScopeRequestHandle {}
+
+#[derive(Debug, Clone)]
+struct OriginalBoundedAcquisitionFailureHandle(std::sync::Arc<crate::bound_tool_batch::OriginalBoundedAcquisitionFailure>);
+impl PartialEq for OriginalBoundedAcquisitionFailureHandle {
+    fn eq(&self, other: &Self) -> bool { std::sync::Arc::ptr_eq(&self.0, &other.0) }
+}
+impl Eq for OriginalBoundedAcquisitionFailureHandle {}
+
 /// Error returned when a tool invocation fails locally.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolError {
     message: String,
+    unknown: bool,
     failure: Option<harness_contract::tool::ToolExecutionFailure>,
     pre_effect_refusal: Option<crate::execution_core::graph::PreEffectRefusal>,
+    /// The tool layer decided this refusal before the call could run, so
+    /// the call never executed and the runtime may settle it as refused.
+    refusal_before_effect: bool,
+    original_bounded_acquisition_failure: Option<OriginalBoundedAcquisitionFailureHandle>,
+    original_packet_scope_denial: Option<OriginalPacketScopeDenialHandle>,
+    original_packet_scope_receipt: Option<OriginalPacketScopeReceiptHandle>,
+    original_packet_scope_request: Option<OriginalPacketScopeRequestHandle>,
+    pending_agent_batch: Option<PendingAgentBatch>,
+    secondary_failures: Vec<(String, ToolError)>,
+    original_child_drive: Option<OriginalChildDriveError>,
+    original_child_close: Option<OriginalChildCloseError>,
+    original_child_receipt: Option<OriginalChildReceiptError>,
+    original_child_cancel: Option<OriginalChildCancellationError>,
 }
 
 impl ToolError {
@@ -3703,8 +4361,19 @@ impl ToolError {
     pub fn new(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
+            unknown: false,
             failure: None,
-            pre_effect_refusal: None,
+            pre_effect_refusal: None, refusal_before_effect: false,
+            original_bounded_acquisition_failure: None,
+            original_packet_scope_denial: None,
+            original_packet_scope_receipt: None,
+            original_packet_scope_request: None,
+            pending_agent_batch: None,
+            secondary_failures: Vec::new(),
+            original_child_drive: None,
+            original_child_close: None,
+            original_child_receipt: None,
+            original_child_cancel: None,
         }
     }
 
@@ -3712,14 +4381,172 @@ impl ToolError {
     pub fn from_failure(failure: harness_contract::tool::ToolExecutionFailure) -> Self {
         Self {
             message: failure.message.clone(),
+            unknown: failure.class == harness_contract::tool::ToolExecutionFailureClass::EffectUncertain,
             failure: Some(failure),
-            pre_effect_refusal: None,
+            pre_effect_refusal: None, refusal_before_effect: false,
+            original_bounded_acquisition_failure: None,
+            original_packet_scope_denial: None,
+            original_packet_scope_receipt: None,
+            original_packet_scope_request: None,
+            pending_agent_batch: None,
+            secondary_failures: Vec::new(),
+            original_child_drive: None,
+            original_child_close: None,
+            original_child_receipt: None,
+            original_child_cancel: None,
         }
     }
+
+    pub(crate) fn from_original_child_drive(
+        error: crate::execution_core::graph::ExecutionRunnerError,
+    ) -> Self {
+        let mut original = Self::new(error.to_string());
+        original.original_child_drive = Some(OriginalChildDriveError(std::sync::Arc::new(error)));
+        original
+    }
+
+    pub(crate) fn from_original_child_close(
+        error: crate::execution_core::graph::NodeExecutorError,
+    ) -> Self {
+        let mut original = Self::new(error.to_string());
+        original.original_child_close = Some(OriginalChildCloseError(std::sync::Arc::new(error)));
+        original
+    }
+
+    pub(crate) fn from_original_child_receipt(
+        error: crate::execution_core::graph::ExecutionCommitError,
+    ) -> Self {
+        let mut original = Self::new(error.to_string());
+        original.original_child_receipt = Some(OriginalChildReceiptError(std::sync::Arc::new(error)));
+        original
+    }
+
+    pub(crate) fn from_original_child_cancel(error: crate::RuntimeServicesError) -> Self {
+        let mut original = Self::new(error.to_string());
+        original.original_child_cancel = Some(OriginalChildCancellationError(std::sync::Arc::new(error)));
+        original
+    }
+
+    /// The original effect may have committed and must remain unresolved.
+    #[must_use]
+    pub fn unknown(message: impl Into<String>) -> Self {
+        Self { message: message.into(), unknown: true, failure: None, pre_effect_refusal: None, refusal_before_effect: false, original_bounded_acquisition_failure: None, original_packet_scope_denial: None, original_packet_scope_receipt: None, original_packet_scope_request: None, pending_agent_batch: None, secondary_failures: Vec::new(), original_child_drive: None, original_child_close: None, original_child_receipt: None, original_child_cancel: None }
+    }
+
+    /// Carry the original producer boundary; Runtime still authenticates and closes the outer effect.
+    pub fn original_terminal_batch(pending: PendingAgentBatch) -> Self {
+        if !matches!(pending.value(), PendingAgentBatchValue::OriginalTerminalBoundary(_)) {
+            return Self::unknown_with_agent_batch("original terminal boundary unavailable", pending);
+        }
+        // The member decision is preserved by the typed carrier; the outer effect
+        // remains unresolved until its original Runtime owner authenticates it.
+        let mut error = Self::unknown("original member terminal awaits original batch closure");
+        error.pending_agent_batch = Some(pending);
+        error
+    }
+
+    /// Preserve the original owner result without interpreting it as delivery.
+    pub fn unknown_with_agent_batch(message: impl Into<String>, pending: PendingAgentBatch) -> Self {
+        let mut error = Self::unknown(message);
+        error.pending_agent_batch = Some(pending.with_unresolved_marker());
+        error
+    }
+
+    pub fn unknown_with_optional_agent_batch(message: impl Into<String>, pending: Option<PendingAgentBatch>) -> Self {
+        let mut error = Self::unknown(message);
+        error.pending_agent_batch = pending.map(PendingAgentBatch::with_unresolved_marker);
+        error
+    }
+
+    /// Preserve the original typed failure while recording that its physical
+    /// effect or cleanup remains unresolved. The original refusal remains
+    /// evidence, but cannot be consumed as a settled no-dispatch decision.
+    pub(crate) fn with_unresolved_context(
+        mut self, context: impl AsRef<str>, pending: Option<PendingAgentBatch>,
+    ) -> Self {
+        let context = context.as_ref();
+        self.message = format!("{}; {}", self.message, context);
+        self.unknown = true;
+        self.pending_agent_batch = match (self.pending_agent_batch.take(), pending) {
+            (Some(original), Some(extra)) if original != extra =>
+                Some(PendingAgentBatch::with_cause(original, Some(extra))),
+            (Some(original), _) => Some(original),
+            (None, extra) => extra,
+        };
+        if let Some(original) = self.pending_agent_batch.take() {
+            self.pending_agent_batch = Some(original.with_unresolved_marker());
+        }
+        self
+    }
+
+    pub(crate) fn with_unresolved_cause(
+        self, phase: &str, cause: ToolError, pending: Option<PendingAgentBatch>,
+    ) -> Self {
+        let context = format!("child {phase} failed: {cause}");
+        let pending = match (pending, cause.pending_agent_batch().cloned()) {
+            (Some(primary), Some(extra)) if primary != extra => Some(PendingAgentBatch::with_cause(primary, Some(extra))),
+            (Some(primary), _) => Some(primary),
+            (None, extra) => extra,
+        };
+        let mut original = self.with_unresolved_context(context, pending);
+        original.secondary_failures.push((phase.to_string(), cause));
+        original
+    }
+
+    pub fn pending_agent_batch(&self) -> Option<&PendingAgentBatch> {
+        self.pending_agent_batch.as_ref()
+    }
+
+    #[must_use]
+    pub fn is_unknown(&self) -> bool { self.unknown }
 
     #[must_use]
     pub fn failure(&self) -> Option<&harness_contract::tool::ToolExecutionFailure> {
         self.failure.as_ref()
+    }
+
+    pub(crate) fn with_original_bounded_acquisition_failure(mut self, fact: std::sync::Arc<crate::bound_tool_batch::OriginalBoundedAcquisitionFailure>) -> Self {
+        self.original_bounded_acquisition_failure = Some(OriginalBoundedAcquisitionFailureHandle(fact));
+        self
+    }
+    pub(crate) fn original_bounded_acquisition_failure(&self) -> Option<&std::sync::Arc<crate::bound_tool_batch::OriginalBoundedAcquisitionFailure>> {
+        self.original_bounded_acquisition_failure.as_ref().map(|fact| &fact.0)
+    }
+    pub(crate) fn original_bounded_acquisition_pending(&self, ticket: &crate::execution_core::NodeExecutionTicket,
+        receipt: Option<crate::execution_core::graph::CommittedCallRefusal>) -> Option<PendingAgentBatch> {
+        let fact = std::sync::Arc::clone(self.original_bounded_acquisition_failure()?);
+        let call_id = fact.request().tool_use_id.clone();
+        Some(PendingAgentBatch::new(PendingAgentBatchValue::OriginalBoundedAcquisition(std::sync::Arc::new(
+            OriginalBoundedAcquisitionPending { ticket: ticket.clone(), fact, receipt: receipt.map(std::sync::Arc::new) },
+        ))).with_original_host_call_set(ticket, &call_id))
+    }
+
+    pub(crate) fn with_original_packet_scope_denial(mut self, fact: std::sync::Arc<crate::agent_in_process_worker::OriginalPacketScopeDenial>) -> Self {
+        self.original_packet_scope_denial = Some(OriginalPacketScopeDenialHandle(fact));
+        self
+    }
+    pub(crate) fn original_packet_scope_denial(&self) -> Option<&std::sync::Arc<crate::agent_in_process_worker::OriginalPacketScopeDenial>> {
+        self.original_packet_scope_denial.as_ref().map(|fact| &fact.0)
+    }
+
+    pub(crate) fn with_original_packet_scope_receipt(mut self, receipt: crate::execution_core::graph::CommittedCallRefusal) -> Self {
+        self.original_packet_scope_receipt = Some(OriginalPacketScopeReceiptHandle(std::sync::Arc::new(receipt)));
+        self
+    }
+
+    pub(crate) fn with_original_packet_scope_request(mut self, request: std::sync::Arc<crate::RuntimeToolExecutionRequest>) -> Self {
+        self.original_packet_scope_request = Some(OriginalPacketScopeRequestHandle(request));
+        self
+    }
+
+    pub(crate) fn original_packet_scope_pending(&self, ticket: &crate::execution_core::NodeExecutionTicket) -> Option<PendingAgentBatch> {
+        let fact = self.original_packet_scope_denial.as_ref()?.0.clone();
+        let request = std::sync::Arc::clone(&self.original_packet_scope_request.as_ref()?.0);
+        let call_id = request.tool_use_id.clone();
+        let receipt = self.original_packet_scope_receipt.as_ref().map(|receipt| std::sync::Arc::clone(&receipt.0));
+        Some(PendingAgentBatch::new(PendingAgentBatchValue::OriginalPacketScope(std::sync::Arc::new(
+            OriginalPacketScopePending { ticket: ticket.clone(), fact, request, receipt },
+        ))).with_original_host_call_set(ticket, &call_id))
     }
 
     pub(crate) fn from_pre_effect_refusal(
@@ -3728,7 +4555,26 @@ impl ToolError {
     ) -> Self {
         let mut error = Self::new(message);
         error.pre_effect_refusal = Some(refusal);
+        error.refusal_before_effect = true;
         error
+    }
+
+    /// A refusal the tool layer decided before the call could run.
+    ///
+    /// The call never executed, so the runtime may settle it as refused
+    /// rather than leave it in flight. The refusal is reported, never
+    /// written: only the runtime's own writer records it.
+    #[must_use]
+    pub fn refused_before_effect(message: impl Into<String>) -> Self {
+        let mut error = Self::new(message);
+        error.refusal_before_effect = true;
+        error
+    }
+
+    /// Whether this error is a refusal decided before the call could run.
+    #[must_use]
+    pub fn is_refusal_before_effect(&self) -> bool {
+        self.refusal_before_effect
     }
 
     pub(crate) fn pre_effect_refusal_for(
@@ -3738,6 +4584,7 @@ impl ToolError {
         input: &str,
         binding: Option<&crate::step_snapshot::StepCallBinding>,
     ) -> Option<&str> {
+        if self.unknown { return None; }
         self.pre_effect_refusal
             .as_ref()?
             .reason_for(call_id, tool_name, input, binding?)
@@ -3765,16 +4612,79 @@ impl ToolError {
 
 impl Display for ToolError {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.model_text())
+        if self.unknown && self.failure.is_some() {
+            write!(f, "{}; {}", self.model_text(), self.message)
+        } else {
+            write!(f, "{}", self.model_text())
+        }
     }
 }
 
 impl std::error::Error for ToolError {}
 
+#[cfg(test)]
+mod original_child_error_tests {
+    use super::*;
+
+    #[test]
+    fn uncertain_cleanup_preserves_original_typed_failure_and_pending() {
+        let original = harness_contract::tool::ToolExecutionFailure::input_contract(
+            "task_claim", "original failure", None, Vec::new(),
+        );
+        let pending = PendingAgentBatch::new(PendingAgentBatchValue::RecordedSink(
+            crate::ToolProgressSink::default(),
+        ));
+        let error = ToolError::from_failure(original.clone())
+            .with_unresolved_context("close failed", Some(pending.clone()));
+        assert!(error.is_unknown());
+        assert_eq!(error.failure(), Some(&original));
+        assert_eq!(error.pending_agent_batch(), Some(&pending));
+        assert!(error.to_string().contains("original failure"));
+        assert!(error.to_string().contains("close failed"));
+        let cause = ToolError::from_failure(harness_contract::tool::ToolExecutionFailure::input_contract(
+            "close", "secondary failure", None, Vec::new(),
+        ));
+        let combined = error.with_unresolved_cause("close", cause.clone(), None);
+        assert_eq!(combined.failure(), Some(&original));
+        assert_eq!(combined.secondary_failures[0], ("close".to_string(), cause));
+        let original_drive = ToolError::from_original_child_drive(
+            crate::execution_core::graph::ExecutionRunnerError::Driver("original".into()),
+        );
+        let combined = original_drive.clone().with_unresolved_cause("close", ToolError::new("close failed"), None);
+        assert_eq!(combined.original_child_drive, original_drive.original_child_drive);
+        let close = ToolError::from_original_child_close(
+            crate::execution_core::graph::NodeExecutorError::Cancel { node_id: "node".into(), reason: "pending".into() },
+        );
+        let receipt = ToolError::from_original_child_receipt(
+            crate::execution_core::graph::ExecutionCommitError::InvalidCommand("unknown".into()),
+        );
+        let combined = combined.with_unresolved_cause("close", close.clone(), None)
+            .with_unresolved_cause("receipt", receipt.clone(), None);
+        assert_eq!(combined.secondary_failures[1].1.original_child_close, close.original_child_close);
+        assert_eq!(combined.secondary_failures[2].1.original_child_receipt, receipt.original_child_receipt);
+    }
+}
+
+/// Unsettled original batch calls, retained in invocation order.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub(crate) enum ToolBatchUnresolved {
+    Unknown { call_id: String, detail: String, terminal_detail: String, commit_error: Option<String> },
+    MissingReceipt { call_id: String, terminal_detail: String, commit_error: Option<String> },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PartialToolBatch {
+    pub member_batches: Vec<(String, PendingAgentBatch)>,
+    pub messages: Vec<ConversationMessage>,
+    pub unresolved: Vec<ToolBatchUnresolved>,
+}
+
 /// Error returned when a conversation turn cannot be completed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeError {
     message: String,
+    session_execution_fence_error: Option<crate::session_execution::SessionExecutionFenceError>,
     context_capacity_failure: Option<crate::context_ledger::ContextCapacityFailure>,
     preparation_failure: Option<crate::ProviderPreparationFailure>,
     provider_failure_scope: model_protocol::provider_failure::ProviderFailureScope,
@@ -3787,14 +4697,65 @@ pub struct RuntimeError {
     provider_retryable: bool,
     provider_usage: Option<TokenUsage>,
     effect_receipts: Vec<EarlyToolExecutionReceipt>,
+    early_tool_failures: Vec<EarlyToolFailure>,
     /// Runtime already answered this exact malformed frame in-step and the
     /// model re-sent it unchanged.
     repeated_tool_frame_refusal: bool,
     authenticated_provider_cancellation: Option<Box<crate::provider_runtime_client::AuthenticatedProviderCancellation>>,
     authenticated_graph_cancellation: bool,
+    tool_effect_unknown: Option<Box<ToolError>>,
+    original_packet_scope_error: Option<Box<ToolError>>,
+    original_bounded_acquisition_error: Option<Box<ToolError>>,
+    partial_tool_batch: Option<PartialToolBatch>,
 }
 
 impl RuntimeError {
+    pub(crate) fn from_session_execution_fence(error: crate::session_execution::SessionExecutionFenceError) -> Self {
+        let mut result = Self::new(error.to_string());
+        result.session_execution_fence_error = Some(error);
+        result
+    }
+
+    pub(crate) fn session_execution_fence_error(&self) -> Option<&crate::session_execution::SessionExecutionFenceError> {
+        self.session_execution_fence_error.as_ref()
+    }
+
+    /// Preserve the original typed failure when turn cleanup also fails.
+    pub(crate) fn with_turn_cleanup_failure(mut self, reason: &str) -> Self {
+        self.message = format!("{}; turn cleanup failed: {reason}", self.message);
+        self
+    }
+
+    pub(crate) fn from_original_bounded_acquisition_error(error: ToolError) -> Self {
+        let mut result = Self::new(error.to_string());
+        result.original_bounded_acquisition_error = Some(Box::new(error));
+        result
+    }
+    pub(crate) fn original_bounded_acquisition_error(&self) -> Option<&ToolError> {
+        self.original_bounded_acquisition_error.as_deref()
+    }
+
+    pub(crate) fn from_original_packet_scope_error(error: ToolError) -> Self {
+        let mut result = Self::new(error.to_string());
+        result.original_packet_scope_error = Some(Box::new(error));
+        result
+    }
+    pub(crate) fn original_packet_scope_error(&self) -> Option<&ToolError> { self.original_packet_scope_error.as_deref() }
+    pub(crate) fn from_tool_effect_unknown(error: ToolError) -> Self {
+        let mut runtime_error = Self::new(error.to_string());
+        runtime_error.tool_effect_unknown = Some(Box::new(error));
+        runtime_error
+    }
+    pub(crate) fn with_partial_tool_batch(mut self, partial: PartialToolBatch) -> Self {
+        self.partial_tool_batch = Some(partial);
+        self
+    }
+    pub(crate) fn partial_tool_batch(&self) -> Option<&PartialToolBatch> {
+        self.partial_tool_batch.as_ref()
+    }
+    pub(crate) fn tool_effect_unknown(&self) -> Option<&ToolError> {
+        self.tool_effect_unknown.as_deref()
+    }
     #[must_use]
     pub fn preparation(
         failure: crate::ProviderPreparationFailure,
@@ -3828,6 +4789,7 @@ impl RuntimeError {
     pub fn new(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
+            session_execution_fence_error: None,
             context_capacity_failure: None,
             preparation_failure: None,
             provider_failure_scope: model_protocol::provider_failure::ProviderFailureScope::Request,
@@ -3840,9 +4802,14 @@ impl RuntimeError {
             provider_retryable: false,
             provider_usage: None,
             effect_receipts: Vec::new(),
+            early_tool_failures: Vec::new(),
             repeated_tool_frame_refusal: false,
             authenticated_provider_cancellation: None,
             authenticated_graph_cancellation: false,
+            tool_effect_unknown: None,
+            original_packet_scope_error: None,
+            original_bounded_acquisition_error: None,
+            partial_tool_batch: None,
         }
     }
 
@@ -3853,6 +4820,7 @@ impl RuntimeError {
     ) -> Self {
         Self {
             message: message.into(),
+            session_execution_fence_error: None,
             context_capacity_failure: None,
             preparation_failure: None,
             provider_failure_scope: model_protocol::provider_failure::ProviderFailureScope::Request,
@@ -3865,9 +4833,14 @@ impl RuntimeError {
             provider_retryable: false,
             provider_usage: None,
             effect_receipts: Vec::new(),
+            early_tool_failures: Vec::new(),
             repeated_tool_frame_refusal: false,
             authenticated_provider_cancellation: None,
             authenticated_graph_cancellation: false,
+            tool_effect_unknown: None,
+            original_packet_scope_error: None,
+            original_bounded_acquisition_error: None,
+            partial_tool_batch: None,
         }
     }
 
@@ -3920,6 +4893,7 @@ impl RuntimeError {
     ) -> Self {
         Self {
             message: message.into(),
+            session_execution_fence_error: None,
             context_capacity_failure: None,
             preparation_failure: None,
             provider_failure_scope,
@@ -3932,9 +4906,14 @@ impl RuntimeError {
             provider_retryable,
             provider_usage: None,
             effect_receipts: Vec::new(),
+            early_tool_failures: Vec::new(),
             repeated_tool_frame_refusal: false,
             authenticated_provider_cancellation: None,
             authenticated_graph_cancellation: false,
+            tool_effect_unknown: None,
+            original_packet_scope_error: None,
+            original_bounded_acquisition_error: None,
+            partial_tool_batch: None,
         }
     }
 
@@ -3942,6 +4921,7 @@ impl RuntimeError {
     pub fn with_tool_exposure_miss(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
+            session_execution_fence_error: None,
             context_capacity_failure: None,
             preparation_failure: None,
             provider_failure_scope: model_protocol::provider_failure::ProviderFailureScope::Request,
@@ -3956,10 +4936,29 @@ impl RuntimeError {
             provider_retryable: false,
             provider_usage: None,
             effect_receipts: Vec::new(),
+            early_tool_failures: Vec::new(),
             repeated_tool_frame_refusal: false,
             authenticated_provider_cancellation: None,
             authenticated_graph_cancellation: false,
+            tool_effect_unknown: None,
+            original_packet_scope_error: None,
+            original_bounded_acquisition_error: None,
+            partial_tool_batch: None,
         }
+    }
+
+    pub(crate) fn early_tool_failure(failures: Vec<EarlyToolFailure>) -> Self {
+        let description = failures.iter().map(|failure| format!(
+            "call={} step={} kind={:?} detail={}",
+            failure.tool_call_id, failure.identity.model_step_id, failure.kind, failure.detail
+        )).collect::<Vec<_>>().join("; ");
+        let mut error = Self::new(format!("early tool infrastructure outcome unknown: {description}"));
+        error.early_tool_failures = failures;
+        error
+    }
+
+    pub(crate) fn early_tool_failures(&self) -> &[EarlyToolFailure] {
+        &self.early_tool_failures
     }
 
     pub(crate) fn authenticated_provider_cancellation(&self) -> Option<&crate::provider_runtime_client::AuthenticatedProviderCancellation> {
@@ -4071,6 +5070,42 @@ impl RuntimeError {
     }
 }
 
+#[cfg(test)]
+mod session_fence_error_tests {
+    use super::RuntimeError;
+    use crate::session_execution::{
+        SessionExecutionFenceConjunction, SessionExecutionFenceError,
+        SessionExecutionFenceOwnership, SessionExecutionFencePhase, SessionExecutionFenceVerdict,
+    };
+
+    #[test]
+    fn preserves_fence_verdict_and_unavailable_without_changing_the_message() {
+        let failures = [
+            SessionExecutionFenceError::Refused {
+                phase: SessionExecutionFencePhase::ProviderRequest,
+                verdict: SessionExecutionFenceVerdict {
+                    ownership: SessionExecutionFenceOwnership::TakenOver,
+                    failed: Some(SessionExecutionFenceConjunction::ClaimOwner),
+                },
+                message: "original refusal".into(),
+            },
+            SessionExecutionFenceError::Unavailable {
+                phase: SessionExecutionFencePhase::ProviderRequest,
+                message: "original read failure".into(),
+            },
+        ];
+        for failure in failures {
+            let message = failure.to_string();
+            let error = RuntimeError::from_session_execution_fence(failure.clone());
+            assert_eq!(error.to_string(), message);
+            assert_eq!(error.session_execution_fence_error(), Some(&failure));
+            assert_eq!(error.clone().session_execution_fence_error(), Some(&failure));
+        }
+        assert!(RuntimeError::new("provider error").session_execution_fence_error().is_none());
+        assert!(RuntimeError::with_tool_exposure_miss("exposure").session_execution_fence_error().is_none());
+    }
+}
+
 impl Display for RuntimeError {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.message)
@@ -4101,6 +5136,9 @@ pub struct TurnSummary {
     /// Invocation-level proof that an exact ToolResult survived packing and
     /// was consumed by a valid Provider continuation in this turn.
     pub model_observations: Vec<harness_contract::context::ProviderModelObservationAttestation>,
+    /// Read-only calls completed through the governed early lane. They are
+    /// real ToolHost receipts and remain evidence for the terminal projection.
+    pub(crate) early_tool_receipts: Vec<EarlyToolExecutionReceipt>,
     pub duplicate_tool_calls: u64,
     /// Canonical workspace paths targeted by write-capable tool calls during
     /// this turn, including calls rejected before execution. This is distinct
@@ -4109,6 +5147,12 @@ pub struct TurnSummary {
     pub write_attempt_paths: Vec<String>,
     pub max_tool_concurrency_observed: usize,
     pub parallel_tool_batches: usize,
+    /// The durable obligation ledger of this turn, as committed by the
+    /// terminal producer.  It is one of the two durable facts the verified
+    /// business conclusion is derived from; the model's terminal wording is
+    /// never part of it.
+    pub obligation_ledger:
+        Option<crate::execution_core::business_conclusion::ObligationLedgerFact>,
 }
 
 /// One provider decision. Model steps are deliberately side-effect free with
@@ -4226,6 +5270,8 @@ impl From<(String, String)> for PreDispatchRefusal {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ToolBatchStepResult {
+    pub(crate) orchestrated_search_coverage: Option<std::collections::BTreeSet<String>>,
+    pub(crate) member_batches: Vec<(String, PendingAgentBatch)>,
     pub(crate) refused_before_dispatch: Vec<PreDispatchRefusal>,
     pub messages: Vec<ConversationMessage>,
     pub failed: usize,
@@ -4459,6 +5505,25 @@ struct SessionProviderWireEvidenceWriter {
     session_port: Arc<dyn crate::SessionRuntimeJournalPort>,
     cache_dimensions: Arc<std::sync::Mutex<TurnCacheDimensionsObservation>>,
     native_wire_receipts: Arc<std::sync::Mutex<Vec<NativeWireReceipt>>>,
+}
+
+// Construct the wire artifact before entering its asynchronous write stage.
+// Keep the envelope and serializer identical to the original writer.
+fn provider_wire_evidence_payload(
+    context: &crate::ProviderRequestEvidenceContext,
+    evidence: &crate::ProviderWireEvidence,
+) -> Result<Vec<u8>, RuntimeError> {
+    serde_json::to_vec(&serde_json::json!({
+        "schema_version": 4,
+        "session_id": context.session_id,
+        "execution_id": context.execution_id,
+        "turn_id": context.turn_id,
+        "request_sequence": context.request_sequence,
+        "request_compiler_cache_hit": context.request_compiler_cache_hit,
+        "budget": context.budget,
+        "provider_request": evidence,
+    }))
+    .map_err(|error| RuntimeError::new(error.to_string()))
 }
 
 #[cfg(test)]
@@ -4799,17 +5864,7 @@ impl crate::ProviderWireEvidenceWriter for SessionProviderWireEvidenceWriter {
         let result_seals = crate::context_evidence::wire_tool_result_seals(&evidence.wire_request);
         let epoch = ProviderAttemptEpoch::new(&context.execution_id, &context.turn_id);
         let request_id = evidence.request_context.request_id.clone();
-        let payload = serde_json::to_vec(&serde_json::json!({
-            "schema_version": 4,
-            "session_id": context.session_id,
-            "execution_id": context.execution_id,
-            "turn_id": context.turn_id,
-            "request_sequence": context.request_sequence,
-            "request_compiler_cache_hit": context.request_compiler_cache_hit,
-            "budget": context.budget,
-            "provider_request": &evidence,
-        }))
-        .map_err(|error| RuntimeError::new(error.to_string()))?;
+        let payload = provider_wire_evidence_payload(context, &evidence)?;
         let visibility_scope = format!("session:{}", context.session_id);
         let artifact = self
             .artifacts
@@ -4851,6 +5906,8 @@ impl crate::ProviderWireEvidenceWriter for SessionProviderWireEvidenceWriter {
                 "request_sequence": context.request_sequence,
                 "request_id": evidence.request_context.request_id,
                 "model": evidence.request_context.profile.model,
+                "diagnostic_send_reason": evidence.request_context.diagnostic_send_reason,
+                "send_mode": if evidence.request_context.diagnostic_send_reason.is_some() { "diagnostic_unauthenticated" } else { "non_diagnostic_unverified" },
                 "protocol": evidence.wire_request.protocol,
                 "body_sha256": evidence.wire_request.body_sha256,
                 "step_render": evidence.step_render,
@@ -5056,11 +6113,9 @@ impl crate::ProviderWireEvidenceWriter for SessionProviderWireEvidenceWriter {
     }
 }
 
-/// Temporary view of the same Runtime, not another stop/state owner. Restores
-/// the original turn token on every return/unwind without locking Runtime.
+/// Temporary view of the same Runtime, not another turn cancellation owner.
 pub(crate) struct ScopedModelStop<'a, C, T> {
     runtime: &'a mut ConversationRuntime<C, T>,
-    previous: CancellationToken,
 }
 
 impl<C, T> std::ops::Deref for ScopedModelStop<'_, C, T> {
@@ -5074,29 +6129,24 @@ impl<C, T> std::ops::DerefMut for ScopedModelStop<'_, C, T> {
         self.runtime
     }
 }
-impl<C, T> Drop for ScopedModelStop<'_, C, T> {
-    fn drop(&mut self) {
-        self.runtime.cancellation_token = self.previous.clone();
-    }
-}
-impl<C, T> ConversationRuntime<C, T> {
+impl<C: ApiClient, T: ToolExecutor> ConversationRuntime<C, T> {
     pub(crate) fn scoped_model_stop(
         &mut self,
         stop: CancellationToken,
-    ) -> ScopedModelStop<'_, C, T> {
+    ) -> Result<ScopedModelStop<'_, C, T>, String> {
         // Step waiters stop on either the turn-level cancellation or this
         // step's stop, so the field stays a linked token. Turn-level
         // predicates never read this field any more: they query the shared
         // `TurnCancellationControl`, so a step stop firing here can no longer
         // read as a turn cancellation.
-        let previous = self.cancellation_token.clone();
-        self.cancellation_token = CancellationToken::linked(previous.clone(), stop);
+        let turn_token = self.turn_cancellation_token()?;
+        self.cancellation_token = CancellationToken::linked(turn_token, stop);
         // A step stop also wakes turn-level waiters through the shared home,
         // without setting any turn-level cancellation state.
         if let Some(control) = self.turn_cancellation_control.as_ref() {
             control.notify_step_stop();
         }
-        ScopedModelStop { runtime: self, previous }
+        Ok(ScopedModelStop { runtime: self })
     }
 }
 
@@ -5108,14 +6158,19 @@ impl<C: ApiClient, T> ConversationRuntime<C, T> {
         // The shared home is kept on the runtime as well, so turn-level
         // predicates in this instance answer from the same state as every
         // other instance of this turn.
-        self.turn_cancellation_control = control.clone();
-        self.api_client.configure_turn_cancellation(control)
+        self.api_client.configure_turn_cancellation(control.clone())?;
+        self.turn_cancellation_control = control;
+        Ok(())
     }
 }
 pub struct ConversationRuntime<C, T> {
     session_id: String,
     session: Arc<RwLock<Session>>, // tokio::sync::RwLock
     session_input_stream: crate::session_input::SessionInputStream,
+    original_session_claim: Option<Arc<crate::execution_core::services::OriginalSessionClaim>>,
+    original_policy_input: Option<crate::session_input::SessionInputStream>,
+    original_policy_control_requested: Arc<OriginalTurnInputControl>,
+    original_policy_control_parent_owned: bool,
     /// Inputs consumed at a provider checkpoint. The graph-owned host drains
     /// this compact receipt list and converts relevant corrections into Goal
     /// observations/revisions in the same graph commit; raw input remains in
@@ -5341,6 +6396,7 @@ pub struct ConversationRuntime<C, T> {
     /// digests only; canonical bytes remain in Session/artifact storage.
     turn_generated_model_receipts: std::sync::Mutex<Vec<GeneratedModelReceipt>>,
     turn_native_tool_sources: std::sync::Mutex<BTreeMap<String, NativeToolSource>>,
+    turn_original_root_calls: std::sync::Mutex<BTreeMap<String, OriginalRootCall>>,
     turn_native_root_owners:
         std::sync::Mutex<BTreeMap<String, crate::context_evidence::RootReadOwner>>,
     native_wire_receipts: Arc<std::sync::Mutex<Vec<NativeWireReceipt>>>,
@@ -5348,6 +6404,8 @@ pub struct ConversationRuntime<C, T> {
     /// appears in a valid, committed Provider continuation.
     turn_model_observations:
         std::sync::Mutex<Vec<harness_contract::context::ProviderModelObservationAttestation>>,
+    /// Early read receipts accumulated across this turn's model steps.
+    turn_early_tool_receipts: std::sync::Mutex<Vec<EarlyToolExecutionReceipt>>,
     /// Per-turn component accounting and tool-result lease consumption.
     turn_context_ledger: std::sync::Mutex<crate::context_ledger::ContextLedger>,
     /// Latest context governance report emitted by a completed turn.
@@ -5389,11 +6447,43 @@ pub struct ConversationRuntime<C, T> {
     session_execution_fence: Option<crate::SessionExecutionFence>,
 }
 
+/// An assessment returned by the actual bound policy evaluation and its
+/// successful event append. It cannot be deserialized or constructed by a
+/// caller from an arbitrary event or a model-visible error.
+pub struct BoundPolicyAssessment {
+    event: crate::DurableRuntimeEvent,
+}
+
+/// The original ticket and invocation verified against its pinned ToolHost.
+/// Scope assessment accepts this handle rather than a caller-authored effect.
+pub(crate) struct PreparedCallEffect {
+    ticket: crate::execution_core::NodeExecutionTicket,
+    request: serde_json::Value,
+    workspace_root: std::path::PathBuf,
+}
+
+impl PreparedCallEffect {
+    pub(crate) fn matches(&self, ticket: &crate::execution_core::NodeExecutionTicket,
+        request: &crate::RuntimeToolExecutionRequest) -> bool {
+        &self.ticket == ticket && serde_json::to_value(request).is_ok_and(|value| value == self.request)
+    }
+    pub(crate) fn matches_workspace(&self, services: &crate::RuntimeServices) -> bool {
+        self.workspace_root == services.workspace_root()
+    }
+}
+
+impl BoundPolicyAssessment {
+    pub(crate) fn event(&self) -> &crate::DurableRuntimeEvent { &self.event }
+}
+
 pub(crate) enum ToolAuthorizationDecision {
     Authorized(crate::ToolExecutionPolicyDecision),
     Gap {
         assessment: harness_contract::policy::CapabilityAssessment,
         effective: crate::EffectiveToolAuthorizationDescriptor,
+        /// The event returned by the original assessment append, when it
+        /// succeeded. It is not itself a per-call refusal authorization.
+        assessment_event: Option<BoundPolicyAssessment>,
     },
 }
 
@@ -5545,6 +6635,8 @@ where
         terminal: &GovernedToolTaskTerminal<Self::Output>,
         receipt: Option<&Self::Receipt>,
     ) {
+        // A failed durability barrier is not a tool terminal event.
+        if receipt.is_none() { return; }
         let (summary, failed) = receipt.map_or_else(
             || (conversation_tool_terminal_reason(terminal), true),
             |(message, _)| {

@@ -464,16 +464,10 @@ impl RuntimeServices {
                 validate_ticket(self, &task, &prepared.ticket)?;
                 let outcome = result_outcome(self, &task, &prepared).await?;
                 graph = self
-                    .commit_service()
-                    .transition_execution_outcome_async(
-                        graph,
-                        prepared.ticket,
-                        outcome,
-                        Default::default(),
-                    )
+                    .execution_supervisor()
+                    .commit_live_prepared_outcome(&prepared.ticket, &outcome)
                     .await
-                    .map_err(|e| e.to_string())?
-                    .graph;
+                    .map_err(|e| e.to_string())?;
             }
         }
         let Some(status) = graph

@@ -3,6 +3,14 @@
 use super::frame_refusal::{refusal_event_refs, wholly_refused_frame_reason, FrameRefusal};
 use super::*;
 
+// Construct result futures after the producer returns, outside its poll frame.
+#[inline(never)]
+fn construct_result_phase<F: std::future::Future>(
+    make: impl FnOnce() -> F,
+) -> std::pin::Pin<Box<F>> {
+    Box::pin(make())
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct TerminalProviderAnswer {
     pub text: String,
@@ -28,6 +36,31 @@ fn add_token_usage(total: &mut TokenUsage, usage: TokenUsage) {
 
 const INTERACTIVE_PROVIDER_ADMISSION_TIMEOUT_MS: u64 = 30_000;
 const DELEGATED_PROVIDER_ADMISSION_TIMEOUT_MS: u64 = 300_000;
+
+fn strict_input_semantics_match(original: &str, validated: &str) -> bool {
+    harness_contract::step::parse_strict_json(original).ok()
+        .zip(harness_contract::step::parse_strict_json(validated).ok())
+        .is_some_and(|(original, validated)| original == validated)
+}
+
+// A completed early call or an attempted early worker needs its original
+// owner reconciliation; a schema refusal alone cannot prove non-dispatch.
+fn early_batch_input_may_have_run(
+    call_id: &str,
+    receipts: &[EarlyToolExecutionReceipt],
+    deferrals: &[EarlyToolDeferral],
+    dispatcher: Option<&dyn EarlyToolDispatcher>,
+) -> bool {
+    receipts.iter().any(|receipt| receipt.call.id == call_id)
+        || deferrals.iter().any(|deferred| {
+            deferred.tool_call_id == call_id
+                && match deferred.origin {
+                    EarlyToolDeferralOrigin::GateDidNotSpawn => deferred.original_undispatched.is_some(),
+                    EarlyToolDeferralOrigin::OriginalWorker => dispatcher
+                        .is_none_or(|owner| !owner.confirms_original_undispatched(call_id, deferred)),
+                }
+        })
+}
 
 // Proactive context reduction fires when the fixed transcript already occupies
 // this percentage of the smallest configured candidate window. It pre-empts the
@@ -815,50 +848,6 @@ where
     }
 
     #[cfg(test)]
-    pub(crate) fn r1_assert_replay_activation_for_test(&self, output: &str) {
-        let catalog = self.tool_executor.tool_discovery_receipt();
-        let historical: harness_contract::tool::ToolDiscoveryReceipt =
-            serde_json::from_str(output).unwrap();
-        assert!(historical.activation_candidates.is_empty());
-        for revision in [catalog.catalog_revision, historical.catalog_revision] {
-            *self.tool_exposure_state.lock().unwrap() = Some(ToolExposureState {
-                catalog_revision: revision,
-                bootstrap: BTreeSet::from(["tool_search".to_string()]),
-                active: BTreeSet::new(),
-                deferred: catalog.activation_candidates.iter().cloned().collect(),
-                reason: "retained replay activation boundary".into(),
-                revision: 1,
-                fallback_full: false,
-            });
-            let activation = self.activate_tool_discovery(output).unwrap();
-            assert!(activation.decisions.is_empty());
-            assert!(self
-                .tool_exposure_state
-                .lock()
-                .unwrap()
-                .as_ref()
-                .unwrap()
-                .active
-                .is_empty());
-        }
-        *self.tool_exposure_state.lock().unwrap() = Some(ToolExposureState {
-            catalog_revision: catalog.catalog_revision,
-            bootstrap: BTreeSet::from(["tool_search".to_string()]),
-            active: BTreeSet::new(),
-            deferred: catalog.activation_candidates.iter().cloned().collect(),
-            reason: "live activation positive control".into(),
-            revision: 1,
-            fallback_full: false,
-        });
-        let mut live = catalog;
-        live.activation_candidates = vec!["read_file".into()];
-        let activation = self
-            .activate_tool_discovery(&serde_json::to_string(&live).unwrap())
-            .unwrap();
-        assert!(activation.activated_ids().any(|name| name == "read_file"));
-    }
-
-    #[cfg(test)]
     pub(crate) async fn r1_dispatch_provider_step_for_test(
         &mut self,
         mut request: ApiRequest,
@@ -1374,7 +1363,7 @@ where
                     source_turn,
                     source_readset,
                 );
-                let stream_run = consume_owned_provider_stream(
+                let stream_run = Box::pin(consume_owned_provider_stream(
                     events,
                     cancellation,
                     Some(ProviderStreamTimeoutPolicy {
@@ -1385,7 +1374,7 @@ where
                     None,
                     transport_activity,
                     execution,
-                )
+                ))
                 .await;
                 tracing::info!(
                     target: "cowd::terminal_provider",
@@ -1422,8 +1411,9 @@ where
                     first_event_at,
                     first_text_at: _,
                     stop_reason: _,
-                    early_tool_receipts: _,
+                    early_tool_receipts,
                     early_tool_deferrals: _,
+                    early_tool_failures,
                     response_completed_at_ms,
                 } = stream_run.collected;
                 let effective_model = effective_provider_identity
@@ -1437,11 +1427,16 @@ where
                 }
                 add_token_usage(&mut billed_usage, usage);
                 billed_usage_observed &= observed_usage.is_some();
-                token_reservations
-                    .reconcile(observed_usage)
-                    .map_err(|error| {
-                        error.with_provider_usage(billed_usage_observed.then_some(billed_usage))
-                    })?;
+                let reconciliation = token_reservations.reconcile(observed_usage);
+                if !early_tool_failures.is_empty() {
+                    return Err(RuntimeError::early_tool_failure(early_tool_failures)
+                        .with_effect_receipts(early_tool_receipts)
+                        .with_provider_usage(billed_usage_observed.then_some(billed_usage)));
+                }
+                reconciliation.map_err(|error| {
+                    error.with_effect_receipts(early_tool_receipts)
+                        .with_provider_usage(billed_usage_observed.then_some(billed_usage))
+                })?;
                 if let Some(observed) = observed_usage {
                     self.reconcile_provider_context_usage(observed);
                 }
@@ -1819,8 +1814,19 @@ where
             "provider_admission_queue_ms",
             queue_wait,
         );
-        self.verify_session_execution_fence(crate::SessionExecutionFencePhase::ProviderRequest)
-            .await?;
+        // The ProviderRequest phase retains a typed decision from the
+        // original Session claim; a released claim is not authority.
+        let member_execution_id = self
+            .execution_identity
+            .as_ref()
+            .and_then(|identity| identity.graph_id())
+            .unwrap_or_default()
+            .to_string();
+        self.verify_session_execution_fence_for_attempt(
+            crate::SessionExecutionFencePhase::ProviderRequest,
+            &member_execution_id,
+        )
+        .await?;
         Ok((lease, queue_wait))
     }
 
@@ -1958,13 +1964,17 @@ where
                 Some((slots, framing)),
             )
             .await?;
+        Self::finish_input_interpretation(&mut step, slots);
+        Ok(step)
+    }
+
+    pub(crate) fn finish_input_interpretation(step: &mut ModelStepResult, slots: usize) {
         step.input_interpretation = Some(match &step.intent {
             ModelStepIntent::FinalAnswer { text }
                 if step.early_tool_receipts.is_empty() && step.preflight_tool_results.is_empty() =>
                 harness_contract::input_disposition::ModelInputDispositionBatch::decode_business_proposal(text, slots),
             _ => Err("input interpretation emitted execution instead of a business proposal".into()),
         });
-        Ok(step)
     }
 
     pub(crate) async fn execute_model_step_for_purpose(
@@ -2695,7 +2705,7 @@ where
                 source_turn,
                 source_readset,
             );
-            let stream_run = consume_owned_provider_stream(
+            let stream_run = Box::pin(consume_owned_provider_stream(
                 events,
                 cancellation,
                 Some(ProviderStreamTimeoutPolicy {
@@ -2706,8 +2716,11 @@ where
                 early_dispatcher.clone(),
                 transport_activity,
                 execution,
-            )
+            ))
             .await;
+            // Construct the result phase only after the original stream and
+            // producer/consumer finish have returned in this same task.
+            let completed = construct_result_phase(|| async {
             let resource_result_class = stream_run.resource_result_class;
             let observed_usage = stream_run
                 .collected
@@ -2724,8 +2737,9 @@ where
                 first_event_at,
                 first_text_at,
                 stop_reason,
-                early_tool_receipts,
+                mut early_tool_receipts,
                 early_tool_deferrals,
+                early_tool_failures,
                 response_completed_at_ms,
             } = stream_run.collected;
             if let Some(first_text_at) = first_text_at {
@@ -2793,9 +2807,13 @@ where
                     .map(RuntimeError::provider_failure_scope),
             );
             drop(provider_lease);
-            token_reservations
-                .reconcile(observed_usage)
-                .map_err(|error| error.with_effect_receipts(early_tool_receipts.clone()))?;
+            let reconciliation = token_reservations.reconcile(observed_usage);
+            if !early_tool_failures.is_empty() {
+                return Err(RuntimeError::early_tool_failure(early_tool_failures)
+                    .with_effect_receipts(early_tool_receipts)
+                    .with_provider_usage(observed_usage));
+            }
+            reconciliation.map_err(|error| error.with_effect_receipts(early_tool_receipts.clone()))?;
             if let Some(error) = stream_run.failure {
                 if error.authenticated_provider_cancellation().is_some() {
                     return Err(if early_tool_receipts.is_empty() { error } else { error.with_effect_receipts(early_tool_receipts) });
@@ -2816,7 +2834,7 @@ where
                 {
                     self.mark_provider_account_unavailable(&error);
                     last_error = Some(error);
-                    continue;
+                    return Ok(None);
                 }
                 if let Some(observed_limit) = error.provider_context_window_limit() {
                     if calibration_retries.insert(model.clone())
@@ -2828,7 +2846,7 @@ where
                             "provider context window calibrated; retrying candidate once"
                         );
                         candidates.push_front(model);
-                        continue;
+                        return Ok(None);
                     }
                 }
                 let retries = provider_retries.entry(model.clone()).or_default();
@@ -2850,10 +2868,10 @@ where
                         () = tokio::time::sleep(retry_after) => {}
                     }
                     candidates.push_front(model);
-                    continue;
+                    return Ok(None);
                 }
                 last_error = Some(error);
-                continue;
+                return Ok(None);
             }
 
             // A `length` truncation used to be silently returned. The terminal
@@ -2886,11 +2904,27 @@ where
             // trip, paid so that no consumer can ever observe an unrepaired
             // frame regardless of what is inserted between here and there.
             for call in &mut calls {
-                if let Ok(repaired) = self.tool_executor.validate_step_tool_input(
+                let validation = self.tool_executor.validate_step_tool_input(
                     call.binding.as_ref(),
                     &call.name,
                     &call.input,
-                ) {
+                );
+                // Serialization alone must not replace the bytes owned by an
+                // earlier call (nor force an already-consumed call to run again).
+                if call.name == "agent_action_batch" && validation.as_ref().is_ok_and(|repaired| {
+                    strict_input_semantics_match(&call.input, repaired)
+                }) {
+                    continue;
+                }
+                if call.name == "agent_action_batch"
+                    && (validation.is_err() || validation.as_ref().is_ok_and(|input| input != &call.input))
+                    && early_batch_input_may_have_run(&call.id, &early_tool_receipts, &early_tool_deferrals, early_dispatcher.as_deref())
+                {
+                    return Err(RuntimeError::new(
+                        "original early tool custody is unresolved for an input requiring validation or normalization",
+                    ).with_effect_receipts(early_tool_receipts).with_provider_usage(observed_usage));
+                }
+                if let Ok(repaired) = validation {
                     if repaired != call.input {
                         // A repair that only closes a cut-off frame is not the
                         // same as one that fixes a quoting mistake: items were
@@ -2915,9 +2949,25 @@ where
                     }
                 }
             }
+            for call in &mut calls {
+                call.input = crate::host::normalize_native_read_input(&call.name, &call.input);
+            }
             let requested_tool_call_count = calls.len();
+            self.remember_original_root_calls(&calls)?;
             self.remember_native_tool_calls(&calls)?;
             let transcript_calls = calls.clone();
+            for receipt in &mut early_tool_receipts {
+                let Some(source) = receipt.original_source.as_mut() else { continue };
+                let mut matching = transcript_calls.iter().filter(|call| call.id == receipt.call.id);
+                if matching.next() == Some(&receipt.call) && matching.next().is_none()
+                    && source.request.tool_use_id == receipt.call.id
+                    && source.request.tool_name == receipt.call.name
+                    && source.request.step_binding == receipt.call.binding
+                    && source.request.input == receipt.call.input
+                {
+                    source.completed_calls = Some(transcript_calls.clone());
+                }
+            }
             // One shape for "the model asked for something that did not run",
             // shared with the whole-frame branches so a refusal is answered and
             // recorded the same way whichever branch found it.
@@ -3162,7 +3212,8 @@ where
                         self.consume_active_runtime_inputs_for_next_step(
                             TurnInputCheckpoint::AfterProviderResponse,
                         );
-                        return Ok(ModelStepResult {
+                        self.record_turn_early_tool_receipts(&early_tool_receipts);
+                        return Ok(Some(ModelStepResult {
                             input_interpretation: None,
                             intent: ModelStepIntent::Replan {
                                 reason: replan_reason,
@@ -3185,7 +3236,7 @@ where
                             early_tool_deferrals,
                             response_completed_at_ms,
                             text_only_response,
-                        });
+                        }));
                     }
                 }
             }
@@ -3343,7 +3394,8 @@ where
                 self.consume_active_runtime_inputs_for_next_step(
                     TurnInputCheckpoint::AfterProviderResponse,
                 );
-                return Ok(ModelStepResult {
+                self.record_turn_early_tool_receipts(&early_tool_receipts);
+                return Ok(Some(ModelStepResult {
                     input_interpretation: None,
                     intent: ModelStepIntent::Replan {
                         reason: format!(
@@ -3369,7 +3421,7 @@ where
                     early_tool_deferrals,
                     response_completed_at_ms,
                     text_only_response,
-                });
+                }));
             }
             if discovery_activation_notice.is_some() {
                 if let Ok(mut notice) = self.next_model_tool_activation_notice.lock() {
@@ -3478,7 +3530,8 @@ where
             self.consume_active_runtime_inputs_for_next_step(
                 TurnInputCheckpoint::AfterProviderResponse,
             );
-            return Ok(ModelStepResult {
+            self.record_turn_early_tool_receipts(&early_tool_receipts);
+            return Ok(Some(ModelStepResult {
                 input_interpretation: None,
                 intent,
                 assistant_message,
@@ -3498,7 +3551,12 @@ where
                 early_tool_deferrals,
                 response_completed_at_ms,
                 text_only_response,
-            });
+            }));
+            }).await?;
+            match completed {
+                Some(result) => return Ok(result),
+                None => continue,
+            }
         }
         Err(last_error.unwrap_or_else(|| RuntimeError::new("all provider fallbacks exhausted")))
     }
@@ -3507,6 +3565,32 @@ where
 #[cfg(test)]
 mod provider_admission_tests {
     use super::*;
+
+    #[test]
+    fn encoded_batch_never_rewrites_a_possibly_executed_early_call() {
+        assert!(strict_input_semantics_match(r#"{ "b": 2, "a": 1 }"#, r#"{"a":1,"b":2}"#));
+        assert!(!strict_input_semantics_match(r#"{"actions":"[]"}"#, r#"{"actions":[]}"#));
+        assert!(!strict_input_semantics_match(r#"{"a":1,"a":1}"#, r#"{"a":1}"#));
+        let call = ModelToolCall { binding: None, id: "original".into(),
+            name: "agent_action_batch".into(), input: "{}".into(), depends_on: vec![] };
+        let receipt = EarlyToolExecutionReceipt {
+            original_source: None, lifecycle: crate::conversation::ToolLifecycleReuse::Unknown,
+            call: call.clone(), ready_at_ms: 1, started_at_ms: 2, completed_at_ms: 3,
+            outcome: crate::RuntimeToolExecutionOutcome { pending_agent_batch: None,
+                tool_use_id: call.id.clone(), tool_name: call.name.clone(),
+                status: crate::RuntimeToolExecutionStatus::Executed,
+                category: crate::ToolSafetyCategory::ReadOnly, output: None, error: None,
+                evidence_ref: String::new(), observed_evidence: vec![] },
+        };
+        assert!(early_batch_input_may_have_run("original", &[receipt], &[], None));
+        let mut deferred = EarlyToolDeferral { tool_call_id: "original".into(),
+            reason: "unknown original worker".into(), ready_at_ms: 0, original_undispatched: None,
+            origin: EarlyToolDeferralOrigin::OriginalWorker };
+        assert!(early_batch_input_may_have_run("original", &[], &[deferred.clone()], None));
+        deferred.origin = EarlyToolDeferralOrigin::GateDidNotSpawn;
+        assert!(!early_batch_input_may_have_run("original", &[], &[deferred], None));
+        assert!(!early_batch_input_may_have_run("original", &[], &[], None));
+    }
 
     #[test]
     fn clean_terminal_ledger_is_present_even_with_native_tool_history() {

@@ -18,6 +18,7 @@ fn host() -> StandardRuntimeHost<NoTools> {
         providers: std::collections::HashMap::from([(
             "own834".into(),
             crate::config::ProviderConfig {
+                reasoning_effort: None,
                 name: "own834".into(),
                 base_url: "http://127.0.0.1:9/v1".into(),
                 api_key: "test".into(),
@@ -38,7 +39,7 @@ fn host() -> StandardRuntimeHost<NoTools> {
     ).without_memory();
     StandardRuntimeHost {
         hook_scope: runtime.hook_execution_scope(),
-        runtime: Some(runtime),
+        runtime: Some(Box::new(runtime)),
         poisoned: false,
         inflight_turn: None,
         services: crate::RuntimeServices::in_memory().unwrap(),

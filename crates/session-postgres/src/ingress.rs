@@ -543,13 +543,18 @@ impl PostgresSessionStore {
         let mut connection = self.executor.checkout_critical().map_err(storage_error)?;
         let mut transaction = connection.transaction().map_err(postgres_error)?;
         let existing = runtime_outbox_for_update(&mut transaction, request_id)?;
+        if existing.claim_fence_epoch.is_none() {
+            return Err(session::SessionError::StaleExecutionFence(
+                "runtime outbox lease has no claim fence epoch".to_string(),
+            ));
+        }
         assert_runtime_lease(
             &mut transaction,
             &existing,
             worker_id,
             session_generation,
             claim_token,
-            expected_revision,
+            existing.revision,
             now_ms,
             &[
                 SessionRuntimeInputStatus::Claimed,
@@ -570,7 +575,7 @@ impl PostgresSessionStore {
                     &to_u64_i64(session_generation, "session generation")?,
                     &worker_id,
                     &claim_token,
-                    &to_u64_i64(expected_revision, "runtime revision")?,
+                    &to_u64_i64(existing.revision, "runtime revision")?,
                 ],
             )
             .map_err(postgres_error)?;
@@ -735,7 +740,16 @@ impl PostgresSessionStore {
         }
         let mut connection = self.executor.checkout_critical().map_err(storage_error)?;
         let mut transaction = connection.transaction().map_err(postgres_error)?;
+        let session_id: String = transaction.query_opt(
+            "SELECT s.session_id FROM session_records s JOIN session_runtime_outbox o ON o.session_id=s.session_id WHERE o.request_id=$1 FOR NO KEY UPDATE OF s",
+            &[&request_id],
+        ).map_err(postgres_error)?.ok_or_else(|| session::SessionError::Store(
+            format!("session request `{request_id}` or its Session no longer exists")
+        ))?.try_get(0).map_err(postgres_error)?;
         let current = runtime_outbox_for_update(&mut transaction, request_id)?;
+        if current.session_id != session_id {
+            return Err(session::SessionError::Store("session request owner changed during requeue".into()));
+        }
         assert_runtime_lease(
             &mut transaction,
             &current,
@@ -1133,7 +1147,18 @@ impl PostgresSessionStore {
         }
         let mut connection = self.executor.checkout_critical().map_err(storage_error)?;
         let mut transaction = connection.transaction().map_err(postgres_error)?;
+        // Serialize a change of routing decision with the Session owner's
+        // pending-control check before taking the individual outbox lock.
+        let session_id: String = transaction.query_opt(
+            "SELECT s.session_id FROM session_records s JOIN session_runtime_outbox o ON o.session_id=s.session_id WHERE o.input_id=$1 FOR NO KEY UPDATE OF s",
+            &[&input_id],
+        ).map_err(postgres_error)?.ok_or_else(|| session::SessionError::Store(
+            format!("session input `{input_id}` or its Session no longer exists")
+        ))?.try_get(0).map_err(postgres_error)?;
         let current = runtime_outbox_by_input_id_for_update(&mut transaction, input_id)?;
+        if current.session_id != session_id {
+            return Err(session::SessionError::Store("session input owner changed during reclassification".into()));
+        }
         require_input_admission_tx(&mut transaction, &current.session_id, session_generation)?;
         if current.session_generation != session_generation
             || current.revision != expected_revision
@@ -1237,13 +1262,37 @@ impl PostgresSessionStore {
         }
         let mut connection = self.executor.checkout_critical().map_err(storage_error)?;
         let mut transaction = connection.transaction().map_err(postgres_error)?;
+        // Every receipt input must belong to one Session. Acquire that owner
+        // before any outbox row so its pending-control scan shares this fence.
+        let session_id: String = transaction.query_opt(
+            "SELECT s.session_id FROM session_records s JOIN session_runtime_outbox o ON o.session_id=s.session_id WHERE o.input_id=$1 FOR NO KEY UPDATE OF s",
+            &[&input_ids[0]],
+        ).map_err(postgres_error)?.ok_or_else(|| session::SessionError::Store(
+            "application receipt Session no longer exists".into()
+        ))?.try_get(0).map_err(postgres_error)?;
         let expected = input_ids
             .iter()
             .zip(expected_revisions)
             .collect::<std::collections::BTreeMap<_, _>>();
         let mut locked = std::collections::BTreeMap::new();
         for (input_id, expected_revision) in expected {
+            let row = transaction.query_opt(
+                "SELECT session_id FROM session_runtime_outbox WHERE input_id=$1", &[input_id],
+            ).map_err(postgres_error)?.ok_or_else(|| session::SessionError::Store(
+                format!("session input `{input_id}` no longer exists")
+            ))?;
+            let row_session: String = row.try_get(0).map_err(postgres_error)?;
+            if row_session != session_id {
+                return Err(session::SessionError::InvalidArgument(
+                    "application receipt inputs span Sessions".into(),
+                ));
+            }
             let record = runtime_outbox_by_input_id_for_update(&mut transaction, input_id)?;
+            if record.session_id != session_id {
+                return Err(session::SessionError::InvalidArgument(
+                    "application receipt inputs span Sessions".into(),
+                ));
+            }
             if matches!(
                 receipt.state,
                 InputApplicationState::Prepared | InputApplicationState::Materializing

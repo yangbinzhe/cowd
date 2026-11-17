@@ -70,11 +70,7 @@ fn manual_and_schedule_triggers_create_durable_invocations() {
         .accepted
         .is_empty());
     let due = dispatcher.accept_due_schedules(100).expect("due schedule");
-    assert_eq!(due.accepted.len(), 1);
-    assert!(matches!(
-        due.accepted[0].trigger,
-        runtime::ManagedAgentInvocationTrigger::Schedule { due_at_ms: 100 }
-    ));
+    assert!(matches!(due.accepted.as_slice(), [invocation] if matches!(invocation.trigger, runtime::ManagedAgentInvocationTrigger::Schedule { due_at_ms: 100 })));
 }
 
 #[test]
@@ -174,8 +170,9 @@ async fn runtime_dispatch_executes_a_bound_definition_without_gateway_scheduler_
         .await
         .expect("Runtime dispatch");
 
-    assert_eq!(admitted.claimed.len(), 1, "{admitted:#?}");
-    assert_eq!(admitted.submitted.len(), 1, "{admitted:#?}");
+    assert!(matches!((admitted.claimed.as_slice(), admitted.submitted.as_slice()),
+        ([claim], [submitted]) if claim.invocation_id == submitted.invocation_id
+            && claim.definition_id == "workspace/cowd/runtime-dispatch"), "{admitted:#?}");
     assert!(admitted.completed.is_empty());
     assert!(admitted.failed.is_empty());
     let canonical_task = services
@@ -206,6 +203,13 @@ async fn runtime_dispatch_executes_a_bound_definition_without_gateway_scheduler_
         completed.status,
         ManagedAgentInvocationStatus::Completed,
         "{completed:#?}\n{graph:#?}"
+    );
+    assert!(
+        !graph.node_statuses.is_empty()
+            && graph.node_statuses.values().all(|status| {
+                *status == harness_contract::execution_graph::ExecutionNodeStatus::Completed
+            }),
+        "managed graph must have only successful nodes: {graph:#?}"
     );
     assert!(completed
         .execution_ref

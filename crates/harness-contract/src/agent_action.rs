@@ -4,11 +4,13 @@
 //! references. Runtime identity, authorization, revisions, leases and physical
 //! execution topology are bound by the trusted host in [`AgentActionEnvelope`].
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+
+use crate::refusal_codes::RefusalEnvelope;
 
 pub const STATE_INSPECT_TOOL_ID: &str = "state_inspect";
 pub const TEAM_CREATE_TOOL_ID: &str = "team_create";
@@ -208,6 +210,9 @@ pub struct TaskClaimInput {
 pub struct TaskReleaseInput {
     pub task_ref: String,
     pub reason: String,
+    /// Claim generation observed by the release owner.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_claim_generation: Option<u64>,
 }
 
 /// Retire failed or invalidated work in favor of one or more concrete successor
@@ -339,6 +344,15 @@ pub struct TaskReviewInput {
     /// receipt: IDs. Runtime already knows which artifacts belong to the Task.
     #[serde(default)]
     pub evidence_refs: Vec<String>,
+    /// 032 K3: named gaps the verdict leaves open (optional; default empty so
+    /// every existing payload keeps its exact wire shape). K2's MissionVerdict
+    /// fills the same fields - one shape, no second directive list.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub gaps: Vec<String>,
+    /// Actions the reviewer asks for next. Durable fact for the next claim and
+    /// for the root's dispatch decisions; Runtime never dispatches from here.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub directed_actions: Vec<String>,
 }
 
 /// Model-authored treatment of a source-bound issue. This classifies evidence;
@@ -534,7 +548,8 @@ pub struct ObjectiveCompleteRequestInput {
     /// EXCEPTION EXIT: the model judges the goal unreachable after repeated
     /// attempts with no new progress. Requires a non-empty `blocked_reason`,
     /// `human_review_required` and at least one `recommended_next_action`;
-    /// Runtime falsifies it with the no-progress streak before accepting it.
+    /// Runtime refuses it while the Program still has work in flight, so a
+    /// blocked exit is accepted only once the remaining work is exhausted.
     #[serde(default)]
     pub blocked: bool,
     #[serde(default)]
@@ -554,9 +569,19 @@ pub enum AgentActorKind {
     Supervisor,
 }
 
+/// Original physical graph node attempt authenticated by Runtime.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct OriginalAgentExecution {
+    pub graph_id: String,
+    pub node_id: String,
+    pub attempt: u32,
+}
+
 /// Trusted identity injected by Runtime. It is never accepted from model JSON.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct AgentActorBinding {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub original_execution: Option<OriginalAgentExecution>,
     pub objective_id: String,
     pub program_id: String,
     pub session_id: String,
@@ -618,6 +643,40 @@ pub enum AgentAction {
     ObjectiveCompleteRequest(ObjectiveCompleteRequestInput),
 }
 
+/// Describes the effect of an action; this is not an authorization grant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EffectClass {
+    DurableEffect,
+    ReadEvidence,
+    ProgramState,
+}
+
+impl AgentAction {
+    #[must_use]
+    pub const fn effect_class(&self) -> EffectClass {
+        match self {
+            Self::StateInspect(_) => EffectClass::ReadEvidence,
+            Self::TaskSubmit(_) | Self::ArtifactCommit(_) => EffectClass::DurableEffect,
+            Self::TeamCreate(_) | Self::AgentInvite(_) | Self::TaskPublish(_)
+            | Self::TaskClaim(_) | Self::TaskRelease(_) | Self::TaskSupersede(_)
+            | Self::TaskWithdraw(_) | Self::TaskAttemptDispatch(_) | Self::TaskAttemptFail(_)
+            | Self::TaskReview(_) | Self::MessagePublish(_) | Self::ObjectiveUpdate(_)
+            | Self::ObjectiveReview(_) | Self::MembershipUpdate(_) | Self::TeamUpdate(_)
+            | Self::ObjectiveCompleteRequest(_) => EffectClass::ProgramState,
+        }
+    }
+
+    /// A submitted Task inherits its already authenticated artifact backing;
+    /// registering an artifact is the durable effect needing a new root owner.
+    #[must_use]
+    pub const fn requires_original_physical_execution(&self) -> bool {
+        match self.effect_class() {
+            EffectClass::DurableEffect => matches!(self, Self::ArtifactCommit(_)),
+            EffectClass::ReadEvidence | EffectClass::ProgramState => false,
+        }
+    }
+}
+
 impl AgentAction {
     #[must_use]
     pub const fn kind(&self) -> &'static str {
@@ -644,7 +703,81 @@ impl AgentAction {
         }
     }
 
+    /// Check the action against its own contract.
+    ///
+    /// The refusal that comes back carries its teaching: the code, the path it
+    /// violated, the legal form of that path, and - when the field is one of
+    /// the reference families - the sibling vocabulary hint. The judgement
+    /// itself is unchanged; only the refusal's payload grew.
     pub fn validate(&self) -> Result<(), AgentActionValidationError> {
+        self.validate_shape()
+            .map_err(|error| AgentActionValidationError::Enveloped(Box::new(
+                crate::refusal_codes::envelope_for(self, &error),
+            )))
+    }
+
+    /// The JSON schema of this action's input, derived from the same derive
+    /// the tool catalog uses.
+    ///
+    /// One source: the schema comes from the types themselves, so a refusal can
+    /// show the legal form of the field it refused without a second hand-written
+    /// table of shapes drifting away from the contract.
+    #[must_use]
+    pub fn input_schema(&self) -> Option<serde_json::Value> {
+        let schema = serde_json::to_value(schemars::schema_for!(AgentAction)).ok()?;
+        let definitions = schema.get("$defs").cloned();
+        // The derive may answer with a `$ref` into `$defs`; the variants live in
+        // the definition, so the search looks there too.
+        let root = if schema
+            .get("oneOf")
+            .or_else(|| schema.get("anyOf"))
+            .is_some()
+        {
+            schema.clone()
+        } else {
+            schema
+                .get("$defs")
+                .and_then(serde_json::Value::as_object)
+                .and_then(|defs| {
+                    defs.values().find(|value| {
+                        value.get("oneOf").or_else(|| value.get("anyOf")).is_some()
+                    })
+                })
+                .cloned()
+                .unwrap_or_else(|| schema.clone())
+        };
+        let variants = root
+            .get("oneOf")
+            .or_else(|| root.get("anyOf"))
+            .and_then(serde_json::Value::as_array)?;
+        for variant in variants {
+            let Some(properties) = variant.get("properties").and_then(serde_json::Value::as_object)
+            else {
+                continue;
+            };
+            let kind = properties
+                .get("kind")
+                .and_then(|kind| kind.get("const"))
+                .and_then(serde_json::Value::as_str);
+            if kind != Some(self.kind()) {
+                continue;
+            }
+            let mut input = properties
+                .get("input")
+                .cloned()
+                .unwrap_or_else(|| variant.clone());
+            // The variant's input is often a `$ref` into the definitions; the
+            // definitions travel with it so a reference inside the input still
+            // resolves.
+            if let (Some(defs), Some(map)) = (definitions.as_ref(), input.as_object_mut()) {
+                map.insert("$defs".to_string(), defs.clone());
+            }
+            return Some(input);
+        }
+        None
+    }
+
+    fn validate_shape(&self) -> Result<(), AgentActionValidationError> {
         match self {
             Self::StateInspect(input) => {
                 optional_nonempty("scope_ref", input.scope_ref.as_deref())?;
@@ -864,6 +997,149 @@ pub struct AgentActionEnvelope {
     pub action: AgentAction,
 }
 
+/// Fold complete, ordered applied Program actions into per-execution attempt state.
+/// The caller must prove the journal is complete and ordered; an empty fold is
+/// not by itself evidence that a Program does not exist.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MemberAttemptFold {
+    attempts: BTreeMap<String, MemberAttemptFact>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MemberAttemptFact {
+    task_ref: String,
+    mode: AgentAttemptMode,
+    generation: u64,
+    unsettled: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemberAttemptObservation {
+    Applied,
+    /// The caller must authenticate this event and the original Program binding.
+    RootNonMember,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemberAttemptFactError {
+    MalformedEnvelope,
+    ForeignLineage,
+    MissingExecution,
+    MismatchedExecution,
+    AmbiguousAttempt,
+    UnprovenRoot,
+    UnverifiedSource,
+}
+
+impl MemberAttemptFold {
+    /// Observe the payload of one `agentic.action_applied` event.
+    pub fn observe_action_applied(
+        &mut self,
+        payload: &serde_json::Value,
+        session_id: &str,
+        turn_id: &str,
+        program_id: &str,
+        original_root_graph: Option<&str>,
+    ) -> Result<MemberAttemptObservation, MemberAttemptFactError> {
+        let envelope: AgentActionEnvelope = serde_json::from_value(
+            payload.get("envelope").cloned().ok_or(MemberAttemptFactError::MalformedEnvelope)?,
+        ).map_err(|_| MemberAttemptFactError::MalformedEnvelope)?;
+        if envelope.actor.session_id != session_id
+            || envelope.actor.turn_id != turn_id
+            || envelope.actor.program_id != program_id
+        {
+            return Err(MemberAttemptFactError::ForeignLineage);
+        }
+        let dispatch = matches!(&envelope.action, AgentAction::TaskAttemptDispatch(_));
+        let settles = matches!(
+            &envelope.action,
+            AgentAction::TaskAttemptFail(_) | AgentAction::TaskSubmit(_)
+                | AgentAction::TaskReview(_) | AgentAction::TaskRelease(_)
+        ) || matches!(&envelope.action, AgentAction::MessagePublish(message)
+            if message.intent.as_ref().is_some_and(|intent| intent.kind == TaskIntentKind::Decline));
+        if !dispatch && !settles {
+            return Ok(MemberAttemptObservation::Applied);
+        }
+        if envelope.actor.kind == AgentActorKind::Root && envelope.actor.execution_id.is_none() {
+            if dispatch || matches!(&envelope.action, AgentAction::TaskAttemptFail(_)) {
+                return Err(MemberAttemptFactError::MissingExecution);
+            }
+            let root = original_root_graph.ok_or(MemberAttemptFactError::UnprovenRoot)?;
+            let physical = envelope.actor.original_execution.as_ref()
+                .ok_or(MemberAttemptFactError::UnprovenRoot)?;
+            if envelope.actor.actor_id != format!("root:{session_id}")
+                || envelope.actor.root_execution_id.as_deref() != Some(root)
+                || physical.graph_id != root || physical.node_id.trim().is_empty()
+                || physical.attempt == 0 || envelope.actor.team_id.is_some()
+                || envelope.actor.agent_id.is_some()
+            {
+                return Err(MemberAttemptFactError::UnprovenRoot);
+            }
+            return Ok(MemberAttemptObservation::RootNonMember);
+        }
+        let execution_id = envelope.actor.execution_id.as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .ok_or(MemberAttemptFactError::MissingExecution)?;
+        if let AgentAction::TaskAttemptDispatch(input) = &envelope.action {
+            if input.execution_id != execution_id {
+                return Err(MemberAttemptFactError::MismatchedExecution);
+            }
+            if let Some(previous) = self.attempts.get(execution_id) {
+                if previous.task_ref != input.task_ref || previous.mode != input.mode
+                    || previous.generation != input.generation
+                {
+                    return Err(MemberAttemptFactError::AmbiguousAttempt);
+                }
+            }
+            self.attempts.insert(execution_id.to_owned(), MemberAttemptFact {
+                task_ref: input.task_ref.clone(), mode: input.mode,
+                generation: input.generation, unsettled: true,
+            });
+            return Ok(MemberAttemptObservation::Applied);
+        }
+        if let AgentAction::TaskAttemptFail(input) = &envelope.action {
+            if input.execution_id != execution_id {
+                return Err(MemberAttemptFactError::MismatchedExecution);
+            }
+        }
+        let task_ref = match &envelope.action {
+            AgentAction::TaskAttemptFail(input) => Some(input.task_ref.as_str()),
+            AgentAction::TaskSubmit(input) => Some(input.task_ref.as_str()),
+            AgentAction::TaskReview(input) => Some(input.task_ref.as_str()),
+            AgentAction::TaskRelease(input) => Some(input.task_ref.as_str()),
+            AgentAction::MessagePublish(input) => input.intent.as_ref().map(|intent| intent.task_ref.as_str()),
+            AgentAction::StateInspect(_) | AgentAction::TeamCreate(_) | AgentAction::AgentInvite(_)
+            | AgentAction::TaskPublish(_) | AgentAction::TaskClaim(_) | AgentAction::TaskSupersede(_)
+            | AgentAction::TaskWithdraw(_) | AgentAction::TaskAttemptDispatch(_)
+            | AgentAction::ArtifactCommit(_) | AgentAction::ObjectiveUpdate(_)
+            | AgentAction::ObjectiveReview(_) | AgentAction::MembershipUpdate(_)
+            | AgentAction::TeamUpdate(_) | AgentAction::ObjectiveCompleteRequest(_) => None,
+        };
+        if let Some(attempt) = self.attempts.get_mut(execution_id) {
+            if task_ref != Some(attempt.task_ref.as_str()) {
+                return Err(MemberAttemptFactError::AmbiguousAttempt);
+            }
+            if let AgentAction::TaskAttemptFail(input) = &envelope.action {
+                if input.mode != attempt.mode {
+                    return Err(MemberAttemptFactError::AmbiguousAttempt);
+                }
+            }
+            attempt.unsettled = false;
+        }
+        Ok(MemberAttemptObservation::Applied)
+    }
+
+    #[must_use]
+    pub fn is_unsettled(&self, execution_id: &str) -> bool {
+        self.attempts.get(execution_id).is_some_and(|attempt| attempt.unsettled)
+    }
+
+    #[must_use]
+    pub fn any_unsettled(&self) -> bool {
+        self.attempts.values().any(|attempt| attempt.unsettled)
+    }
+}
+
 impl AgentActionEnvelope {
     pub fn validate(&self) -> Result<(), AgentActionValidationError> {
         required("action_id", &self.action_id)?;
@@ -904,6 +1180,8 @@ pub struct AgentActionObservation {
     pub action_id: String,
     pub action: String,
     pub program_id: String,
+    /// Program revision of this observation's read view. For a duplicate this
+    /// may have advanced since the original action was committed.
     pub revision: u64,
     pub status: AgentActionStatus,
     /// True when Runtime returned the receipt of an already committed action.
@@ -928,6 +1206,41 @@ pub struct AgentActionErrorObservation {
     pub recoverable: bool,
 }
 
+/// The refusal a validation error carries, without the teaching around it.
+///
+/// A refusal keeps its judgement when the teaching is attached: the code, the
+/// legal form and the hint are added around the refusal, never in place of it.
+/// This is what a caller compares when it wants to know that two refusals are
+/// the same judgement.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AgentActionRefusal {
+    /// A required field was not sent.
+    Missing(&'static str),
+    /// A field the model sent carries nothing.
+    Empty(&'static str, &'static str),
+    /// A list field repeats a value.
+    Duplicate(&'static str),
+    /// A reference field does not carry its canonical form.
+    Invalid(&'static str),
+    /// A cross-field rule refused the call.
+    Rejected(&'static str),
+}
+
+impl AgentActionValidationError {
+    /// The refusal this error carries.
+    #[must_use]
+    pub fn refusal(&self) -> AgentActionRefusal {
+        match self {
+            Self::Missing(field) => AgentActionRefusal::Missing(field),
+            Self::Empty(field, rule) => AgentActionRefusal::Empty(field, rule),
+            Self::Duplicate(field) => AgentActionRefusal::Duplicate(field),
+            Self::Invalid(field) => AgentActionRefusal::Invalid(field),
+            Self::Rejected(rule) => AgentActionRefusal::Rejected(rule),
+            Self::Enveloped(envelope) => envelope.refusal.clone(),
+        }
+    }
+}
+
 #[derive(Debug, thiserror::Error, Clone, PartialEq, Eq)]
 pub enum AgentActionValidationError {
     #[error("agent action field `{0}` is required")]
@@ -946,6 +1259,13 @@ pub enum AgentActionValidationError {
     /// field name, so the model sees what to change instead of a phantom field.
     #[error("{0}")]
     Rejected(&'static str),
+    /// A refusal that carries its teaching with it: the code, the path it
+    /// violated, the legal form of that path, and the sibling vocabulary hint.
+    ///
+    /// The envelope never changes what was refused - it only says more about
+    /// it, so the model has something to copy instead of something to guess.
+    #[error("{0}")]
+    Enveloped(Box<RefusalEnvelope>),
 }
 
 /// What a Task submit must carry, stated once.
@@ -983,6 +1303,30 @@ pub const OBJECTIVE_REVIEW_SUPPORT_RULE: &str =
 /// one. Reporting an empty value as a missing field names a field the model did
 /// send, which is the same phantom as reporting an absent optional.
 pub const NON_EMPTY_VALUE_RULE: &str = "the fields you sent must carry real values; an empty string or empty list is treated as not provided";
+
+/// Which fields each teaching rule is about, so a refusal can name the path it
+/// violated instead of only the rule text.
+///
+/// The rules are the teaching texts (layer 2); the paths are the names the
+/// model wrote. Keeping them together means a rule can never be taught for
+/// one field and refused against another.
+const RULE_SUBJECTS: &[(&str, &[&str])] = &[
+    (TASK_SUBMIT_RESULT_RULE, &["artifact_refs", "deliverable"]),
+    (OBJECTIVE_ADD_RULE, &["statement_ref", "source_refs"]),
+    (OBJECTIVE_EVOLVE_RULE, &["criterion_ref", "source_refs", "reason_ref"]),
+    (OBJECTIVE_REVIEW_REASON_RULE, &["reason"]),
+    (OBJECTIVE_REVIEW_SUPPORT_RULE, &["result_refs", "evidence_refs"]),
+    (OBJECTIVE_COMPLETE_RESULT_RULE, &["result_refs"]),
+];
+
+/// The fields a rule is about, when it is one of the registered rules.
+#[must_use]
+pub fn rule_subjects(rule: &str) -> Option<&'static [&'static str]> {
+    RULE_SUBJECTS
+        .iter()
+        .find(|(known, _)| *known == rule)
+        .map(|(_, subjects)| *subjects)
+}
 
 fn required(field: &'static str, value: &str) -> Result<(), AgentActionValidationError> {
     if value.trim().is_empty() {
@@ -1030,6 +1374,31 @@ fn unique_nonempty(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn effect_class_preserves_submit_backing_and_artifact_owner_requirement() {
+        use super::*;
+        let inspect = AgentAction::StateInspect(StateInspectInput::default());
+        let team = AgentAction::TeamCreate(TeamCreateInput {
+            name: "team".into(), mission: "mission".into(), objective: None,
+        });
+        let submit = AgentAction::TaskSubmit(TaskSubmitInput {
+            task_ref: "task".into(), artifact_refs: vec!["artifact:result".into()],
+            evidence_refs: vec!["tool://receipt".into()], unresolved: vec![], deliverable: None,
+        });
+        let artifact = AgentAction::ArtifactCommit(ArtifactCommitInput {
+            content_ref: "artifact://result".into(), kind: "report".into(),
+            title: "result".into(), relates_to: vec!["task".into()],
+        });
+        assert_eq!(inspect.effect_class(), EffectClass::ReadEvidence);
+        assert_eq!(team.effect_class(), EffectClass::ProgramState);
+        assert_eq!(submit.effect_class(), EffectClass::DurableEffect);
+        assert_eq!(artifact.effect_class(), EffectClass::DurableEffect);
+        assert!(!inspect.requires_original_physical_execution());
+        assert!(!team.requires_original_physical_execution());
+        assert!(!submit.requires_original_physical_execution());
+        assert!(artifact.requires_original_physical_execution());
+    }
+
     use super::*;
 
     fn objective_review(decision: ObjectiveReviewDecision, reason: &str) -> AgentAction {
@@ -1085,7 +1454,7 @@ mod tests {
         assert!(
             matches!(
                 bare.validate(),
-                Err(AgentActionValidationError::Rejected(rule)) if rule == OBJECTIVE_REVIEW_REASON_RULE
+                Err(error) if error.refusal() == AgentActionRefusal::Rejected(OBJECTIVE_REVIEW_REASON_RULE)
             ),
             "an empty reason must be refused"
         );
@@ -1130,6 +1499,29 @@ mod tests {
         );
     }
 
+    /// 034 GB-3 (a9 half): the blocked-exit teaching text must name the gate
+    /// that is actually live. It used to name the no-progress streak gate,
+    /// which the gate consolidation removed - a model that reads "Runtime
+    /// falsifies it with the no-progress streak" is being told about a gate
+    /// that does not exist, and cannot tell what will actually refuse it.
+    #[test]
+    fn the_blocked_exit_text_names_the_live_gate_and_no_deleted_one() {
+        let schema = serde_json::to_value(schemars::schema_for!(ObjectiveCompleteRequestInput))
+            .expect("schema");
+        let description = schema["properties"]["blocked"]["description"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        assert!(
+            !description.to_lowercase().contains("streak"),
+            "the blocked-exit text still names the deleted no-progress streak gate: {description}"
+        );
+        assert!(
+            description.contains("in flight") || description.contains("exhausted"),
+            "the blocked-exit text does not name the live gate: {description}"
+        );
+    }
+
     #[test]
     fn long_content_is_not_part_of_the_artifact_action_contract() {
         let schema = schemars::schema_for!(ArtifactCommitInput);
@@ -1143,6 +1535,7 @@ mod tests {
         let envelope = AgentActionEnvelope {
             action_id: "action-1".to_string(),
             actor: AgentActorBinding {
+                original_execution: None,
                 objective_id: "objective-1".to_string(),
                 program_id: "program-1".to_string(),
                 session_id: "session-1".to_string(),
@@ -1193,7 +1586,7 @@ mod tests {
         });
         let error = empty.validate().expect_err("an empty result is rejected");
         assert!(
-            matches!(error, AgentActionValidationError::Rejected(_)),
+            matches!(error.refusal(), AgentActionRefusal::Rejected(_)),
             "a field the schema calls optional must not be reported as missing: {error}"
         );
         assert!(
@@ -1214,7 +1607,7 @@ mod tests {
             .validate()
             .expect_err("an unsupported verdict is rejected");
         assert!(
-            matches!(error, AgentActionValidationError::Rejected(_)),
+            matches!(error.refusal(), AgentActionRefusal::Rejected(_)),
             "there is no field named `result_refs_or_evidence_refs` in any schema: {error}"
         );
     }
@@ -1233,8 +1626,8 @@ mod tests {
         .expect_err("an empty name is a field the model sent");
         assert!(
             matches!(
-                error,
-                AgentActionValidationError::Empty("name", NON_EMPTY_VALUE_RULE)
+                error.refusal(),
+                AgentActionRefusal::Empty("name", NON_EMPTY_VALUE_RULE)
             ),
             "the field the model sent must be named: {error}"
         );
@@ -1259,10 +1652,8 @@ mod tests {
             deliverable: None,
         });
         assert_eq!(
-            empty.validate(),
-            Err(AgentActionValidationError::Rejected(
-                TASK_SUBMIT_RESULT_RULE
-            ))
+            empty.validate().map_err(|error| error.refusal()),
+            Err(AgentActionRefusal::Rejected(TASK_SUBMIT_RESULT_RULE))
         );
         // A one-shot deliverable is an equally real Task result: Runtime
         // expands it into exactly the canonical artifact path.
@@ -1312,8 +1703,10 @@ mod tests {
             evidence_refs: vec!["tool://failure-receipt".to_string()],
         });
         assert_eq!(
-            missing_successor.validate(),
-            Err(AgentActionValidationError::Missing("replacement_task_refs"))
+            missing_successor
+                .validate()
+                .map_err(|error| error.refusal()),
+            Err(AgentActionRefusal::Missing("replacement_task_refs"))
         );
 
         let split = AgentAction::TaskSupersede(TaskSupersedeInput {
@@ -1340,13 +1733,17 @@ mod tests {
         // required by this operation, so neither may be reported as a missing
         // field: the instruction has to name what the operation needs.
         assert_eq!(
-            AgentAction::ObjectiveUpdate(replace.clone()).validate(),
-            Err(AgentActionValidationError::Rejected(OBJECTIVE_EVOLVE_RULE))
+            AgentAction::ObjectiveUpdate(replace.clone())
+                .validate()
+                .map_err(|error| error.refusal()),
+            Err(AgentActionRefusal::Rejected(OBJECTIVE_EVOLVE_RULE))
         );
         replace.source_refs = vec!["tool://scope-change-evidence".to_string()];
         assert_eq!(
-            AgentAction::ObjectiveUpdate(replace.clone()).validate(),
-            Err(AgentActionValidationError::Rejected(OBJECTIVE_EVOLVE_RULE))
+            AgentAction::ObjectiveUpdate(replace.clone())
+                .validate()
+                .map_err(|error| error.refusal()),
+            Err(AgentActionRefusal::Rejected(OBJECTIVE_EVOLVE_RULE))
         );
         replace.reason_ref = Some("artifact://scope-change-rationale".to_string());
         assert_eq!(AgentAction::ObjectiveUpdate(replace).validate(), Ok(()));

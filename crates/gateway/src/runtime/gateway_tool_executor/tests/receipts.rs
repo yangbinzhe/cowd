@@ -138,7 +138,7 @@
     }
 
     #[test]
-    fn read_many_only_mints_complete_success_children() {
+    fn unbound_orchestration_output_cannot_mint_child_evidence() {
         let services = runtime::RuntimeServices::in_memory().expect("runtime services");
         let executor = GatewayToolExecutor::new(None, false, GatewayToolRegistry::builtin());
         executor
@@ -182,12 +182,7 @@
             &output.to_string(),
             "gateway-tool:read-many",
         );
-        assert_eq!(facts.len(), 1);
-        assert!(matches!(
-            &facts[0].target,
-            harness_contract::context::EvidenceTargetIdentity::Workspace { scope }
-                if scope.path.workspace_relative_path == "complete.txt"
-        ));
+        assert!(facts.is_empty(), "model-shaped output without the original child owner is not evidence");
     }
 
     #[test]
@@ -373,7 +368,7 @@
         request.observation_wave_sequence = 11;
 
         let facts = gateway_observed_evidence(&executor, &request, &output, "actual-patch-receipt");
-        assert_eq!(facts.len(), 1);
+        assert!(matches!(facts.as_slice(), [fact] if fact.observed_at_sequence == 11));
         assert_eq!(
             facts[0].workspace_prior_state,
             Some(harness_contract::context::WorkspacePriorState::Existing {
@@ -413,7 +408,7 @@
             "error": null
         });
         let facts = gateway_observed_evidence(&executor, &request, &output.to_string(), "notebook");
-        assert_eq!(facts.len(), 1);
+        assert!(matches!(facts.as_slice(), [fact] if fact.observed_at_sequence == 5));
         let expected = format!("{:x}", Sha256::digest(content.as_bytes()));
         assert!(matches!(
             &facts[0].target,

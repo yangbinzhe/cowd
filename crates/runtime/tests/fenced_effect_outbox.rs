@@ -136,5 +136,5 @@ fn completed_effect_is_never_claimed_or_executed_twice() {
             "dispatcher-a",
         )
         .is_err());
-    assert_eq!(dispatcher.outbox().expect("outbox").len(), 1);
+    assert!(matches!(dispatcher.outbox().expect("outbox").as_slice(), [effect] if effect.invocation_id == invocation.invocation_id && effect.effect_id == "write-result" && effect.status == FencedEffectStatus::Completed));
 }

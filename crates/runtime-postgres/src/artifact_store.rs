@@ -414,6 +414,28 @@ impl runtime::ArtifactMetadataRepository for PostgresArtifactRepository {
         }).transpose()
     }
 
+    fn verified_compact_page(
+        &self, sha256: &str, generation: &str, revision: &str, bytes: u64,
+        range: std::ops::Range<u64>,
+    ) -> Result<Option<Vec<u8>>, String> {
+        if range.start > range.end || range.end > bytes || range.end - range.start > 64 * 1024 {
+            return Err("invalid compact page range".into());
+        }
+        let start = i32::try_from(range.start.checked_add(1).ok_or("compact offset overflow")?)
+            .map_err(|_| "compact offset overflow")?;
+        let length = i32::try_from(range.end - range.start).map_err(|_| "compact length overflow")?;
+        let bytes = artifact_to_i64(bytes)?;
+        let mut connection = self.executor.checkout_online_read().map_err(|error| error.to_string())?;
+        connection.query_opt(
+            "SELECT substring(compact_body FROM $5 FOR $6) FROM artifact_objects
+             WHERE sha256=$1 AND generation=$2 AND xmin::text=$3 AND bytes=$4
+             AND tier='compact' AND ready AND NOT deleting AND compact_body IS NOT NULL
+             AND octet_length(compact_body)::bigint=bytes
+             AND 'sha256:' || pg_catalog.encode(pg_catalog.sha256(compact_body),'hex')=sha256",
+            &[&sha256, &generation, &revision, &bytes, &start, &length],
+        ).map_err(|error| error.to_string()).map(|row| row.map(|row| row.get(0)))
+    }
+
     fn record(&self, artifact_id: &str) -> Result<Option<runtime::ArtifactRecord>, String> {
         let mut connection = self
             .executor

@@ -1,4 +1,5 @@
 mod commit_service;
+pub(crate) use commit_service::{validate_node_ticket_start, validate_node_ticket_start_at_revision, bounded_tool_effect_outcome, tool_effect_outcome_requires_truncation};
 #[cfg(test)]
 pub(crate) use commit_service::bounded_process_tests;
 mod compiler;
@@ -8,6 +9,15 @@ mod host;
 mod recovery;
 mod registry;
 mod runner;
+pub(crate) use runner::PumpCancellationOwner;
+mod override_custody;
+pub(crate) use override_custody::{
+    seal_override_node_terminal_when_terminalized, seal_superseded_override_nodes, OverrideCustody,
+};
+#[cfg(feature = "test-fixtures")]
+pub(crate) use runner::k05_completion_trace;
+#[cfg(any(test, feature = "test-fixtures"))]
+pub(crate) use runner::k05_trace_emit;
 mod state_store;
 
 pub mod resources;
@@ -24,14 +34,16 @@ pub mod resources;
 /// retirement can share one bound.
 pub(crate) const PHYSICAL_CLOSURE_BUDGET: std::time::Duration = std::time::Duration::from_secs(60);
 
-pub(crate) use commit_service::{process_closure_document, receipt_replay_contract, TerminalScopeReader};
-#[cfg(test)]
-pub(crate) use commit_service::receipt_lifecycle_anchor;
+pub(crate) use commit_service::{validate_external_outcome_binding_from_source, execution_lineage_stream_id, process_closure_document, receipt_replay_contract, TerminalScopeReader};
+pub(crate) use commit_service::{read_effect_admission, read_effect_admission_intent, EffectAdmission};
 pub use commit_service::{
-    DurableAgentToolReceipt, ExecutionCommitError, ExecutionCommitReceipt, ExecutionCommitService,
+    CallRefusalOwner, CommittedCallRefusal, DurableAgentToolReceipt, ExecutionCommitError, ExecutionCommitReceipt, ExecutionCommitService,
     ExecutionEffectState, ProcessClosurePublicationAuthority, ToolEffectState,
 };
-pub(crate) use commit_service::{PreEffectRefusal, ToolReceiptQuery};
+pub(crate) use commit_service::PreEffectRefusal;
+pub(crate) use commit_service::OriginalFreshEffectOwner;
+#[cfg(test)]
+pub(crate) use commit_service::ToolReceiptQuery;
 pub use compiler::{ExecutionCompileError, ExecutionCompileRequest, ExecutionGraphCompiler};
 pub use events::{ExecutionGraphEvent, ExecutionNodeBinding};
 pub use executors::{ScopedNodeBackend, ScopedNodeExecutor};
@@ -41,6 +53,7 @@ pub use registry::{
     ExecutionGraphReplan, NodeExecutionContext, NodeExecutionOutcome, NodeExecutionTicket,
     NodeExecutor, NodeExecutorError, NodeExecutorRegistry,
 };
+pub(crate) use registry::{OriginalSynthesizeReplan, OriginalSynthesizeReplanHandle};
 pub use resources::{
     ExecutionAdmissionPolicy, ExecutionResourceKind, ExecutionResourceLease,
     ExecutionResourceManager, ExecutionResourceSnapshot, ExecutionServiceClass,
@@ -56,9 +69,12 @@ pub use resources::{
 pub(crate) use runner::validate_worktree_path;
 #[cfg(test)]
 pub(crate) use commit_service::ExecutionTerminalCommit;
-pub(crate) use runner::ExecutionGraphRunner;
+pub(crate) use runner::{ExecutionGraphRunner, OriginalPumpTask};
 pub use runner::{ExecutionRunReport, ExecutionRunnerError};
 pub use state_store::{graph_id_for_lookup, ExecutionGraphStateStore, ExecutionStateStoreError};
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(any(test, feature = "test-fixtures"))]
+pub use commit_service::{TerminalAppendFailureClass, TerminalAppendFailureObservation};

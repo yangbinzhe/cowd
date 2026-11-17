@@ -245,6 +245,30 @@ impl<'a> SessionActor<'a> {
         Ok(selected)
     }
 
+    pub(crate) fn select_finalized_terminal_message(
+        &mut self,
+        message_ids: &[String],
+        expected_turn_id: &str,
+        expected_execution_id: &str,
+        terminal_ref: &str,
+    ) -> Result<Option<String>, String> {
+        self.maintain_receipt_authority()?;
+        let mut selected = None;
+        let mut seen = std::collections::BTreeSet::new();
+        for message_id in message_ids {
+            if !seen.insert(message_id) { continue; }
+            let context = self.terminal_receipt_context(message_id)?;
+            if finalized_terminal_source_matches(
+                &context, &self.session_id, message_id, expected_turn_id,
+                expected_execution_id, terminal_ref,
+            ) && selected.replace(message_id.clone()).is_some() {
+                return Err("receipt_terminal_source_ambiguous".into());
+            }
+        }
+        remaining_until(self.observation_deadline)?;
+        Ok(selected)
+    }
+
     pub(crate) fn maintain_receipt_authority(&mut self) -> Result<(), String> {
         let mut attempted = false;
         let result = (|| {
@@ -575,6 +599,24 @@ fn terminal_source_matches(
                 && outbox_cursor == runtime_commit_cursor
         }
     }
+}
+
+fn finalized_terminal_source_matches(
+    context: &SessionMessageReceiptContext,
+    session_id: &str,
+    message_id: &str,
+    turn_id: &str,
+    execution_id: &str,
+    terminal_ref: &str,
+) -> bool {
+    matches!(context,
+        SessionMessageReceiptContext::Available {
+            message_id: observed,
+            outbox_observation: SessionReceiptOutboxObservation::RuntimeOutbox {
+                terminal_id, execution_id: Some(owner), ..
+            }, ..
+        } if observed == message_id && terminal_id == terminal_ref && owner == execution_id)
+        && terminal_source_matches(context, session_id, turn_id, execution_id)
 }
 
 fn select_terminal_source(
@@ -1054,6 +1096,18 @@ mod tests {
             turn_id: "turn-1".into(),
             request_id: "request-1".into(),
         }
+    }
+
+    #[test]
+    fn finalized_failure_requires_the_original_known_outbox_owner() {
+        let mut current = context();
+        assert!(!finalized_terminal_source_matches(&current, "session-1", "assistant:input-1", "turn-1", "execution-1", "turn-terminal:request-1"));
+        if let SessionMessageReceiptContext::Available { outbox_observation, .. } = &mut current {
+            *outbox_observation = known_outbox(Some("execution-1"));
+        }
+        assert!(finalized_terminal_source_matches(&current, "session-1", "assistant:input-1", "turn-1", "execution-1", "turn-terminal:request-1"));
+        assert!(!finalized_terminal_source_matches(&current, "session-1", "assistant:input-1", "turn-1", "other", "turn-terminal:request-1"));
+        assert!(!finalized_terminal_source_matches(&current, "session-1", "assistant:input-1", "turn-1", "execution-1", "turn-terminal:other"));
     }
 
     #[test]

@@ -15,6 +15,65 @@
 
 use serde_json::{Map, Value};
 
+/// A short correction only when this exact schema proves the statement.
+#[must_use]
+pub fn input_shape_correction(tool: &str, reason: &str, schema: &Value) -> Option<&'static str> {
+    if tool == "membership_update" && reason == "$: unexpected field `reason`"
+        && ["$ref", "oneOf", "anyOf", "allOf"].iter().all(|key| schema.get(*key).is_none())
+        && schema["additionalProperties"] == false && schema["properties"].get("reason").is_none()
+        && schema["properties"].get("reason_ref").is_some()
+    {
+        return Some("membership_update does not accept `reason`; its schema lists `reason_ref`. Do not automatically convert reason text; supply a value that meets that field's contract if needed.");
+    }
+    if tool == "tool_orchestrate" && reason == "$: unexpected field `id`"
+        && ["$ref", "oneOf", "anyOf", "allOf"].iter().all(|key| schema.get(*key).is_none())
+        && schema["additionalProperties"] == false
+        && schema["properties"].get("id").is_none()
+        && schema["properties"]["steps"]["type"] == "array"
+        && schema["properties"]["steps"]["items"]["type"] == "object"
+        && ["$ref", "oneOf", "anyOf", "allOf"].iter()
+            .all(|key| schema["properties"]["steps"]["items"].get(*key).is_none())
+        && schema["properties"]["steps"]["items"]["properties"]["id"]["type"] == "string"
+        && schema["properties"]["steps"]["items"]["required"].as_array()
+            .is_some_and(|fields| fields.iter().any(|field| field == "id"))
+    {
+        return Some("tool_orchestrate has no top-level `id`; each step requires its own string `id` in `steps`. Choose the step IDs explicitly.");
+    }
+    if tool != "task_review"
+        || ["$ref", "oneOf", "anyOf", "allOf"].iter().any(|key| schema.get(*key).is_some())
+        || !schema["required"].as_array().is_some_and(|fields| fields.iter().any(|field| field == "reason"))
+        || schema["properties"]["reason"]["type"] != "string"
+    {
+        return None;
+    }
+    match reason {
+        "$: missing required field `reason`" => Some("task_review requires a string `reason`; supply your own reason text."),
+        "$: unexpected field `reason_ref`"
+            if schema["additionalProperties"] == false && schema["properties"].get("reason_ref").is_none() =>
+            Some("task_review requires a string `reason`; `reason_ref` is not a task_review field. Supply your own reason text."),
+        _ => None,
+    }
+}
+
+/// Report other known unexpected root fields without modifying the caller's input.
+#[must_use]
+pub fn orchestrate_extra_root_fields(tool: &str, reason: &str, schema: &Value, input: &Value) -> Option<String> {
+    if tool != "tool_orchestrate" || reason != "$: unexpected field `id`"
+        || input_shape_correction(tool, reason, schema).is_none()
+        || schema.get("patternProperties").is_some()
+    {
+        return None;
+    }
+    let properties = schema.get("properties")?.as_object()?;
+    let object = input.as_object()?;
+    let extras: Vec<_> = ["op", "item"].into_iter()
+        .filter(|field| object.contains_key(*field) && !properties.contains_key(*field))
+        .map(|field| format!("`{field}`"))
+        .collect();
+    if extras.is_empty() { return None; }
+    Some(format!("Also unsupported at the top level of this schema: {}. Choose the intended step structure explicitly and validate the complete input.", extras.join(", ")))
+}
+
 /// A `$ref` chain longer than this is treated as absent rather than followed, so
 /// a self-referential schema cannot spin here.
 const MAX_REF_DEPTH: usize = 5;
@@ -35,6 +94,50 @@ const REF_HINT: &str = "canonical Runtime ref; the receipt that returned the obj
 /// Longest example rendered for one tool. Past this an example stops being
 /// something a model copies and becomes something it skims.
 const EXAMPLE_MAX_CHARS: usize = 600;
+
+/// The key that marks an example that could not be rendered as a copyable
+/// instance.
+///
+/// An example that quietly omits a required field is worse than no example: a
+/// model copies it, the copy is refused for the missing field, and the round
+/// teaches nothing. A degraded example says so by name and lists the fields
+/// instead of showing a half-call.
+pub const DEGRADED_EXAMPLE_KEY: &str = "__example_degraded__";
+
+/// Why an example was degraded rather than rendered.
+pub const DEGRADED_REASON: &str =
+    "the whole instance would not fit the example budget; every field is named below instead";
+
+/// One field of a degraded example: where it is, what it holds, and whether the
+/// schema demands it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DegradedField {
+    /// Dotted path from the tool's input root.
+    pub name: String,
+    /// The field's shape in words (`string`, `array of string`, `const ...`).
+    pub type_name: String,
+    /// Whether the schema requires this field.
+    pub required: bool,
+}
+
+/// A named degradation: the example could not be rendered whole, so it is
+/// replaced by the field list a model can still read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DegradedExample {
+    /// Why the instance was not rendered.
+    pub reason: String,
+    /// Every field the instance would have carried.
+    pub fields: Vec<DegradedField>,
+}
+
+/// How one tool's example was rendered.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExampleRender {
+    /// A complete instance a model can copy.
+    Complete(Value),
+    /// The instance could not be shown whole; its fields are named instead.
+    Degraded(DegradedExample),
+}
 
 /// Beyond this many `oneOf` variants only the first is examplified and the rest
 /// are pointed at the contract lines: seven examples is seven that nobody reads.
@@ -65,34 +168,267 @@ fn placeholder(field: &str) -> Value {
 /// content.
 #[must_use]
 pub fn input_example(schema: &Value) -> Option<Value> {
+    match render_example(schema) {
+        ExampleRender::Complete(value) => {
+            // A schema that declares nothing to fill in has nothing to
+            // exemplify; an example of `{}` is noise.
+            let is_empty = value.as_object().is_some_and(Map::is_empty);
+            (!is_empty).then_some(value)
+        }
+        ExampleRender::Degraded(degraded) => Some(degraded_marker(&degraded)),
+    }
+}
+
+/// Render one tool's example, naming the degradation when the instance cannot
+/// be shown whole.
+///
+/// The budget used to end the rendering silently: a field the example meant to
+/// carry was simply left out, and a model that copied the result was refused
+/// for the field the framework had dropped. A degradation is the honest
+/// alternative - the instance is not shown, and every field is named instead.
+#[must_use]
+pub fn render_example(schema: &Value) -> ExampleRender {
     let defs = schema.get("$defs").and_then(Value::as_object);
-    let mut rendered = 0_usize;
-    let example = example_for(schema, defs, 0, &mut rendered, "value");
-    // A schema that declares nothing to fill in has nothing to exemplify; an
-    // example of `{}` is noise.
-    let is_empty = example.as_object().is_some_and(Map::is_empty);
-    (!is_empty).then_some(example)
+    let mut state = RenderState {
+        rendered: 0,
+        lost: Vec::new(),
+    };
+    let example = example_for(schema, defs, 0, &mut state, "value");
+    if state.lost.is_empty() {
+        return ExampleRender::Complete(
+            example.unwrap_or_else(|| Value::Object(Map::new())),
+        );
+    }
+    ExampleRender::Degraded(DegradedExample {
+        reason: DEGRADED_REASON.to_string(),
+        fields: degraded_fields(schema, defs),
+    })
+}
+
+/// The legal form of one field, derived from the same schema the whole example
+/// comes from.
+///
+/// The field the model got wrong is the one it needs to see. An optional or
+/// chosen field never appears in a whole-tool example, so a refusal that shows
+/// only the whole example teaches the model to send the same call again.
+#[must_use]
+pub fn example_for_path(schema: &Value, path: &str) -> Option<Value> {
+    let defs = schema.get("$defs").and_then(Value::as_object);
+    let segments = path_segments(path);
+    let node = schema_at_path(schema, defs, &segments)?;
+    let field_name = segments.last().map(String::as_str).unwrap_or("value");
+    let mut state = RenderState {
+        rendered: 0,
+        lost: Vec::new(),
+    };
+    example_for(node, defs, 0, &mut state, field_name)
+}
+
+/// The degraded form of one example, if that is what it is.
+#[must_use]
+pub fn degraded_example(value: &Value) -> Option<DegradedExample> {
+    let marker = value.get(DEGRADED_EXAMPLE_KEY)?;
+    let fields = marker
+        .get("fields")
+        .and_then(Value::as_array)
+        .map(|fields| {
+            fields
+                .iter()
+                .filter_map(|field| {
+                    Some(DegradedField {
+                        name: field.get("name")?.as_str()?.to_string(),
+                        type_name: field.get("type")?.as_str()?.to_string(),
+                        required: field
+                            .get("required")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    Some(DegradedExample {
+        reason: marker
+            .get("reason")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .unwrap_or_else(|| DEGRADED_REASON.to_string()),
+        fields,
+    })
+}
+
+/// The model-facing text of a degraded example.
+#[must_use]
+pub fn degraded_example_text(degraded: &DegradedExample) -> String {
+    let fields = degraded
+        .fields
+        .iter()
+        .map(|field| {
+            let requirement = if field.required { "required" } else { "optional" };
+            format!("{}: {} ({requirement})", field.name, field.type_name)
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    format!("Example degraded - {}. Fields: {fields}.", degraded.reason)
+}
+
+/// The floor of real instances a tool surface's examples must carry.
+///
+/// The floor counts **instances only**. A tool whose example degraded is not
+/// covered by an instance - it is covered by a field list - so it never widens
+/// this window. The window is the pre-degradation rule, unchanged.
+pub const INSTANCE_COVERAGE_FLOOR: usize = 20;
+
+/// How many degradations the instance count may carry.
+///
+/// The degraded branch is a bounded side branch, not a second window: four
+/// degradations per instance is the most a surface may show before the
+/// degradation stops being an edge case.
+pub const DEGRADED_BRANCH_RATIO: usize = 4;
+
+/// How much of a tool surface's examples were real instances, and how much
+/// degraded into a field list.
+///
+/// The two counts are kept apart on purpose. Folding them together is what
+/// let a surface lose real instances and still pass the coverage window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExampleCoverage {
+    /// Tools whose example is a real instance.
+    pub instances: usize,
+    /// Tools whose example degraded into a named field list.
+    pub degraded: usize,
+}
+
+impl ExampleCoverage {
+    /// Whether the instance window holds.
+    ///
+    /// Degradations never enter this test: the window says how much of the
+    /// surface is covered by examples a model can copy.
+    #[must_use]
+    pub fn instance_window_holds(self) -> bool {
+        self.instances > INSTANCE_COVERAGE_FLOOR
+    }
+
+    /// Whether the degraded branch stays inside its own bound.
+    #[must_use]
+    pub fn degraded_branch_holds(self) -> bool {
+        self.degraded.saturating_mul(DEGRADED_BRANCH_RATIO) <= self.instances
+    }
+}
+
+/// The schema node a field really means.
+///
+/// A derived schema answers with a `$ref` into the definitions, and a choice of
+/// named variants answers with a `$ref` inside its first branch. A repair that
+/// reads the node as it was written therefore reads **no type and no members**
+/// on exactly the fields that need repairing: the one-shot deliverable block
+/// is a named struct, and its quote-corrupted form is what the shape gate
+/// refused over and over.
+#[must_use]
+pub fn resolve_schema_node<'a>(root: &'a Value, node: &'a Value) -> &'a Value {
+    let defs = root.get("$defs").and_then(Value::as_object);
+    let mut current = follow_ref(node, defs);
+    for _ in 0..MAX_REF_DEPTH {
+        let mut next = None;
+        for keyword in ["oneOf", "anyOf"] {
+            if let Some(variants) = current.get(keyword).and_then(Value::as_array) {
+                if let Some(first) = variants.first() {
+                    let resolved = follow_ref(first, defs);
+                    if !std::ptr::eq(resolved, current) {
+                        next = Some(resolved);
+                    }
+                }
+            }
+        }
+        match next {
+            Some(resolved) => current = resolved,
+            None => break,
+        }
+    }
+    current
+}
+
+/// The legal spelling of one literal, when the value names it in another case.
+///
+/// A schema that closes a field to a fixed set of values is the authority on
+/// what those values are. When the model's value differs from a legal member
+/// **only in case**, and exactly one member matches that way, the member is the
+/// value the model meant: the shape is the same shape, spelled the way the
+/// contract spells it.
+///
+/// Two members that differ only in case are two members, not one - then the
+/// value names nothing and nothing is repaired.
+#[must_use]
+pub fn normalize_schema_literal(schema_node: &Value, value: &Value) -> Option<Value> {
+    let serde_json::Value::String(text) = value else {
+        return None;
+    };
+    let members: Vec<&Value> = match schema_node.get("enum").and_then(Value::as_array) {
+        Some(values) => values.iter().collect(),
+        None => match schema_node.get("const") {
+            Some(one) => vec![one],
+            None => return None,
+        },
+    };
+    let matching = members
+        .iter()
+        .filter(|member| {
+            member
+                .as_str()
+                .is_some_and(|member| member.eq_ignore_ascii_case(text))
+        })
+        .collect::<Vec<_>>();
+    match matching.as_slice() {
+        [only] if only.as_str() != Some(text.as_str()) => Some((**only).clone()),
+        _ => None,
+    }
+}
+
+/// How much of the example budget is spent, and which fields the budget cost.
+struct RenderState {
+    rendered: usize,
+    lost: Vec<String>,
+}
+
+fn degraded_marker(degraded: &DegradedExample) -> Value {
+    let fields = degraded
+        .fields
+        .iter()
+        .map(|field| {
+            serde_json::json!({
+                "name": field.name,
+                "type": field.type_name,
+                "required": field.required,
+            })
+        })
+        .collect::<Vec<_>>();
+    serde_json::json!({
+        DEGRADED_EXAMPLE_KEY: {
+            "reason": degraded.reason,
+            "fields": fields,
+        }
+    })
 }
 
 fn example_for(
     schema: &Value,
     defs: Option<&Map<String, Value>>,
     depth: usize,
-    rendered: &mut usize,
+    state: &mut RenderState,
     field_name: &str,
-) -> Value {
-    if depth > MAX_REF_DEPTH || *rendered > EXAMPLE_MAX_CHARS {
-        return Value::Null;
+) -> Option<Value> {
+    if depth > MAX_REF_DEPTH || state.rendered > EXAMPLE_MAX_CHARS {
+        return None;
     }
     // The module's existing resolver, reused rather than reimplemented: a second
     // `$ref` walker is a second thing that can drift.
     let schema = follow_ref(schema, defs);
     if let Some(one) = schema.get("const") {
-        return one.clone();
+        return Some(one.clone());
     }
     if let Some(values) = schema.get("enum").and_then(Value::as_array) {
         // The first legal value is the one a model can copy without choosing.
-        return values.first().cloned().unwrap_or(Value::Null);
+        return values.first().cloned();
     }
     // A tagged enum is the case this function exists for: the model's difficulty
     // is picking the variant, so each variant gets its own example.
@@ -108,9 +444,8 @@ fn example_for(
         // that validates, not to enumerate the choice.
         for variant in variants.iter().take(MAX_EXAMPLIFIED_VARIANTS) {
             let resolved = follow_ref(variant, defs);
-            let example = example_for(resolved, defs, depth + 1, rendered, field_name);
-            if !example.is_null() {
-                return example;
+            if let Some(example) = example_for(resolved, defs, depth + 1, state, field_name) {
+                return Some(example);
             }
         }
     }
@@ -131,24 +466,22 @@ fn example_for(
     match declared_type.as_deref() {
         Some("string") => {
             let example = placeholder(field_name);
-            *rendered += example.as_str().map_or(0, str::len);
-            example
+            state.rendered += example.as_str().map_or(0, str::len);
+            Some(example)
         }
-        Some("integer") | Some("number") => Value::from(0),
-        Some("boolean") => Value::Bool(true),
+        Some("integer") | Some("number") => Some(Value::from(0)),
+        Some("boolean") => Some(Value::Bool(true)),
         Some("array") => match schema.get("items") {
             // One element shows the element's shape; an empty array shows none.
             Some(items) => {
-                let item = example_for(items, defs, depth + 1, rendered, field_name);
-                if item.is_null() {
-                    Value::Array(Vec::new())
-                } else {
-                    Value::Array(vec![item])
+                match example_for(items, defs, depth + 1, state, field_name) {
+                    Some(item) => Some(Value::Array(vec![item])),
+                    None => Some(Value::Array(Vec::new())),
                 }
             }
-            None => Value::Array(Vec::new()),
+            None => Some(Value::Array(Vec::new())),
         },
-        _ => object_example(schema, defs, depth, rendered),
+        _ => Some(object_example(schema, defs, depth, state)),
     }
 }
 
@@ -156,7 +489,7 @@ fn object_example(
     schema: &Value,
     defs: Option<&Map<String, Value>>,
     depth: usize,
-    rendered: &mut usize,
+    state: &mut RenderState,
 ) -> Value {
     let properties = schema
         .get("properties")
@@ -166,11 +499,7 @@ fn object_example(
     if properties.is_empty() {
         return Value::Object(Map::new());
     }
-    let required = schema
-        .get("required")
-        .and_then(Value::as_array)
-        .map(|items| items.iter().filter_map(Value::as_str).collect::<Vec<_>>())
-        .unwrap_or_default();
+    let required = required_names(schema);
     // A tool with nothing mandatory has nothing an example must show. Filling in
     // every optional field instead would teach a model to send what it may omit -
     // `state_inspect` would be exemplified with all six of its optional filters,
@@ -190,12 +519,205 @@ fn object_example(
         if !required.iter().any(|name| name == field) && !is_discriminator {
             continue;
         }
-        let value = example_for(field_schema, defs, depth + 1, rendered, field);
-        if !value.is_null() {
-            example.insert(field.clone(), value);
+        match example_for(field_schema, defs, depth + 1, state, field) {
+            Some(value) => {
+                example.insert(field.clone(), value);
+            }
+            None => {
+                // The instance would be partial, and a partial instance is a
+                // refusal waiting to happen. The loss is recorded so the whole
+                // example degrades into a field list instead.
+                state.lost.push(field.clone());
+            }
         }
     }
     Value::Object(example)
+}
+
+/// Every field the instance would have carried, with its shape.
+fn degraded_fields(
+    schema: &Value,
+    defs: Option<&Map<String, Value>>,
+) -> Vec<DegradedField> {
+    let mut fields = Vec::new();
+    collect_degraded_fields(schema, defs, "", 0, &mut fields);
+    fields
+}
+
+fn collect_degraded_fields(
+    schema: &Value,
+    defs: Option<&Map<String, Value>>,
+    prefix: &str,
+    depth: usize,
+    out: &mut Vec<DegradedField>,
+) {
+    if depth > MAX_REF_DEPTH {
+        return;
+    }
+    let schema = follow_ref(schema, defs);
+    // A choice: the instance would have shown the first variant, so the field
+    // list names that variant's fields.
+    for keyword in ["oneOf", "anyOf"] {
+        if let Some(variants) = schema.get(keyword).and_then(Value::as_array) {
+            if let Some(first) = variants.first() {
+                collect_degraded_fields(follow_ref(first, defs), defs, prefix, depth + 1, out);
+            }
+            return;
+        }
+    }
+    let Some(properties) = schema.get("properties").and_then(Value::as_object) else {
+        return;
+    };
+    let required = required_names(schema);
+    for (field, field_schema) in properties {
+        let is_discriminator = field_schema.get("const").is_some();
+        let is_required = required.iter().any(|name| name == field);
+        if !is_required && !is_discriminator {
+            continue;
+        }
+        let path = if prefix.is_empty() {
+            field.clone()
+        } else {
+            format!("{prefix}.{field}")
+        };
+        out.push(DegradedField {
+            name: path.clone(),
+            type_name: type_name_of(field_schema, defs),
+            required: is_required,
+        });
+        // A nested object's own required fields travel with their parent.
+        let resolved = follow_ref(field_schema, defs);
+        if resolved.get("properties").is_some() {
+            collect_degraded_fields(resolved, defs, &path, depth + 1, out);
+        } else if let Some(items) = resolved.get("items") {
+            if follow_ref(items, defs).get("properties").is_some() {
+                collect_degraded_fields(items, defs, &path, depth + 1, out);
+            }
+        }
+    }
+}
+
+/// A field's shape in the fewest words a model can act on.
+fn type_name_of(schema: &Value, defs: Option<&Map<String, Value>>) -> String {
+    let schema = follow_ref(schema, defs);
+    if let Some(one) = schema.get("const") {
+        return format!("const {one}");
+    }
+    if let Some(values) = schema.get("enum").and_then(Value::as_array) {
+        let listed = values
+            .iter()
+            .take(4)
+            .map(|value| value.to_string())
+            .collect::<Vec<_>>()
+            .join(" | ");
+        return format!("enum {listed}");
+    }
+    for keyword in ["oneOf", "anyOf"] {
+        if let Some(variants) = schema.get(keyword).and_then(Value::as_array) {
+            let tags = variants
+                .iter()
+                .take(4)
+                .filter_map(|variant| {
+                    let resolved = follow_ref(variant, defs);
+                    let properties = resolved.get("properties").and_then(Value::as_object)?;
+                    discriminator(properties, defs).map(|(_, value)| value)
+                })
+                .collect::<Vec<_>>();
+            return if tags.is_empty() {
+                "one of".to_string()
+            } else {
+                format!("one of {}", tags.join(" | "))
+            };
+        }
+    }
+    match schema.get("type") {
+        Some(Value::String(one)) if one == "array" => match schema.get("items") {
+            Some(items) => format!("array of {}", type_name_of(items, defs)),
+            None => "array".to_string(),
+        },
+        Some(Value::String(one)) => one.clone(),
+        Some(Value::Array(choices)) => choices
+            .iter()
+            .filter_map(Value::as_str)
+            .find(|choice| *choice != "null")
+            .unwrap_or("value")
+            .to_string(),
+        _ => {
+            if schema.get("properties").is_some() {
+                "object".to_string()
+            } else {
+                "value".to_string()
+            }
+        }
+    }
+}
+
+/// The field names a JSON path names, in order.
+///
+/// The schema validator writes its paths as `$.deliverable` or
+/// `$.entries[0].input`; the index of an array item says which item, not which
+/// field, so it is dropped.
+fn path_segments(path: &str) -> Vec<String> {
+    path.trim_start_matches('$')
+        .split('.')
+        .filter_map(|part| {
+            let name = part
+                .chars()
+                .take_while(|character| character.is_alphanumeric() || *character == '_')
+                .collect::<String>();
+            (!name.is_empty()).then_some(name)
+        })
+        .collect()
+}
+
+/// The schema node one path names, if the path names one.
+fn schema_at_path<'a>(
+    schema: &'a Value,
+    defs: Option<&'a Map<String, Value>>,
+    segments: &[String],
+) -> Option<&'a Value> {
+    let mut current = schema;
+    for segment in segments {
+        let resolved = follow_ref(current, defs);
+        let mut next: Option<&'a Value> = None;
+        // A choice: the segment belongs to the variant that declares it.
+        for keyword in ["oneOf", "anyOf"] {
+            let Some(variants) = resolved.get(keyword).and_then(Value::as_array) else {
+                continue;
+            };
+            for variant in variants {
+                let variant = follow_ref(variant, defs);
+                if let Some(property) = variant
+                    .get("properties")
+                    .and_then(Value::as_object)
+                    .and_then(|properties| properties.get(segment))
+                {
+                    next = Some(property);
+                    break;
+                }
+            }
+            if next.is_some() {
+                break;
+            }
+        }
+        if next.is_none() {
+            next = resolved
+                .get("properties")
+                .and_then(Value::as_object)
+                .and_then(|properties| properties.get(segment));
+        }
+        if next.is_none() {
+            // An array's element schema carries the fields of its items.
+            next = resolved.get("items").and_then(|items| {
+                follow_ref(items, defs)
+                    .get("properties")
+                    .and_then(Value::as_object)
+                    .and_then(|properties| properties.get(segment))
+            });
+        }
+        current = next?;
+    }
+    Some(current)
 }
 
 /// Compact statement of what one tool accepts, derived only from `schema`.
@@ -460,6 +982,22 @@ fn required_of(obj: &Map<String, Value>) -> Vec<&str> {
         .unwrap_or_default()
 }
 
+/// The names a schema requires, owned so a caller can keep them alongside the
+/// schema it read them from.
+fn required_names(schema: &Value) -> Vec<String> {
+    schema
+        .get("required")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// The variant key whose `const` tells the variants apart: the tag of an
 /// internally-tagged enum.
 fn discriminator<'a>(
@@ -521,6 +1059,195 @@ pub fn admissible_field_names(schema: &Value) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn gb2_correction_requires_the_exact_closed_schema_and_error() {
+        let schema = serde_json::json!({"type":"object", "required":["reason"],
+            "properties":{"reason":{"type":"string"}}, "additionalProperties":false});
+        let hint = super::input_shape_correction;
+        assert!(hint("task_review", "$: missing required field `reason`", &schema).is_some());
+        assert!(hint("task_review", "$: unexpected field `reason_ref`", &schema).is_some());
+        assert!(hint("other", "$: unexpected field `reason_ref`", &schema).is_none());
+        assert!(hint("task_review", "$.other: unexpected field `reason_ref`", &schema).is_none());
+        let mut open = schema.clone();
+        open["additionalProperties"] = true.into();
+        assert!(hint("task_review", "$: unexpected field `reason_ref`", &open).is_none());
+        let mut branched = schema.clone();
+        branched["oneOf"] = serde_json::json!([{}]);
+        assert!(hint("task_review", "$: missing required field `reason`", &branched).is_none());
+        let shape = serde_json::json!({"type":"object", "additionalProperties":false,
+            "properties":{"steps":{"type":"array","items":{"type":"object",
+                "required":["id"],"properties":{"id":{"type":"string"}}}}}});
+        assert!(hint("tool_orchestrate", "$: unexpected field `id`", &shape).is_some());
+        let mut open = shape.clone();
+        open["additionalProperties"] = true.into();
+        assert!(hint("tool_orchestrate", "$: unexpected field `id`", &open).is_none());
+    }
+
+    /// A degradation never widens the instance-coverage window, and the
+    /// degraded branch is bounded on its own.
+    ///
+    /// This is the symmetric negative control of the coverage gate: the
+    /// positive control says every tool's example is a real instance or a
+    /// named degradation; this one says a surface full of degradations cannot
+    /// pass the window that counts instances.
+    #[test]
+    fn a_degradation_never_widens_the_instance_window() {
+        // Twenty instances and forty degradations: neither the window nor the
+        // degraded branch may hold.
+        let widened = ExampleCoverage {
+            instances: 20,
+            degraded: 40,
+        };
+        assert!(
+            !widened.instance_window_holds(),
+            "a degradation must not count into the instance-coverage window"
+        );
+        assert!(
+            !widened.degraded_branch_holds(),
+            "the degraded branch is bounded on its own"
+        );
+        // The honest shape: the instances carry the window, and the
+        // degradations stay inside the side branch.
+        let honest = ExampleCoverage {
+            instances: 21,
+            degraded: 4,
+        };
+        assert!(honest.instance_window_holds());
+        assert!(honest.degraded_branch_holds());
+        // A surface that lost its instances cannot be carried by degradations.
+        let lost = ExampleCoverage {
+            instances: 3,
+            degraded: 40,
+        };
+        assert!(!lost.instance_window_holds());
+    }
+
+    /// A field's schema node resolves to the shape it really means.
+    ///
+    /// The derived schema answers with a `$ref` into the definitions, and a
+    /// choice of named variants answers with a `$ref` inside its first branch.
+    /// A repair that reads the node as written reads no type at all on exactly
+    /// the fields that need repairing.
+    #[test]
+    fn a_field_schema_resolves_to_the_shape_it_means() {
+        let root = serde_json::json!({
+            "$defs": {
+                "Deliverable": {"type": "object", "required": ["block_index"]},
+                "Decision": {"type": "string", "enum": ["accept", "rework"]},
+            },
+            "type": "object",
+            "properties": {
+                "deliverable": {"$ref": "#/$defs/Deliverable"},
+                "decision": {"$ref": "#/$defs/Decision"},
+                "optional": {"anyOf": [{"$ref": "#/$defs/Deliverable"}, {"type": "null"}]},
+            },
+        });
+        let properties = root
+            .get("properties")
+            .and_then(serde_json::Value::as_object)
+            .expect("properties");
+        let deliverable = resolve_schema_node(&root, &properties["deliverable"]);
+        assert_eq!(deliverable.get("type").and_then(serde_json::Value::as_str), Some("object"));
+        let decision = resolve_schema_node(&root, &properties["decision"]);
+        assert_eq!(
+            decision.get("enum").and_then(serde_json::Value::as_array).map(Vec::len),
+            Some(2)
+        );
+        let optional = resolve_schema_node(&root, &properties["optional"]);
+        assert_eq!(optional.get("type").and_then(serde_json::Value::as_str), Some("object"));
+    }
+
+    /// A literal that differs from a legal member only in case is put back into
+    /// the contract's spelling - but only when exactly one member matches.
+    ///
+    /// Two members that differ only in case are two members: the value names
+    /// neither, and nothing is repaired.
+    #[test]
+    fn a_literal_is_repaired_only_when_one_member_matches() {
+        let schema = serde_json::json!({"enum": ["accept", "challenge", "rework"]});
+        assert_eq!(
+            normalize_schema_literal(&schema, &serde_json::json!("Accept")),
+            Some(serde_json::json!("accept"))
+        );
+        // A value that names no member is not repaired.
+        assert_eq!(
+            normalize_schema_literal(&schema, &serde_json::json!("nonsense")),
+            None
+        );
+        // Two members that differ only in case: nothing is repaired.
+        let ambiguous = serde_json::json!({"enum": ["Accept", "accept"]});
+        assert_eq!(
+            normalize_schema_literal(&ambiguous, &serde_json::json!("ACCEPT")),
+            None
+        );
+        // A const is a member of one.
+        let fixed = serde_json::json!({"const": "task_review"});
+        assert_eq!(
+            normalize_schema_literal(&fixed, &serde_json::json!("Task_Review")),
+            Some(serde_json::json!("task_review"))
+        );
+        // A value that already holds is not touched.
+        assert_eq!(
+            normalize_schema_literal(&schema, &serde_json::json!("accept")),
+            None
+        );
+    }
+
+    /// A required field the budget cost is never dropped silently.
+    ///
+    /// The budget ends the rendering, and a field the example meant to carry
+    /// used to disappear with it: a model that copied the example was refused
+    /// for the field the framework had dropped. The example may therefore be a
+    /// named degradation - but it may never be a partial instance.
+    ///
+    /// This control is written against the stable surface only, so it runs on
+    /// the tree that predates the degradation as well: there it is red.
+    #[test]
+    fn a_required_field_the_budget_cost_is_never_dropped_silently() {
+        let mut properties = serde_json::Map::new();
+        let mut required = Vec::new();
+        for index in 0..120 {
+            let name = format!("field_{index}");
+            properties.insert(name.clone(), serde_json::json!({"type": "string"}));
+            required.push(serde_json::Value::String(name));
+        }
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": properties,
+            "required": required,
+        });
+        let example = input_example(&schema).expect("a schema with required fields has an example");
+        if let Some(degraded) = example.get("__example_degraded__") {
+            let named = degraded
+                .get("fields")
+                .and_then(serde_json::Value::as_array)
+                .map(|fields| {
+                    fields
+                        .iter()
+                        .filter_map(|field| field.get("name").and_then(serde_json::Value::as_str))
+                        .collect::<std::collections::BTreeSet<_>>()
+                })
+                .unwrap_or_default();
+            for index in 0..120 {
+                let name = format!("field_{index}");
+                assert!(
+                    named.contains(name.as_str()),
+                    "the degradation must name the required field {name}: {example}"
+                );
+            }
+            return;
+        }
+        let instance = example
+            .as_object()
+            .expect("an instance that is not degraded is an object");
+        for index in 0..120 {
+            let name = format!("field_{index}");
+            assert!(
+                instance.contains_key(&name),
+                "the example dropped the required field {name}: {example}"
+            );
+        }
+    }
 
     #[test]
     fn the_contract_carries_what_each_field_means() {

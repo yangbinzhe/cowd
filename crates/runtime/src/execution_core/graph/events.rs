@@ -191,15 +191,15 @@ impl ExecutionNodeBinding {
         let original: super::registry::NodeExecutionTicket =
             serde_json::from_value(intent.payload.clone())
                 .map_err(|_| "invalid execution effect intent".to_string())?;
-        if original.graph_id != ticket.graph_id
-            || original.node_id != ticket.node_id
-            || original.executor_kind != ticket.executor_kind
-            || original.service_class != ticket.service_class
-            || original.payload_ref != ticket.payload_ref
-            || original.idempotency_key != ticket.idempotency_key
+        // The original and supplied tickets must agree in every typed field;
+        // deriving equality prevents a newly added identity field from being
+        // silently omitted from an independently maintained comparison list.
+        if original != *ticket
+            || serde_json::to_value(ticket)
+                .map_err(|_| "invalid execution effect ticket encoding".to_string())?
+                != intent.payload
             || original.idempotency_key.trim().is_empty()
             || original.attempt == 0
-            || original.attempt != ticket.attempt
         {
             return Err("execution effect intent ticket mismatch".into());
         }

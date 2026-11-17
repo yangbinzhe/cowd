@@ -201,13 +201,16 @@ pub(super) fn validate_transition_with_admission_contexts(
                             && attempt.agent_id == envelope.actor.actor_id
                             && attempt.mode
                                 == harness_contract::agent_action::AgentAttemptMode::Execute
-                            && attempt.generation == task.claim_generation
+                            && attempt.generation.checked_add(1) == Some(task.claim_generation)
+                            && task.claim_renewal_streak == 0
                             && projection.agent_is_active_in(&attempt.agent_id, &task.team_id)
                     });
                     if !current
                         || !matches!(
                             task.status,
-                            AgenticTaskStatus::Published | AgenticTaskStatus::Rework
+                            AgenticTaskStatus::Published
+                                | AgenticTaskStatus::Rework
+                                | AgenticTaskStatus::Claimed
                         )
                     {
                         return Some((
@@ -414,42 +417,6 @@ fn validate_task_claim(
     let Some(task) = projection.tasks.get(&input.task_ref) else {
         return Some(("task_not_found", input.task_ref.clone()));
     };
-    let expired_claim = task.status == AgenticTaskStatus::Claimed
-        && task
-            .lease_expires_at_ms
-            .is_some_and(|expires| expires <= now_ms);
-    let same_execution_renewal = task.status == AgenticTaskStatus::Claimed
-        && task.claimant.as_deref() == actor_agent_id(envelope)
-        && task.claim_execution_id == envelope.actor.execution_id;
-    if !matches!(
-        task.status,
-        AgenticTaskStatus::Published | AgenticTaskStatus::Rework
-    ) && !expired_claim
-        && !same_execution_renewal
-    {
-        return Some(("task_not_claimable", format!("{:?}", task.status)));
-    }
-    // A renewal is free today, so a Task that never advances can be re-claimed
-    // forever: run mon7's final task burned fourteen minutes that way. Past the
-    // bound the claim is refused with the two actions that actually move it.
-    if expired_claim || same_execution_renewal {
-        if let Some(bound) = crate::agentic::work_market::claim_renewal_bound() {
-            if task.claim_renewal_streak >= bound {
-                return Some((
-                    "task_reclaim_without_progress",
-                    format!(
-                        "task {} has been claimed {} times in a row with no new deliverable and no \
-                         status change; the artifacts already committed for it are [{}]. Submit a \
-                         NEW deliverable, or release the task with task_release so the work can \
-                         move - re-claiming it again cannot advance the objective.",
-                        input.task_ref,
-                        task.claim_renewal_streak,
-                        task.artifact_refs.join(", ")
-                    ),
-                ));
-            }
-        }
-    }
     if !matches!(
         envelope.actor.kind,
         AgentActorKind::Agent | AgentActorKind::TeamLead
@@ -477,6 +444,55 @@ fn validate_task_claim(
                 input.task_ref
             ),
         ));
+    }
+    let expired_claim = task.status == AgenticTaskStatus::Claimed
+        && task
+            .lease_expires_at_ms
+            .is_some_and(|expires| expires <= now_ms);
+    let same_execution_renewal = task.status == AgenticTaskStatus::Claimed
+        && task.claimant.as_deref() == actor_agent_id(envelope)
+        && task.claim_execution_id == envelope.actor.execution_id;
+    let expired_original_renewal = actor_agent_id(envelope)
+        .zip(envelope.actor.execution_id.as_deref())
+        .and_then(|(agent, execution)| {
+            projection.membership_for(agent, &task.team_id).map(|membership| {
+                projection.agent_is_active_in(agent, &task.team_id)
+                    && crate::agentic::work_market::expired_original_claim(
+                        task, agent, execution, &membership.membership_id, now_ms,
+                    )
+            })
+        })
+        .unwrap_or(false);
+    if expired_claim && !same_execution_renewal {
+        return Some(("task_physical_closure_unconfirmed", input.task_ref.clone()));
+    }
+    if !matches!(
+        task.status,
+        AgenticTaskStatus::Published | AgenticTaskStatus::Rework
+    ) && !same_execution_renewal
+    {
+        return Some(("task_not_claimable", format!("{:?}", task.status)));
+    }
+    // A renewal is free today, so a Task that never advances can be re-claimed
+    // forever: run mon7's final task burned fourteen minutes that way. Past the
+    // bound the claim is refused with the two actions that actually move it.
+    if (expired_claim || same_execution_renewal) && !expired_original_renewal {
+        if let Some(bound) = crate::agentic::work_market::claim_renewal_bound() {
+            if task.claim_renewal_streak >= bound {
+                return Some((
+                    "task_reclaim_without_progress",
+                    format!(
+                        "task {} has been claimed {} times in a row with no new deliverable and no \
+                         status change; the artifacts already committed for it are [{}]. Submit a \
+                         NEW deliverable, or release the task with task_release so the work can \
+                         move - re-claiming it again cannot advance the objective.",
+                        input.task_ref,
+                        task.claim_renewal_streak,
+                        task.artifact_refs.join(", ")
+                    ),
+                ));
+            }
+        }
     }
     if let Some(waiting) = task.depends_on.iter().find(|dependency| {
         !crate::agentic::work_market::task_dependency_satisfied(projection, dependency)
@@ -526,9 +542,22 @@ fn validate_task_release(
     envelope: &AgentActionEnvelope,
     input: &TaskReleaseInput,
 ) -> Option<(&'static str, String)> {
+    if envelope.expected_revision.is_none() {
+        return Some(("task_release_revision_required", input.task_ref.clone()));
+    }
     let Some(task) = projection.tasks.get(&input.task_ref) else {
         return Some(("task_not_found", input.task_ref.clone()));
     };
+    match input.expected_claim_generation {
+        None => return Some(("task_release_generation_required", input.task_ref.clone())),
+        Some(expected) if expected != task.claim_generation => {
+            return Some(("stale_claim_generation", format!(
+                "task {} expected claim generation {}, actual {}",
+                input.task_ref, expected, task.claim_generation
+            )));
+        }
+        Some(_) => {}
+    }
     if let Some(attempt) = envelope
         .actor
         .execution_id
@@ -951,39 +980,75 @@ fn validate_task_review(
     // the operator's own criteria did not require. The rework loop that ended those
     // runs was manufactured here, not by the author.
     //
-    // The Task declares `acceptance_checks`, and `objective_review` already carries a
-    // `criterion_ref` for exactly this purpose. `task_review` was the one verdict that
-    // could not say what it was judging, so a reviewer substituted its own standard
-    // for the operator's. An accept needs no anchor - accepting is never an overreach -
-    // but a rework sends someone back to work, and that has to be answerable to the
-    // declared criteria.
-    if input.decision == TaskReviewDecision::Rework && !task.acceptance_checks.is_empty() {
-        let anchored = task.acceptance_checks.iter().any(|check| {
-            let needle = check.trim();
-            // A check is prose, so match on a distinctive run rather than the whole
-            // string: a reviewer paraphrases, but it cannot paraphrase away the
-            // subject of the criterion.
-            needle.len() >= 12 && input.reason.contains(&needle[..12])
-                || needle.len() < 12 && input.reason.contains(needle)
-        });
-        if !anchored {
-            let declared = task
-                .acceptance_checks
-                .iter()
-                .map(|check| format!("- {check}"))
-                .collect::<Vec<_>>()
-                .join("\n");
-            return Some((
-                "rework_without_declared_criterion",
-                format!(
-                    "a rework must name the declared acceptance criterion it failed. \
-                     This Task declares:\n{declared}\n\
-                     Quote the criterion you are rejecting. If your objection is \
-                     outside these criteria, it may be recorded in `reason` alongside \
-                     an accept as a non-blocking observation - it cannot force the \
-                     author to redo work the operator did not ask for."
-                ),
-            ));
+    // 032 K1 (B1): anchor against the compiled criterion record - the
+    // publish-time single source produced by `compile_task_obligations`. The
+    // old gate ran only when `acceptance_checks` was non-empty, so a prose-only
+    // Task left reviewers free to reject against standards nobody declared;
+    // the authoritative prose is now itself a criterion (`key=acceptance`),
+    // which closes exactly that hole. A hand-built fixture without compiled
+    // obligations keeps the previous checks-only behavior unchanged.
+    if input.decision == TaskReviewDecision::Rework {
+        // 032 K1b (B1): the authoritative prose is itself a criterion, so a
+        // prose-only Task is never exempt from the anchor. The set below always
+        // carries the prose - the old "no compiled record and no checks => skip
+        // the anchor" path let a reviewer reject against standards nobody
+        // declared, which is the hole the two live runs fell into.
+        // 033 S8: the review duty lives in its own projection slot, so the
+        // anchor reads only the acceptance obligations - a duty the Runtime
+        // owes is never a criterion a reviewer may reject against.
+        let mut criteria: Vec<&str> = if task.obligations.is_empty() {
+            task.acceptance_checks.iter().map(String::as_str).collect()
+        } else {
+            task.obligations.iter().map(|item| item.text.as_str()).collect()
+        };
+        let prose = task.acceptance.trim();
+        if !prose.is_empty() && !criteria.iter().any(|criterion| criterion.trim() == prose) {
+            criteria.push(prose);
+        }
+        if !criteria.is_empty() {
+            let anchored = criteria.iter().any(|criterion| {
+                let needle = criterion.trim();
+                // Criteria are prose, so match on a distinctive run rather
+                // than the whole string: a reviewer paraphrases, but it
+                // cannot paraphrase away the subject of the criterion.
+                // The run is now taken over the authoritative prose too, so
+                // the window cannot assume byte==char: walk down to a char
+                // boundary before slicing.
+                let mut head = needle.len().min(12);
+                while head > 0 && !needle.is_char_boundary(head) {
+                    head -= 1;
+                }
+                needle.len() >= 12 && head > 0 && input.reason.contains(&needle[..head])
+                    || needle.len() < 12 && input.reason.contains(needle)
+            });
+            if !anchored {
+                let declared = if task.obligations.is_empty() {
+                    criteria
+                        .iter()
+                        .map(|criterion| format!("- {criterion}"))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                } else {
+                    task.obligations
+                        .iter()
+                        .map(|item| {
+                            format!("- {} ({})", item.text, if item.authoritative { "authoritative" } else { "hint" })
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                };
+                return Some((
+                    "rework_without_declared_criterion",
+                    format!(
+                        "a rework must name the declared acceptance criterion it failed. \
+                         This Task declares:\n{declared}\n\
+                         Quote the criterion you are rejecting. If your objection is \
+                         outside these criteria, it may be recorded in `reason` alongside \
+                         an accept as a non-blocking observation - it cannot force the \
+                         author to redo work the operator did not ask for."
+                    ),
+                ));
+            }
         }
     }
     if let Some(reference) = input
@@ -1072,6 +1137,7 @@ mod reclaim_discipline_tests {
         AgentActionEnvelope {
             action_id: format!("claim:{}", execution_id),
             actor: AgentActorBinding {
+                original_execution: None,
                 objective_id: "objective".to_string(),
                 program_id: "program".to_string(),
                 session_id: "session".to_string(),
@@ -1124,6 +1190,10 @@ mod reclaim_discipline_tests {
                 acceptance: "durable evidence".to_string(),
                 acceptance_checks: Vec::new(),
                 criterion_source: Default::default(),
+                obligations: Vec::new(),
+                rework_directives: Vec::new(),
+                unsettled_released_attempts: Vec::new(),
+                terminal_note: None,
                 required_capabilities: Vec::new(),
                 obligation_refs: Vec::new(),
                 purpose: Default::default(),
@@ -1146,6 +1216,11 @@ mod reclaim_discipline_tests {
                 failed_attempts: 0,
                 review_generation: 0,
                 failed_review_attempts: 0,
+                structural_execution_stalls: 0,
+                structural_review_stalls: 0,
+                reviews_applied: 0,
+                review_obligation: None,
+                reviews_accepted: 0,
                 last_failure: None,
                 replacement_task_refs: Vec::new(),
                 supersede_evidence_refs: Vec::new(),
@@ -1236,6 +1311,30 @@ mod reclaim_discipline_tests {
         assert!(!context.covers(&projection, &request));
     }
     #[test]
+    fn expired_original_claim_recovers_past_streak_without_foreign_takeover() {
+        use crate::agentic::program::{AgenticMembershipProjection, AgenticTaskAttemptProjection, AgenticTeamProjection};
+        let mut projection = projection_with_streak(3);
+        let membership_id = AgenticProgramProjection::membership_id("agent", "team");
+        projection.teams.insert("team".into(), AgenticTeamProjection {
+            team_id: "team".into(), name: "team".into(), mission: String::new(),
+            objective: None, topic_ref: String::new(), created_by: "root".into(),
+            member_ids: vec!["agent".into()], task_ids: vec!["task".into()], lifecycle: Default::default(),
+        });
+        projection.memberships.insert(membership_id.clone(), AgenticMembershipProjection {
+            membership_id: membership_id.clone(), agent_id: "agent".into(), team_id: "team".into(),
+            lifecycle: Default::default(), delegation_ref: None, reason_ref: None, created_by: "root".into(),
+        });
+        projection.tasks.get_mut("task").unwrap().active_attempts.insert("exec-1".into(), AgenticTaskAttemptProjection {
+            execution_id: "exec-1".into(), agent_id: "agent".into(), membership_id,
+            mode: harness_contract::agent_action::AgentAttemptMode::Execute, generation: 0,
+        });
+        assert!(validate_task_claim(&projection, &envelope("exec-1"), &claim_input(), 10_000).is_none());
+        assert_eq!(validate_task_claim(&projection, &envelope("foreign"), &claim_input(), 10_000).unwrap().0, "task_physical_closure_unconfirmed");
+        projection.tasks.get_mut("task").unwrap().active_attempts.get_mut("exec-1").unwrap().generation = 1;
+        assert_eq!(validate_task_claim(&projection, &envelope("exec-1"), &claim_input(), 10_000).unwrap().0, "task_reclaim_without_progress");
+    }
+
+    #[test]
     fn a_reclaim_without_progress_is_refused_past_the_bound() {
         let projection = projection_with_streak(3);
         let refusal = validate_task_claim(&projection, &envelope("exec-1"), &claim_input(), 10_000);
@@ -1298,4 +1397,45 @@ mod reclaim_discipline_tests {
             "the model must know the claim is not its job: {detail}"
         );
     }
+
+    #[test]
+    fn k1_b_rework_anchors_on_compiled_criteria_prose_only_included() {
+        use harness_contract::agent_action::{TaskReviewDecision, TaskReviewInput};
+        let acceptance = "the answer quotes Cargo.toml exactly";
+        let mut projection = projection_with_streak(0);
+        {
+            let task = projection.tasks.get_mut("task").unwrap();
+            task.status = AgenticTaskStatus::Submitted;
+            // The reviewer must not be the author: the self-review guards run
+            // before the criterion anchor, so the fixture keeps them apart.
+            task.claimant = Some("agent:author".to_string());
+            task.claim_execution_id = Some("exec-author".to_string());
+            task.acceptance = acceptance.to_string();
+            task.acceptance_checks = Vec::new();
+            task.obligations = crate::agentic::work_market::compile_task_obligations(
+                acceptance, &task.acceptance_checks, task.criterion_source,
+            );
+        }
+        let mut request = envelope("exec-1");
+        let unanchored = |reason: &str| AgentAction::TaskReview(TaskReviewInput {
+            gaps: Vec::new(),
+            directed_actions: Vec::new(),
+            task_ref: "task".into(),
+            decision: TaskReviewDecision::Rework,
+            reason: reason.into(),
+            operator_requirement: None,
+            evidence_refs: vec!["tool://call-9-0123456789abcdef".into()],
+        });
+        // 032 K1 (B1): a prose-only Task is no longer an unanchored hole - the
+        // authoritative prose itself is a compiled criterion.
+        request.action = unanchored("the workspace lacks a documented domain index");
+        let rejection = validate_transition(&projection, &request, 10_000, None)
+            .expect("a rework against standards nobody declared must be refused by name");
+        assert_eq!(rejection.0, "rework_without_declared_criterion");
+        assert!(rejection.1.contains("authoritative"), "the refusal lists the real criteria:\n{}", rejection.1);
+        request.action = unanchored("the answer quotes Cargo.toml exactly is missing at line 12");
+        assert!(validate_transition(&projection, &request, 10_000, None).is_none(),
+            "quoting the compiled prose anchors the rework");
+    }
+
 }

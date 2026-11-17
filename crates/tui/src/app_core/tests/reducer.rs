@@ -370,7 +370,7 @@ fn scroll_up_loads_page() {
         app.add_message("user", &format!("msg {i}"));
     }
     assert_eq!(app.timeline_len(), 600);
-    assert_eq!(app.timeline.timeline_pages.len(), 2);
+    assert_eq!(app.timeline.timeline_pages.iter().map(|page| page.start_index).collect::<Vec<_>>(), vec![0, PAGE_SIZE]);
     let at_500 = app.timeline_get(500).unwrap();
     assert!(at_500.full_text().contains("msg 500"));
     let at_0 = app.timeline_get(0).unwrap();
@@ -730,11 +730,11 @@ fn page_boundary_seamless() {
         app.add_message("user", &format!("msg {i}"));
     }
     assert_eq!(app.timeline_len(), PAGE_SIZE);
-    assert_eq!(app.timeline.timeline_pages.len(), 1);
+    assert_eq!(app.timeline.timeline_pages.iter().map(|page| page.start_index).collect::<Vec<_>>(), vec![0]);
 
     app.add_message("user", "overflow");
     assert_eq!(app.timeline_len(), PAGE_SIZE + 1);
-    assert_eq!(app.timeline.timeline_pages.len(), 2);
+    assert_eq!(app.timeline.timeline_pages.iter().map(|page| page.start_index).collect::<Vec<_>>(), vec![0, PAGE_SIZE]);
 
     assert!(app.timeline_get(0).unwrap().full_text().contains("msg 0"));
     assert!(app
@@ -1199,8 +1199,8 @@ fn add_entry_appends_to_last_page() {
         app.timeline_push(make_msg(&format!("entry {i}")));
     }
     assert_eq!(app.timeline_len(), 300);
-    assert_eq!(app.timeline.timeline_pages.len(), 1);
-    assert_eq!(app.timeline.timeline_pages[0].entries.len(), 300);
+    assert_eq!(app.timeline.timeline_pages.iter().map(|page| page.start_index).collect::<Vec<_>>(), vec![0]);
+    assert_eq!(app.timeline.timeline_pages[0].entries.len(), app.timeline_len());
     assert_eq!(app.timeline.timeline_pages[0].start_index, 0);
 }
 
@@ -1606,7 +1606,7 @@ fn causal_reasoning_items_remain_distinct_in_the_tui_timeline() {
             _ => None,
         })
         .collect::<Vec<_>>();
-    assert_eq!(items.len(), 2);
+    assert_eq!(items.iter().map(|(id, _, _)| id.as_deref()).collect::<Vec<_>>(), vec![Some("reasoning-a:reasoning-summary:0"), Some("reasoning-b:reasoning-summary:0")]);
     assert_eq!(
         items[0],
         (
@@ -1898,6 +1898,7 @@ fn durable_history_restores_tool_use_and_result_as_one_deduplicated_card() {
             _ => None,
         })
         .collect::<Vec<_>>();
+    assert_eq!(tools.iter().map(|tool| tool.0.clone()).collect::<std::collections::BTreeSet<_>>().len(), 1);
     assert_eq!(tools.len(), 1);
     assert!(
         tools[0].0.starts_with("tool-instance|"),
@@ -1969,7 +1970,7 @@ fn stable_turn_identity_prevents_cross_turn_delta_and_terminal_corruption() {
             _ => None,
         })
         .collect::<Vec<_>>();
-    assert_eq!(messages.len(), 3);
+    assert_eq!(messages.iter().map(|(content, _)| *content).collect::<Vec<_>>(), vec!["same prefix first", "second question", "same prefix second"]);
     assert!(
         messages
             .iter()

@@ -12,8 +12,12 @@ use runtime::{
     RuntimeExecutionHost, RuntimeServices, RuntimeToolExecutionOutcome,
     RuntimeToolExecutionRequest, RuntimeToolExecutionStatus,
 };
+use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
+
+#[path = "canonical_session_port.rs"]
+mod canonical_session_port;
 
 pub struct CanonicalProviderServer {
     task: tokio::task::JoinHandle<()>,
@@ -27,10 +31,32 @@ impl Drop for CanonicalProviderServer {
 
 struct CanonicalReadHost {
     resolver: runtime::path_identity::WorkspacePathIdentityResolver,
+    tools: tools::ToolHost,
+    root: std::path::PathBuf,
 }
 
 #[async_trait]
 impl RuntimeExecutionHost for CanonicalReadHost {
+    fn pin_step_catalog(&self) -> Option<tools::ToolHostLease> {
+        Some(self.tools.pin_snapshot())
+    }
+
+    fn delegated_tool_definitions(&self, names: &[String]) -> Vec<runtime::ProviderToolDefinition> {
+        let requested = names.iter().cloned().collect();
+        self.tools
+            .pin_snapshot()
+            .snapshot()
+            .catalog
+            .definitions(Some(&requested))
+            .into_iter()
+            .map(|definition| runtime::ProviderToolDefinition {
+                name: definition.name,
+                description: definition.description,
+                input_schema: definition.input_schema,
+            })
+            .collect()
+    }
+
     async fn execute_runtime_tool(
         &self,
         request: &RuntimeToolExecutionRequest,
@@ -41,22 +67,41 @@ impl RuntimeExecutionHost for CanonicalReadHost {
             .get("path")
             .and_then(serde_json::Value::as_str)
             .expect("read_file path");
+        // R4-034-fixture-fix: the fixture host must really read the requested
+        // file and return the self-describing complete-read payload the
+        // product's evidence contract requires. A request argument is never
+        // proof that the file content reached the caller.
+        let bytes = std::fs::read(self.root.join(path)).expect("canonical read_file body");
+        let content = String::from_utf8(bytes).expect("canonical read_file text");
+        let lines = content.lines().count();
+        let digest = format!("{:x}", Sha256::digest(content.as_bytes()));
+        let output = serde_json::json!({
+            "type": "text",
+            "truncated": false,
+            "file": {
+                "filePath": path,
+                "content": content,
+                "startLine": 1,
+                "numLines": lines,
+                "totalLines": lines,
+                "sha256": digest,
+            }
+        });
         let mut observed = self
             .resolver
-            .observe_tool_scope(
+            .observe_complete_read_tool_output(
                 "read_file",
-                &format!("read:{path}"),
-                Some(&"a".repeat(64)),
-                1,
+                &output,
+                request.observation_wave_sequence,
             )
-            .expect("canonical observed read receipt");
+            .expect("canonical complete read receipt");
         observed.evidence_ref = Some(harness_contract::context::EvidenceAccessRef::durable(
             harness_contract::context::EvidenceRef::observed(
                 "tool",
                 format!("canonical-read:{}", request.tool_use_id),
             ),
-            "a".repeat(64),
-            32,
+            digest.clone(),
+            u64::try_from(content.len()).unwrap_or(u64::MAX),
             "text/plain",
             format!("runtime-tool:{}", request.tool_use_id),
             format!(
@@ -69,10 +114,11 @@ impl RuntimeExecutionHost for CanonicalReadHost {
             tool_name: request.tool_name.clone(),
             status: RuntimeToolExecutionStatus::Executed,
             category: request.category,
-            output: Some("canonical source evidence".to_string()),
+            output: Some(output.to_string()),
             error: None,
             evidence_ref: format!("runtime-tool:{}", request.tool_use_id),
             observed_evidence: vec![observed],
+            pending_agent_batch: None,
         }
     }
 
@@ -124,6 +170,7 @@ pub async fn services_with_canonical_agent(
         providers: HashMap::from([(
             "test".to_string(),
             model_protocol::provider_config::ProviderConfig {
+                reasoning_effort: None,
                 name: "test".to_string(),
                 base_url: format!("{}/v1", server.base_url),
                 api_key: "test".to_string(),
@@ -137,15 +184,22 @@ pub async fn services_with_canonical_agent(
     let host = Arc::new(CanonicalReadHost {
         resolver: runtime::path_identity::WorkspacePathIdentityResolver::discover(&workspace)
             .expect("workspace identity resolver"),
+        tools: tools::ToolHost::builtin("canonical-agent-fixture", &workspace),
+        root: workspace.clone(),
     });
+    let session_port = canonical_session_port::create_session_port(session_id).await;
     let services = RuntimeServices::builder(&root, &workspace)
         .non_durable_backends_for_testing(&root)
         .provider_registry(Arc::new(
             runtime::ProviderRegistry::new(providers).expect("provider registry"),
         ))
         .tool_execution_host(host)
+        .session_ports(session_port.clone(), session_port.clone(), session_port.clone(), session_port)
         .build()
         .expect("runtime services");
+    let recovery = services.recover_execution_graphs_on_startup().await.expect("original startup recovery");
+    assert!(recovery.errors.is_empty(), "startup recovery: {:?}", recovery.errors);
+    services.release_recovered_producers().await.expect("release recovered producers");
     services.publish_session_execution_policy(
         session_id,
         runtime::permissions::SessionExecutionPolicyControl::from_policy(
@@ -236,8 +290,9 @@ fn tool_call_response() -> String {
     concat!(
         "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_tool\",\"model\":\"default\"}}\n\n",
         "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"call_id\":\"call_read\",\"name\":\"read_file\"}}\n\n",
-        "data: {\"type\":\"response.function_call_arguments.delta\",\"output_index\":0,\"delta\":\"{\\\"path\\\":\\\"crates/runtime/src/lib.rs\\\"}\"}\n\n",
-        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_tool\",\"model\":\"default\",\"output\":[{\"type\":\"function_call\",\"call_id\":\"call_read\",\"name\":\"read_file\",\"arguments\":\"{\\\"path\\\":\\\"crates/runtime/src/lib.rs\\\"}\"}],\"usage\":{\"input_tokens\":8,\"output_tokens\":5}}}\n\n",
+        // R4-034-fixture-fix: request a complete read so the fixture can mint exact evidence.
+        "data: {\"type\":\"response.function_call_arguments.delta\",\"output_index\":0,\"delta\":\"{\\\"path\\\":\\\"crates/runtime/src/lib.rs\\\",\\\"complete\\\":true}\"}\n\n",
+        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_tool\",\"model\":\"default\",\"output\":[{\"type\":\"function_call\",\"call_id\":\"call_read\",\"name\":\"read_file\",\"arguments\":\"{\\\"path\\\":\\\"crates/runtime/src/lib.rs\\\",\\\"complete\\\":true}\"}],\"usage\":{\"input_tokens\":8,\"output_tokens\":5}}}\n\n",
         "data: [DONE]\n\n"
     )
     .to_string()

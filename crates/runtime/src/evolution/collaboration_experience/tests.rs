@@ -204,7 +204,7 @@ fn projector_reconstruction_preserves_checkpoint_and_episode_idempotency() {
             .len(),
         3
     );
-    assert_eq!(read_patterns(&store, 8).unwrap().len(), 1);
+    assert!(matches!(read_patterns(&store, 8).unwrap().as_slice(), [pattern] if pattern.support_count == 3));
 }
 
 #[test]
@@ -301,6 +301,7 @@ fn model_can_read_advice_without_mutating_program_or_gaining_permissions() {
     }
     let cursor = store.current_commit_cursor();
     let actor = AgentActorBinding {
+        original_execution: None,
         objective_id: "new-objective".into(),
         program_id: "new-program".into(),
         session_id: "new-session".into(),
@@ -335,7 +336,14 @@ fn model_can_read_advice_without_mutating_program_or_gaining_permissions() {
         .unwrap();
     let projection = response.projection.unwrap();
     assert_eq!(projection["advisory_only"], true);
-    assert_eq!(projection["patterns"].as_array().unwrap().len(), 1);
+    let expected_patterns =
+        crate::evolution::collaboration_experience::read_patterns(&store, 8).unwrap();
+    assert_eq!(
+        projection["patterns"].as_array().unwrap().iter()
+            .map(|pattern| pattern["pattern_ref"].as_str().unwrap()).collect::<Vec<_>>(),
+        expected_patterns.iter().filter(|pattern| pattern.is_actionable())
+            .map(|pattern| pattern.pattern_id.as_str()).collect::<Vec<_>>()
+    );
     assert!(
         projection["patterns"][0]
             .get("qualifying_episode_ids")

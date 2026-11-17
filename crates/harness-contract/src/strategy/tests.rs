@@ -896,19 +896,22 @@ fn every_candidate_records_integer_costs_and_snapshot_provenance() {
     let decision = decide_strategy(&StrategyInput::from_prompt(
         "全面审查 runtime gateway frontend 三个独立责任域，分别给出工具证据后综合",
     ));
-    assert_eq!(decision.candidate_estimates.len(), 3);
-    assert_eq!(
-        decision
-            .candidate_estimates
-            .iter()
-            .map(|estimate| estimate.candidate)
-            .collect::<Vec<_>>(),
-        vec![
-            ExecutionCandidateKind::Direct,
-            ExecutionCandidateKind::ParallelTools,
-            ExecutionCandidateKind::Team,
-        ]
-    );
+    assert!(!decision.candidate_estimates.is_empty());
+    assert!(decision.candidate_estimates.iter().all(|estimate| !estimate.reasons.is_empty()));
+    assert!(decision.candidate_estimates.iter().any(|estimate| estimate.candidate == decision.selected_candidate));
+    for (index, estimate) in decision.candidate_estimates.iter().enumerate() {
+        assert!(!decision.candidate_estimates[..index].iter().any(|prior| prior.candidate == estimate.candidate));
+    }
+    assert_eq!(decision.candidate_estimates.iter().map(|estimate| estimate.candidate).collect::<Vec<_>>(), vec![
+        ExecutionCandidateKind::Direct,
+        ExecutionCandidateKind::ParallelTools,
+        ExecutionCandidateKind::Team,
+    ]);
+    assert!(decision.candidate_estimates.iter().all(|estimate|
+        estimate.evidence_overlap_penalty_bp <= 10_000
+            && estimate.provider_concurrency_penalty_bp <= 10_000
+            && estimate.risk_approval_penalty_bp <= 10_000
+    ));
     assert_eq!(decision.resource_snapshot.version, "strategy-resource-v1");
     assert_eq!(
         decision.resource_snapshot.provenance,
@@ -1602,10 +1605,32 @@ fn failed_positive_claim_can_import_only_a_negative_veto() {
     let mut store = StrategyExperienceStore::new();
     assert!(store.import_paired_evaluation_report(&report).is_err());
     assert_eq!(store.import_negative_benefit_report(&report), Ok(1));
-    assert_eq!(store.records.len(), 0);
-    assert_eq!(store.negative_benefit_observations.len(), 1);
-    assert!(is_sha256(
-        &store.negative_benefit_observations[0].report_sha256
+    assert!(store.records.is_empty());
+    let observations = &store.negative_benefit_observations;
+    assert_eq!(observations.len(), 1);
+    let observation = &observations[0];
+    assert!(is_sha256(&observation.report_sha256));
+    assert_eq!(observation.workload_fingerprint_sha256, fingerprint);
+    assert_eq!(observation.provider_profile_fingerprint, "a".repeat(64));
+    assert_eq!(observation.baseline_candidate, ExecutionCandidateKind::Direct);
+    assert_eq!(
+        observations
+            .iter()
+            .map(|observation| observation.workload_fingerprint_sha256.clone())
+            .collect::<Vec<_>>(),
+        vec![fingerprint.clone()],
+        "exactly one negative veto for this workload fingerprint must be recorded"
+    );
+    assert_eq!(
+        observations
+            .iter()
+            .map(|observation| observation.provenance_ref.as_str())
+            .collect::<Vec<_>>(),
+        vec!["harness_eval.auto_strategy_paired.v1:test"]
+    );
+    assert!(store.negative_benefit_observations.iter().all(|observation|
+        is_sha256(&observation.report_sha256)
+            && observation.workload_fingerprint_sha256 == fingerprint
     ));
 }
 

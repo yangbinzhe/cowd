@@ -43,12 +43,14 @@ fn gateway_skill_projection_maps_canonical_identity_without_fallback() {
     }))
     .expect("valid Gateway projection");
 
-    assert_eq!(skills.len(), 1);
-    assert_eq!(skills[0].id, "local:release");
-    assert_eq!(skills[0].category, "delivery");
-    assert_eq!(skills[0].status, "ready");
-    assert_eq!(skills[0].risk, "operator_review");
-    assert!(skills[0].installed);
+    let [skill] = skills.as_slice() else { panic!("expected one skill projection"); };
+    {
+        assert_eq!(skill.id, "local:release");
+        assert_eq!(skill.category, "delivery");
+        assert_eq!(skill.status, "ready");
+        assert_eq!(skill.risk, "operator_review");
+        assert!(skill.installed);
+    }
     assert!(skill_summaries_from_catalog(&serde_json::json!({
         "items": [{ "name": "invented" }]
     }))
@@ -83,7 +85,11 @@ fn reality_governance_action_is_not_queued_twice_while_running() {
     let key = crossterm::event::Event::Key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE));
 
     assert!(state.handle_reality_panel_action(&key));
-    assert_eq!(state.take_pending_core_gateway_effects().len(), 1);
+    let queued = state.take_pending_core_gateway_effects();
+    assert_eq!(queued.len(), 1);
+    let effect = queued.into_iter().next().expect("one governance effect");
+    assert_eq!(effect.session_id, "test-session");
+    assert_eq!(effect.authority_generation, state.authority_generation());
 
     state
         .workbench
@@ -137,6 +143,8 @@ async fn gateway_effect_is_deferred_and_reduced_only_on_the_ui_owner() {
         operation,
         completion,
     } = pending.pop().expect("queued effect");
+    assert_eq!(session_id, "test-session");
+    assert_eq!(authority_generation, state.authority_generation());
     let client =
         crate::gateway_client::GatewayApiClient::new("http://127.0.0.1:1", None).expect("client");
     let result = operation(client).await.map_err(|error| error.to_string());
@@ -166,7 +174,14 @@ fn model_switch_waits_for_gateway_authority_and_rolls_back_on_failure() {
     );
     let mut pending = state.take_pending_core_gateway_effects();
     assert_eq!(pending.len(), 1);
-    let PendingCoreGatewayEffect { completion, .. } = pending.pop().expect("model update effect");
+    let PendingCoreGatewayEffect {
+        session_id,
+        authority_generation,
+        completion,
+        ..
+    } = pending.pop().expect("model update effect");
+    assert_eq!(session_id, "session-model");
+    assert_eq!(authority_generation, state.authority_generation());
     CompletedCoreGatewayEffect::new(
         state.app.shell.session_id.clone(),
         state.authority_generation(),
@@ -534,8 +549,19 @@ fn apply_event_resources_committed_clears_only_sent_resources() {
         ids: vec!["res-a".into()],
     });
 
-    assert_eq!(state.app.workbench.pending_resources.len(), 1);
-    assert_eq!(state.app.workbench.pending_resources[0].id, "res-b");
+    assert_eq!(
+        state
+            .app
+            .workbench
+            .pending_resources
+            .iter()
+            .map(|resource| resource.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["res-b"],
+        "only the uncommitted resource may survive the commit"
+    );
+    assert_eq!(state.app.workbench.pending_resources[0].kind, "pdf");
+    assert_eq!(state.app.workbench.pending_resources[0].label, "b.pdf");
 }
 
 #[test]
@@ -647,7 +673,23 @@ fn process_raw_key_allows_submit_when_context_file_is_valid() {
     let result = state.process_raw_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
 
     match result {
-        ProcessedKey::Submit(text) => assert_eq!(text, "分析 @file:readme.md"),
+        ProcessedKey::Submit(text) => {
+            assert_eq!(text, "分析 @file:readme.md");
+            assert!(
+                text.contains("@file:readme.md"),
+                "the @file: reference must be handed over verbatim: {text}"
+            );
+            assert_eq!(
+                state.shell.prompt.engine().history(),
+                &["分析 @file:readme.md".to_string()],
+                "the submitted text must be the one and only history entry"
+            );
+            assert_eq!(
+                state.input_text(),
+                "",
+                "submitting must hand the text over and clear the composer"
+            );
+        }
         other => panic!("expected submit, got {other:?}"),
     }
 }
@@ -708,7 +750,16 @@ fn handle_input_gg_multi_chord() {
     // First 'g' — prefix match
     let g1 = KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE);
     assert!(!state.handle_input(g1));
-    assert_eq!(state.shell.keybind_engine.pending_chord().len(), 1);
+    let chord = state.shell.keybind_engine.pending_chord();
+    assert_eq!(chord.len(), 1);
+    assert_eq!(
+        chord
+            .iter()
+            .map(|key| key.code)
+            .collect::<Vec<_>>(),
+        vec![KeyCode::Char('g')],
+        "the pending chord must hold exactly the first key press"
+    );
 
     // Second 'g' — full match
     let g2 = KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE);
@@ -1516,8 +1567,20 @@ fn composer_uses_visual_rows_for_vertical_movement_and_keeps_bytes() {
 fn composer_paste_is_one_undoable_unicode_transaction() {
     let mut state = TuiState::new("m", "s");
     state.replace_input_text("prefix ");
-    state.process_paste("👨‍👩‍👧‍👦\r\n中文");
-    assert_eq!(state.input_text(), "prefix 👨‍👩‍👧‍👦\r\n中文");
+    let pasted = "👨‍👩‍👧‍👦\r\n中文";
+    state.process_paste(pasted);
+    let composed = state.input_text();
+    assert_eq!(composed, "prefix 👨‍👩‍👧‍👦\r\n中文");
+    assert_eq!(composed, format!("prefix {pasted}"));
+    assert!(
+        !composed.contains('\u{FFFD}'),
+        "a unicode paste must never be replaced: {composed}"
+    );
+    assert_eq!(
+        composed.chars().count(),
+        "prefix ".chars().count() + pasted.chars().count(),
+        "every pasted character must survive exactly once"
+    );
 
     state.process_raw_key(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::CONTROL));
     assert_eq!(state.input_text(), "prefix ");
@@ -1654,8 +1717,18 @@ fn paste_targets_search_without_mutating_the_hidden_composer() {
 
     state.process_paste("中文\r\nneedle\tquery");
 
-    assert_eq!(state.app.timeline.search_query, "中文  needle query");
-    assert_eq!(state.input_text(), "preserved composer draft");
+    let query = state.app.timeline.search_query.clone();
+    assert_eq!(query, "中文  needle query");
+    assert!(
+        !query.contains('\t') && !query.contains('\r') && !query.contains('\n'),
+        "the pasted control characters must be normalized to spaces: {query}"
+    );
+    assert_eq!(
+        state.input_text(),
+        "preserved composer draft",
+        "a search paste must never touch the hidden composer draft"
+    );
+    assert_ne!(query, state.input_text());
 }
 
 #[test]

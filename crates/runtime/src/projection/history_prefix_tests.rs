@@ -267,7 +267,8 @@ async fn own865_terminal_l01_sized_quiescent_bindings_resume_in_original_checkpo
     for _ in 0..32 {
         let (mut budget, states, _, cut) = read(&services, &graph);
         if !budget.is_incomplete() {
-            assert_eq!(states[&graph.id].terminal_proofs.len(), 16);
+            assert_eq!(states[&graph.id].terminal_proofs.keys().collect::<Vec<_>>(),
+                states[&graph.id].bindings.keys().collect::<Vec<_>>());
             let before = budget.consumed_work();
             let closure = settlement::read(&services, &states, cut, &mut budget).unwrap();
             assert_eq!(budget.consumed_work(), before);
@@ -397,7 +398,11 @@ async fn own865_l01_sized_effects_resume_at_fixed_cut_without_unpaid_publication
         if !budget.is_incomplete() { canonical = Some(state); break; }
     }
     let mut state = canonical.expect("canonical source must finish through bounded original reads");
-    assert_eq!(state.bindings.len(), 16);
+    let mut bound_nodes = state.bindings.values().map(|(node, _)| node.as_str()).collect::<Vec<_>>();
+    let mut expected_nodes = graph.nodes.iter().map(|node| node.id.as_str()).collect::<Vec<_>>();
+    bound_nodes.sort_unstable();
+    expected_nodes.sort_unstable();
+    assert_eq!(bound_nodes, expected_nodes);
     assert!(serde_json::to_vec(&encode_storage_checkpoint(&state).unwrap()).unwrap().len() >= 97262);
     let fixed = state.through;
     state.effect_proofs.clear();
@@ -441,7 +446,7 @@ async fn own865_l01_sized_effects_resume_at_fixed_cut_without_unpaid_publication
         next.publish(&services).unwrap();
         if !next.is_incomplete() {
             assert_eq!(state.effects_checked_through, Some(through));
-            assert_eq!(state.effect_proofs.len(), 16);
+            assert_eq!(state.effect_proofs.keys().collect::<Vec<_>>(), state.bindings.keys().collect::<Vec<_>>());
             assert!(!state.effect_missing_receipt);
             complete = true;
             break;
@@ -618,8 +623,8 @@ async fn own843_pending_publication_is_prepaid_across_roots_for_inline_and_artif
             )
             .is_err());
             assert!(!budget.exhausted);
-            assert_eq!(budget.checkpoints.len(), 1);
-            assert_eq!(budget.prepaid_checkpoints.len(), 1);
+            assert_eq!(budget.checkpoints.keys().collect::<Vec<_>>(), [&projection_id]);
+            assert_eq!(budget.prepaid_checkpoints.keys().collect::<Vec<_>>(), [&projection_id]);
         } else {
             stage(
                 &services,
@@ -962,10 +967,15 @@ async fn own843_original_large_bodies_finish_across_bounded_requests_with_unrela
             assert!(state.through <= state.prefix.as_ref().unwrap().target_cursor);
         } else {
             assert!(state.prefix.is_none());
-            assert_eq!(state.bindings.len(), 2);
-            assert_eq!(state.start_specs.len(), 2);
-            assert_eq!(state.start_tickets.len(), 2);
-            assert_eq!(state.start_positions.len(), 2);
+            let mut bound_nodes = state.bindings.values().map(|(node, _)| node.as_str()).collect::<Vec<_>>();
+            let mut expected_nodes = graph.nodes[..2].iter().map(|node| node.id.as_str()).collect::<Vec<_>>();
+            bound_nodes.sort_unstable();
+            expected_nodes.sort_unstable();
+            assert_eq!(bound_nodes, expected_nodes);
+            let slots = state.bindings.keys().collect::<Vec<_>>();
+            assert_eq!(state.start_specs.keys().collect::<Vec<_>>(), slots);
+            assert_eq!(state.start_tickets.keys().collect::<Vec<_>>(), slots);
+            assert_eq!(state.start_positions.keys().collect::<Vec<_>>(), slots);
             assert_eq!(state.effects_checked_through, Some(through));
             assert_eq!(state.graph_state.as_ref().unwrap().revision, graph.revision);
             complete = true;
@@ -1486,7 +1496,7 @@ async fn r451_summary_prepaid_large_graph_body_is_charged_once() {
         )
     });
     assert_eq!(projection.execution_id, graph.id);
-    assert_eq!(projection.graph.nodes.len(), 3);
+    assert_eq!(projection.graph.nodes.iter().map(|node| node.node_id.as_str()).collect::<Vec<_>>(), ["r451-node-0", "r451-node-1", "r451-node-2"]);
     assert_eq!(
         stored
             .nodes

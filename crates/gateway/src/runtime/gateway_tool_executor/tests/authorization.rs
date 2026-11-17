@@ -29,6 +29,7 @@
         ];
         let admitted_scopes = ["session:session-root".to_string()];
         let binding = RuntimeToolExecutionBinding {
+            action_invocation: None,
             tool_lease: None,
             action_id: Some("root-action"),
             session_id: Some("session-root"),
@@ -36,6 +37,7 @@
             memory_context: None, reality_context: None,
             model_lease: Some("deepseek-v4-flash"),
             parent_execution: None,
+            parent_execution_attempt: None,
             execution_decision: Some(&decision),
             permission_ceiling: harness_contract::policy::PermissionMode::ReadOnly,
         };
@@ -317,6 +319,33 @@
     }
 
     #[tokio::test]
+    async fn grep_samecall_gateway_keeps_private_grant_and_batch_identity() {
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::write(workspace.path().join("a.txt"), "alpha\nbeta\n").unwrap();
+        let host = Arc::new(tools::ToolHost::builtin("gateway-grep-test", workspace.path())
+            .with_authorization_lease_verifier(Arc::new(runtime::AuthorizationNegotiator::verify_lease_signature)));
+        let executor = GatewayToolExecutor::from_tool_host(None, false, host);
+        for input in [json!({"path":"a.txt","pattern":".*"}),
+            json!({"searches":[{"path":"a.txt","pattern":"alpha"},{"path":"a.txt","pattern":"beta"}]}),
+            json!({"path":workspace.path().to_str().unwrap(),"searches":[{"glob":"a.txt","pattern":"alpha"},{"glob":"a.txt","pattern":"beta"}]})] {
+            let auth = signed_test_authorization(&executor, "grep_search", &input, 1);
+            let output = executor.execute_authorized_output_with_progress(&auth, "grep_search", &input.to_string(),
+                None, Some(executor.tool_host.pin_snapshot())).await.unwrap();
+            let harness_contract::context::ToolOutputDraft::InProcess { content, evidence } = output else { panic!("private grep channel missing") };
+            let reads = evidence.downcast_ref::<tools::OrchestratedChildren>().unwrap().reads.as_ref().unwrap();
+            assert_eq!(reads.len(), if input.get("searches").is_some() { 2 } else { 1 });
+            assert!(reads.iter().all(|read| read.parent_authorization() == &auth && read.grep_windows().is_some()));
+            assert!(!content.contains("physical_identity"));
+            if reads.len() == 2 {
+                assert_eq!(reads.iter().filter_map(|r| r.grep_batch_index()).collect::<std::collections::BTreeSet<_>>(), [0,1].into_iter().collect());
+            }
+            let mut forged = auth.clone(); forged.authorization_lease.signature = "forged".into();
+            assert!(executor.execute_authorized_output_with_progress(&forged, "grep_search", &input.to_string(),
+                None, Some(executor.tool_host.pin_snapshot())).await.is_err());
+        }
+    }
+
+    #[tokio::test]
     async fn nested_child_gateway_channel_requires_original_grant() {
         let workspace = tempfile::tempdir().unwrap();
         std::fs::write(workspace.path().join("a.txt"), "alpha\n").unwrap();
@@ -333,9 +362,9 @@
         let harness_contract::context::ToolOutputDraft::InProcess { content, evidence } = output else {
             panic!("missing private child channel")
         };
-        let children = evidence.downcast_ref::<Vec<tools::OrchestratedRead>>().unwrap();
-        assert_eq!(children.len(), 1);
-        assert_eq!((children[0].step_index(), children[0].position()), (0, 0));
+        let children = evidence.downcast_ref::<tools::OrchestratedChildren>().unwrap().reads.as_ref().unwrap();
+        let [unique_children_366] = children.as_slice() else { panic!("expected the original children exactly once") };
+        assert_eq!((unique_children_366.step_index(), children[0].position()), (0, 0));
         assert_eq!(children[0].parent_authorization(), &auth);
         assert!(content.contains("alpha"));
         let mut forged = auth.clone();
@@ -482,6 +511,7 @@
         ] {
             let decision = runtime::build_runtime_execution_decision(prompt, None);
             let actor = root_agent_action_actor(RuntimeToolExecutionBinding {
+            action_invocation: None,
                 tool_lease: None,
                 action_id: None,
                 session_id: Some("quantity-session"),
@@ -490,6 +520,7 @@
                 reality_context: None,
                 model_lease: Some("local-contract-only"),
                 parent_execution: None,
+                parent_execution_attempt: None,
                 execution_decision: Some(&decision),
                 permission_ceiling: harness_contract::policy::PermissionMode::ReadOnly,
             })
@@ -513,6 +544,7 @@
         let mut missing = decision.clone();
         missing.collaboration_obligation = None;
         let bind = |decision| RuntimeToolExecutionBinding {
+            action_invocation: None,
             tool_lease: None,
             action_id: None,
             session_id: Some("quantity-session"),
@@ -521,9 +553,115 @@
             reality_context: None,
             model_lease: Some("local-contract-only"),
             parent_execution: None,
+            parent_execution_attempt: None,
             execution_decision: Some(decision),
             permission_ceiling: harness_contract::policy::PermissionMode::ReadOnly,
         };
         assert!(root_agent_action_actor(bind(&decision)).is_err());
         assert!(root_agent_action_actor(bind(&missing)).is_err());
+    }
+
+    #[tokio::test]
+    async fn gb2_gateway_corrected_edit_requires_authorization_and_executes_once() {
+        let workspace = tempfile::tempdir().unwrap();
+        let output_path = workspace.path().join("gb2.txt");
+        let host = Arc::new(tools::ToolHost::builtin("gb2-gateway", workspace.path())
+            .with_authorization_lease_verifier(Arc::new(runtime::AuthorizationNegotiator::verify_lease_signature)));
+        let executor = GatewayToolExecutor::from_tool_host(None, false, host);
+        let invalid = json!({"action":"write", "path":"gb2.txt", "content":"first", "invented":true});
+        let refusal = executor.validate_tool_input("edit", &invalid.to_string()).expect_err("unexpected field must be refused");
+        assert!(refusal.to_string().contains("unexpected field `invented`"));
+        let mut bad_request = runtime::RuntimeToolExecutionRequest::from_tool_request(&runtime::tool_dispatch::ToolRequest {
+            tool_use_id: "gb2-edit-bad".into(), tool_name: "edit".into(), input: invalid.to_string(), depends_on: vec![],
+        });
+        bad_request.session_id = Some("security-session".into());
+        bad_request.policy_revision = 7;
+        attach_gateway_step(&executor, &mut bad_request);
+        let bad_binding = bad_request.step_binding.as_ref().unwrap();
+        let bad_step = bad_binding.resolve(Some(executor.tool_host.pin_snapshot())).unwrap();
+        let bound_error = bad_step.validate_call(&bad_binding.origin, "security-session", "gb2-edit-bad", "edit", &bad_request.input, chrono::Utc::now().timestamp_millis()).expect_err("bound invalid frame must be refused");
+        assert!(bound_error.to_string().contains("unexpected field `invented`"));
+        assert!(!output_path.exists());
+        let fixed = json!({"action":"write", "path":"gb2.txt", "content":"first"});
+        let fixed_text = executor.validate_tool_input("edit", &fixed.to_string()).expect("corrected shape");
+        let mut request = runtime::RuntimeToolExecutionRequest::from_tool_request(&runtime::tool_dispatch::ToolRequest {
+            tool_use_id: "gb2-edit".into(), tool_name: "edit".into(), input: fixed_text.clone(), depends_on: vec![],
+        });
+        request.session_id = Some("security-session".into());
+        request.policy_revision = 7;
+        attach_gateway_step(&executor, &mut request);
+        let authorization = signed_test_authorization(&executor, "edit", &fixed, 7);
+        let mut forged = authorization.clone();
+        forged.authorization_lease.signature = "forged".into();
+        assert!(executor.execute_step_authorized_invocation_output(request.step_binding.as_ref(), &request.tool_use_id,
+            &forged, "edit", &fixed_text).await.is_err());
+        assert!(!output_path.exists());
+        executor.execute_step_authorized_invocation_output(request.step_binding.as_ref(), &request.tool_use_id,
+            &authorization, "edit", &fixed_text).await.expect("corrected authorized invocation");
+        assert_eq!(std::fs::read_to_string(&output_path).unwrap(), "first");
+    }
+
+    #[test]
+    fn gb2_bound_review_teaching_uses_the_original_step_after_catalog_replacement() {
+        let registry = GatewayToolRegistry::builtin()
+            .with_runtime_tools(crate::runtime_bootstrap::runtime_capability_tool_definitions())
+            .expect("runtime tools");
+        let executor = GatewayToolExecutor::new(None, false, registry);
+        let missing = json!({"task_ref":"task-1", "decision":"accept", "reason_ref":"artifact://other"});
+        let extra = json!({"task_ref":"task-1", "decision":"accept", "reason":"done", "reason_ref":"artifact://other"});
+        let valid = json!({"task_ref":"task-1", "decision":"accept", "reason":"done"});
+        let mut request = runtime::RuntimeToolExecutionRequest::from_tool_request(&runtime::tool_dispatch::ToolRequest {
+            tool_use_id: "gb2-review".into(), tool_name: "task_review".into(), input: missing.to_string(), depends_on: vec![],
+        });
+        request.session_id = Some("security-session".into());
+        request.policy_revision = 7;
+        attach_gateway_step(&executor, &mut request);
+        let binding = request.step_binding.as_ref().unwrap();
+        let original = binding.resolve(Some(executor.tool_host.pin_snapshot())).unwrap();
+        let schema_hash = original.lease().catalog_receipt().descriptors.into_iter()
+            .find(|descriptor| descriptor.canonical_id == "task_review").unwrap().schema_hash;
+        let replacement = tools::ToolHostSnapshot::new(
+            Arc::new(GatewayToolRegistry::builtin()),
+            Arc::new(tools::lsp_client::LspRegistry::default()), None,
+        );
+        executor.tool_host.replace_snapshot(replacement);
+        assert!(executor.tool_host.pin_snapshot().snapshot().catalog.canonical_name("task_review").is_none());
+        let step = binding.resolve(Some(executor.tool_host.pin_snapshot())).unwrap();
+        assert_eq!(step.lease().catalog_receipt().descriptors.into_iter()
+            .find(|descriptor| descriptor.canonical_id == "task_review").unwrap().schema_hash, schema_hash);
+        let check = |value: &serde_json::Value| step.validate_call(&binding.origin, "security-session", "gb2-review", "task_review", &value.to_string(), chrono::Utc::now().timestamp_millis());
+        let original_error = step.lease().validate_input("task_review", &missing).unwrap_err().to_string();
+        let definition = step.lease().snapshot().catalog.definitions(None).into_iter()
+            .find(|definition| definition.name == "task_review").unwrap();
+        let example = harness_contract::tool_input_contract::input_example(&definition.input_schema).unwrap();
+        let previous_message = format!("{original_error}. Send it shaped like this: {example}");
+        let first = check(&missing).expect_err("missing reason must be refused").to_string();
+        assert!(first.starts_with(&previous_message), "{first}");
+        assert!(first.contains("missing required field `reason`"), "{first}");
+        assert!(first.contains("task_review requires a string `reason`"), "{first}");
+        let second = check(&extra).expect_err("extra field must be refused").to_string();
+        assert!(second.contains("unexpected field `reason_ref`"), "{second}");
+        assert!(second.contains("`reason_ref` is not a task_review field"), "{second}");
+        assert_eq!(check(&valid).expect("explicitly corrected frame"), valid);
+    }
+
+    #[test]
+    fn gb2_bound_orchestrate_refusal_shows_a_valid_complete_shape() {
+        let executor = GatewayToolExecutor::new(None, false, GatewayToolRegistry::builtin());
+        let invalid = json!({"id":"wrong", "op":"call", "item":{}, "steps":[{"id":"read", "op":"call", "tool":"read_file", "input":{"path":"a"}}]});
+        let mut request = runtime::RuntimeToolExecutionRequest::from_tool_request(&runtime::tool_dispatch::ToolRequest {
+            tool_use_id: "gb2-bound-orchestrate".into(), tool_name: "tool_orchestrate".into(), input: invalid.to_string(), depends_on: vec![],
+        });
+        request.session_id = Some("security-session".into());
+        request.policy_revision = 7;
+        attach_gateway_step(&executor, &mut request);
+        let binding = request.step_binding.as_ref().unwrap();
+        let step = binding.resolve(Some(executor.tool_host.pin_snapshot())).unwrap();
+        let check = |value: &serde_json::Value| step.validate_call(&binding.origin, "security-session", "gb2-bound-orchestrate", "tool_orchestrate", &value.to_string(), chrono::Utc::now().timestamp_millis());
+        let error = check(&invalid).expect_err("invalid fields remain refused").to_string();
+        assert!(error.contains("unexpected field `id`"), "{error}");
+        assert!(error.contains("`op`") && error.contains("`item`"), "{error}");
+        assert!(error.contains("Schema-valid structural example"), "{error}");
+        let corrected = json!({"steps":[{"id":"read", "op":"call", "tool":"read_file", "input":{"path":"a"}}]});
+        assert_eq!(check(&corrected).unwrap(), corrected);
     }

@@ -1013,8 +1013,7 @@ async fn list_sessions_reads_unified_store_metadata() {
     assert_eq!(json["sort"], "updated_at");
     assert_eq!(json["order"], "desc");
     let sessions = json["sessions"].as_array().unwrap();
-    assert_eq!(sessions.len(), 1);
-    let session = &sessions[0];
+    let [session] = sessions.as_slice() else { panic!("expected only the stored session") };
     assert_eq!(session["id"], "stored-session");
     assert_eq!(session["title"], "Stored session metadata");
     assert_eq!(session["model"], "test-model");
@@ -1242,7 +1241,7 @@ async fn session_messages_support_sequence_paging_and_limit_cap() {
     assert_eq!(json["from_seq"], 990);
     assert_eq!(json["next_seq"], 1000);
     assert_eq!(json["has_more"], false);
-    assert_eq!(json["messages"].as_array().unwrap().len(), 10);
+    assert_eq!(json["messages"].as_array().unwrap().iter().map(|message| message["sequence"].as_u64().unwrap()).collect::<Vec<_>>(), (990..1000).collect::<Vec<_>>());
     assert_eq!(json["messages"][0]["id"], "page:message-page-session:990");
     assert_eq!(json["messages"][0]["sequence"], 990);
     assert_eq!(json["messages"][9]["sequence"], 999);
@@ -1546,8 +1545,8 @@ async fn session_baseline_replays_durable_cancellation_receipt() {
         message_routes::replay_materialized_terminal_events(state.as_ref(), session_id, 0, 20)
             .await;
     assert!(!page.requires_resync);
-    assert_eq!(page.events.len(), 1);
-    let replayed: serde_json::Value = serde_json::from_str(&page.events[0]).unwrap();
+    let [event] = page.events.as_slice() else { panic!("expected one original terminal delivery") };
+    let replayed: serde_json::Value = serde_json::from_str(event).unwrap();
     assert_eq!(replayed["type"], "TerminalDelivery");
     assert_eq!(replayed["delivery"]["event"], "cancellation_committed");
     assert_eq!(
@@ -1672,7 +1671,7 @@ async fn runtime_timeline_projection_is_paged() {
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(json["session_id"], session_id);
     assert_eq!(json["total"], 2);
-    assert_eq!(json["events"].as_array().unwrap().len(), 1);
+    assert!(matches!(json["events"].as_array().unwrap().as_slice(), [event] if event["kind"] == "tool.started" && event["scope"] == "tool"));
     assert_eq!(json["events"][0]["kind"], "tool.started");
     assert_eq!(json["events"][0]["scope"], "tool");
     assert_eq!(json["next_cursor"], "v2:1:-:-");
@@ -1740,7 +1739,7 @@ async fn runtime_timeline_composite_cursor_does_not_skip_interleaved_sources() {
     assert_eq!(first.status(), StatusCode::OK);
     let first: serde_json::Value =
         serde_json::from_slice(&to_bytes(first.into_body(), usize::MAX).await.unwrap()).unwrap();
-    assert_eq!(first["events"].as_array().unwrap().len(), 2);
+    assert_eq!(first["events"].as_array().unwrap().iter().map(|event| event["kind"].as_str().unwrap()).collect::<Vec<_>>(), ["task.phase.0", "runtime.session.observed"]);
     assert_eq!(first["events"][0]["kind"], "task.phase.0");
     assert_eq!(first["events"][1]["kind"], "runtime.session.observed");
     let cursor = first["next_cursor"].as_str().unwrap();
@@ -1760,8 +1759,7 @@ async fn runtime_timeline_composite_cursor_does_not_skip_interleaved_sources() {
     let second: serde_json::Value =
         serde_json::from_slice(&to_bytes(second.into_body(), usize::MAX).await.unwrap()).unwrap();
     let events = second["events"].as_array().unwrap();
-    assert_eq!(events.len(), 1);
-    assert_eq!(events[0]["kind"], "task.phase.1");
+    assert!(matches!(events.as_slice(), [event] if event["kind"] == "task.phase.1"));
 }
 
 #[tokio::test]
@@ -2179,7 +2177,7 @@ async fn runtime_projection_uses_selected_empty_pg_sources() {
     let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(json["degraded"], false);
-    assert_eq!(json["events"].as_array().unwrap().len(), 0);
+    assert!(json["events"].as_array().unwrap().is_empty());
     assert_eq!(json["execution_graph_summary"]["count"], 0);
     assert_ne!(json["health_summary"]["status"], "degraded");
     assert_eq!(json["health_summary"]["degraded_events"], 0);

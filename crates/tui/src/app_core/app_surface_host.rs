@@ -1402,7 +1402,10 @@ mod tests {
             entry("old", "protocol_incompatible", "protocol_incompatible")
         ])))
         .expect("degraded catalog");
-        assert_eq!(host.app_ids().len(), 3);
+        let ids = host.app_ids();
+        assert!(!ids.is_empty());
+        assert!(ids.iter().all(|id| ["failed", "circuit", "old"].contains(&id.as_str())));
+        assert!(["failed", "circuit", "old"].iter().all(|id| ids.iter().any(|actual| actual == id)));
         assert!(host.take_commands().is_empty());
     }
 

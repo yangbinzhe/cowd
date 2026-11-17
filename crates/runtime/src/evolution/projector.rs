@@ -2270,6 +2270,9 @@ mod tests {
 
     #[test]
     fn r1_event_replay_observation_failure_keeps_worker_checkpoint() {
+        if crate::test_support::skip_if_env_absent("COWD_R1_06_FIXTURE_ROOT") {
+            return;
+        }
         for (large, fault) in [false, true].into_iter().flat_map(|large| {
             [
                 "schema",
@@ -2398,6 +2401,9 @@ mod tests {
 
     #[test]
     fn r1_event_replay_observation_repair_resumes_exactly_once() {
+        if crate::test_support::skip_if_env_absent("COWD_R1_06_FIXTURE_ROOT") {
+            return;
+        }
         for (result, tools, failure, gain, expected_signals) in [
             ("failed", 1, Some("tool"), false, 1),
             ("partial", 1, Some("tool"), false, 1),
@@ -2491,6 +2497,9 @@ mod tests {
 
     #[test]
     fn r1_event_replay_observation_failure_stops_same_commit_successor() {
+        if crate::test_support::skip_if_env_absent("COWD_R1_06_FIXTURE_ROOT") {
+            return;
+        }
         let fixture = ObservationWorkerFixture::new(false, "failed", 1, Some("tool"), false);
         let goals = crate::execution_core::GoalStore::new(fixture.events.clone());
         let mut observation: harness_contract::goal::RuntimeObservation = serde_json::from_value(
@@ -2571,6 +2580,9 @@ mod tests {
 
     #[test]
     fn r1_event_replay_non_observation_dead_letter_keeps_existing_governance() {
+        if crate::test_support::skip_if_env_absent("COWD_R1_06_FIXTURE_ROOT") {
+            return;
+        }
         let fixture = ObservationWorkerFixture::new(false, "informational", 0, None, false);
         let source = fixture
             .events
@@ -2609,6 +2621,9 @@ mod tests {
 
     #[test]
     fn r1_event_replay_observation_ref_preserves_evolution_classification() {
+        if crate::test_support::skip_if_env_absent("COWD_R1_06_FIXTURE_ROOT") {
+            return;
+        }
         let root = std::path::PathBuf::from(
             std::env::var_os("COWD_R1_06_FIXTURE_ROOT")
                 .expect("explicit private plan fixture root"),
@@ -2846,6 +2861,7 @@ mod tests {
             strategy_feedback: Default::default(),
             evidence_refs: Vec::new(),
             evidence_completeness: EvidenceCompleteness::None,
+            verified: None,
             schema_revision: OUTCOME_SCHEMA_REVISION,
         }
     }

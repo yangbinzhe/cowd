@@ -2,13 +2,16 @@
 """Metadata selection and admission shared by the existing Cargo test lanes."""
 
 import argparse
+import fcntl
 from contextlib import contextmanager
 import hashlib
+import importlib.util
 import json
 import os
 from pathlib import Path
 import re
 import signal
+import shutil
 import subprocess
 import sys
 import time
@@ -117,7 +120,7 @@ def write_log(path, data, root=None):
 def source_identity(root):
     # Tests also run from source archives and ordinary directories. Git's index
     # and trust configuration are not prerequisites for measuring those bytes.
-    excluded = {".git", "target", "node_modules", "__pycache__", ".venv",
+    excluded = {".git", "target", "target-gatefix", "node_modules", "__pycache__", ".venv",
                 ".cowd-build", ".cowd-deps", ".cowd-test-evidence"}
     paths = []
     for directory, subdirs, files in os.walk(root, followlinks=False):
@@ -385,8 +388,45 @@ def check_resources(root, plan, data=None):
             raise NotStarted("launcher source/version/hash/path mismatch")
         plan["launcher"] = {key: receipt[key] for key in ("source", "version", "sha256", "path")}
         actual = command(root, [str(launcher.resolve()), "__cowd_internal", "sandbox-launcher", "--protocol-version"], timeout=5)
-        if actual.decode().strip() != f"sandbox-launcher/{receipt['version']}/kernel-v2":
+        if actual.decode().strip() != f"sandbox-launcher/{receipt['version']}/kernel-v3-controlled-host":
             raise NotStarted("launcher protocol/version mismatch")
+
+
+def prepare_original_launcher(root, plan, data, log_dir):
+    if not any(item["needs_process"] for item in plan["targets"]):
+        return
+    environment = cargo_environment(root)
+    if environment.get("COWD_TEST_LAUNCHER_IDENTITY") or os.environ.get("COWD_SANDBOX_LAUNCHER_BINARY"):
+        return
+    packages = workspace_packages(data)
+    if "cli" not in packages or "sandbox-launcher" not in packages:
+        return
+    check_source(root, plan)
+    os.environ["CARGO_TARGET_DIR"] = str(root / "target-gatefix")
+    result = run_process(["cargo", "build", "-p", "cli", "--bin", "cowd", "--message-format=json"],
+                         cwd=root, capture_output=True, timeout=1200)
+    write_log(log_dir / "launcher-build.stderr", result.stderr, root)
+    write_log(log_dir / "launcher-build.jsonl", result.stdout, root)
+    if result.returncode:
+        raise NotStarted("original Cowd launcher build failed; see launcher build logs")
+    check_source(root, plan)
+    artifacts = [json.loads(line) for line in result.stdout.splitlines() if line.startswith(b"{")]
+    binaries = {str(Path(item["executable"]).resolve()) for item in artifacts
+                if item.get("reason") == "compiler-artifact" and item.get("executable")
+                and item.get("package_id") == packages["cli"]["id"]
+                and item.get("target", {}).get("name") == "cowd"
+                and "bin" in item.get("target", {}).get("kind", [])}
+    if len(binaries) != 1:
+        raise NotStarted("original Cowd build did not produce one executable")
+    binary = Path(next(iter(binaries)))
+    identity = {"source": plan["source"], "version": packages["sandbox-launcher"]["version"],
+                "path": str(binary), "sha256": digest(binary.read_bytes())}
+    receipt = log_dir / "launcher-identity.json"
+    with receipt.open("x") as output:
+        receipt.chmod(0o600)
+        json.dump(identity, output, sort_keys=True)
+    os.environ["COWD_SANDBOX_LAUNCHER_BINARY"] = str(binary)
+    os.environ["COWD_TEST_LAUNCHER_IDENTITY"] = str(receipt)
 
 
 def validate_executables(root, plan):
@@ -456,6 +496,7 @@ def listed_output(root, args, path):
 
 def discover(root, plan, data, log_dir):
     check_source(root, plan)
+    prepare_original_launcher(root, plan, data, log_dir)
     check_resources(root, plan, data)
     for index, args in enumerate(plan["external_checks"]):
         result = run_process(args, cwd=root, capture_output=True, timeout=1200)
@@ -486,7 +527,21 @@ def discover(root, plan, data, log_dir):
         else:
             check_source(root, plan)
         artifacts, executables = prepared[key]
+        out_dirs = {entry["out_dir"] for entry in artifacts
+                    if entry.get("reason") == "build-script-executed"
+                    and entry.get("package_id") == item["package_id"] and entry.get("out_dir")}
+        if len(out_dirs) > 1:
+            raise NotStarted("ambiguous build-script output directory")
+        if out_dirs:
+            item["out_dir"] = out_dirs.pop()
         item["executables"] = executables
+        out_dirs = {artifact["out_dir"] for artifact in artifacts
+                    if artifact.get("reason") == "build-script-executed"
+                    and artifact.get("package_id") == item["package_id"]}
+        if len(out_dirs) > 1:
+            raise NotStarted("ambiguous build-script OUT_DIR for target")
+        if out_dirs:
+            item["out_dir"] = out_dirs.pop()
         admission = log_dir / f"{index}-launch-admission.json"
         launch_plan = {**plan, "targets": [item], "executables": item["executables"]}
         admission.write_text(json.dumps(launch_plan))
@@ -598,14 +653,26 @@ def execute(root, plan, data, log_dir):
 
 
 def main():
+    root = Path(__file__).resolve().parents[2]
+    if not os.environ.get("COWD_FRONTEND_REPO"):
+        for parent in (root.parent, root.parent.parent):
+            edge = parent / "cowd-edge"
+            if (edge / "Cargo.toml").is_file() and (edge / "surfaces/webui/package.json").is_file():
+                os.environ["COWD_FRONTEND_REPO"] = str(edge.resolve())
+                break
     if len(sys.argv) >= 5 and sys.argv[1] == "launch":
-        root = Path(__file__).resolve().parents[2]
         try:
             admission = json.loads(Path(sys.argv[2]).read_text())
             validate_executables(root, admission)
             binary = str(Path(sys.argv[3]).resolve())
             if binary not in admission["executables"]:
                 raise NotStarted("Cargo selected an unbound executable")
+            out_dir = admission["targets"][0].get("out_dir")
+            if out_dir:
+                if not Path(out_dir).is_dir():
+                    raise NotStarted("build-script output directory missing")
+                os.environ["OUT_DIR"] = out_dir
+                    raise NotStarted("build-script OUT_DIR is missing")
             os.execv(binary, [binary, *sys.argv[4:]])
         except (NotStarted, OSError, ValueError, KeyError, TypeError) as error:
             print(json.dumps({"status": "NotStarted", "reason": str(error) if isinstance(error, NotStarted) else type(error).__name__}))
@@ -640,16 +707,27 @@ def main():
     elif any(value is not None and value is not False for value in request.values()):
         parser.error("narrow arguments require --package")
     root = Path(__file__).resolve().parents[2]
+    def external_report():
+        result = subprocess.run(["bash", str(root / "scripts/test/unblock.sh"), "evidence-path", str(root)],
+                                text=True, capture_output=True, check=True)
+        path = Path(result.stdout.strip()).resolve()
+        if path.is_relative_to(root) or path.exists():
+            raise NotStarted("unblock returned an unsafe or existing evidence path")
+        return path
     if args.mode == "report":
         directory = Path(os.environ.get("COWD_TEST_EVIDENCE_ROOT", str(root.parent / ".cowd-test-evidence"))).resolve()
         if directory.is_relative_to(root):
-            parser.error("evidence root must be outside the source tree")
+            print(external_report())
+            return 0
         print(directory / f"selection-{time.time_ns()}-{os.getpid()}.json")
         return 0
     plan = {"status": "NotStarted", "business_acceptance": "NotAssessed"}
     status = 0
     try:
-        if args.output and (args.output.resolve().is_relative_to(root) or args.output.exists()):
+        if args.output and args.output.resolve().is_relative_to(root):
+            args.output = external_report()
+            print(f"warning: report redirected outside source tree: {args.output}", file=sys.stderr)
+        if args.output and args.output.exists():
             args.output = None
             raise NotStarted("report must be a new file outside the source tree")
         data = metadata(root)
@@ -692,5 +770,22 @@ def main():
 
 
 if __name__ == "__main__":
-    with cli_signals():
-        sys.exit(main())
+    # The admitted Cargo launcher inherits one POSIX-capable private temp root.
+    if (len(sys.argv) >= 2 and sys.argv[1] == "launch") or not Path(__file__).with_name("pg-owned-run.py").is_file():
+        with cli_signals():
+            sys.exit(main())
+    spec = importlib.util.spec_from_file_location("pg_owned", Path(__file__).with_name("pg-owned-run.py"))
+    pg_owned = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(pg_owned)
+    temporary = pg_owned.private_root(prefix="cowd-pilot-")
+    lock = (temporary / ".cowd-pilot.lock").open("x+")
+    fcntl.flock(lock, fcntl.LOCK_EX)
+    (temporary / ".cowd-pilot-owner.json").write_text(json.dumps(pg_owned.process(os.getpid())))
+    try:
+        os.environ["TMPDIR"] = str(temporary)
+        with cli_signals():
+            result = main()
+    finally:
+        shutil.rmtree(temporary)
+        lock.close()
+    sys.exit(result)

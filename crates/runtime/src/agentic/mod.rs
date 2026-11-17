@@ -6,10 +6,16 @@
 //! existing scheduler and ToolHost.
 
 mod action_service;
+pub(crate) mod fact_admission;
+pub mod action_invocation;
 pub(crate) mod continuation;
 pub(crate) mod coordination;
+#[cfg(feature = "test-fixtures")]
+mod coordination_test_fixtures;
 pub(crate) mod execution;
 mod ingress;
+#[cfg(test)]
+pub(crate) use ingress::gb3_settle_synthetic_old_cut_for_graph_test;
 pub(crate) mod issues;
 pub(crate) mod order_contract;
 mod program;
@@ -19,17 +25,19 @@ mod roster;
 pub(crate) mod supervision;
 mod topic;
 pub(crate) mod topic_delivery;
-mod work_market;
+// Crate-visible so the admission authority's own test can build the claim
+// fence with the production writer instead of a copy of it: a negative
+// control that asserts against a hand-written claim proves nothing about
+// the fence the dispatch actually writes.
+pub(crate) mod work_market;
 
-#[cfg(test)]
-pub(crate) use crate::execution_core::goal::assessment::{
-    current_reviews_satisfy_the_goal, uncovered_delivered_result_refs,
-};
 pub(crate) use action_service::{
     validate_receipt_index_record, AgenticTopicObservationAck, AgenticWaitDisposition,
     TopicObservationKind,
 };
-pub use action_service::{AgentActionService, AgentActionServiceError};
+pub use action_service::{AgentActionService, AgentActionServiceError, OriginalCommittedMember, OriginalMemberSubmission, RefusalOutcome, RefusedCall};
+pub(crate) use action_service::{OriginalCommittedConclusion, OriginalCommittedSingle, OriginalReplayedAction};
+pub(crate) use action_service::process_original_member_replay;
 pub(crate) use execution::start_agentic_claim_heartbeat;
 pub use execution::{AgenticDispatchContext, AgenticDispatchReceipt};
 pub(crate) use ingress::agentic_program_completion_gap;
@@ -37,8 +45,10 @@ pub use program::{
     AgentMemberProjection, AgenticArtifactProjection, AgenticCompletionRequestProjection,
     AgenticMembershipLifecycle, AgenticMembershipProjection, AgenticObjectiveVerdictProjection,
     AgenticProgramProjection, AgenticProgramStatus, AgenticTaskAttemptProjection,
-    AgenticTaskProjection, AgenticTaskRetirement,
+    AgenticTaskObligation, AgenticTaskProjection, AgenticTaskRetirement,
     AgenticTaskStatus, AgenticTeamLifecycle, AgenticTeamProjection, AgenticTopicEntryProjection,
 };
 pub(crate) use read_model::AgenticReadModel;
 pub(crate) use work_market::task_dependency_satisfied;
+
+pub(crate) use program::registered_attempt_generation;

@@ -27,9 +27,61 @@ impl runtime::RuntimeExecutionHost for GatewayToolExecutor {
         Some(self.tool_host.pin_snapshot())
     }
 
-    async fn execute_runtime_tool(
+    async fn execute_runtime_tool(&self, request: &runtime::RuntimeToolExecutionRequest) -> runtime::RuntimeToolExecutionOutcome {
+        self.execute_runtime_tool_carried(request, None).await
+    }
+
+    async fn execute_runtime_tool_with_action_invocation(&self, request: &runtime::RuntimeToolExecutionRequest, capability: &runtime::agentic::action_invocation::VerifiedActionInvocation) -> runtime::RuntimeToolExecutionOutcome {
+        if let Err(error) = capability.validate_request(request) {
+            return runtime::RuntimeToolExecutionOutcome { pending_agent_batch: None,
+                tool_use_id: request.tool_use_id.clone(), tool_name: request.tool_name.clone(),
+                status: runtime::RuntimeToolExecutionStatus::BlockedPermission, category: request.category,
+                output: None, error: Some(error.to_string()), evidence_ref: String::new(), observed_evidence: vec![],
+            };
+        }
+        self.execute_runtime_tool_carried(request, Some(capability)).await
+    }
+
+    fn delegated_tool_definitions(
+        &self,
+        tool_names: &[String],
+    ) -> Vec<runtime::ProviderToolDefinition> {
+        let allowed = tool_names
+            .iter()
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>();
+        self.tool_host
+            .pin_snapshot()
+            .snapshot()
+            .catalog
+            .definitions(Some(&allowed))
+            .into_iter()
+            .map(|definition| runtime::ProviderToolDefinition {
+                name: definition.name,
+                description: definition.description,
+                input_schema: definition.input_schema,
+            })
+            .collect()
+    }
+
+    fn delegated_tool_effect_descriptor(
+        &self,
+        tool_name: &str,
+        input: &serde_json::Value,
+    ) -> Option<harness_contract::tool::ToolEffectDescriptor> {
+        self.has_tool(tool_name).then(|| {
+            self.tool_host
+                .pin_snapshot()
+                .describe_effect(tool_name, input)
+        })
+    }
+}
+
+impl GatewayToolExecutor {
+    async fn execute_runtime_tool_carried(
         &self,
         request: &runtime::RuntimeToolExecutionRequest,
+        action_invocation: Option<&runtime::agentic::action_invocation::VerifiedActionInvocation>,
     ) -> runtime::RuntimeToolExecutionOutcome {
         let runtime_services = self.upgrade_runtime_services();
         let evidence_ref = format!(
@@ -72,7 +124,7 @@ impl runtime::RuntimeExecutionHost for GatewayToolExecutor {
             }) {
             Ok(lease) => lease,
             Err(error) => {
-                return runtime::RuntimeToolExecutionOutcome {
+                return runtime::RuntimeToolExecutionOutcome { pending_agent_batch: None,
                     tool_use_id: request.tool_use_id.clone(),
                     tool_name: request.tool_name.clone(),
                     status: runtime::RuntimeToolExecutionStatus::BlockedPermission,
@@ -89,7 +141,7 @@ impl runtime::RuntimeExecutionHost for GatewayToolExecutor {
             .catalog
             .canonical_name(&request.tool_name)
         else {
-            return runtime::RuntimeToolExecutionOutcome {
+            return runtime::RuntimeToolExecutionOutcome { pending_agent_batch: None,
                 tool_use_id: request.tool_use_id.clone(),
                 tool_name: request.tool_name.clone(),
                 status: runtime::RuntimeToolExecutionStatus::Failed,
@@ -117,7 +169,7 @@ impl runtime::RuntimeExecutionHost for GatewayToolExecutor {
                 .iter()
                 .any(|scope| scope.starts_with("write:.cowd/evaluation/"))
         {
-            return runtime::RuntimeToolExecutionOutcome {
+            return runtime::RuntimeToolExecutionOutcome { pending_agent_batch: None,
                 tool_use_id: request.tool_use_id.clone(),
                 tool_name: request.tool_name.clone(),
                 status: runtime::RuntimeToolExecutionStatus::BlockedPermission,
@@ -134,7 +186,7 @@ impl runtime::RuntimeExecutionHost for GatewayToolExecutor {
         let value: serde_json::Value = match serde_json::from_str(&request.input) {
             Ok(value) => value,
             Err(error) => {
-                return runtime::RuntimeToolExecutionOutcome {
+                return runtime::RuntimeToolExecutionOutcome { pending_agent_batch: None,
                     tool_use_id: request.tool_use_id.clone(),
                     tool_name: request.tool_name.clone(),
                     status: runtime::RuntimeToolExecutionStatus::Failed,
@@ -147,7 +199,7 @@ impl runtime::RuntimeExecutionHost for GatewayToolExecutor {
             }
         };
         if request.policy_revision == 0 {
-            return runtime::RuntimeToolExecutionOutcome {
+            return runtime::RuntimeToolExecutionOutcome { pending_agent_batch: None,
                 tool_use_id: request.tool_use_id.clone(),
                 tool_name: request.tool_name.clone(),
                 status: runtime::RuntimeToolExecutionStatus::BlockedPermission,
@@ -164,7 +216,7 @@ impl runtime::RuntimeExecutionHost for GatewayToolExecutor {
                 .and_then(|services| services.session_execution_policy(session_id))
         });
         if current_policy.as_ref().map(|policy| policy.revision) != Some(request.policy_revision) {
-            return runtime::RuntimeToolExecutionOutcome {
+            return runtime::RuntimeToolExecutionOutcome { pending_agent_batch: None,
                 tool_use_id: request.tool_use_id.clone(),
                 tool_name: request.tool_name.clone(),
                 status: runtime::RuntimeToolExecutionStatus::BlockedPermission,
@@ -181,7 +233,7 @@ impl runtime::RuntimeExecutionHost for GatewayToolExecutor {
         if current_policy.as_ref().map(|policy| policy.sandbox_posture)
             != Some(request.sandbox_posture)
         {
-            return runtime::RuntimeToolExecutionOutcome {
+            return runtime::RuntimeToolExecutionOutcome { pending_agent_batch: None,
                 tool_use_id: request.tool_use_id.clone(),
                 tool_name: request.tool_name.clone(),
                 status: runtime::RuntimeToolExecutionStatus::BlockedPermission,
@@ -194,7 +246,7 @@ impl runtime::RuntimeExecutionHost for GatewayToolExecutor {
         }
         if let Some(authorization) = request.authorization.as_ref() {
             if authorization.policy_revision != request.policy_revision {
-                return runtime::RuntimeToolExecutionOutcome {
+                return runtime::RuntimeToolExecutionOutcome { pending_agent_batch: None,
                     tool_use_id: request.tool_use_id.clone(),
                     tool_name: request.tool_name.clone(),
                     status: runtime::RuntimeToolExecutionStatus::BlockedPermission,
@@ -219,7 +271,7 @@ impl runtime::RuntimeExecutionHost for GatewayToolExecutor {
                     if let Err(error) =
                         host_lease.validate_authorization(authorization, &request.tool_name, &value)
                     {
-                        return runtime::RuntimeToolExecutionOutcome {
+                        return runtime::RuntimeToolExecutionOutcome { pending_agent_batch: None,
                             tool_use_id: request.tool_use_id.clone(),
                             tool_name: request.tool_name.clone(),
                             status: runtime::RuntimeToolExecutionStatus::BlockedPermission,
@@ -234,7 +286,7 @@ impl runtime::RuntimeExecutionHost for GatewayToolExecutor {
                 None if effect.required_permission
                     != harness_contract::policy::PermissionMode::ReadOnly =>
                 {
-                    return runtime::RuntimeToolExecutionOutcome {
+                    return runtime::RuntimeToolExecutionOutcome { pending_agent_batch: None,
                         tool_use_id: request.tool_use_id.clone(),
                         tool_name: request.tool_name.clone(),
                         status: runtime::RuntimeToolExecutionStatus::BlockedPermission,
@@ -254,7 +306,7 @@ impl runtime::RuntimeExecutionHost for GatewayToolExecutor {
         let managed_effect = if request.category != runtime::ToolSafetyCategory::ReadOnly {
             if let Some(fence) = request.managed_invocation.as_ref() {
                 let Some(services) = runtime_services.as_ref().map(Arc::clone) else {
-                    return runtime::RuntimeToolExecutionOutcome {
+                    return runtime::RuntimeToolExecutionOutcome { pending_agent_batch: None,
                         tool_use_id: request.tool_use_id.clone(),
                         tool_name: request.tool_name.clone(),
                         status: runtime::RuntimeToolExecutionStatus::BlockedPermission,
@@ -283,7 +335,7 @@ impl runtime::RuntimeExecutionHost for GatewayToolExecutor {
                         Some((fence.clone(), effect_id, services))
                     }
                     Ok(runtime::ManagedAgentEffectPermit::AlreadyCompleted { record }) => {
-                        return runtime::RuntimeToolExecutionOutcome {
+                        return runtime::RuntimeToolExecutionOutcome { pending_agent_batch: None,
                             tool_use_id: request.tool_use_id.clone(),
                             tool_name: request.tool_name.clone(),
                             status: runtime::RuntimeToolExecutionStatus::Executed,
@@ -298,7 +350,7 @@ impl runtime::RuntimeExecutionHost for GatewayToolExecutor {
                         };
                     }
                     Err(error) => {
-                        return runtime::RuntimeToolExecutionOutcome {
+                        return runtime::RuntimeToolExecutionOutcome { pending_agent_batch: None,
                             tool_use_id: request.tool_use_id.clone(),
                             tool_name: request.tool_name.clone(),
                             status: runtime::RuntimeToolExecutionStatus::BlockedPermission,
@@ -324,10 +376,7 @@ impl runtime::RuntimeExecutionHost for GatewayToolExecutor {
         } else if is_gateway_runtime_control_tool(&request.tool_name)
             || is_gateway_context_tool(&request.tool_name)
         {
-            self.execute_runtime_tool_with_binding(
-                &request.tool_name,
-                value,
-                RuntimeToolExecutionBinding {
+            let binding = RuntimeToolExecutionBinding { action_invocation,
                     tool_lease: Some(&step_lease),
                     action_id: Some(request.idempotency_key.as_str()),
                     session_id: request.session_id.as_deref(),
@@ -336,6 +385,7 @@ impl runtime::RuntimeExecutionHost for GatewayToolExecutor {
                     reality_context: request.reality_context.as_ref(),
                     model_lease: request.model_lease.as_deref(),
                     parent_execution: request.parent_execution.as_ref(),
+                    parent_execution_attempt: request.parent_execution_attempt,
                     execution_decision: request.execution_decision.as_ref(),
                     permission_ceiling: request
                         .authorization
@@ -343,9 +393,12 @@ impl runtime::RuntimeExecutionHost for GatewayToolExecutor {
                         .map_or(self.runtime_permission_ceiling, |authorization| {
                             authorization.authorization_lease.ceiling
                         }),
-                },
-            )
-            .await
+                };
+            if request.tool_name == "agent_action_batch" {
+                self.execute_agent_action_batch(value, binding, request).await
+            } else {
+                self.execute_runtime_tool_with_binding(&request.tool_name, value, binding).await
+            }
         } else if let Some(authorization) = request.authorization.as_ref() {
             // Runtime-derived SandboxPosture is the single authoritative
             // source for bash execution boundaries. Admission above already
@@ -359,7 +412,15 @@ impl runtime::RuntimeExecutionHost for GatewayToolExecutor {
                 request.input.clone()
             };
             if request.compiled_invocation.as_ref().is_some_and(|invocation| {
-                invocation.effect.uses_network && !invocation.effect.spawns_process
+                // The property predicate is a necessary condition, not the
+                // routing decision: the joined path implements only the tools
+                // `joined_local_network_tool` names, and the executor enforces
+                // the same set. Reading one function on both sides is what
+                // stops a network read tool from being routed into a path that
+                // cannot run it.
+                invocation.effect.uses_network
+                    && !invocation.effect.spawns_process
+                    && tools::host::joined_local_network_tool(&request.tool_name)
             }) {
                 async {
                     let input = harness_contract::step::parse_strict_json(&effective_input)
@@ -367,11 +428,27 @@ impl runtime::RuntimeExecutionHost for GatewayToolExecutor {
                     self.reject_orchestrated_tools_outside_allow_list(&request.tool_name, &input)?;
                     let binding = runtime::ExecutionCommitService::local_network_binding(request)
                         .map_err(|error| ToolError::new(error.to_string()))?;
-                    let (output, fact) = step_lease.execute_joined_local_network(
+                    let joined = step_lease.execute_joined_local_network(
                         authorization, &request.tool_name, &effective_input, binding,
                         request.session_id.as_deref().ok_or_else(|| ToolError::new("local network Session missing"))?,
                         &request.step_binding.as_ref().ok_or_else(|| ToolError::new("local network Step missing"))?.origin,
-                    ).await.map_err(|error| ToolError::new(error.to_string()))?;
+                    ).await;
+                    let (output, fact) = match joined {
+                        Ok(joined) => joined,
+                        Err(error) => {
+                            // A failed joined call carries the per-operation
+                            // facts it produced. They travel through the same
+                            // observed evidence slot a successful call uses, so
+                            // a reader can tell "nothing was sent" from "we
+                            // cannot prove it". The call still fails.
+                            if let Some(fact) = error.local_network_fact() {
+                                typed_observations.push(fact.into_observation(
+                                    request.tool_name.clone(), request.observation_wave_sequence,
+                                ));
+                            }
+                            return Err(ToolError::new(error.to_string()));
+                        }
+                    };
                     typed_observations.push(fact.into_observation(
                         request.tool_name.clone(), request.observation_wave_sequence,
                     ));
@@ -382,16 +459,15 @@ impl runtime::RuntimeExecutionHost for GatewayToolExecutor {
                     authorization,
                     &request.tool_name,
                     &effective_input,
-                    request.tool_progress.0.as_ref(),
+                    request.tool_progress.callback(),
                     Some(step_lease),
                 )
                 .await
                 .and_then(|output| {
                     typed_observations = output.observations().to_vec();
                     if let harness_contract::context::ToolOutputDraft::InProcess { evidence, .. } = &output {
-                        if let Some(reads) = evidence.downcast_ref::<Vec<tools::OrchestratedRead>>() {
-                            request.tool_progress.record_child_reads(reads.clone())
-                                .map_err(ToolError::new)?;
+                        if let Some(children) = evidence.downcast_ref::<tools::OrchestratedChildren>() {
+                            request.tool_progress.record_orchestrated_children(children).map_err(ToolError::new)?;
                         }
                     }
                     Ok(output.model_text().to_string())
@@ -403,6 +479,9 @@ impl runtime::RuntimeExecutionHost for GatewayToolExecutor {
                 request.tool_name
             )))
         };
+        let original_members = request.tool_progress.original_members();
+        let pending_agent_batch = (!original_members.is_empty() || request.tool_progress.has_original_member_stop()).then(||
+            runtime::PendingAgentBatch::new(runtime::PendingAgentBatchValue::RecordedSink(request.tool_progress.clone())));
         match result {
             Ok(output) => {
                 if let Some((fence, effect_id, services)) = managed_effect {
@@ -418,10 +497,10 @@ impl runtime::RuntimeExecutionHost for GatewayToolExecutor {
                                 "tool returned success but effect receipt commit failed: {error}"
                             ),
                         );
-                        return runtime::RuntimeToolExecutionOutcome {
+                        return runtime::RuntimeToolExecutionOutcome { pending_agent_batch: pending_agent_batch.clone(),
                             tool_use_id: request.tool_use_id.clone(),
                             tool_name: request.tool_name.clone(),
-                            status: runtime::RuntimeToolExecutionStatus::Failed,
+                            status: if pending_agent_batch.is_some() { runtime::RuntimeToolExecutionStatus::Unknown } else { runtime::RuntimeToolExecutionStatus::Failed },
                             category: request.category,
                             output: None,
                             error: Some(format!(
@@ -439,7 +518,7 @@ impl runtime::RuntimeExecutionHost for GatewayToolExecutor {
                     &output,
                     &evidence_ref,
                 ));
-                runtime::RuntimeToolExecutionOutcome {
+                runtime::RuntimeToolExecutionOutcome { pending_agent_batch: pending_agent_batch.clone(),
                     tool_use_id: request.tool_use_id.clone(),
                     tool_name: request.tool_name.clone(),
                     status: runtime::RuntimeToolExecutionStatus::Executed,
@@ -451,58 +530,46 @@ impl runtime::RuntimeExecutionHost for GatewayToolExecutor {
                 }
             }
             Err(error) => {
-                if let Some((fence, effect_id, services)) = managed_effect {
+                let unknown = error.is_unknown() || pending_agent_batch.is_some();
+                if let Some((fence, effect_id, services)) = managed_effect.filter(|_| !unknown) {
                     let _ = services.reconcile_managed_agent_effect(
                         &fence,
                         &effect_id,
                         format!("tool adapter returned error: {error}"),
                     );
                 }
-                runtime::RuntimeToolExecutionOutcome {
+                // Keep the actual same-call sink alive on an unresolved outcome,
+                // including a single action whose checked result was already stored.
+                let original_sink = unknown.then(|| runtime::PendingAgentBatch::new(
+                    runtime::PendingAgentBatchValue::RecordedSink(request.tool_progress.clone())));
+                let pending_agent_batch = match (pending_agent_batch, error.pending_agent_batch().cloned()) {
+                    (Some(primary), cause) => Some(runtime::PendingAgentBatch::with_cause(primary, cause)),
+                    (None, cause) => cause,
+                };
+                let pending_agent_batch = match (pending_agent_batch, original_sink) {
+                    (Some(primary), cause) => Some(runtime::PendingAgentBatch::with_cause(primary, cause)),
+                    (None, cause) => cause,
+                };
+                runtime::RuntimeToolExecutionOutcome { pending_agent_batch,
                     tool_use_id: request.tool_use_id.clone(),
                     tool_name: request.tool_name.clone(),
-                    status: runtime::RuntimeToolExecutionStatus::Failed,
+                    // A refusal decided before the call could run never
+                    // executed: it is blocked, not failed, and the runtime
+                    // may settle it as refused.
+                    status: if unknown { runtime::RuntimeToolExecutionStatus::Unknown }
+                        else if error.is_refusal_before_effect() { runtime::RuntimeToolExecutionStatus::BlockedPermission }
+                        else { runtime::RuntimeToolExecutionStatus::Failed },
                     category: request.category,
                     output: None,
                     error: Some(error.to_string()),
                     evidence_ref,
-                    observed_evidence: Vec::new(),
+                    // A failed call keeps the observations it really made. The
+                    // reader decides what they prove; an empty list stays an
+                    // empty list.
+                    observed_evidence: typed_observations,
                 }
             }
         }
     }
 
-    fn delegated_tool_definitions(
-        &self,
-        tool_names: &[String],
-    ) -> Vec<runtime::ProviderToolDefinition> {
-        let allowed = tool_names
-            .iter()
-            .cloned()
-            .collect::<std::collections::BTreeSet<_>>();
-        self.tool_host
-            .pin_snapshot()
-            .snapshot()
-            .catalog
-            .definitions(Some(&allowed))
-            .into_iter()
-            .map(|definition| runtime::ProviderToolDefinition {
-                name: definition.name,
-                description: definition.description,
-                input_schema: definition.input_schema,
-            })
-            .collect()
-    }
-
-    fn delegated_tool_effect_descriptor(
-        &self,
-        tool_name: &str,
-        input: &serde_json::Value,
-    ) -> Option<harness_contract::tool::ToolEffectDescriptor> {
-        self.has_tool(tool_name).then(|| {
-            self.tool_host
-                .pin_snapshot()
-                .describe_effect(tool_name, input)
-        })
-    }
 }

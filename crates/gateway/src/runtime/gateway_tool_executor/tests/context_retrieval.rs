@@ -247,6 +247,7 @@ async fn context_retrieve_reads_the_exact_runtime_memory_binding() {
     }
     assert_eq!(restored, exact_content);
     let binding = RuntimeToolExecutionBinding {
+        action_invocation: None,
         tool_lease: None,
         action_id: Some("working-memory-pin"),
         session_id: Some("session-exact"),
@@ -255,6 +256,7 @@ async fn context_retrieve_reads_the_exact_runtime_memory_binding() {
         reality_context: None,
         model_lease: None,
         parent_execution: None,
+        parent_execution_attempt: None,
         execution_decision: None,
         permission_ceiling: harness_contract::policy::PermissionMode::ReadOnly,
     };
@@ -832,6 +834,7 @@ async fn context_fact_directory_and_exact_evidence_use_runtime_data_lease_and_re
         matrix_snapshot_refs: vec![],
     };
     let binding = RuntimeToolExecutionBinding {
+        action_invocation: None,
         tool_lease: None,
         action_id: Some("fact-discovery"),
         session_id: Some("session-facts"),
@@ -840,6 +843,7 @@ async fn context_fact_directory_and_exact_evidence_use_runtime_data_lease_and_re
         reality_context: Some(&lease),
         model_lease: None,
         parent_execution: None,
+        parent_execution_attempt: None,
         execution_decision: None,
         permission_ceiling: harness_contract::policy::PermissionMode::ReadOnly,
     };
@@ -905,7 +909,7 @@ async fn context_fact_directory_and_exact_evidence_use_runtime_data_lease_and_re
         }
         request = page["next_request"].clone();
     }
-    assert_eq!(seen.len(), 35);
+    assert_eq!(seen, (0..35).map(|i| format!("fact:fact-{i:03}")).collect::<std::collections::BTreeSet<_>>());
     assert!(!seen.contains("fact:private"));
     for (request, binding) in [
         (json!({"source":"fact","entry_ref":"fact:private"}), binding),
@@ -1096,6 +1100,7 @@ async fn context_matrix_directory_reads_complete_scoped_json_and_rejects_changed
         matrix_snapshot_refs: vec!["matrix:source_snapshot:allowed".into()],
     };
     let binding = RuntimeToolExecutionBinding {
+        action_invocation: None,
         tool_lease: None,
         action_id: Some("matrix-discovery"),
         session_id: Some("session-matrix"),
@@ -1104,6 +1109,7 @@ async fn context_matrix_directory_reads_complete_scoped_json_and_rejects_changed
         reality_context: Some(&lease),
         model_lease: None,
         parent_execution: None,
+        parent_execution_attempt: None,
         execution_decision: None,
         permission_ceiling: harness_contract::policy::PermissionMode::ReadOnly,
     };
@@ -1178,7 +1184,9 @@ async fn context_matrix_directory_reads_complete_scoped_json_and_rejects_changed
         }
         request = page["next_request"].clone();
     }
-    assert_eq!(seen.len(), 36);
+    let mut expected = (0..35).map(|i| format!("matrix:fact:fact-{i:03}")).collect::<std::collections::BTreeSet<_>>();
+    expected.insert("matrix:source_snapshot:allowed".to_string());
+    assert_eq!(seen, expected);
     assert!(seen.contains("matrix:source_snapshot:allowed"));
     assert!(!seen.contains("matrix:fact:hidden"));
     let mut changed_grant = lease.clone();
@@ -1384,6 +1392,7 @@ async fn context_session_discovery_pages_beyond_512_and_binds_exact_message_revi
     let executor = GatewayToolExecutor::new(None, false, registry);
     executor.bind_runtime_services(&services).unwrap();
     let binding = RuntimeToolExecutionBinding {
+        action_invocation: None,
         tool_lease: None,
         action_id: Some("session-discovery"),
         session_id: Some("session-000"),
@@ -1392,6 +1401,7 @@ async fn context_session_discovery_pages_beyond_512_and_binds_exact_message_revi
         reality_context: None,
         model_lease: None,
         parent_execution: None,
+        parent_execution_attempt: None,
         execution_decision: None,
         permission_ceiling: harness_contract::policy::PermissionMode::ReadOnly,
     };
@@ -1446,7 +1456,7 @@ async fn context_session_discovery_pages_beyond_512_and_binds_exact_message_revi
         }
         request = page["next_request"].clone();
     }
-    assert_eq!(seen.len(), 600);
+    assert_eq!(seen, (0..600).map(|i| format!("session-{i:03}")).collect::<std::collections::BTreeSet<_>>());
     assert!(seen.contains("session-599"));
     assert!(!seen.contains("private"));
     assert!(!seen.contains("future"));
@@ -1489,7 +1499,7 @@ async fn context_session_discovery_pages_beyond_512_and_binds_exact_message_revi
         }
         request = page["next_request"].clone();
     }
-    assert_eq!(ids.len(), 130);
+    assert_eq!(ids, (0..130).map(|i| format!("session-000-m{i}")).collect::<std::collections::BTreeSet<_>>());
     assert!(!ids.contains("session-000-m200"));
     for (request, binding) in [
         (
@@ -1584,4 +1594,5 @@ async fn context_session_discovery_pages_beyond_512_and_binds_exact_message_revi
         .unwrap()
         .batch_execute(&format!("DROP SCHEMA {schema} CASCADE"))
         .unwrap();
+
 }

@@ -566,6 +566,9 @@ mod tests {
 
     #[tokio::test]
     async fn session_store_adapter_roundtrips_verified_raw_payload() {
+        if crate::test_support::skip_if_env_absent("COWD_TEST_POSTGRES_URL") {
+            return;
+        }
         let artifact_root = tempfile::tempdir().expect("artifact tempdir");
         let store = Arc::new(crate::test_support::session_store());
         store
@@ -606,6 +609,9 @@ mod tests {
 
     #[tokio::test]
     async fn read_cache_does_not_borrow_another_artifact_store_receipt() {
+        if crate::test_support::skip_if_env_absent("COWD_TEST_POSTGRES_URL") {
+            return;
+        }
         let journal = Arc::new(crate::test_support::session_store());
         journal
             .create_session(&session::SessionRecord {
@@ -671,6 +677,9 @@ mod tests {
 
     #[tokio::test]
     async fn session_scoped_raw_evidence_cannot_be_read_through_a_sibling_scope() {
+        if crate::test_support::skip_if_env_absent("COWD_TEST_POSTGRES_URL") {
+            return;
+        }
         let store = Arc::new(crate::test_support::session_store());
         store
             .create_session(&session::SessionRecord {
@@ -713,6 +722,9 @@ mod tests {
 
     #[tokio::test]
     async fn native_staged_artifact_publishes_receipt_without_rematerializing_payload() {
+        if crate::test_support::skip_if_env_absent("COWD_TEST_POSTGRES_URL") {
+            return;
+        }
         let store = Arc::new(crate::test_support::session_store());
         store
             .create_session(&session::SessionRecord {

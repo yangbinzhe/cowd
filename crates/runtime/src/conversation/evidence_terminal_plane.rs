@@ -92,6 +92,9 @@ mod raw_origin_tests {
 
     #[tokio::test]
     async fn raw_writer_cache_checks_actual_bytes_scope_and_staged_access() {
+        if crate::test_support::skip_if_env_absent("COWD_TEST_POSTGRES_URL") {
+            return;
+        }
         let (_workspace, runtime) = runtime().await;
         let (_, access) = runtime
             .record_tool_raw_evidence(
@@ -274,6 +277,9 @@ mod raw_origin_tests {
     #[tokio::test]
     async fn prepared_raw_writer_checks_original_invocation_and_never_seals_recovery_without_owner()
     {
+        if crate::test_support::skip_if_env_absent("COWD_TEST_POSTGRES_URL") {
+            return;
+        }
         let (_workspace, runtime) = runtime().await;
         runtime
             .prepare_governed_tool_result_with_invocation(
@@ -2238,20 +2244,51 @@ where
         // with the reason "satisfied; 2 tool calls failed before terminal
         // synthesis" - two calls the model had already retried past. The count
         // stays in the reason so the information is not lost.
+        // The business verdict of a terminal outcome is derived from durable
+        // Runtime facts: the terminal conclusion this Runtime committed for
+        // the turn, and the durable obligation ledger of the same turn.  The
+        // model's terminal wording is preserved verbatim as the reason, but
+        // it never decides the verdict: a completion that no durable fact
+        // verified is recorded as a typed `Unsatisfied`, never as a success.
+        let verified =
+            crate::execution_core::business_conclusion::derive_verified_business_conclusion(
+                &crate::execution_core::business_conclusion::BusinessConclusionFacts {
+                    model_reason: outcome.terminal_reason.clone(),
+                    goal: match state.status {
+                        crate::execution_core::TurnStrategyDecisionStatus::Completed => {
+                            crate::execution_core::business_conclusion::GoalConclusionFact::Satisfied
+                        }
+                        _ => crate::execution_core::business_conclusion::GoalConclusionFact::NotSatisfied,
+                    },
+                    goal_reference: format!("turn_strategy:{}", state.decision_id),
+                    ledger: outcome.obligation_ledger.clone().unwrap_or(
+                        crate::execution_core::business_conclusion::ObligationLedgerFact::NoContract,
+                    ),
+                },
+            );
+        // The Runtime's own rendering of the turn's terminal conclusion keeps
+        // its historical meaning: it may lower a terminal class, never raise
+        // one.  A completion whose recovered tool failures were not part of a
+        // satisfied conclusion stays a partial failure, and no wording can
+        // turn an unverified completion into a success.
         let objective_satisfied = outcome.terminal_reason.trim() == "satisfied";
         let terminal = match state.status {
-            crate::execution_core::TurnStrategyDecisionStatus::Completed
-                if outcome.failed_tool_calls > 0 && !objective_satisfied =>
-            {
-                harness_contract::outcome::OutcomeTerminalClass::PartialFailure(format!(
-                    "{}; {} tool calls failed before terminal synthesis",
-                    outcome.terminal_reason, outcome.failed_tool_calls
-                ))
-            }
             crate::execution_core::TurnStrategyDecisionStatus::Completed => {
-                harness_contract::outcome::OutcomeTerminalClass::Succeeded(
-                    outcome.terminal_reason.clone(),
-                )
+                match crate::execution_core::business_conclusion::terminal_class_for_completion(
+                    &verified,
+                    outcome.failed_tool_calls,
+                    &outcome.terminal_reason,
+                ) {
+                    harness_contract::outcome::OutcomeTerminalClass::Succeeded(reason)
+                        if outcome.failed_tool_calls > 0 && !objective_satisfied =>
+                    {
+                        harness_contract::outcome::OutcomeTerminalClass::PartialFailure(format!(
+                            "{}; {} tool calls failed before terminal synthesis",
+                            reason, outcome.failed_tool_calls
+                        ))
+                    }
+                    other => other,
+                }
             }
             crate::execution_core::TurnStrategyDecisionStatus::Cancelled => {
                 harness_contract::outcome::OutcomeTerminalClass::Cancelled(
@@ -2392,6 +2429,10 @@ where
             } else {
                 harness_contract::reality::EvidenceCompleteness::None
             },
+            // The verified business conclusion travels with the durable event
+            // so every consumer reads the same decision instead of
+            // re-interpreting the model's terminal wording.
+            verified: Some(verified),
             schema_revision: harness_contract::outcome::OUTCOME_SCHEMA_REVISION,
         };
         service
@@ -2604,15 +2645,6 @@ where
                 );
                 return;
             }
-        }
-        #[cfg(test)]
-        if kind == "tool.invocation.completed"
-            && input.payload["tool_call_id"].as_str().is_some_and(|call|
-                take_lifecycle_append_failure(&session_id, call))
-        {
-            // Simulate the original writer failing before the durable append;
-            // the effect receipt, if any, is left untouched.
-            return;
         }
         // A retained original invocation can reach this writer again after a
         // retry. Key its original lifecycle, not the tool call label, so two

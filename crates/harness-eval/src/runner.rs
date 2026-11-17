@@ -934,13 +934,36 @@ fn execution_token_usage(
 fn live_gateway_scenario_summary(details: &Value) -> Value {
     let mut summary = details.clone();
     if let Some(scenarios) = summary.get_mut("scenarios").and_then(Value::as_array_mut) {
-        for scenario in scenarios {
+        for (index, scenario) in scenarios.iter_mut().enumerate() {
+            // The recompute layer follows a reference; it never re-types a
+            // failure. The path says where the block lives in the artifact and
+            // the digest says what it hashes to, so a truncated copy can be
+            // caught instead of read as a fact.
+            let failure_reference = scenario
+                .get("failure_diagnostics")
+                .filter(|block| !block.is_null())
+                .map(|block| {
+                    let scenario_id = scenario
+                        .get("scenario_id")
+                        .and_then(Value::as_str)
+                        .unwrap_or("unnamed");
+                    crate::machine_reference::reference_block(
+                        &format!(
+                            "live-scenarios/{}#/failure_diagnostics",
+                            crate::report_store::live_scenario_artifact_name(index, scenario_id)
+                        ),
+                        block,
+                    )
+                });
             if let Some(object) = scenario.as_object_mut() {
                 object.remove("trace");
                 object.insert(
                     "trace_artifact".to_string(),
                     Value::String("live-scenarios/<scenario>.json".to_string()),
                 );
+                if let Some(reference) = failure_reference {
+                    object.insert("failure_reference".to_string(), reference);
+                }
             }
         }
     }
@@ -1601,12 +1624,15 @@ mod tests {
         assert!(crate::report::observed_usage_source(
             &evidence.usage.usage_source
         ));
-        assert_eq!(evidence.rounds.len(), 2);
-        assert_eq!(evidence.rounds[1]["round_kind"], "live_gateway_scenario");
-        assert_eq!(
-            evidence.rounds[1]["trace_artifact"],
-            "live-scenarios/team.json"
-        );
+        let expected: std::collections::BTreeSet<_> = details["scenarios"].as_array().unwrap().iter()
+            .map(|scenario| scenario["scenario_id"].as_str().unwrap()).collect();
+        let mut observed = std::collections::BTreeSet::new();
+        assert!(!expected.is_empty());
+        assert!(evidence.rounds.iter().all(|round| round["round_kind"] == "live_gateway_scenario"
+            && observed.insert(round["scenario_id"].as_str().unwrap())));
+        assert_eq!(observed, expected);
+        let team = evidence.rounds.iter().find(|round| round["scenario_id"] == "team").unwrap();
+        assert_eq!(team["trace_artifact"], "live-scenarios/team.json");
         for value in [Value::Null, json!(1)] {
             let mut partial = details.clone();
             partial["scenarios"][0]["metrics"]["usage_unknown_attempts"] = value;
@@ -1926,7 +1952,7 @@ mod shared_lifecycle_tests {
         } else {
             crate::report::u5_stage_tests::original_stage()
         };
-        let host:crate::live_scenario_runner::U5Host=serde_json::from_value(json!({"nonce":"a".repeat(64),"launcher_pid":1,"launcher_start":1,"pid":2,"starttime":2,"image_sha256":format!("sha256:{}","c".repeat(64)),"exe_dev":1,"exe_ino":1,"listener_inode":1,"port":1,"candidate":"b".repeat(40),"source_sha256":"d".repeat(64),"namespace":"test-only-contract","base_url":"http://127.0.0.1:1","harness_sha256":"e".repeat(64),"runtime_dev":1,"runtime_ino":1})).unwrap();
+        let host:crate::live_scenario_runner::U5Host=serde_json::from_value(json!({"nonce":"a".repeat(64),"launcher_pid":1,"launcher_start":1,"pid":2,"starttime":2,"listener_inode":1,"port":1,"candidate":"b".repeat(40),"source_sha256":"d".repeat(64),"namespace":"test-only-contract","base_url":"http://127.0.0.1:1","runtime_dev":1,"runtime_ino":1})).unwrap();
         report["u5_host"] = host.binding();
         let path = if fault == "missing-parent" {
             root.join("absent/receipt.json")

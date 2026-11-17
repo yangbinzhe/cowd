@@ -232,6 +232,10 @@ mod tests {
         projection.tasks.insert(
             "task:1".to_string(),
             AgenticTaskProjection {
+                obligations: Vec::new(),
+                rework_directives: Vec::new(),
+                unsettled_released_attempts: Vec::new(),
+                terminal_note: None,
                 task_id: "task:1".to_string(),
                 team_id: "team:1".to_string(),
                 title: "t".to_string(),
@@ -261,6 +265,11 @@ mod tests {
                 failed_attempts: 0,
                 review_generation: 0,
                 failed_review_attempts: 0,
+                structural_execution_stalls: 0,
+                structural_review_stalls: 0,
+                reviews_applied: 0,
+                review_obligation: None,
+                reviews_accepted: 0,
                 last_failure: None,
                 replacement_task_refs: Vec::new(),
                 supersede_evidence_refs: Vec::new(),
@@ -282,6 +291,7 @@ mod tests {
 
     fn root_envelope() -> AgentActionEnvelope {
         let actor = AgentActorBinding {
+            original_execution: None,
             objective_id: "objective".into(),
             program_id: "program".into(),
             session_id: "session".into(),

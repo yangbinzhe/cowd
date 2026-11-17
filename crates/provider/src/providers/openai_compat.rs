@@ -39,8 +39,9 @@ const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(180);
 fn bounded_http_client() -> reqwest::Client {
     reqwest::Client::builder()
         .timeout(DEFAULT_REQUEST_TIMEOUT)
+        .redirect(reqwest::redirect::Policy::none())
         .build()
-        .unwrap_or_else(|_| reqwest::Client::new())
+        .expect("failed to construct no-redirect OpenAI transport")
 }
 // Some DeepSeek-compatible deployments emit a documented DSML envelope in
 // `content` instead of OpenAI's structured `tool_calls`. This is intentionally
@@ -3564,6 +3565,10 @@ impl StringExt for String {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn default_openai_compat_client_refuses_redirects() {
+        crate::http_client::fixture_assert_redirect_refused(super::bounded_http_client()).await;
+    }
     use super::{
         build_chat_completion_request, build_responses_request, chat_completions_endpoint,
         is_reasoning_model, normalize_finish_reason, openai_tool_choice, parse_compat_tool_calls,

@@ -258,7 +258,8 @@ async fn real_postgres_embedding_partial_progress_survives_store_and_client_reop
     let first =
         memory::embedding::EmbeddingClient::new(config.clone()).with_progress_store(store.clone());
     assert!(first.embed(&["first", "second"]).await.is_err());
-    assert_eq!(store.list_key_values().await.unwrap().len(), 1);
+    let checkpoints = store.list_key_values().await.unwrap();
+    assert!(matches!(checkpoints.as_slice(), [checkpoint] if checkpoint.key.starts_with("embedding-progress:v1:")));
     drop(first);
     drop(store);
     let reopened: Arc<dyn MemoryStore> =
@@ -400,7 +401,7 @@ async fn real_postgres_memory_roundtrip() {
         .record_usage(&KnowledgeUsageSignal {
             signal_id: format!("usage-{marker}"),
             session_id: format!("session-{marker}"),
-            pack_id: receipt.pack.pack_id,
+            pack_id: receipt.pack.pack_id.clone(),
             action: "activated".to_string(),
             summary: "real PostgreSQL test".to_string(),
             score_delta_bp: 25,
@@ -410,8 +411,8 @@ async fn real_postgres_memory_roundtrip() {
     let knowledge_reopened =
         PostgresKnowledgeStore::new(reopened.executor().clone()).expect("reopen Knowledge owner");
     let knowledge_snapshot = knowledge_reopened.snapshot().unwrap();
-    assert_eq!(knowledge_snapshot.corpus.len(), 1);
-    assert_eq!(knowledge_snapshot.usage.len(), 1);
+    assert_eq!(knowledge_snapshot.corpus.iter().map(|item| &item.corpus_id).collect::<Vec<_>>(), vec![&receipt.corpus.corpus_id]);
+    assert_eq!(knowledge_snapshot.usage.iter().map(|item| item.signal_id.as_str()).collect::<Vec<_>>(), vec![format!("usage-{marker}")]);
 
     let mut concurrent_ids = Vec::new();
     let mut tasks = Vec::new();
@@ -469,8 +470,7 @@ async fn real_postgres_authority_filters_private_and_team_domains_before_limit()
         .lookup_authority_candidates(query.clone())
         .await
         .unwrap();
-    assert_eq!(found.len(), 1);
-    assert_eq!(found[0].id, own.id);
+    assert_eq!(found.iter().map(|entry| entry.id).collect::<Vec<_>>(), vec![own.id]);
     query.source_agent = None;
     assert!(store
         .lookup_authority_candidates(query.clone())
@@ -492,8 +492,7 @@ async fn real_postgres_authority_filters_private_and_team_domains_before_limit()
             .lookup_authority_candidates(query.clone())
             .await
             .unwrap();
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].id, scoped.id);
+        assert_eq!(rows.iter().map(|entry| entry.id).collect::<Vec<_>>(), vec![scoped.id]);
     }
 }
 
@@ -525,9 +524,9 @@ fn real_postgres_knowledge_roundtrip_and_usage_persist_across_reopen() {
         receipt.warnings
     );
     let snapshot = store.snapshot().expect("knowledge snapshot");
-    assert_eq!(snapshot.corpus.len(), 1);
-    assert_eq!(snapshot.packs.len(), 1);
-    assert_eq!(snapshot.canon.len(), 1);
+    assert_eq!(snapshot.corpus.iter().map(|item| &item.corpus_id).collect::<Vec<_>>(), vec![&receipt.corpus.corpus_id]);
+    assert_eq!(snapshot.packs.iter().map(|item| &item.pack_id).collect::<Vec<_>>(), vec![&receipt.pack.pack_id]);
+    assert!(matches!(snapshot.canon.as_slice(), [canon] if canon == &receipt.canon));
     assert_eq!(snapshot.chunks.len(), receipt.chunks.len());
     assert_eq!(snapshot.corpus[0].corpus_id, receipt.corpus.corpus_id);
     assert_eq!(snapshot.packs[0].pack_id, receipt.pack.pack_id);
@@ -548,10 +547,8 @@ fn real_postgres_knowledge_roundtrip_and_usage_persist_across_reopen() {
     let reopened =
         PostgresKnowledgeStore::new(fixture.reconnect()).expect("reopened knowledge namespace");
     let snapshot = reopened.snapshot().expect("reopened knowledge snapshot");
-    assert_eq!(snapshot.packs.len(), 1);
-    assert_eq!(snapshot.packs[0].pack_id, receipt.pack.pack_id);
-    assert_eq!(snapshot.usage.len(), 1);
-    assert_eq!(snapshot.usage[0].signal_id, signal.signal_id);
+    assert_eq!(snapshot.packs.iter().map(|item| &item.pack_id).collect::<Vec<_>>(), vec![&receipt.pack.pack_id]);
+    assert_eq!(snapshot.usage.iter().map(|item| &item.signal_id).collect::<Vec<_>>(), vec![&signal.signal_id]);
 }
 
 #[tokio::test]
@@ -688,7 +685,10 @@ async fn real_postgres_knowledge_graph_scopes_never_cross_wipe_under_concurrency
         1,
         "a snapshot replace must be a replace, not a merge"
     );
-    assert_eq!(store.load_entities("scope-1").await.expect("reload scope-1").len(), 81);
+    let scope_one = store.load_entities("scope-1").await.expect("reload scope-1");
+    let ids = scope_one.iter().map(|entity| entity.id.clone()).collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(ids, (0..81).map(|i| scenario_entity("scope-1", i).id).collect());
+    assert_eq!(scope_one.len(), ids.len());
 }
 
 
@@ -802,7 +802,7 @@ fn real_postgres_knowledge_refusal_rolls_back_receipt_and_all_original_rows() {
     let original = ingest().unwrap();
     let repeated = ingest().unwrap();
     assert_eq!(repeated.pack, original.pack);
-    assert_eq!(store.snapshot().unwrap().packs.len(), 1);
+    assert_eq!(store.snapshot().unwrap().packs.iter().map(|pack| &pack.pack_id).collect::<Vec<_>>(), vec![&original.pack.pack_id]);
     drop(connection);
     drop(fabric);
     drop(store);
@@ -971,8 +971,7 @@ fn real_postgres_knowledge_usage_duplicate_is_idempotent_and_changed_identity_re
     wrong.session_id = "foreign".into();
     assert!(store.record_usage(&wrong).is_err());
     let snapshot = store.snapshot().unwrap();
-    assert_eq!(snapshot.usage.len(), 1);
-    assert_eq!(snapshot.usage[0].session_id, "session");
+    assert_eq!(snapshot.usage.iter().map(|item| item.session_id.as_str()).collect::<Vec<_>>(), vec!["session"]);
     drop(store);
     drop(std::mem::ManuallyDrop::into_inner(fixture));
 }
@@ -1251,8 +1250,8 @@ fn real_postgres_knowledge_continuation_preserves_scope_revision_and_restart_ide
         .read_candidate_page(&scope, Some(&cursor), 1, KNOWLEDGE_READ_MAX_BYTES)
         .unwrap();
     assert_eq!(continued.revision, first.revision);
-    assert_eq!(continued.packs.len(), 1);
-    assert_ne!(continued.packs[0].pack_id, first.packs[0].pack_id);
+    let [continued_pack] = continued.packs.as_slice() else { panic!("expected one continuation pack"); };
+    assert_ne!(continued_pack.pack_id, first.packs[0].pack_id);
     let wrong_scope = KnowledgeCandidateScope::Activation {
         project_id: Some("B".into()),
     };
@@ -1580,8 +1579,8 @@ async fn real_postgres_memory_archive_pending_replays_after_knowledge_failure_an
         .await
         .unwrap();
     let pending = store.pending_memory_cleanup(None, 16).await.unwrap();
-    assert_eq!(pending.len(), 1);
-    assert_eq!(pending[0].source.delete_epoch, 1);
+    let [pending_source] = pending.as_slice() else { panic!("expected one pending cleanup"); };
+    assert_eq!(pending_source.source.delete_epoch, 1);
     assert!(!manager
         .recover_memory_cleanup(&fabric, 16)
         .await
@@ -1756,8 +1755,7 @@ async fn real_postgres_memory_archive_pending_replays_after_knowledge_failure_an
     );
     drop(writer);
     let triples = reopened_store.load_triples(&scope).await.unwrap();
-    assert_eq!(triples.len(), 1);
-    assert_eq!(triples[0].id, "independent-triple");
+    assert_eq!(triples.iter().map(|triple| triple.id.as_str()).collect::<Vec<_>>(), vec!["independent-triple"]);
     assert_eq!(
         reopened_store.load_triples(&foreign_scope).await.unwrap()[0].id,
         "same-scoped-triple"
@@ -2662,8 +2660,7 @@ async fn real_postgres_erasure_receipt_binds_original_cut_identity_and_reopens_w
         Some(receipt.clone())
     );
     let pending = reopened.pending_memory_cleanup(None, 16).await.unwrap();
-    assert_eq!(pending.len(), 1);
-    assert_eq!(pending[0].mutation_id, receipt.mutation_id);
+    assert_eq!(pending.iter().map(|item| &item.mutation_id).collect::<Vec<_>>(), vec![&receipt.mutation_id]);
     assert!(reopened.insert(&original).await.is_err());
 }
 
@@ -2819,8 +2816,7 @@ async fn real_postgres_auxiliary_original_cuts_and_cleanup_refusal_survive_reope
         .await
         .unwrap();
     let pending = store.pending_memory_cleanup(None, 16).await.unwrap();
-    assert_eq!(pending.len(), 1);
-    assert_eq!(pending[0].mutation_id, receipt.mutation_id);
+    assert_eq!(pending.iter().map(|item| &item.mutation_id).collect::<Vec<_>>(), vec![&receipt.mutation_id]);
     let mut connection = executor.checkout_critical().unwrap();
     connection.batch_execute("CREATE FUNCTION skip_auxiliary_cleanup() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NULL; END $$; CREATE TRIGGER skip_auxiliary_cleanup BEFORE DELETE ON memory_entities FOR EACH ROW EXECUTE FUNCTION skip_auxiliary_cleanup()").unwrap();
     assert!(store
@@ -2845,11 +2841,7 @@ async fn real_postgres_auxiliary_original_cuts_and_cleanup_refusal_survive_reope
         );
     }
     let visible = store.load_entities(&scope).await.unwrap();
-    assert_eq!(visible.len(), 1);
-    assert_eq!(
-        visible[0].id, external.id,
-        "read fence precedes physical cleanup"
-    );
+    assert_eq!(visible.iter().map(|item| &item.id).collect::<Vec<_>>(), vec![&external.id], "read fence precedes physical cleanup");
     connection
         .batch_execute("DROP TRIGGER skip_auxiliary_cleanup ON memory_entities")
         .unwrap();
@@ -2873,12 +2865,7 @@ async fn real_postgres_auxiliary_original_cuts_and_cleanup_refusal_survive_reope
         .is_empty());
     assert!(reopened.load_triples(&scope).await.unwrap().is_empty());
     let visible = reopened.load_entities(&scope).await.unwrap();
-    assert_eq!(visible.len(), 1);
-    assert_eq!(
-        visible[0].source_ids,
-        vec![a.id.to_string()],
-        "an external UUID must not be erased as a Memory reference"
-    );
+    assert!(matches!(visible.as_slice(), [entity] if entity.source_ids == vec![a.id.to_string()]), "an external UUID must not be erased as a Memory reference");
     fresh.id = "late-new-auxiliary-id".into();
     assert!(reopened.save_entities(&scope, &[fresh]).await.is_err());
     assert_eq!(
@@ -2925,15 +2912,15 @@ async fn real_postgres_auxiliary_production_filter_shares_one_bounded_source_fra
     let scope = a.scope.scope_key();
     let (kept, _) =
         memory::store::filter_auxiliary_snapshot(&store, &scope, &[entity], &[]).unwrap();
-    assert_eq!(kept.len(), 1);
-    assert_eq!(kept[0].source_ids.len(), 2);
+    let [kept_entity] = kept.as_slice() else { panic!("expected one kept entity"); };
+    assert_eq!(kept_entity.source_ids, leaves.iter().map(|entry| entry.id.to_string()).collect::<Vec<_>>());
     let (frame, spent) = store
         .read_source_revisions(
             &leaves.iter().map(|entry| entry.id).collect::<Vec<_>>(),
             8 * 1024 * 1024,
         )
         .unwrap();
-    assert_eq!(frame.len(), 2);
+    assert_eq!(frame.keys().copied().collect::<std::collections::BTreeSet<_>>(), leaves.iter().map(|entry| entry.id).collect());
     assert!(spent > a.content.len() && spent < 6 * 1024 * 1024);
     store
         .save_knowledge_graph(&scope, &kept, &[])
@@ -2989,8 +2976,7 @@ async fn real_postgres_legacy_retirement_adopts_original_cut_after_reopen_withou
         .legacy_lifecycle_page(page.after_id.as_deref(), 1)
         .await
         .unwrap();
-    assert_eq!(next.entries.len(), 1);
-    assert_eq!(next.entries[0].0.id, original.id);
+    assert_eq!(next.entries.iter().map(|item| item.0.id).collect::<Vec<_>>(), vec![original.id]);
     let captured =
         MemoryLifecycleMutation::adopt_legacy_retirement(&next.entries[0].0, &next.entries[0].1)
             .unwrap()
@@ -3033,8 +3019,7 @@ async fn real_postgres_legacy_retirement_adopts_original_cut_after_reopen_withou
             .unwrap();
     // The oversized row is reported/held but cannot starve the next source.
     let errors = manager.recover_memory_cleanup(&fabric, 1).await.unwrap();
-    assert_eq!(errors.len(), 1);
-    assert!(errors[0].contains(&huge.id.to_string()));
+    assert!(matches!(errors.as_slice(), [error] if error.contains(&huge.id.to_string())));
     assert!(store
         .lifecycle_receipt(&captured.mutation_id)
         .await
@@ -3304,7 +3289,10 @@ async fn real_postgres_runtime_turn_writes_keep_original_cuts_and_legacy_unknown
         memory::CognitiveContextManager::new_with_selected_store(config, None, store.clone())
             .await
             .unwrap();
-    assert_eq!(manager.list_entities().await.unwrap().len(), 3);
+    let listed = manager.list_entities().await.unwrap();
+    let ids = listed.iter().map(|entity| entity.id.as_str()).collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(ids, std::collections::BTreeSet::from(["independent-node", "external-node", "multi-node"]));
+    assert_eq!(listed.len(), ids.len());
     for id in [legacy.id, independent.id] {
         let fence = store
             .read_source_fence(&format!("memory:{id}"))

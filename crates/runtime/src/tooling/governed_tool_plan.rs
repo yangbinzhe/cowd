@@ -144,8 +144,39 @@ pub struct ToolConflict {
     pub reason: String,
 }
 
+/// Same-compilation invocation and its original live executor owner.
+#[derive(Clone)]
+pub struct OriginalPinnedInvocation {
+    invocation: harness_contract::tool::GovernedToolInvocation,
+    lease: Option<std::sync::Arc<tools::ToolHostLease>>,
+    executor: std::sync::Weak<dyn crate::ToolExecutor>,
+}
+impl OriginalPinnedInvocation {
+    pub(crate) fn new(invocation: harness_contract::tool::GovernedToolInvocation,
+        lease: Option<std::sync::Arc<tools::ToolHostLease>>, executor: std::sync::Arc<dyn crate::ToolExecutor>) -> Self {
+        Self { invocation, lease, executor: std::sync::Arc::downgrade(&executor) }
+    }
+    pub(crate) fn invocation(&self) -> &harness_contract::tool::GovernedToolInvocation { &self.invocation }
+    pub(crate) fn lease(&self) -> Option<&std::sync::Arc<tools::ToolHostLease>> { self.lease.as_ref() }
+    pub(crate) fn executor(&self) -> Option<std::sync::Arc<dyn crate::ToolExecutor>> { self.executor.upgrade() }
+}
+impl std::fmt::Debug for OriginalPinnedInvocation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OriginalPinnedInvocation").field("invocation", &self.invocation).finish_non_exhaustive()
+    }
+}
+impl PartialEq for OriginalPinnedInvocation {
+    fn eq(&self, other: &Self) -> bool {
+        std::sync::Weak::ptr_eq(&self.executor, &other.executor)
+            && match (&self.lease, &other.lease) { (Some(a), Some(b)) => std::sync::Arc::ptr_eq(a, b), (None, None) => true, _ => false }
+            && self.invocation == other.invocation
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct GovernedToolPlanTask {
+    #[serde(skip)]
+    pub(crate) original_pin: Option<std::sync::Arc<OriginalPinnedInvocation>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub step_binding: Option<crate::step_snapshot::StepCallBinding>,
     pub original_call_index: usize,
@@ -711,6 +742,7 @@ impl ValidatedGovernedToolDag {
             let resource_demand = invocation.resource_demand.clone();
             let idempotency_key = invocation.idempotency_key.clone();
             tasks.push(GovernedToolPlanTask {
+                original_pin: None,
                 step_binding: None,
                 original_call_index,
                 contract_version: GOVERNED_TOOL_PLAN_CONTRACT_VERSION,
@@ -839,7 +871,19 @@ impl ValidatedGovernedToolDag {
             // never turn them into reads or suppress an actual approval.
             requires_approval |= effect.approval_class != ToolApprovalClass::None
                 || effect.effect_kind == ToolEffectKind::Unknown;
-            requires_checkpoint |= matches!(
+            // A read-only bounded process has no file mutation to back up.
+            // This is only a checkpoint decision: the dispatchers route every
+            // such effect through the original bounded-process owner, which
+            // verifies the live authorization, lease and sandbox. No generic
+            // host execution may consume this exception.
+            let bounded_read_only = tools::tool_orchestrator::effect_is_bounded_read_only_compute(effect);
+            // Runtime-only control writes have no workspace state to checkpoint.
+            let internal_control = harness_contract::tool::is_internal_control_effect(
+                effect.effect_kind, effect.idempotency, effect.required_permission,
+                effect.approval_class, &effect.scopes, effect.uses_network,
+                effect.spawns_process, effect.mutates_packages, effect.mutates_system,
+            ) && effect.assessment.externality == harness_contract::policy::EffectExternality::Internal;
+            requires_checkpoint |= !bounded_read_only && !internal_control && (matches!(
                 effect.effect_kind,
                 ToolEffectKind::Write
                     | ToolEffectKind::Process
@@ -849,7 +893,7 @@ impl ValidatedGovernedToolDag {
                     | ToolEffectKind::Unknown
             ) || effect.spawns_process
                 || effect.mutates_packages
-                || effect.mutates_system;
+                || effect.mutates_system);
         }
         GovernedToolPolicyValidationReport {
             allowed: findings.is_empty(),
@@ -2511,6 +2555,104 @@ mod tests {
         assert_eq!(plan.tasks[0].safety_category, ToolSafetyCategory::ReadOnly);
         assert_eq!(plan.tasks[0].output_budget_class, "batch");
         assert!(plan.tasks[0].conflicts.is_empty());
+    }
+
+    #[test]
+    fn bounded_read_only_process_needs_no_mutation_checkpoint_but_writes_still_do() {
+        let workspace = tempfile::tempdir().unwrap();
+        let lease = tools::ToolHost::builtin("checkpoint-process-contract", workspace.path()).pin_snapshot();
+        let input = serde_json::json!({"language":"python", "code":"print(1)", "input_files":["src/a.rs"]});
+        let request = ToolRequest { tool_use_id:"process".into(), tool_name:"execute_code".into(),
+            input:input.to_string(), depends_on:Vec::new() };
+        let invocation = lease.prepare_governed_invocation(&request.tool_use_id, &request.tool_name, &input, &[]);
+        assert!(tools::tool_orchestrator::effect_is_bounded_read_only_compute(&invocation.effect));
+        let mut plan = GovernedToolCompiler.compile_prepared_partial(workspace.path(), &[request], &[invocation], &Default::default())
+            .unwrap().plan.unwrap();
+        let decision = execution_decision(RuntimeCompileTarget::InlineModel, TaskRisk::Low, &[], &[]);
+        let safe = plan.validate_against_execution_decision(&decision);
+        assert!(safe.allowed && !safe.requires_checkpoint, "{safe:?}");
+
+        use harness_contract::policy::{PermissionOperation, PermissionResource, PermissionScope};
+        let write = PermissionScope { resource:PermissionResource::File, operation:PermissionOperation::Write,
+            target:Some("out.txt".into()) };
+        plan.tasks[0].invocation.effect.scopes.push(write);
+        plan.tasks[0].effect = plan.tasks[0].invocation.effect.clone();
+        assert!(plan.validate_against_execution_decision(&decision).requires_checkpoint,
+            "a process with a write scope must not bypass the checkpoint boundary");
+        plan.tasks[0].invocation.effect.uses_network = true;
+        plan.tasks[0].effect = plan.tasks[0].invocation.effect.clone();
+        assert!(plan.validate_against_execution_decision(&decision).requires_checkpoint,
+            "a networked process must remain conservative");
+    }
+
+    #[test]
+    fn checkpoint_uses_effect_scope_for_internal_control_and_keeps_other_writes() {
+        use harness_contract::policy::{EffectExternality, PermissionOperation, PermissionResource, PermissionScope};
+        use harness_contract::tool::{ToolApprovalClass, ToolEffectResolverSpec, ToolPermissionMode};
+        let input = serde_json::json!({"actions": []});
+        let effect = tools::tool_orchestrator::resolve_registered_tool_effect(
+            &ToolEffectResolverSpec { resolver_id: "runtime.agent_action".into(), resolver_version: 2 },
+            "agent_action_batch", &input, ToolPermissionMode::ReadOnly,
+        );
+        let request = request_with_input("batch", "agent_action_batch", &input.to_string(), Vec::new());
+        let workspace = std::env::current_dir().unwrap();
+        let mut plan = GovernedToolCompiler.compile(&workspace, &[request], |_, _|
+            Some((effect.clone(), 1, "original-control".to_string()))).unwrap();
+        let decision = execution_decision(RuntimeCompileTarget::InlineModel, TaskRisk::Low, &[], &[]);
+        assert!(plan.validate_against_execution_decision(&decision).allowed);
+        assert!(!plan.validate_against_execution_decision(&decision).requires_checkpoint);
+        let original = plan.tasks[0].invocation.effect.clone();
+        let mut changed = original.clone();
+        changed.scopes.push(PermissionScope { resource: PermissionResource::File,
+            operation: PermissionOperation::Write, target: Some("out.txt".into()) });
+        plan.tasks[0].invocation.effect = changed.clone();
+        plan.tasks[0].effect = changed;
+        assert!(plan.validate_against_execution_decision(&decision).requires_checkpoint);
+        let mut changed = original.clone();
+        changed.assessment.externality = EffectExternality::Unknown;
+        plan.tasks[0].invocation.effect = changed.clone();
+        plan.tasks[0].effect = changed;
+        assert!(plan.validate_against_execution_decision(&decision).requires_checkpoint);
+        let mut changed = original.clone();
+        changed.uses_network = true;
+        plan.tasks[0].invocation.effect = changed.clone();
+        plan.tasks[0].effect = changed;
+        assert!(plan.validate_against_execution_decision(&decision).requires_checkpoint);
+        let mut changed = original.clone();
+        changed.scopes.clear();
+        plan.tasks[0].invocation.effect = changed.clone();
+        plan.tasks[0].effect = changed;
+        assert!(plan.validate_against_execution_decision(&decision).requires_checkpoint);
+        let mut changed = original.clone();
+        changed.spawns_process = true;
+        plan.tasks[0].invocation.effect = changed.clone();
+        plan.tasks[0].effect = changed;
+        assert!(plan.validate_against_execution_decision(&decision).requires_checkpoint);
+        let mut changed = original.clone();
+        changed.required_permission = ToolPermissionMode::WorkspaceWrite;
+        plan.tasks[0].invocation.effect = changed.clone();
+        plan.tasks[0].effect = changed;
+        assert!(plan.validate_against_execution_decision(&decision).requires_checkpoint);
+        let mut changed = original.clone();
+        changed.effect_kind = ToolEffectKind::Unknown;
+        plan.tasks[0].invocation.effect = changed.clone();
+        plan.tasks[0].effect = changed;
+        let unknown = plan.validate_against_execution_decision(&decision);
+        assert!(unknown.requires_approval && unknown.requires_checkpoint);
+        let mut changed = original.clone();
+        changed.approval_class = ToolApprovalClass::Policy;
+        plan.tasks[0].invocation.effect = changed.clone();
+        plan.tasks[0].effect = changed;
+        let approval = plan.validate_against_execution_decision(&decision);
+        assert!(approval.requires_approval && approval.requires_checkpoint);
+        let mut changed = original.clone();
+        changed.effect_kind = ToolEffectKind::Network;
+        changed.uses_network = true;
+        plan.tasks[0].invocation.effect = changed.clone();
+        plan.tasks[0].effect = changed;
+        assert!(!plan.validate_against_execution_decision(&decision).requires_checkpoint);
+        plan.tasks[0].invocation.effect = original;
+        assert!(!plan.validate_against_execution_decision(&decision).allowed);
     }
 
     #[test]

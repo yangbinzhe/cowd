@@ -437,6 +437,47 @@ pub enum SandboxError {
     ProbeFailed(String),
     #[error("sandbox kernel hardening is required but unavailable: {0}")]
     KernelHardeningUnavailable(String),
+    #[error("bounded launcher preparation failed at {stage}: {source}")]
+    BoundedPreparation { stage: &'static str, #[source] source: Box<SandboxError> },
+}
+
+impl SandboxError {
+    fn bounded_preparation(stage: &'static str, source: SandboxError) -> Self {
+        Self::BoundedPreparation { stage, source: Box::new(source) }
+    }
+
+    /// Fixed, non-sensitive evidence; original error text is never included.
+    pub fn bounded_preparation_reason_code(&self) -> String {
+        let (stage, source) = match self {
+            Self::BoundedPreparation { stage, source } => (*stage, source.as_ref()),
+            other => ("unclassified", other),
+        };
+        let (stage, source) = match source {
+            Self::BoundedPreparation { stage: inner, source } if stage == "preflight" => (*inner, source.as_ref()),
+            _ => (stage, source),
+        };
+        let stage = match stage {
+            "profile" | "workspace_canonical" | "workspace_overlap" | "workspace_open"
+            | "preflight" | "launcher_image" | "platform" | "preflight_spec" | "preflight_launcher"
+            | "preflight_bootstrap" | "preflight_image" | "preflight_fixture" | "preflight_probe_spec"
+            | "preflight_probe_args" | "preflight_probe_run" | "preflight_probe_result" | "preflight_hardening" => stage,
+            _ => "unclassified",
+        };
+        let category = match source {
+            Self::LauncherUnavailable => "launcher_unavailable",
+            Self::UnsupportedPlatform => "unsupported_platform",
+            Self::BootstrapUnavailable(_) => "bootstrap_unavailable",
+            Self::MissingPath(_) => "missing_path",
+            Self::RelativePath(_) => "relative_path",
+            Self::ProtectedRootExposed { .. } => "protected_root",
+            Self::DisallowedEnvironment(_) => "disallowed_environment",
+            Self::MalformedEnvironment(_) => "malformed_environment",
+            Self::ProbeFailed(_) => "probe_failed",
+            Self::KernelHardeningUnavailable(_) => "hardening_unavailable",
+            Self::BoundedPreparation { .. } => "nested_preparation",
+        };
+        format!("bounded_launcher_prepare_failed_{stage}_{category}")
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -618,14 +659,19 @@ pub fn probe() -> Result<(), SandboxError> {
 /// environment is the only child environment. If it cannot establish those
 /// facts, command construction fails.
 pub fn preflight(spec: &SandboxLaunchSpec) -> Result<SandboxPreflight, SandboxError> {
+    preflight_with_stages(spec, false)
+}
+
+fn preflight_with_stages(spec: &SandboxLaunchSpec, bounded: bool) -> Result<SandboxPreflight, SandboxError> {
+    let tag = |stage, error| if bounded { SandboxError::bounded_preparation(stage, error) } else { error };
     if !cfg!(target_os = "linux") {
-        return Err(SandboxError::UnsupportedPlatform);
+        return Err(tag("platform", SandboxError::UnsupportedPlatform));
     }
-    spec.validate()?;
-    let bwrap_path = bwrap_path().ok_or(SandboxError::LauncherUnavailable)?;
-    ensure_bootstrap_shell()?;
-    let cowd_binary_path = launcher_binary_path()?;
-    let fixture = ProbeFixture::new()?;
+    spec.validate().map_err(|error| tag("preflight_spec", error))?;
+    let bwrap_path = bwrap_path().ok_or_else(|| tag("preflight_launcher", SandboxError::LauncherUnavailable))?;
+    ensure_bootstrap_shell().map_err(|error| tag("preflight_bootstrap", error))?;
+    let cowd_binary_path = launcher_binary_path().map_err(|error| tag("preflight_image", error))?;
+    let fixture = ProbeFixture::new().map_err(|error| tag("preflight_fixture", error))?;
     let mut probe_spec = SandboxLaunchSpec::workspace(&spec.workspace_root);
     probe_spec.working_directory = spec.working_directory.clone();
     probe_spec.readable_roots = spec.readable_roots.clone();
@@ -636,17 +682,17 @@ pub fn preflight(spec: &SandboxLaunchSpec) -> Result<SandboxPreflight, SandboxEr
     probe_spec.workspace_access = spec.workspace_access;
     probe_spec.environment = spec.environment.clone();
     probe_spec.require_kernel_hardening = spec.require_kernel_hardening;
-    probe_spec.validate()?;
+    probe_spec.validate().map_err(|error| tag("preflight_probe_spec", error))?;
 
     let args = bwrap_args(
         &bwrap_path,
         &cowd_binary_path,
         &probe_spec,
         probe_command(&fixture.control, &probe_spec.environment),
-    )?;
-    let output = run_fd_closing_wrapper(&bwrap_path, &cowd_binary_path, &args)?;
+    ).map_err(|error| tag("preflight_probe_args", error))?;
+    let output = run_fd_closing_wrapper(&bwrap_path, &cowd_binary_path, &args).map_err(|error| tag("preflight_probe_run", error))?;
     if !output.status.success() {
-        return Err(SandboxError::ProbeFailed(render_output(&output)));
+        return Err(tag("preflight_probe_result", SandboxError::ProbeFailed(render_output(&output))));
     }
 
     let preflight = SandboxPreflight {
@@ -661,7 +707,7 @@ pub fn preflight(spec: &SandboxLaunchSpec) -> Result<SandboxPreflight, SandboxEr
         unavailable_hardening: Vec::new(),
     };
     if spec.require_kernel_hardening {
-        preflight.require_kernel_hardening()?;
+        preflight.require_kernel_hardening().map_err(|error| tag("preflight_hardening", error))?;
     }
     Ok(preflight)
 }
@@ -1403,9 +1449,9 @@ mod bounded {
             || timeout.is_zero()
             || timeout > Duration::from_secs(120)
         {
-            return Err(SandboxError::ProbeFailed("bounded_profile_invalid".into()));
+            return Err(SandboxError::bounded_preparation("profile", SandboxError::ProbeFailed("bounded_profile_invalid".into())));
         }
-        let root = canonical(&spec.workspace_root)?;
+        let root = canonical(&spec.workspace_root).map_err(|error| SandboxError::bounded_preparation("workspace_canonical", error))?;
         for system in SYSTEM_READ_ONLY_ROOTS {
             for runtime in [
                 PathBuf::from(system),
@@ -1414,9 +1460,9 @@ mod bounded {
                     .unwrap_or_else(|_| PathBuf::from(system)),
             ] {
                 if root.starts_with(&runtime) || runtime.starts_with(&root) {
-                    return Err(SandboxError::ProbeFailed(
+                    return Err(SandboxError::bounded_preparation("workspace_overlap", SandboxError::ProbeFailed(
                         "bounded_system_root_overlap".into(),
-                    ));
+                    )));
                 }
             }
         }
@@ -1430,10 +1476,10 @@ mod bounded {
             rustix::fs::Mode::empty(),
             rustix::fs::ResolveFlags::NO_SYMLINKS | rustix::fs::ResolveFlags::NO_MAGICLINKS,
         )
-        .map_err(|error| SandboxError::ProbeFailed(error.to_string()))?;
-        let preflight = preflight(&spec)?;
+        .map_err(|error| SandboxError::bounded_preparation("workspace_open", SandboxError::ProbeFailed(error.to_string())))?;
+        let preflight = preflight_with_stages(&spec, true).map_err(|error| SandboxError::bounded_preparation("preflight", error))?;
         let image = File::open(&preflight.cowd_binary_path)
-            .map_err(|error| SandboxError::ProbeFailed(error.to_string()))?;
+            .map_err(|error| SandboxError::bounded_preparation("launcher_image", SandboxError::ProbeFailed(error.to_string())))?;
         Ok(PreparedBoundedCommand {
             state: PreparedBoundedState {
                 spec,
@@ -3555,7 +3601,7 @@ mod bounded_unsupported {
         _: std::time::Duration,
         _: [u8; 32],
     ) -> Result<PreparedBoundedCommand, SandboxError> {
-        Err(SandboxError::UnsupportedPlatform)
+        Err(SandboxError::bounded_preparation("platform", SandboxError::UnsupportedPlatform))
     }
     impl PreparedBoundedCommand {
         pub fn run(self, _: &AtomicBool) -> BoundedSandboxObservation {

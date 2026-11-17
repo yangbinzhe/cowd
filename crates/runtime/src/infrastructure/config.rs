@@ -1436,6 +1436,14 @@ fn parse_optional_providers_config(root: &JsonValue) -> Result<ProvidersConfig, 
             .unwrap_or_default();
         let models = optional_string_array(entry, "models", &ctx)?.unwrap_or_default();
         let protocol = optional_string_dual(entry, "protocol", &ctx)?.map(str::to_string);
+        let reasoning_effort = optional_string_dual(entry, "reasoning_effort", &ctx)?
+            .map(|value| {
+                if model_protocol::provider_config::valid_reasoning_effort(value) { Ok(value.to_string()) }
+                else { Err(ConfigError::Invalid {
+                    key: format!("providers.{name}.reasoning_effort"),
+                    message: format!("unsupported value '{value}'. Valid values: low, medium, high, max"),
+                }) }
+            }).transpose()?;
         let parallel_tool_calls = optional_string_dual(entry, "parallel_tool_calls", &ctx)?
             .map_or(Ok(ParallelToolCallsMode::Auto), |value| {
                 ParallelToolCallsMode::parse(value).ok_or_else(|| ConfigError::Invalid {
@@ -1478,6 +1486,7 @@ fn parse_optional_providers_config(root: &JsonValue) -> Result<ProvidersConfig, 
                 api_key,
                 models,
                 protocol,
+                reasoning_effort,
                 parallel_tool_calls,
                 early_tool_start,
             },
@@ -1912,6 +1921,11 @@ fn parse_optional_gateway_config(root: &JsonValue) -> Result<GatewayConfig, Conf
             runtime_workers: optional_usize(
                 value,
                 "runtime_workers",
+                "merged settings.gateway.capacity",
+            )?,
+            runtime_stack_bytes: optional_usize(
+                value,
+                "runtime_stack_bytes",
                 "merged settings.gateway.capacity",
             )?,
             control_requests: optional_usize(

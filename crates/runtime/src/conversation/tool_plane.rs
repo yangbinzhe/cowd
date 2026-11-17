@@ -1,7 +1,37 @@
 //! Governed tool-wave execution, evidence preparation, and result publication.
 
 use super::*;
+use std::collections::HashMap;
 use std::sync::Mutex;
+
+pub(crate) fn persist_governed_tool_plan_event(
+    store: &crate::RuntimeEventStore,
+    session_id: &str,
+    context: Option<&crate::CowdExecutionContext>,
+    plan: &crate::GovernedToolPlan,
+) -> Result<(), RuntimeError> {
+    let mut refs = vec![RuntimeEventRef {
+        kind: "governed_tool_plan".to_string(),
+        id: plan.plan_id.clone(),
+    }];
+    if let Some(context) = context {
+        refs.extend([
+            RuntimeEventRef { kind: "execution".into(), id: context.execution_id.clone() },
+            RuntimeEventRef { kind: "session".into(), id: context.session_id.clone() },
+            RuntimeEventRef { kind: "turn".into(), id: context.turn_id.clone() },
+        ]);
+    }
+    store.append(RuntimeEventInput {
+        stream_id: format!("session:{session_id}"),
+        scope: RuntimeEventScope::Tool,
+        kind: "tool.execution_plan.created".into(),
+        status: Some("planned".into()),
+        actor: Some("conversation_runtime".into()),
+        refs,
+        payload: serde_json::to_value(plan).map_err(|error| RuntimeError::new(error.to_string()))?,
+    }).map_err(RuntimeError::new)?;
+    Ok(())
+}
 
 /// Construct each responsibility future outside its caller's poll frame. The
 /// factory only allocates; polling stays in the original task and cancel scope.
@@ -93,9 +123,10 @@ fn checkpoint_paths_for_admission(
             if canonical.is_empty()
                 || canonical.trim() != canonical
                 || canonical.contains('\\')
-                || relative
-                    .components()
-                    .any(|c| !matches!(c, Component::Normal(part) if part != ".cowd"))
+                || (!crate::tool_host::is_bounded_evaluation_output_path(relative)
+                    && relative
+                        .components()
+                        .any(|c| !matches!(c, Component::Normal(part) if part != ".cowd")))
                 || relative
                     .components()
                     .collect::<std::path::PathBuf>()
@@ -159,7 +190,6 @@ impl<C, T> Drop for RootNodeActivityRuntime<'_, C, T> {
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ProgramRawEncoding {
-    LegacyOrdinary16,
     BadAnchor(&'static str),
 }
 
@@ -208,11 +238,7 @@ impl crate::RuntimeServices {
         );
         let mut entries = program_raw_encodings().lock().unwrap();
         assert!(!entries.contains_key(&key));
-        let mode = if field == "legacy" {
-            ProgramRawEncoding::LegacyOrdinary16
-        } else {
-            ProgramRawEncoding::BadAnchor(field)
-        };
+        let mode = ProgramRawEncoding::BadAnchor(field);
         entries.insert(key.clone(), (mode, 0));
         ProgramRawEncodingGuard { key, _store: store }
     }
@@ -253,12 +279,6 @@ where
         assert_eq!(record.tool_name, "artifact_publish");
         assert!(payload["runtime_raw_content_v1"].is_object());
         match mode {
-            ProgramRawEncoding::LegacyOrdinary16 => {
-                payload
-                    .as_object_mut()
-                    .unwrap()
-                    .remove("runtime_raw_content_v1");
-            }
             ProgramRawEncoding::BadAnchor(field) => {
                 payload["runtime_raw_content_v1"][field] = match field {
                     "version" => serde_json::json!(2),
@@ -419,13 +439,106 @@ fn original_ticket_start_event(
     serde_json::from_value(payload).map_err(|error| RuntimeError::new(error.to_string()))
 }
 
-struct LockedRootEffectScope {
+pub(crate) use crate::conversation::turn_engine::{OriginalSingleCheckedInputs, OriginalSingleProducerCapture};
+
+/// Sealed original root ticket and admitted call. Fields are private to this
+/// owner module, so coordinate DTOs cannot construct this proof.
+/// 033 S3 (settled vs unsettled): report a delegated child's outcome by
+/// what it actually is.
+///
+/// A delegated child that finished and was refused for a named reason
+/// produced a *settled* outcome: nothing is in flight and nothing will
+/// arrive later. Reporting that as an unsettled receipt marked the effect
+/// unknown, and an unknown member blocks the whole tool batch - the graph
+/// produced no terminal turn result, the review attempt was charged to the
+/// model, and three attempts later the task was blocked for a structural
+/// fault nobody could read. Only an effect that is still unknown may be
+/// reported as unsettled.
+fn delegated_child_outcome_error(error: &ToolError) -> ToolError {
+    if error.is_unknown() {
+        error.clone().with_unresolved_context("original child receipt remains unsettled", None)
+    } else {
+        error.clone()
+    }
+}
+
+pub(crate) struct VerifiedRootActionOwner {
+    // The exact turn owner must survive until the single-action commit owner consumes it.
+    shared_policy_owner: Option<Arc<crate::conversation::SharedPolicyOwner>>,
+    single_producer_events: Vec<crate::DurableRuntimeEvent>,
+    single_control: Option<Arc<crate::conversation::MemberCommitControl>>,
+    single_permission_context: Option<crate::PermissionContext>,
+    single_original_decision: Option<crate::execution_core::RuntimeExecutionDecision>,
+    read_ref_target: Option<crate::conversation::turn_engine::OriginalReadRefTarget>,
+    ticket: crate::execution_core::NodeExecutionTicket,
+    request: crate::RuntimeToolExecutionRequest,
+    activity: harness_contract::projection::RuntimeActivityBinding,
     scope: harness_contract::goal::ProofEffectScope,
-    resolver: crate::path_identity::WorkspacePathIdentityResolver,
+    lease: tools::ToolHostLease,
+    step_id: String,
+    call_id: String,
+    effect_key: String,
+    outer_tool: String,
+    outer_input: serde_json::Value,
+}
+
+impl std::fmt::Debug for VerifiedRootActionOwner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VerifiedRootActionOwner").field("ticket", &self.ticket).finish_non_exhaustive()
+    }
+}
+
+impl VerifiedRootActionOwner {
+    pub(crate) fn shared_policy_owner(&self) -> Option<&Arc<crate::conversation::SharedPolicyOwner>> {
+        self.shared_policy_owner.as_ref()
+    }
+    pub(crate) fn original_ticket(&self) -> &crate::execution_core::NodeExecutionTicket { &self.ticket }
+    pub(crate) fn single_producer_events(&self) -> &[crate::DurableRuntimeEvent] { &self.single_producer_events }
+    /// Original owner remains live only inside VerifiedActionInvocation's
+    /// call-scoped lifetime. A supplies its Program/goal/review sources and
+    /// calls apply_single_locked from the synchronous closure.
+    pub(crate) fn with_single_checked<T>(
+        &self, services: &crate::RuntimeServices, additional_streams: &[String],
+        append: impl FnOnce(&OriginalSingleCheckedInputs<'_>) -> Result<T, String>,
+    ) -> Result<T, String> {
+        let owner = self.shared_policy_owner.as_deref().ok_or("original single-call policy owner missing")?;
+        let control = self.single_control.as_ref().ok_or("original single-call control missing")?;
+        let context = self.single_permission_context.as_ref().ok_or("original single-call permission context missing")?;
+        let decision = self.single_original_decision.as_ref().ok_or("original single-call decision missing")?;
+        owner.with_single_checked(services, &self.ticket, &self.request, &self.single_producer_events,
+            context, decision, self.read_ref_target.as_ref(), Arc::clone(control), additional_streams, append)
+    }
+
+
+    pub(crate) fn original_request(&self) -> &crate::RuntimeToolExecutionRequest { &self.request }
+    pub(crate) fn read_ref_target(&self) -> Option<&crate::conversation::turn_engine::OriginalReadRefTarget> {
+        self.read_ref_target.as_ref()
+    }
+    pub(crate) fn physical(&self) -> harness_contract::agent_action::OriginalAgentExecution {
+        harness_contract::agent_action::OriginalAgentExecution { graph_id: self.ticket.graph_id.clone(), node_id: self.ticket.node_id.clone(), attempt: self.ticket.attempt }
+    }
+    pub(crate) fn validate_actor(&self, actor: &harness_contract::agent_action::AgentActorBinding) -> Result<(), &'static str> {
+        if actor.kind != harness_contract::agent_action::AgentActorKind::Root
+            || actor.session_id != self.activity.session_id || actor.turn_id != self.activity.turn_id
+            || actor.root_execution_id.as_deref() != Some(self.ticket.graph_id.as_str())
+            || actor.original_execution.as_ref() != Some(&self.physical()) {
+            return Err("root actor differs from original physical owner");
+        }
+        Ok(())
+    }
+    pub(crate) fn call_identity(&self) -> (String, String, String, String, String, String, serde_json::Value) {
+        (self.activity.session_id.clone(), self.activity.turn_id.clone(), self.step_id.clone(),
+         self.call_id.clone(), self.effect_key.clone(), self.outer_tool.clone(), self.outer_input.clone())
+    }
+}
+
+pub(crate) struct LockedRootEffectScope {
+    pub(crate) scope: harness_contract::goal::ProofEffectScope,
+    pub(crate) resolver: crate::path_identity::WorkspacePathIdentityResolver,
     _lease: Option<crate::execution_core::graph::ScopeLockLease>,
 }
 
-fn validate_root_physical_scope(
+pub(crate) fn validate_root_physical_scope(
     resolver: &crate::path_identity::WorkspacePathIdentityResolver,
     scope: &harness_contract::goal::ProofEffectScope,
 ) -> Result<(), ToolError> {
@@ -442,23 +555,22 @@ fn validate_root_physical_scope(
     Ok(())
 }
 
-async fn lock_root_effect_scope(
+pub(crate) async fn lock_root_effect_scope(
     request: &crate::RuntimeToolExecutionRequest,
     descriptor: &harness_contract::tool::ToolEffectDescriptor,
     current: Option<tools::ToolHostLease>,
     locks: &crate::execution_core::graph::ScopeLockManager,
     executor_owns_admission: bool,
 ) -> Result<LockedRootEffectScope, ToolError> {
-    let step = request
-        .step_binding
-        .as_ref()
-        .ok_or_else(|| ToolError::new("effect admission requires the original Step"))?
-        .resolve(current.clone())
+    let pinned = if let Some(binding) = request.step_binding.as_ref() {
+        binding.resolve(current.clone()).map_err(|error| ToolError::new(error.to_string()))?.lease().clone()
+    } else {
+        request.tool_progress.original_governed_hook().map_err(ToolError::new)?
+            .ok_or_else(|| ToolError::new("original unbound call owner missing"))?
+            .original_authorized_lease(request).map_err(ToolError::new)?
+    };
+    let resolver = crate::path_identity::WorkspacePathIdentityResolver::discover(pinned.workspace_root())
         .map_err(|error| ToolError::new(error.to_string()))?;
-    let resolver = crate::path_identity::WorkspacePathIdentityResolver::discover(
-        step.lease().workspace_root(),
-    )
-    .map_err(|error| ToolError::new(error.to_string()))?;
     let (requests, identities) =
         crate::bound_tool_batch::bound_effect_lock_requests(&resolver, descriptor)?;
     let lease = if executor_owns_admission || requests.is_empty() {
@@ -515,6 +627,10 @@ fn model_tool_output_feedback(
 fn replay_tool_output(
     outcome: crate::RuntimeToolExecutionOutcome,
 ) -> Result<harness_contract::context::ToolOutputDraft, ToolError> {
+    if outcome.status == crate::RuntimeToolExecutionStatus::Unknown {
+        return Err(ToolError::unknown(outcome.error.unwrap_or_else(||
+            "original tool outcome is unknown".into())));
+    }
     if outcome.status == crate::RuntimeToolExecutionStatus::Executed {
         if let Some(artifact_ref) =
             outcome
@@ -552,15 +668,273 @@ fn replay_tool_output(
 struct TicketToolContext<'context, 'runtime, C, T> {
     inner: &'context ConversationGovernedToolContext<'runtime, C, T>,
     owner: Option<&'context (harness_contract::projection::RuntimeActivityBinding, u32)>,
+    // The original ToolBatch owner ticket must travel with each call; it is
+    // deliberately not reconstructed from a serialized output or call ID.
+    ticket: Option<&'context crate::execution_core::NodeExecutionTicket>,
+    calls: &'context [ModelToolCall],
+    scope_state: Option<&'context Arc<tokio::sync::Mutex<crate::host::TurnGraphState>>>,
+    services: Option<&'context crate::RuntimeServices>,
+    commit_service: Option<&'context crate::execution_core::graph::ExecutionCommitService>,
+    scope_facts: Mutex<HashMap<String, crate::host::EvaluationScopeRefusal>>,
+    packet_scope_facts: Mutex<HashMap<String, (std::sync::Arc<crate::agent_in_process_worker::OriginalPacketScopeDenial>, crate::RuntimeToolExecutionRequest)>>,
+    bounded_acquisition_facts: Mutex<HashMap<String, std::sync::Arc<crate::bound_tool_batch::OriginalBoundedAcquisitionFailure>>>,
+    policy_refusals: Mutex<HashMap<String, TicketPolicyRefusal>>,
+    unknown_effects: Mutex<HashMap<String, ToolError>>,
+    member_progress: Mutex<HashMap<String, Arc<Mutex<Option<Arc<crate::RuntimeToolExecutionRequest>>>>>>,
+    admission_plan: &'context crate::GovernedToolPlan,
+    decision: &'context crate::execution_core::RuntimeExecutionDecision,
     preflight_refusals: &'context Mutex<Vec<(String, String)>>,
+    evaluation_scope_rejections: &'context BTreeMap<String, String>,
+}
+
+/// An unbound call is either an executor-owned root effect (no delegated
+/// parent at all) or a delegated effect naming its original ticket. A
+/// missing parent cannot be distinguished from a missing fact when the
+/// effect was delegated, so a foreign parent stays refused.
+fn unbound_ticket_parent_matches(
+    ticket: &crate::execution_core::NodeExecutionTicket,
+    parent: Option<&harness_contract::execution_graph::ExecutionParentBinding>,
+    attempt: Option<u32>,
+) -> bool {
+    parent.is_none_or(|parent| {
+        parent.execution_id == ticket.graph_id
+            && parent.node_id == ticket.node_id
+            && attempt == Some(ticket.attempt)
+    })
+}
+
+tokio::task_local! {
+    static TICKET_ORIGINAL_SINGLE_CAPTURE: Arc<OriginalSingleProducerCapture>;
+}
+pub(crate) fn current_original_single_capture() -> Option<Arc<OriginalSingleProducerCapture>> {
+    TICKET_ORIGINAL_SINGLE_CAPTURE.try_with(Arc::clone).ok()
+}
+
+struct PreparedGovernedToolCall {
+    single_capture: Option<Arc<OriginalSingleProducerCapture>>,
+    pre_hook_result: HookRunResult,
+    effective_input: String,
+    model_delivery_requirement: crate::conversation::ToolModelDeliveryRequirement,
+    tool_timeout: Duration,
+    authorization_decision: ToolAuthorizationDecision,
+    bound_request: Option<crate::RuntimeToolExecutionRequest>,
+}
+
+#[cfg(any(test, feature = "test-fixtures"))]
+fn r622_ticket_stage(ticket: Option<&crate::execution_core::NodeExecutionTicket>, call: &str, index: usize, phase: &'static str, stage: &'static str, category: &'static str, stage_known: bool) {
+    if index >= 32 || std::env::var_os("COWD_R622_TRACE").is_none() { return; }
+    crate::execution_core::graph::k05_trace_emit(format!(
+        "r622_toolbatch phase=ticket_error graph={:?} node={:?} attempt={:?} call={:?} owner_phase={} stage={} category={} stage_known={}",
+        ticket.map(|t| t.graph_id.chars().take(64).collect::<String>()),
+        ticket.map(|t| t.node_id.chars().take(64).collect::<String>()),
+        ticket.map(|t| t.attempt), call.chars().take(64).collect::<String>(),
+        phase, stage, category, stage_known));
+}
+
+struct TicketPolicyRefusal {
+    request: crate::RuntimeToolExecutionRequest,
+    assessment: crate::conversation::BoundPolicyAssessment,
+    prepared: PreparedGovernedToolCall,
+}
+
+pub(crate) struct PreparedGovernedHook {
+    pub(crate) pre_hook_result: HookRunResult,
+    pub(crate) effective_input: String,
+    pub(crate) model_delivery_requirement: crate::conversation::ToolModelDeliveryRequirement,
+    pub(crate) permission_context: PermissionContext,
+    pub(crate) tool_timeout: Duration,
+}
+
+/// Same-call hook result, constructed only by the original ToolBatch owner.
+/// It is deliberately absent from serialized requests.
+pub(crate) struct OriginalGovernedHook {
+    ticket: crate::execution_core::NodeExecutionTicket,
+    step: Option<crate::step_snapshot::StepCallBinding>,
+    pinned: Arc<crate::governed_tool_plan::OriginalPinnedInvocation>,
+    authorization: std::sync::OnceLock<harness_contract::tool::ToolExecutionAuthorization>,
+    plan_id: String,
+    plan_revision: u64,
+    session_id: String,
+    parent: Option<harness_contract::execution_graph::ExecutionParentBinding>,
+    attempt: Option<u32>,
+    model_input: serde_json::Value,
+    effective_input: serde_json::Value,
+    invocation: harness_contract::tool::GovernedToolInvocation,
+}
+impl OriginalGovernedHook {
+    pub(crate) fn matches(&self, ticket: &crate::execution_core::NodeExecutionTicket,
+        request: &crate::RuntimeToolExecutionRequest, model_input: &serde_json::Value) -> bool {
+        &self.ticket == ticket && request.step_binding == self.step
+            && request.governed_plan_id == self.plan_id && request.governed_plan_revision == self.plan_revision
+            && request.session_id.as_deref() == Some(self.session_id.as_str())
+            && request.parent_execution == self.parent && request.parent_execution_attempt == self.attempt
+            && &self.model_input == model_input
+            && harness_contract::step::parse_strict_json(&request.input).ok().as_ref() == Some(&self.effective_input)
+            && request.compiled_invocation.as_ref() == Some(&self.invocation)
+    }
+
+    pub(crate) fn original_pinned_lease(&self) -> Option<&tools::ToolHostLease> { self.pinned.lease().map(Arc::as_ref) }
+    pub(crate) fn original_native_executor(&self) -> Option<Arc<dyn crate::ToolExecutor>> {
+        self.pinned.lease().is_none().then(|| self.pinned.executor()).flatten()
+    }
+    pub(crate) fn original_ticket(&self) -> &crate::execution_core::NodeExecutionTicket { &self.ticket }
+    pub(crate) fn original_plan_id(&self) -> &str { &self.plan_id }
+    pub(crate) fn original_plan_revision(&self) -> u64 { self.plan_revision }
+    pub(crate) fn original_session_id(&self) -> &str { &self.session_id }
+    pub(crate) fn original_parent(&self) -> Option<&harness_contract::execution_graph::ExecutionParentBinding> { self.parent.as_ref() }
+    pub(crate) fn original_attempt(&self) -> Option<u32> { self.attempt }
+    pub(crate) fn original_prepared_lease(&self, ticket: &crate::execution_core::NodeExecutionTicket,
+        request: &crate::RuntimeToolExecutionRequest) -> Result<tools::ToolHostLease, String> {
+        if request.step_binding.is_some() || !self.matches(ticket, request, &self.model_input) {
+            return Err("original unbound preparation differs".into());
+        }
+        self.original_pinned_lease().cloned().ok_or_else(|| "original call has no pinned catalogue".to_string())
+    }
+    pub(crate) fn matches_native_preparation(&self, ticket: &crate::execution_core::NodeExecutionTicket,
+        request: &crate::RuntimeToolExecutionRequest) -> bool {
+        self.original_native_executor().is_some() && request.step_binding.is_none()
+            && self.matches(ticket, request, &self.model_input)
+    }
+    pub(crate) fn original_authorization(&self) -> Option<&harness_contract::tool::ToolExecutionAuthorization> { self.authorization.get() }
+    pub(crate) fn original_authorized_lease(&self, request: &crate::RuntimeToolExecutionRequest) -> Result<tools::ToolHostLease, String> {
+        let authorization = self.authorization.get().ok_or("original unbound authorization missing")?;
+        if !self.matches(&self.ticket, request, &self.model_input)
+            || Some(authorization) != request.authorization.as_ref() {
+            return Err("original unbound call authorization differs".into());
+        }
+        self.original_pinned_lease().cloned().ok_or_else(|| "original call has no pinned catalogue".to_string())
+    }
+    pub(crate) fn original_authorized_native(&self, request: &crate::RuntimeToolExecutionRequest) -> Result<Arc<dyn crate::ToolExecutor>, String> {
+        let authorization = self.authorization.get().ok_or("original native authorization missing")?;
+        if !self.matches(&self.ticket, request, &self.model_input) || Some(authorization) != request.authorization.as_ref() {
+            return Err("original native call authorization differs".into());
+        }
+        self.original_native_executor().ok_or_else(|| "original call is not native".into())
+    }
+    pub(crate) fn bind_original_authorization(&self, request: &crate::RuntimeToolExecutionRequest) -> Result<(), String> {
+        let authorization = request.authorization.as_ref().ok_or("original authorization missing")?;
+        if !self.matches(&self.ticket, request, &self.model_input)
+            || authorization.policy_revision != request.policy_revision
+            || authorization.tool_id != request.tool_name
+            || authorization.descriptor_hash != self.invocation.effect.descriptor_hash {
+            return Err("original authorization differs from same-call owner".into());
+        }
+        match self.authorization.set(authorization.clone()) {
+            Ok(()) => Ok(()),
+            Err(value) if self.authorization.get() == Some(&value) => Ok(()),
+            Err(_) => Err("original authorization changed".into()),
+        }
+    }
+
+    /// Retain the actual same-call execution owner through receipt creation.
+    pub(crate) fn nonstep_receipt_facts(&self, request: &crate::RuntimeToolExecutionRequest) -> Result<serde_json::Value, String> {
+        if self.step.is_some() || request.step_binding.is_some() {
+            return Err("original unbound owner required".into());
+        }
+        let mut facts = self.publication_facts(self.original_ticket(), request)?;
+        if self.original_pinned_lease().is_some() {
+            let lease = self.original_authorized_lease(request)?;
+            facts["execution_owner"] = serde_json::json!({"kind":"pinned_tool_host",
+                "catalog_revision":lease.revision(), "schema_revision":lease.schema_revision()});
+        } else {
+            // The original hook holds the executor Arc; this check is not a
+            // synthetic catalogue lease or a durable cross-process identity.
+            self.original_authorized_native(request)?;
+            facts["execution_owner"] = serde_json::json!({"kind":"native_executor"});
+        }
+        Ok(facts)
+    }
+
+    pub(crate) fn publication_facts(
+        &self,
+        ticket: &crate::execution_core::NodeExecutionTicket,
+        request: &crate::RuntimeToolExecutionRequest,
+    ) -> Result<serde_json::Value, String> {
+        if !self.matches(ticket, request, &self.model_input) {
+            return Err("original governed hook does not match its call".into());
+        }
+        Ok(serde_json::json!({
+            "ticket": self.ticket,
+            "step": self.step,
+            "plan_id": self.plan_id, "plan_revision": self.plan_revision,
+            "session_id": self.session_id, "parent": self.parent, "attempt": self.attempt,
+            "model_input": self.model_input,
+            "effective_input": self.effective_input,
+            "invocation": self.invocation,
+        }))
+    }
+}
+
+#[cfg(any(test, feature = "test-fixtures"))]
+impl OriginalGovernedHook {
+    /// Build the same-call hook an admission installs, for tests that drive a
+    /// delegated agent-tool node without the full governed ToolBatch planner.
+    /// The pinned owner is inert: only the plan/session/parent identity this
+    /// hook records is read on the bound (Step-carrying) path.
+    pub(crate) fn installed_for_test(
+        ticket: crate::execution_core::NodeExecutionTicket,
+        step: Option<crate::step_snapshot::StepCallBinding>,
+        plan_id: String,
+        plan_revision: u64,
+        session_id: String,
+        parent: Option<harness_contract::execution_graph::ExecutionParentBinding>,
+        attempt: Option<u32>,
+        model_input: serde_json::Value,
+        effective_input: serde_json::Value,
+        invocation: harness_contract::tool::GovernedToolInvocation,
+    ) -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self {
+            ticket,
+            step,
+            pinned: std::sync::Arc::new(crate::governed_tool_plan::OriginalPinnedInvocation::new(
+                invocation.clone(),
+                None,
+                std::sync::Arc::new(crate::conversation::StaticToolExecutor::new()),
+            )),
+            authorization: std::sync::OnceLock::new(),
+            plan_id,
+            plan_revision,
+            session_id,
+            parent,
+            attempt,
+            model_input,
+            effective_input,
+            invocation,
+        })
+    }
+}
+
+struct TicketToolAdmission {
+    resource: Option<crate::ToolExecutionAdmission>,
+    prepared: Option<PreparedGovernedToolCall>,
+}
+
+struct TicketToolReceipt {
+    output: (ConversationMessage, Option<String>),
+    refusal: Option<crate::execution_core::graph::CommittedCallRefusal>,
+}
+
+pub(crate) fn checkpoint_call_identity(
+    ticket: Option<&crate::execution_core::NodeExecutionTicket>,
+    owner: Option<&(harness_contract::projection::RuntimeActivityBinding, u32)>,
+    plan_id: &str,
+    plan_revision: u64,
+    task: &crate::GovernedToolPlanTask,
+) -> Result<String, serde_json::Error> {
+    serde_json::to_string(&(
+        ticket.map(|ticket| (&ticket.graph_id, &ticket.node_id, ticket.attempt)),
+        owner, plan_id, plan_revision,
+        task.step_binding.as_ref().map(|binding| binding.effect_idempotency_key()),
+        &task.tool_call_id,
+    ))
 }
 
 impl<C: ApiClient + Sync, T: ToolExecutor> GovernedToolExecutionContext
     for TicketToolContext<'_, '_, C, T>
 {
     type Output = (ConversationMessage, Option<String>);
-    type Admission = Option<crate::ToolExecutionAdmission>;
-    type Receipt = (ConversationMessage, Option<String>);
+    type Admission = TicketToolAdmission;
+    type Receipt = TicketToolReceipt;
 
     fn local_ceiling(&self) -> usize {
         self.inner.local_ceiling()
@@ -569,7 +943,7 @@ impl<C: ApiClient + Sync, T: ToolExecutor> GovernedToolExecutionContext
         &self,
         task: &crate::GovernedToolPlanTask,
     ) -> Option<(GovernedToolTaskTerminal<Self::Output>, Self::Receipt)> {
-        self.inner.precompleted(task)
+        self.inner.precompleted(task).map(|(terminal, output)| (terminal, TicketToolReceipt { output, refusal: None }))
     }
     fn is_cancelled(&self) -> bool {
         self.inner.is_cancelled()
@@ -587,7 +961,153 @@ impl<C: ApiClient + Sync, T: ToolExecutor> GovernedToolExecutionContext
         &'future self,
         task: &'future crate::GovernedToolPlanTask,
     ) -> GovernedToolFuture<'future, GovernedToolAdmission<Self::Admission>> {
-        self.inner.try_admit(task)
+        boxed_tool_future(|| async move {
+            let mut _r622_stage = "owner";
+            let result = async {
+            if self.ticket.is_none() || self.scope_state.is_none()
+                || self.services.is_none() || self.commit_service.is_none()
+            {
+                return GovernedToolAdmission::Failed(
+                    "tool batch requires its original ticket, turn scope and commit owner".into(),
+                );
+            }
+            let Some((call_id, name, input)) = self.inner.pending_tool_uses.get(task.original_call_index) else {
+                return GovernedToolAdmission::Refused("original call missing".into());
+            };
+            let mut originals = self.calls.iter().filter(|call| &call.id == call_id);
+            let original = originals.next();
+            if call_id != &task.tool_call_id || name != &task.invocation.intent.tool_name
+                || !original.is_some_and(|call| &call.name == name && &call.input == input
+                    && call.binding == task.step_binding
+                    && harness_contract::step::parse_strict_json(&call.input).ok().as_ref() == Some(&task.normalized_input))
+                || originals.next().is_some()
+            {
+                return GovernedToolAdmission::Refused("original call identity mismatch".into());
+            }
+            _r622_stage = "resource_admission";
+            let resource = match self.inner.try_admit(task).await {
+                GovernedToolAdmission::Granted(resource) => resource,
+                GovernedToolAdmission::Deferred => return GovernedToolAdmission::Deferred,
+                GovernedToolAdmission::Refused(reason) => return GovernedToolAdmission::Refused(reason),
+                GovernedToolAdmission::Failed(error) => return GovernedToolAdmission::Failed(error),
+            };
+            let mut hook = None;
+            let mut prepared_effect = None;
+            let mut original_request = None;
+            if let (Some(ticket), Some(state), Some(services)) = (self.ticket, self.scope_state, self.services) {
+                _r622_stage = "hook";
+                let prepared_hook = match self.inner.runtime.prepare_governed_hook_inner(task, input, true) {
+                    Ok(hook) => hook,
+                    Err(error) => return GovernedToolAdmission::Failed(error.to_string()),
+                };
+                let runtime = self.inner.runtime;
+                let policy = runtime.permission_policy.execution_policy_control().snapshot();
+                _r622_stage = "parent";
+                let parent = match runtime.governed_effect_parent(task, &prepared_hook.effective_input) {
+                    Ok(parent) => parent,
+                    Err(error) => return GovernedToolAdmission::Failed(error.to_string()),
+                };
+                _r622_stage = "request";
+                let mut request = match runtime.governed_tool_request(task, self.inner.plan_id, self.inner.plan_revision,
+                    self.inner.iterations, &prepared_hook.effective_input, None, policy.sandbox_posture, policy.revision, parent.as_ref()) {
+                    Ok(request) => request,
+                    Err(error) => {
+                        if let Some(original) = error.original_packet_scope_error().and_then(|error| error.original_packet_scope_denial()).cloned() {
+                            let mut refused_request = original.request().clone();
+                            if let Err(error) = runtime.bind_original_governed_hook(ticket, task, input, &prepared_hook, &mut refused_request,
+                                self.inner.plan_id, self.inner.plan_revision) {
+                                return GovernedToolAdmission::Failed(error.to_string());
+                            }
+                            let reason = original.violation().to_string();
+                            self.packet_scope_facts.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .insert(call_id.clone(), (original, refused_request));
+                            return GovernedToolAdmission::Refused(reason);
+                        }
+                        if let Some(unknown) = error.tool_effect_unknown() {
+                            self.unknown_effects.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .insert(task.tool_call_id.clone(), unknown.clone());
+                        }
+                        return GovernedToolAdmission::Failed(error.to_string());
+                    },
+                };
+                _r622_stage = "hook_binding";
+                if let Err(error) = runtime.bind_original_governed_hook(ticket, task, input, &prepared_hook, &mut request,
+                    self.inner.plan_id, self.inner.plan_revision) {
+                    return GovernedToolAdmission::Failed(error.to_string());
+                }
+                // Bind the actual plan decision before the original policy
+                // producer emits its assessment and call_authorized event.
+                // The later dispatch writes this very same decision again.
+                if task.tool_name == harness_contract::agent_action::OBJECTIVE_COMPLETE_REQUEST_TOOL_ID
+                    && runtime.root_effect_context().is_some() {
+                    request.execution_decision = Some(self.decision.clone());
+                }
+                _r622_stage = "effect_evidence";
+                let effect = match runtime.prepare_call_effect_evidence(ticket, &request) {
+                    Ok(effect) => effect,
+                    Err(error) => return GovernedToolAdmission::Failed(format!("original pinned effect unavailable: {error}")),
+                };
+                _r622_stage = "scope_assessment";
+                let evaluated = {
+                    let state = state.lock().await;
+                    if !state.has_evaluation_scope() { Ok(None) }
+                    else { state.evaluate_scope_refusal(ticket, &request, services, &effect) }
+                };
+                match evaluated {
+                    Ok(Some(fact)) => {
+                        let reason = fact.model_feedback();
+                        self.scope_facts.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(call_id.clone(), fact);
+                        return GovernedToolAdmission::Refused(reason);
+                    }
+                    Ok(None) => {
+                        hook = Some(prepared_hook);
+                        prepared_effect = Some(effect);
+                        original_request = Some(request);
+                    },
+                    Err(error) => return GovernedToolAdmission::Failed(format!("scope assessment failed: {error}")),
+                }
+            } else if let Some(scope) = self.evaluation_scope_rejections.get(call_id) {
+                return GovernedToolAdmission::Refused(format!("evaluation_scope_exceeded: {scope}"));
+            }
+            _r622_stage = "policy_preparation";
+            let mut prepared = if self.ticket.is_some() {
+                match self.inner.runtime.prepare_governed_tool_call(task, self.inner.plan_id,
+                    self.inner.plan_revision, input, self.inner.prompter, self.inner.iterations, self.ticket, hook, prepared_effect, original_request).await {
+                    Ok(prepared) => Some(prepared),
+                    Err(error) => {
+                        #[cfg(any(test, feature = "test-fixtures"))]
+                        r622_ticket_stage(self.ticket, &task.tool_call_id, task.original_call_index, "admit", "policy_preparation_typed", if error.tool_effect_unknown().is_some() { "unknown" } else { "unclassified" }, true);
+                        return GovernedToolAdmission::Failed(format!("tool preparation or policy evaluation failed: {error}"));
+                    },
+                }
+            } else { None };
+            _r622_stage = "policy_binding";
+            if let Some(prepared_call) = prepared.as_mut() {
+                if let Some(capture) = &prepared_call.single_capture { capture.bind_original_decision(self.decision); }
+                if let ToolAuthorizationDecision::Gap { assessment, assessment_event, .. } = &mut prepared_call.authorization_decision {
+                    if assessment.path == harness_contract::policy::AuthorizationPath::HardDeny {
+                        let reason = assessment.gap.as_ref().map_or("policy hard denial", |gap| gap.reason.as_str()).to_string();
+                        let Some(event) = assessment_event.take() else {
+                            return GovernedToolAdmission::Failed("policy hard denial lacks original committed assessment".into());
+                        };
+                        let Some(request) = prepared_call.bound_request.take() else {
+                            return GovernedToolAdmission::Failed("policy hard denial lacks original request".into());
+                        };
+                        let Some(prepared_call) = prepared.take() else { unreachable!() };
+                        self.policy_refusals.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .insert(call_id.clone(), TicketPolicyRefusal { request, assessment: event, prepared: prepared_call });
+                        return GovernedToolAdmission::Refused(reason);
+                    }
+                }
+            }
+            GovernedToolAdmission::Granted(TicketToolAdmission { resource, prepared })
+            }.await;
+            #[cfg(any(test, feature = "test-fixtures"))]
+            if matches!(&result, GovernedToolAdmission::Failed(_)) {
+                r622_ticket_stage(self.ticket, &task.tool_call_id, task.original_call_index, "admit", _r622_stage, "unclassified", true);
+            }
+            result
+        })
     }
     fn execute<'future>(
         &'future self,
@@ -595,6 +1115,31 @@ impl<C: ApiClient + Sync, T: ToolExecutor> GovernedToolExecutionContext
         admission: &'future mut Self::Admission,
     ) -> GovernedToolFuture<'future, Result<Self::Output, String>> {
         boxed_tool_future(|| async move {
+            let mut _r622_stage = "prepared";
+            let result = async {
+            // Run the original gate in the scheduled worker, so a checkpoint
+            // waiting for capacity cannot prevent other workers being polled.
+            // Refused calls never reach this point; an unknown or failed gate
+            // remains a failure, never an authenticated refusal.
+            let prepared = admission.prepared.take()
+                .ok_or_else(|| "tool batch original prepared request is missing".to_string())?;
+            let original_request_slot = if prepared.bound_request.as_ref()
+                .is_some_and(|request| request.tool_name == "tool_orchestrate" || request.tool_name == "agent_action_batch"
+                    || harness_contract::agent_action::AGENT_ACTION_TOOL_IDS.contains(&request.tool_name.as_str())
+                    || (self.inner.runtime.executor_owns_governed_effect(&request.tool_name, &task.effect)
+                        && crate::agentic::action_invocation::is_directory_read(&request.tool_name, &request.input))) {
+                let slot = Arc::new(Mutex::new(None));
+                self.member_progress.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .insert(task.tool_call_id.clone(), Arc::clone(&slot));
+                Some(slot)
+            } else { None };
+            let can_execute = matches!(&prepared.authorization_decision, ToolAuthorizationDecision::Authorized(_));
+            _r622_stage = "strategy_gate";
+            if can_execute {
+                self.inner.runtime.satisfy_original_call_strategy_gate(task, self.admission_plan,
+                    self.decision, self.inner.prompter, self.ticket, self.owner).await?;
+            }
+            _r622_stage = "original_input";
             let input = self
                 .inner
                 .pending_tool_uses
@@ -602,7 +1147,7 @@ impl<C: ApiClient + Sync, T: ToolExecutor> GovernedToolExecutionContext
                 .ok_or_else(|| "tool ticket references missing original call".to_string())?
                 .2
                 .as_str();
-            self.inner
+            let work = self.inner
                 .runtime
                 .execute_single_tool_at(
                     task,
@@ -611,13 +1156,41 @@ impl<C: ApiClient + Sync, T: ToolExecutor> GovernedToolExecutionContext
                     input,
                     self.inner.prompter,
                     self.inner.iterations,
-                    admission,
+                    &mut admission.resource,
                     self.owner,
+                    self.ticket,
+                    Some(self.decision),
                     Some(self.preflight_refusals),
-                )
-                .await
+                    Some(prepared),
+                    self.scope_state,
+                );
+            _r622_stage = "original_tool_call";
+            let execution = if let Some(slot) = original_request_slot {
+                crate::tool_host::ORIGINAL_EFFECT_REQUEST.scope(slot, work).await
+            } else { work.await };
+            execution
                 .map(|message| self.inner.runtime.collect_tool_result_message(message).1)
-                .map_err(|error| error.to_string())
+                .map_err(|error| {
+                    #[cfg(any(test, feature = "test-fixtures"))]
+                    r622_ticket_stage(self.ticket, &task.tool_call_id, task.original_call_index, "execute", _r622_stage,
+                        if error.tool_effect_unknown().is_some() { "unknown" } else { "other" }, false);
+                    if let Some(unknown) = error.tool_effect_unknown() {
+                        self.unknown_effects.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .insert(task.tool_call_id.clone(), unknown.clone());
+                    }
+                    if let Some(fact) = error.original_bounded_acquisition_error()
+                        .and_then(ToolError::original_bounded_acquisition_failure) {
+                        self.bounded_acquisition_facts.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .insert(task.tool_call_id.clone(), std::sync::Arc::clone(fact));
+                    }
+                    error.to_string()
+                })
+            }.await;
+            #[cfg(any(test, feature = "test-fixtures"))]
+            if result.is_err() && _r622_stage != "original_tool_call" {
+                r622_ticket_stage(self.ticket, &task.tool_call_id, task.original_call_index, "execute", _r622_stage, "unclassified", true);
+            }
+            result
         })
     }
     fn classify_output(&self, output: &Self::Output) -> Result<(), String> {
@@ -628,13 +1201,158 @@ impl<C: ApiClient + Sync, T: ToolExecutor> GovernedToolExecutionContext
         task: &'future crate::GovernedToolPlanTask,
         terminal: &'future GovernedToolTaskTerminal<Self::Output>,
     ) -> GovernedToolFuture<'future, Result<Self::Receipt, String>> {
-        if let Some(reason) = terminal.undispatched_reason() {
-            self.preflight_refusals
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .push((task.tool_call_id.clone(), reason));
-        }
-        self.inner.commit_terminal(task, terminal)
+        boxed_tool_future(|| async move {
+            if self.unknown_effects.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains_key(&task.tool_call_id) {
+                return Err("original tool effect remains unknown".into());
+            }
+            let policy_refusal = if matches!(terminal, GovernedToolTaskTerminal::Refused { .. }) {
+                self.policy_refusals.lock().unwrap_or_else(std::sync::PoisonError::into_inner).remove(&task.tool_call_id)
+            } else { None };
+            if let Some(policy) = policy_refusal {
+                let ticket = self.ticket.ok_or_else(|| "policy refusal original ticket unavailable".to_string())?;
+                let commits = self.commit_service.ok_or_else(|| "policy refusal original commit owner unavailable".to_string())?;
+                let proof = commits.commit_call_refusal(
+                    crate::execution_core::graph::CallRefusalOwner::Node(ticket), &policy.request, &policy.assessment,
+                ).map_err(|error| error.to_string())?;
+                let services = self.services.ok_or_else(|| "policy refusal original services unavailable".to_string())?;
+                let observation = services.tool_batch_executor().binding_observation(ticket)
+                    .ok_or_else(|| "committed refusal original ToolBatch observation unavailable".to_string())?;
+                observation.refuse_committed(&proof)?;
+                let mut resource = None;
+                let message = self.inner.runtime.execute_single_tool_at(task, self.inner.plan_id,
+                    self.inner.plan_revision, &policy.request.input, self.inner.prompter, self.inner.iterations,
+                    &mut resource, self.owner, self.ticket, Some(self.decision), None, Some(policy.prepared), self.scope_state).await.map_err(|error| error.to_string())?;
+                if let Some(reason) = terminal.undispatched_reason() {
+                    self.preflight_refusals.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .push((task.tool_call_id.clone(), reason));
+                }
+                return Ok(TicketToolReceipt { output: self.inner.runtime.collect_tool_result_message(message).1, refusal: Some(proof) });
+            }
+            let bounded_fact = self.bounded_acquisition_facts.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner).get(&task.tool_call_id).cloned();
+            if let Some(fact) = bounded_fact {
+                let missing_owner = |reason: &str| {
+                    let error = ToolError::unknown(reason)
+                        .with_original_bounded_acquisition_failure(std::sync::Arc::clone(&fact));
+                    let pending = self.ticket.and_then(|ticket| error.original_bounded_acquisition_pending(ticket, None));
+                    self.unknown_effects.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .insert(task.tool_call_id.clone(), error.with_unresolved_context("same-call acquisition", pending));
+                    reason.to_owned()
+                };
+                let ticket = self.ticket.ok_or_else(|| missing_owner("bounded acquisition original ticket unavailable"))?;
+                let commits = self.commit_service.ok_or_else(|| missing_owner("bounded acquisition commit owner unavailable"))?;
+                let services = self.services.ok_or_else(|| missing_owner("bounded acquisition services unavailable"))?;
+                let observation = services.tool_batch_executor().binding_observation(ticket)
+                    .ok_or_else(|| missing_owner("bounded acquisition original observation unavailable"))?;
+                let mark_unknown = |receipt: Option<crate::execution_core::graph::CommittedCallRefusal>| {
+                    observation.uncertain(fact.request());
+                    let _ = observation.hold_bounded_acquisition(std::sync::Arc::clone(&fact), receipt.clone());
+                    let error = ToolError::unknown("original bounded acquisition transaction or delivery unresolved")
+                        .with_original_bounded_acquisition_failure(std::sync::Arc::clone(&fact));
+                    let pending = error.original_bounded_acquisition_pending(ticket, receipt);
+                    self.unknown_effects.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .insert(task.tool_call_id.clone(), error.with_unresolved_context("same-call acquisition", pending));
+                };
+                let stop = crate::bound_tool_batch::current_tool_stop();
+                let proof = match commits.commit_bounded_acquisition_failure(services, ticket, &fact, stop.as_ref(), None, &observation) {
+                    Ok(proof) => proof,
+                    Err(_) => { mark_unknown(None); return Err("original bounded acquisition transaction unresolved".into()); }
+                };
+                if observation.refuse_bounded_committed(std::sync::Arc::clone(&fact), &proof, None).is_err() {
+                    mark_unknown(Some(proof));
+                    return Err("original bounded acquisition observation unresolved".into());
+                }
+                let output = match self.inner.commit_terminal(task, terminal).await {
+                    Ok(output) => output,
+                    Err(_) => { mark_unknown(Some(proof)); return Err("original bounded acquisition delivery unresolved".into()); }
+                };
+                return Ok(TicketToolReceipt { output, refusal: Some(proof) });
+            }
+            let packet_fact = if matches!(terminal, GovernedToolTaskTerminal::Refused { .. }) {
+                self.packet_scope_facts.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(&task.tool_call_id).cloned()
+            } else { None };
+            if let Some((fact, request)) = packet_fact {
+                let ticket = self.ticket.ok_or_else(|| "packet refusal original ticket unavailable".to_string())?;
+                let commits = self.commit_service.ok_or_else(|| "packet refusal original commit owner unavailable".to_string())?;
+                let services = self.services.ok_or_else(|| "packet refusal original services unavailable".to_string())?;
+                let observation = services.tool_batch_executor().binding_observation(ticket)
+                    .ok_or_else(|| "packet refusal original observation unavailable".to_string())?;
+                let proof = match commits.commit_agent_packet_scope_refusal(ticket, &request, &fact) {
+                    Ok(proof) => proof,
+                    Err(error) => {
+                        observation.uncertain(&request);
+                        let _ = observation.hold_packet_scope(&request);
+                        let unknown = ToolError::unknown(format!("original packet refusal transaction unresolved: {error}"))
+                            .with_original_packet_scope_denial(std::sync::Arc::clone(&fact))
+                            .with_original_packet_scope_request(std::sync::Arc::new(request.clone()));
+                        self.unknown_effects.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .insert(task.tool_call_id.clone(), unknown);
+                        return Err("original packet refusal transaction unresolved".into());
+                    }
+                };
+                if let Err(error) = observation.refuse_committed(&proof) {
+                    observation.uncertain(&request);
+                    let _ = observation.hold_packet_scope(&request);
+                    let unknown = ToolError::unknown(format!("original committed packet refusal observation unresolved: {error}"))
+                        .with_original_packet_scope_denial(std::sync::Arc::clone(&fact))
+                            .with_original_packet_scope_request(std::sync::Arc::new(request.clone()))
+                        .with_original_packet_scope_receipt(proof.clone());
+                    self.unknown_effects.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .insert(task.tool_call_id.clone(), unknown);
+                    return Err("original committed packet refusal observation unresolved".into());
+                }
+                if let Some(reason) = terminal.undispatched_reason() {
+                    self.preflight_refusals.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .push((task.tool_call_id.clone(), reason));
+                }
+                let output = match self.inner.commit_terminal(task, terminal).await {
+                    Ok(output) => output,
+                    Err(error) => {
+                        observation.uncertain(&request);
+                        let _ = observation.hold_packet_scope(&request);
+                        let unknown = ToolError::unknown(format!("original committed packet refusal delivery unresolved: {error}"))
+                            .with_original_packet_scope_denial(std::sync::Arc::clone(&fact))
+                            .with_original_packet_scope_request(std::sync::Arc::new(request.clone()))
+                            .with_original_packet_scope_receipt(proof.clone());
+                        self.unknown_effects.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .insert(task.tool_call_id.clone(), unknown);
+                        return Err("original committed packet refusal delivery unresolved".into());
+                    }
+                };
+                return Ok(TicketToolReceipt { output, refusal: Some(proof) });
+            }
+            let scope_fact = if matches!(terminal, GovernedToolTaskTerminal::Refused { .. }) {
+                self.scope_facts.lock().unwrap_or_else(std::sync::PoisonError::into_inner).remove(&task.tool_call_id)
+            } else { None };
+            let refusal = if let Some(fact) = scope_fact {
+                let ticket = self.ticket.ok_or_else(|| "scope refusal original ticket unavailable".to_string())?;
+                let services = self.services.ok_or_else(|| "scope refusal original services unavailable".to_string())?;
+                let commits = self.commit_service.ok_or_else(|| "scope refusal original commit owner unavailable".to_string())?;
+                let proof = commits.commit_evaluation_scope_refusal(&fact).map_err(|error| error.to_string())?;
+                let observation = services.tool_batch_executor().binding_observation(ticket)
+                    .ok_or_else(|| "committed refusal original ToolBatch observation unavailable".to_string())?;
+                observation.refuse_committed(&proof)?;
+                Some(proof)
+            } else if matches!(terminal, GovernedToolTaskTerminal::Refused { .. })
+                && self.evaluation_scope_rejections.contains_key(&task.tool_call_id) {
+                return Err("scope refusal original turn owner fact unavailable".into());
+            } else { None };
+            if let Some(reason) = terminal.undispatched_reason() {
+                self.preflight_refusals.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push((task.tool_call_id.clone(), reason));
+            }
+            let output = self.inner.commit_terminal(task, terminal).await?;
+            Ok(TicketToolReceipt { output, refusal })
+        })
+    }
+    fn refusal_receipt_is_durable(&self, task: &crate::GovernedToolPlanTask, receipt: &Self::Receipt) -> bool {
+        receipt.refusal.as_ref().zip(self.ticket).is_some_and(|(proof, ticket)| {
+            proof.call_id() == task.tool_call_id && proof.owner_graph_id() == ticket.graph_id
+                && proof.owner_node_id() == ticket.node_id && proof.owner_attempt() == ticket.attempt
+                && task.step_binding.as_ref().is_some_and(|binding| proof.step_id() == binding.snapshot.identity.step_id
+                    && proof.effect_key() == binding.effect_idempotency_key())
+        })
     }
     fn on_task_started(&self, task: &crate::GovernedToolPlanTask) {
         self.inner.on_task_started(task);
@@ -645,15 +1363,604 @@ impl<C: ApiClient + Sync, T: ToolExecutor> GovernedToolExecutionContext
         terminal: &GovernedToolTaskTerminal<Self::Output>,
         receipt: Option<&Self::Receipt>,
     ) {
-        self.inner.on_task_terminal(task, terminal, receipt);
+        self.inner.on_task_terminal(task, terminal, receipt.map(|receipt| &receipt.output));
     }
 }
 
+
+/// Read-only proof of the unique call in the original root ToolBatch ticket.
+/// It grants no Host dispatch or new action submission. Its constructor is
+/// private and the borrow prevents it outliving the original turn issuer.
+pub(crate) struct OriginalRootReplayWitness<'a> {
+    _owner: &'a OwnedRootActionIssuer,
+    ticket: crate::execution_core::NodeExecutionTicket,
+    activity: harness_contract::projection::RuntimeActivityBinding,
+    call_id: String,
+    effect_key: String,
+    tool: String,
+    input: serde_json::Value,
+    original_action_event: crate::DurableRuntimeEvent,
+    original_action_receipt: crate::AppendTransactionReceipt,
+    original_request: crate::RuntimeToolExecutionRequest,
+    original_envelope: harness_contract::agent_action::AgentActionEnvelope,
+}
+impl OriginalRootReplayWitness<'_> {
+    pub(crate) fn ticket(&self) -> &crate::execution_core::NodeExecutionTicket { &self.ticket }
+    pub(crate) fn call_id(&self) -> &str { &self.call_id }
+    pub(crate) fn effect_key(&self) -> &str { &self.effect_key }
+    pub(crate) fn tool(&self) -> &str { &self.tool }
+    pub(crate) fn input(&self) -> &serde_json::Value { &self.input }
+    pub(crate) fn original_action_event(&self) -> &crate::DurableRuntimeEvent { &self.original_action_event }
+    /// The receipt already authenticated by the original replay owner.
+    pub(crate) fn original_action_receipt(&self) -> &crate::AppendTransactionReceipt { &self.original_action_receipt }
+    /// The committed envelope belongs to the authenticated action transaction;
+    /// the replay path does not synthesize an actor from a current request.
+    pub(crate) fn original_envelope(&self) -> &harness_contract::agent_action::AgentActionEnvelope { &self.original_envelope }
+    /// The serialized request stored in the authenticated original transaction,
+    /// never a current caller-supplied request or a new authorization.
+    pub(crate) fn original_request(&self) -> &crate::RuntimeToolExecutionRequest { &self.original_request }
+    /// Bind replay to the original physical actor, exact call and parsed
+    /// action. This does not authenticate a transaction receipt or result.
+    pub(crate) fn validate_envelope(
+        &self, envelope: &harness_contract::agent_action::AgentActionEnvelope,
+        tool: &str, input: &serde_json::Value,
+    ) -> Result<(), &'static str> {
+        let actor = &envelope.actor;
+        let physical = harness_contract::agent_action::OriginalAgentExecution {
+            graph_id: self.ticket.graph_id.clone(), node_id: self.ticket.node_id.clone(), attempt: self.ticket.attempt,
+        };
+        if actor.kind != harness_contract::agent_action::AgentActorKind::Root
+            || actor.session_id != self.activity.session_id || actor.turn_id != self.activity.turn_id
+            || actor.root_execution_id.as_deref() != Some(self.ticket.graph_id.as_str())
+            || actor.original_execution.as_ref() != Some(&physical)
+            || envelope.action_id != self.effect_key || tool != self.tool || input != &self.input {
+            return Err("replay is not the original root call");
+        }
+        let mut parsed = input.clone();
+        let object = parsed.as_object_mut().ok_or("original action input is not an object")?;
+        let expected_revision = match object.remove("expected_revision") {
+            None | Some(serde_json::Value::Null) => None,
+            Some(serde_json::Value::Number(number)) => Some(number.as_u64().ok_or("invalid expected revision")?),
+            Some(_) => return Err("invalid expected revision"),
+        };
+        if tool == "state_inspect" && (object.contains_key("entry_ref") || object.contains_key("scope_ref")) {
+            object.remove("page_cursor"); object.remove("query");
+        }
+        let action: harness_contract::agent_action::AgentAction = serde_json::from_value(
+            serde_json::json!({"kind":tool,"input":parsed})).map_err(|_| "invalid original action")?;
+        if envelope.action != action || envelope.expected_revision != expected_revision {
+            return Err("replay envelope differs from original call");
+        }
+        Ok(())
+    }
+}
+
+/// Original turn-owned handles, detached before a retained leaf is started.
+/// Ticket identity is revalidated against the live bus and durable node start.
+pub(crate) struct OwnedRootActionIssuer {
+    shared_policy_owner: Arc<crate::conversation::SharedPolicyOwner>,
+    cowd_bus: Option<Arc<crate::cowd_event::CowdEventBus>>,
+    runtime_event_store: Option<Arc<crate::RuntimeEventStore>>,
+    permission_policy: crate::permissions::PermissionPolicy,
+    memory_agent_id: String,
+    session_id: String,
+    tool_lease: Option<tools::ToolHostLease>,
+    fence: Option<crate::SessionExecutionFence>,
+    cancellation: crate::CancellationToken,
+}
+impl OwnedRootActionIssuer {
+    /// Authenticate from the real owner, durable ticket start and exactly one
+    /// persisted original call. No authorization or live policy is consulted.
+    pub(crate) fn original_replay_witness<'a>(
+        &'a self, ticket: &crate::execution_core::NodeExecutionTicket, call_id: &str,
+    ) -> Result<Option<OriginalRootReplayWitness<'a>>, ToolError> {
+        let (activity, attempt) = self.historical_replay_owner_for_ticket(ticket).map_err(|e| ToolError::unknown(e.to_string()))?;
+        if attempt != ticket.attempt || call_id.is_empty() { return Err(ToolError::unknown("original replay ticket mismatch")); }
+        let (calls, _) = crate::host::decode_tool_batch(&ticket.payload_ref).map_err(|e| ToolError::unknown(e.to_string()))?;
+        let mut matches = calls.iter().filter(|call| call.id == call_id);
+        let call = matches.next().ok_or_else(|| ToolError::unknown("original replay call absent"))?;
+        let directory_read = if call.name == "read_ref" {
+            let input = harness_contract::step::parse_strict_json(&call.input).map_err(|error| ToolError::unknown(error.to_string()))?;
+            crate::agentic::action_invocation::read_ref_directory_input(&input).map_err(ToolError::unknown)?.is_some()
+        } else { false };
+        if matches.next().is_some() || (!directory_read && !harness_contract::agent_action::AGENT_ACTION_TOOL_IDS.contains(&call.name.as_str())) {
+            return Err(ToolError::unknown("original replay call ambiguous or not a single action"));
+        }
+        let binding = call.binding.as_ref().ok_or_else(|| ToolError::unknown("original replay Step missing"))?;
+        let lease = self.tool_lease.clone().ok_or_else(|| ToolError::unknown("original replay catalog missing"))?;
+        let step = binding.resolve(Some(lease)).map_err(|e| ToolError::unknown(e.to_string()))?;
+        let store = self.runtime_event_store.as_ref().ok_or_else(|| ToolError::unknown("original replay store unavailable"))?;
+        let objective_id = harness_contract::agent_action::root_objective_id(&activity.session_id, &activity.turn_id);
+        let program_id = harness_contract::agent_action::program_id_for_objective(&objective_id);
+        let stream = format!("agentic-program:{program_id}");
+        let effect_key = binding.effect_idempotency_key();
+        let key = format!("agent-action:{effect_key}");
+        let applied = store.event_by_idempotency_key(&stream, &key).map_err(|e| ToolError::unknown(e.to_string()))?;
+        let rejected_key = format!("completion-rejected:{effect_key}");
+        let rejected = store.event_by_idempotency_key(&stream, &rejected_key).map_err(|e| ToolError::unknown(e.to_string()))?;
+        let (event, expected_key, expected_kind, expected_status) = match (applied, rejected) {
+            (None, None) => return Ok(None), // Unobserved is not rollback or admission.
+            (Some(event), None) => (event, key.as_str(), "agentic.action_applied", "applied"),
+            (None, Some(event)) => (event, rejected_key.as_str(), "agentic.completion_rejected", "rejected"),
+            (Some(_), Some(_)) => return Err(ToolError::unknown("original replay has conflicting terminal events")),
+        };
+        let receipt = store.original_transaction_receipt(&event.transaction_id).map_err(|e| ToolError::unknown(e.to_string()))?
+            .ok_or_else(|| ToolError::unknown("original replay transaction receipt unavailable"))?;
+        let facts = &event.payload["original_single_call"];
+        let original_input = facts["request"]["input"].as_str().ok_or_else(|| ToolError::unknown("original replay effective input missing"))?;
+        let effective_value = harness_contract::step::parse_strict_json(original_input).map_err(|e| ToolError::unknown(e.to_string()))?;
+        let ticket_value = harness_contract::step::parse_strict_json(&call.input).map_err(|e| ToolError::unknown(e.to_string()))?;
+        if effective_value != ticket_value {
+            return Err(ToolError::unknown("original hook rewrite has no authenticated same-call proof"));
+        }
+        if event.stream_id != stream || event.kind != expected_kind
+            || event.scope != RuntimeEventScope::Program || event.status.as_deref() != Some(expected_status)
+            || event.idempotency_key.as_deref() != Some(expected_key) || event.schema_version != 1
+            || receipt.transaction_id != event.transaction_id || receipt.commit_cursor != event.commit_cursor
+            || receipt.event_ids.get(event.transaction_index as usize) != Some(&event.event_id)
+            || facts["ticket"] != serde_json::to_value(ticket).map_err(|e| ToolError::unknown(e.to_string()))?
+            || facts["request"]["tool_use_id"].as_str() != Some(call.id.as_str())
+            || facts["request"]["tool_name"].as_str() != Some(call.name.as_str())
+            || facts["request"]["idempotency_key"].as_str() != Some(effect_key.as_str())
+            || facts["request"]["step_binding"] != serde_json::to_value(binding).map_err(|e| ToolError::unknown(e.to_string()))?
+            || facts["request"]["authorization"]["request_id"].as_str().is_none_or(str::is_empty)
+            || facts["request"]["authorization"]["authorization_lease"]["lease_id"].as_str().is_none_or(str::is_empty)
+            || facts["authorization_events"].as_array().is_none_or(Vec::is_empty) {
+            return Err(ToolError::unknown("original replay transaction lacks matching single-call facts"));
+        }
+        let mut admitted_request = facts["request"].clone();
+        admitted_request.as_object_mut().ok_or_else(|| ToolError::unknown("original replay request invalid"))?.remove("authorization");
+        let references = facts["authorization_events"].as_array().ok_or_else(|| ToolError::unknown("original replay evidence missing"))?;
+        let mut assessed = 0usize;
+        let mut consumed = 0usize;
+        let mut assessment_binding = None;
+        let mut assessment_coord = None;
+        let mut consume_coord = None;
+        let mut call_authorizations = Vec::new();
+        for reference in references {
+            let source = reference["stream_id"].as_str().filter(|s| !s.is_empty()).ok_or_else(|| ToolError::unknown("original replay evidence stream missing"))?;
+            let sequence = reference["sequence"].as_u64().filter(|n| *n > 0).ok_or_else(|| ToolError::unknown("original replay evidence sequence missing"))?;
+            let records = store.list_stream_before(source, sequence, 1, 1024 * 1024).map_err(|e| ToolError::unknown(e.to_string()))?;
+            let evidence = records.first().filter(|e| e.sequence == sequence
+                && reference["event_id"].as_str() == Some(e.event_id.as_str())
+                && reference["transaction_id"].as_str() == Some(e.transaction_id.as_str())
+                && reference["transaction_index"].as_u64() == Some(u64::from(e.transaction_index))
+                && reference["commit_cursor"].as_u64() == Some(e.commit_cursor))
+                .ok_or_else(|| ToolError::unknown("original replay evidence mismatch"))?;
+            let fence = store.transaction_stream_revision_exact(&event.transaction_id, source)
+                .map_err(|e| ToolError::unknown(e.to_string()))?
+                .ok_or_else(|| ToolError::unknown("original replay action source fence unavailable"))?;
+            if fence.expected_revision < sequence || fence.expected_revision != fence.committed_revision {
+                return Err(ToolError::unknown("original replay action source fence mismatch"));
+            }
+            let source_receipt = store.original_transaction_receipt(&evidence.transaction_id).map_err(|e| ToolError::unknown(e.to_string()))?
+                .ok_or_else(|| ToolError::unknown("original replay evidence receipt unavailable"))?;
+            if source_receipt.transaction_id != evidence.transaction_id || source_receipt.commit_cursor != evidence.commit_cursor
+                || source_receipt.event_ids.get(evidence.transaction_index as usize) != Some(&evidence.event_id)
+                || evidence.commit_cursor > event.commit_cursor { return Err(ToolError::unknown("original replay evidence receipt mismatch")); }
+            if evidence.kind == "authorization.capability_assessed" && evidence.actor.as_deref() == Some("conversation_runtime")
+                && evidence.payload["_call_refusal_binding"]["owner"]["ticket"] == facts["ticket"]
+                && evidence.payload["_call_refusal_binding"]["call_id"].as_str() == Some(call.id.as_str())
+                && evidence.payload["_call_refusal_binding"]["effect_key"].as_str() == Some(effect_key.as_str())
+                && evidence.payload["_call_refusal_binding"]["request"] == admitted_request
+                && evidence.payload["_call_refusal_binding"]["step_binding"] == facts["request"]["step_binding"]
+                && evidence.payload["_call_refusal_binding"]["tool_name"].as_str() == Some(call.name.as_str())
+                && evidence.payload["lease"] == facts["request"]["authorization"]["authorization_lease"] {
+                assessed += 1; assessment_binding = Some(evidence.payload["_call_refusal_binding"].clone());
+                assessment_coord = Some(reference.clone());
+            }
+            if evidence.kind == "authorization.lease_transition" && evidence.actor.as_deref() == Some("conversation_runtime")
+                && evidence.status.as_deref() == Some("consumed") {
+                let transition: harness_contract::policy::AuthorizationLeaseTransition = serde_json::from_value(evidence.payload.clone())
+                    .map_err(|e| ToolError::unknown(e.to_string()))?;
+                let authorization: harness_contract::tool::ToolExecutionAuthorization = serde_json::from_value(facts["request"]["authorization"].clone())
+                    .map_err(|e| ToolError::unknown(e.to_string()))?;
+                let issued_snapshot_matches = || -> Result<bool, ToolError> {
+                    // Issuance hands the original pre-consumption snapshot to the
+                    // call. Authenticate that original issuer and its receipt;
+                    // do not manufacture a snapshot from a later transition.
+                    let issued = store.list_stream_before(source, 1, 1, 1024 * 1024)
+                        .map_err(|e| ToolError::unknown(e.to_string()))?;
+                    let Some(issued) = issued.first() else { return Ok(false); };
+                    if crate::authorization_negotiator::validate_historical_authorization_issuer(
+                        issued, &authorization, evidence.commit_cursor,
+                    ).is_err() { return Ok(false); }
+                    let original: harness_contract::policy::AuthorizationLeaseTransition = serde_json::from_value(issued.payload.clone())
+                        .map_err(|e| ToolError::unknown(e.to_string()))?;
+                    let Some(receipt) = store.original_transaction_receipt(&issued.transaction_id)
+                        .map_err(|e| ToolError::unknown(e.to_string()))? else { return Ok(false); };
+                    Ok(original.lease == authorization.authorization_lease
+                        && issued.sequence < evidence.sequence
+                        && receipt.transaction_id == issued.transaction_id
+                        && receipt.commit_cursor == issued.commit_cursor
+                        && receipt.event_ids.as_slice() == [issued.event_id.clone()]
+                        && receipt.stream_revisions.len() == 1
+                        && receipt.stream_revisions[0].stream_id == source
+                        && receipt.stream_revisions[0].expected_revision == 0
+                        && receipt.stream_revisions[0].committed_revision == issued.sequence)
+                };
+                if transition.kind == harness_contract::policy::AuthorizationLeaseTransitionKind::Consumed
+                    && transition.idempotency_key.as_deref() == Some(authorization.request_id.as_str())
+                    && evidence.stream_id == format!("authorization-lease:{}", authorization.authorization_lease.lease_id)
+                    && evidence.idempotency_key.as_deref() == Some(transition.transition_id.as_str())
+                    && evidence.transaction_id == format!("authorization-transition:{}", transition.transition_id)
+                    && evidence.transaction_index == 0 && source_receipt.event_ids.len() == 1
+                    && crate::authorization_negotiator::AuthorizationNegotiator::verify_lease_signature(&transition.lease)
+                    && crate::authorization_negotiator::AuthorizationNegotiator::verify_lease_signature(&authorization.authorization_lease)
+                    && crate::authorization_negotiator::authorization_lease_signed_payload(&transition.lease)
+                        == crate::authorization_negotiator::authorization_lease_signed_payload(&authorization.authorization_lease)
+                    && (crate::authorization_negotiator::execution_snapshot(&transition.lease, &authorization.request_id) == authorization.authorization_lease
+                        || issued_snapshot_matches()?) {
+                    consumed += 1; consume_coord = Some(reference.clone());
+                }
+            }
+            if evidence.kind == "authorization.call_authorized" && evidence.scope == RuntimeEventScope::Tool
+                && evidence.actor.as_deref() == Some("conversation_runtime") && evidence.status.as_deref() == Some("authorized")
+                && evidence.stream_id == format!("session:{}", activity.session_id) && evidence.schema_version == 1 {
+                call_authorizations.push(evidence.payload.clone());
+            }
+        }
+        if assessed != 1 || consumed != 1 { return Err(ToolError::unknown("original replay assessment or lease identity ambiguous")); }
+        if call.name == harness_contract::agent_action::OBJECTIVE_COMPLETE_REQUEST_TOOL_ID {
+            let matches = call_authorizations.iter().filter(|payload| payload["version"].as_u64() == Some(1)
+                && Some(&payload["binding"]) == assessment_binding.as_ref()
+                && payload["authorization"] == facts["request"]["authorization"]
+                && Some(&payload["assessment"]) == assessment_coord.as_ref()
+                && Some(&payload["consume"]) == consume_coord.as_ref()).count();
+            if matches != 1 { return Err(ToolError::unknown("original completion authorization event unavailable or ambiguous")); }
+        }
+        // Historical replay validates immutable Step structure without using
+        // today's time or inventing a time at which the call was admitted.
+        let snapshot = step.snapshot();
+        if snapshot.contract_version != harness_contract::step::STEP_CONTRACT_VERSION
+            || binding.origin.origin_step_id != snapshot.identity.step_id
+            || binding.origin.call_id != call.id || binding.origin.catalog_digest != snapshot.catalog_digest
+            || !matches!(&binding.origin.source, harness_contract::step::CallSource::Provider { attempt_id }
+                if attempt_id == &snapshot.provider_attempt.attempt_id)
+            || !snapshot.tools.iter().any(|tool| tool.tool_id == call.name
+                && tool.availability != harness_contract::step::CatalogAvailability::Unavailable) {
+            return Err(ToolError::unknown("original replay Step structure mismatch"));
+        }
+        let input = effective_value;
+        step.lease().validate_input(&call.name, &input).map_err(|e| ToolError::unknown(e.to_string()))?;
+        let identity = &step.snapshot().identity;
+        if identity.step_id.is_empty() || identity.session_id != activity.session_id || identity.turn_id != activity.turn_id
+            || identity.execution_id.as_deref() != Some(ticket.graph_id.as_str()) || identity.run_ref.is_some()
+            || identity.attempt.is_some_and(|value| value != ticket.attempt)
+            || !matches!(&binding.origin.source, harness_contract::step::CallSource::Provider { .. }) {
+            return Err(ToolError::unknown("original replay Step owner mismatch"));
+        }
+        let original_request: crate::RuntimeToolExecutionRequest = serde_json::from_value(facts["request"].clone())
+            .map_err(|e| ToolError::unknown(e.to_string()))?;
+        let original_envelope: harness_contract::agent_action::AgentActionEnvelope = serde_json::from_value(event.payload["envelope"].clone())
+            .map_err(|e| ToolError::unknown(e.to_string()))?;
+        if original_envelope.actor.program_id != program_id || event.actor.as_deref() != Some(original_envelope.actor.actor_id.as_str()) {
+            return Err(ToolError::unknown("original replay envelope owner mismatch"));
+        }
+        let witness = OriginalRootReplayWitness { _owner: self, ticket: ticket.clone(), activity,
+            call_id: call.id.clone(), effect_key, tool: call.name.clone(), input, original_action_event: event,
+            original_action_receipt: receipt, original_request, original_envelope };
+        witness.validate_envelope(&witness.original_envelope, &witness.tool, &witness.input)
+            .map_err(ToolError::unknown)?;
+        Ok(Some(witness))
+    }
+    /// Reconstruct the exact original node start, even after its live node
+    /// becomes terminal. Only the original turn context and atomic durable
+    /// start activity may supply the owner; no request coordinates mint it.
+    fn historical_replay_owner_for_ticket(
+        &self, ticket: &crate::execution_core::NodeExecutionTicket,
+    ) -> Result<(harness_contract::projection::RuntimeActivityBinding, u32), RuntimeError> {
+        let root = self.root_effect_context().ok_or_else(|| RuntimeError::new("original replay turn context unavailable"))?;
+        let store = self.runtime_event_store.as_ref().ok_or_else(|| RuntimeError::new("original replay event store unavailable"))?;
+        let graph = crate::execution_core::graph::validate_node_ticket_start(store, ticket, None)
+            .map_err(|e| RuntimeError::new(e.to_string()))?;
+        let previous = graph.revision.checked_sub(1).ok_or_else(|| RuntimeError::new("original replay start revision invalid"))?;
+        let starts = store.list_stream_after(&ticket.graph_id, previous, graph.revision, 1, 4 * 1024 * 1024)
+            .map_err(RuntimeError::new)?;
+        let start = starts.first().filter(|event| event.sequence == graph.revision)
+            .ok_or_else(|| RuntimeError::new("original replay graph start missing"))?;
+        let node_stream = format!("{}:node:{}", ticket.graph_id, ticket.node_id);
+        let head = store.stream_revision(&node_stream).map_err(|e| RuntimeError::new(e.to_string()))?;
+        let mut after = 0u64;
+        let mut matched = None;
+        let mut scanned = 0usize;
+        while after < head {
+            let page = store.list_stream_after(&node_stream, after, head, 100, 4 * 1024 * 1024).map_err(RuntimeError::new)?;
+            if page.is_empty() { return Err(RuntimeError::new("original replay node history gap")); }
+            for event in page {
+                if event.sequence != after.checked_add(1).ok_or_else(|| RuntimeError::new("original replay node sequence overflow"))? {
+                    return Err(RuntimeError::new("original replay node history discontinuity"));
+                }
+                after = event.sequence;
+                scanned += 1;
+                if scanned > 4096 { return Err(RuntimeError::new("original replay node history budget exceeded")); }
+                if event.transaction_id == start.transaction_id && event.commit_cursor == start.commit_cursor
+                    && event.kind == "execution_node.transitioned" && event.actor.as_deref() == Some("execution_commit_service")
+                    && event.scope == RuntimeEventScope::ExecutionNode && event.status.as_deref() == Some("running")
+                    && event.payload["to"] == "running" && event.payload["graph_revision"].as_u64() == Some(graph.revision) {
+                    if event.activity_binding().is_none() { return Err(RuntimeError::new("original replay node activity missing")); }
+                    if matched.replace(event).is_some() { return Err(RuntimeError::new("original replay node activity ambiguous")); }
+                }
+            }
+        }
+        let original = matched.ok_or_else(|| RuntimeError::new("original replay atomic node activity unavailable"))?;
+        let receipt = store.original_transaction_receipt(&start.transaction_id).map_err(|e| RuntimeError::new(e.to_string()))?
+            .ok_or_else(|| RuntimeError::new("original replay start receipt unavailable"))?;
+        if receipt.transaction_id != start.transaction_id || receipt.commit_cursor != start.commit_cursor
+            || receipt.event_ids.get(start.transaction_index as usize) != Some(&start.event_id)
+            || receipt.event_ids.get(original.transaction_index as usize) != Some(&original.event_id) {
+            return Err(RuntimeError::new("original replay start receipt mismatch"));
+        }
+        let owner = original.activity_binding().ok_or_else(|| RuntimeError::new("original replay node owner missing"))?;
+        let (owner, attempt) = authenticated_root_effect_owner(&root, owner, &graph)?;
+        if attempt != ticket.attempt || owner.node_id.as_deref() != Some(ticket.node_id.as_str()) {
+            return Err(RuntimeError::new("original replay activity differs from ticket"));
+        }
+        Ok((owner, attempt))
+    }
+
+    fn root_effect_context(&self) -> Option<crate::CowdExecutionContext> {
+        let bus = self.cowd_bus.as_ref()?;
+        if bus.current_activity_binding().is_some_and(|binding| binding.agent_run_id.is_some()) { return None; }
+        bus.current_execution_context()
+    }
+    pub(crate) async fn verify_live(&self) -> Result<(), ToolError> {
+        if self.cancellation.is_cancelled() { return Err(ToolError::new("original turn cancelled")); }
+        let fence = self.fence.as_ref().ok_or_else(|| ToolError::new("original Session fence unavailable"))?;
+        fence.verify(crate::SessionExecutionFencePhase::ToolExecution).await.map_err(ToolError::new)?;
+        if self.cancellation.is_cancelled() { return Err(ToolError::new("original turn cancelled")); }
+        Ok(())
+    }
+    fn root_effect_owner_for_ticket(
+        &self,
+        ticket: &crate::execution_core::NodeExecutionTicket,
+    ) -> Result<(harness_contract::projection::RuntimeActivityBinding, u32), RuntimeError> {
+        let root = self
+            .root_effect_context()
+            .ok_or_else(|| RuntimeError::new("root ticket has no execution context"))?;
+        let live = self
+            .cowd_bus
+            .as_ref()
+            .and_then(|bus| bus.current_activity_binding())
+            .ok_or_else(|| RuntimeError::new("root ticket has no activity source"))?;
+        live.validate().map_err(RuntimeError::new)?;
+        let store = self
+            .runtime_event_store
+            .as_ref()
+            .ok_or_else(|| RuntimeError::new("root ticket has no durable source"))?;
+        let graph = crate::execution_core::graph::ExecutionGraphStateStore::new(Arc::clone(store))
+            .load(&ticket.graph_id)
+            .map_err(|error| RuntimeError::new(error.to_string()))?;
+        let original = store
+            .latest_for_stream(&format!("{}:node:{}", ticket.graph_id, ticket.node_id))
+            .map_err(|error| RuntimeError::new(error.to_string()))?
+            .ok_or_else(|| RuntimeError::new("root ticket has no original node activity"))?;
+        let owner = original
+            .activity_binding()
+            .ok_or_else(|| RuntimeError::new("root ticket node has no activity binding"))?;
+        let (owner, attempt) = authenticated_root_effect_owner(&root, owner, &graph)?;
+        let start_revision = original.payload["graph_revision"]
+            .as_u64()
+            .filter(|revision| *revision > 0 && *revision <= graph.revision)
+            .ok_or_else(|| {
+                RuntimeError::new("root ticket original node has no graph start revision")
+            })?;
+        let start_events = store
+            .list_stream_after(
+                &ticket.graph_id,
+                start_revision - 1,
+                start_revision,
+                1,
+                4 * 1024 * 1024,
+            )
+            .map_err(RuntimeError::new)?;
+        let start = start_events
+            .first()
+            .filter(|event| {
+                event.sequence == start_revision
+                    && event.transaction_id == original.transaction_id
+                    && event.commit_cursor == original.commit_cursor
+            })
+            .ok_or_else(|| RuntimeError::new("root ticket has no atomic original graph start"))?;
+        let start_event = original_ticket_start_event(store, start)?;
+        let start_binding = match &start_event {
+            crate::execution_core::graph::ExecutionGraphEvent::NodeTransitioned {
+                node_id,
+                binding,
+                ..
+            } if node_id == &ticket.node_id => binding.as_ref(),
+            crate::execution_core::graph::ExecutionGraphEvent::NodesStarted {
+                bindings, ..
+            }
+            | crate::execution_core::graph::ExecutionGraphEvent::Checkpoint { bindings, .. } => {
+                bindings.get(&ticket.node_id)
+            }
+            _ => None,
+        }
+        .ok_or_else(|| RuntimeError::new("root ticket has no original execution start binding"))?;
+        if attempt != ticket.attempt
+            || owner.node_id.as_deref() != Some(ticket.node_id.as_str())
+            || start_binding.attempt != ticket.attempt
+            || start_binding.executor_kind != ticket.executor_kind
+            || start_binding.ticket_idempotency_key != ticket.idempotency_key
+            || ticket.service_class != graph.service_class
+            || live.root_execution_id != ticket.graph_id
+            || live.session_id != owner.session_id
+            || live.turn_id != owner.turn_id
+            || live.root_task_id != owner.root_task_id
+            || live.task_id != owner.task_id
+            || live.generation != owner.generation
+            || original.payload["to"] != "running"
+            || original.kind != "execution_node.transitioned"
+            || original.actor.as_deref() != Some("execution_commit_service")
+            || original.scope != RuntimeEventScope::ExecutionNode
+            || original.status.as_deref() != Some("running")
+            || live.tool_call_id.is_some()
+            || live.tool_contract_id.is_some()
+            || live
+                .node_id
+                .as_ref()
+                .is_some_and(|node_id| node_id != &ticket.node_id)
+            || (live.node_id.is_some() && live != owner)
+            || !graph.nodes.iter().any(|node| {
+                node.id == ticket.node_id
+                    && node.executor_kind == ticket.executor_kind
+                    && node.payload_ref == ticket.payload_ref
+            })
+        {
+            return Err(RuntimeError::new(
+                "root ticket graph/node/attempt disagrees with its activity source",
+            ));
+        }
+        Ok((owner, attempt))
+    }
+
+    pub(crate) async fn with_verified_root_action<F, Fut, Out>(
+        &self,
+        ticket: &crate::execution_core::NodeExecutionTicket,
+        request: &crate::RuntimeToolExecutionRequest,
+        descriptor: &harness_contract::tool::ToolEffectDescriptor,
+        locked: &LockedRootEffectScope,
+        admission: &crate::execution_core::graph::ToolEffectState,
+        capture: &crate::conversation::turn_engine::OriginalSingleProducerCapture,
+        invoke: F,
+    ) -> Result<Out, ToolError>
+    where F: FnOnce(crate::agentic::action_invocation::VerifiedActionInvocation) -> Fut,
+          Fut: std::future::Future<Output = Out> {
+        if !matches!(admission, crate::execution_core::graph::ToolEffectState::Fresh | crate::execution_core::graph::ToolEffectState::NotRequired) {
+            return Err(ToolError::new("root action has no fresh admitted effect"));
+        }
+        let (activity, attempt) = self.root_effect_owner_for_ticket(ticket)
+            .map_err(|error| ToolError::new(error.to_string()))?;
+        if ticket.graph_id.is_empty() || ticket.node_id.is_empty() || ticket.idempotency_key.is_empty()
+            || attempt != ticket.attempt || request.session_id.as_deref() != Some(activity.session_id.as_str())
+            || activity.turn_id.is_empty() || request.tool_use_id.is_empty() || request.idempotency_key.is_empty()
+            || request.policy_revision == 0 {
+            return Err(ToolError::new("root action original ticket or call identity missing"));
+        }
+        if let Some(parent) = request.parent_execution.as_ref() {
+            if parent.execution_id != ticket.graph_id || parent.node_id != ticket.node_id
+                || request.parent_execution_attempt != Some(ticket.attempt) {
+                return Err(ToolError::new("root action request parent differs from original ticket"));
+            }
+        } else if request.parent_execution_attempt.is_some() {
+            return Err(ToolError::new("root action attempt has no parent"));
+        }
+        let read_ref_target = capture.read_ref_target().map_err(ToolError::unknown)?;
+        if request.tool_name != "agent_action_batch"
+            && !(request.tool_name == "read_ref" && read_ref_target.as_ref().is_some_and(|target|
+                target.ticket == *ticket && target.effect.effect_kind == harness_contract::tool::ToolEffectKind::Read
+                    && !target.effect.uses_network && !target.effect.spawns_process && !target.effect.scopes.is_empty()
+                    && target.effect.scopes.iter().all(|scope| scope.resource == harness_contract::policy::PermissionResource::Tool
+                        && scope.operation == harness_contract::policy::PermissionOperation::Read)))
+            && !harness_contract::agent_action::AGENT_ACTION_TOOL_IDS.contains(&request.tool_name.as_str()) {
+            return Err(ToolError::new("root action tool not recognized"));
+        }
+        let decision = request.execution_decision.as_ref().ok_or_else(|| ToolError::new("unknown: original root decision unavailable"))?;
+        if decision.session_ref.as_deref() != Some(activity.session_id.as_str())
+            || decision.turn_ref.as_deref() != Some(activity.turn_id.as_str())
+            || decision.execution_graph_ref.as_deref() != Some(ticket.graph_id.as_str())
+            || decision.lease.lease_id.is_empty() {
+            return Err(ToolError::new("unknown: original root decision owner mismatch"));
+        }
+        let binding = request.step_binding.as_ref().ok_or_else(|| ToolError::new("root action Step missing"))?;
+        if binding.effect_idempotency_key() != request.idempotency_key {
+            return Err(ToolError::new("root action effect key mismatch"));
+        }
+        let lease = self.tool_lease.clone().ok_or_else(|| ToolError::new("root action lease missing"))?;
+        let step = binding.resolve(Some(lease)).map_err(|error| ToolError::new(error.to_string()))?;
+        let input = step.validate_call(&binding.origin, &activity.session_id, &request.tool_use_id,
+            &request.tool_name, &request.input, chrono::Utc::now().timestamp_millis())
+            .map_err(|error| ToolError::new(error.to_string()))?;
+        let identity = &step.snapshot().identity;
+        if identity.step_id.is_empty() || identity.session_id != activity.session_id || identity.turn_id != activity.turn_id
+            || identity.execution_id.as_deref() != Some(ticket.graph_id.as_str()) || identity.run_ref.is_some()
+            || identity.attempt.is_some_and(|value| value != ticket.attempt)
+            || !matches!(&binding.origin.source, harness_contract::step::CallSource::Provider { .. }) {
+            return Err(ToolError::new("root action Step owner mismatch"));
+        }
+        let recomputed = crate::bound_tool_batch::admitted_effect_scope(request, descriptor, Some(step.lease().clone()), &locked.resolver)?;
+        if recomputed != locked.scope { return Err(ToolError::new("root action admitted effect scope mismatch")); }
+        let auth = request.authorization.as_ref().ok_or_else(|| ToolError::new("unknown: original signed root authorization missing"))?;
+        let policy = self.permission_policy.execution_policy_control().snapshot();
+        let principal = if self.memory_agent_id != "primary" { format!("agent:{}", self.memory_agent_id) } else { format!("session:{}", self.session_id.as_str()) };
+        let compiled = request.compiled_invocation.as_ref().ok_or_else(|| ToolError::new("unknown: original compiled root call missing"))?;
+        if self.session_id.as_str() != activity.session_id || policy.revision != request.policy_revision
+            || auth.policy_revision != policy.revision || policy.sandbox_posture != request.sandbox_posture
+            || step.snapshot().related_revisions.get("policy") != Some(&request.policy_revision.to_string())
+            || !self.permission_policy.active_mode().permits(descriptor.required_permission)
+            || !self.permission_policy.active_mode().permits(auth.authorization_lease.ceiling)
+            || auth.authorization_lease.principal_id != principal
+            || compiled.effect != *descriptor || compiled.intent.normalized_input != input
+            || compiled.intent.tool_name != request.tool_name || compiled.invocation_id != request.tool_use_id
+            || compiled.origin.as_ref() != Some(&binding.origin) {
+            return Err(ToolError::new("unknown: original root authorization/policy owner mismatch"));
+        }
+        step.lease().validate_authorization(auth, &request.tool_name, &input).map_err(|error| ToolError::new(error.to_string()))?;
+        let producer_events = capture.events();
+        let producer_owner = capture.owner().ok_or_else(|| ToolError::unknown("original single-call producer owner missing"))?;
+        let auth = request.authorization.as_ref().ok_or_else(|| ToolError::new("original action authorization missing"))?;
+        let assessments: Vec<_> = producer_events.iter().filter(|event| event.kind == "authorization.capability_assessed"
+            && event.payload["_call_refusal_binding"]["call_id"].as_str() == Some(request.tool_use_id.as_str())
+            && event.payload["lease"]["lease_id"].as_str() == Some(auth.authorization_lease.lease_id.as_str())).collect();
+        let consumptions: Vec<_> = producer_events.iter().filter(|event| event.kind == "authorization.lease_transition"
+            && event.payload["lease"]["lease_id"].as_str() == Some(auth.authorization_lease.lease_id.as_str())
+            && event.payload["idempotency_key"].as_str() == Some(auth.request_id.as_str())
+            && event.status.as_deref() == Some("consumed")).collect();
+        if assessments.len() != 1 || consumptions.len() != 1 {
+            return Err(ToolError::unknown("original single-call assessment or lease-consumption event unavailable"));
+        }
+        if request.tool_name == harness_contract::agent_action::OBJECTIVE_COMPLETE_REQUEST_TOOL_ID {
+            let coord = |event: &crate::DurableRuntimeEvent| serde_json::json!({
+                "stream_id":event.stream_id, "sequence":event.sequence, "event_id":event.event_id,
+                "transaction_id":event.transaction_id, "transaction_index":event.transaction_index, "commit_cursor":event.commit_cursor,
+            });
+            let matching = producer_events.iter().filter(|event| event.kind == "authorization.call_authorized"
+                && event.scope == RuntimeEventScope::Tool && event.actor.as_deref() == Some("conversation_runtime")
+                && event.status.as_deref() == Some("authorized") && event.stream_id == format!("session:{}", activity.session_id)
+                && event.payload["version"].as_u64() == Some(1)
+                && event.payload["binding"] == assessments[0].payload["_call_refusal_binding"]
+                && event.payload["authorization"] == serde_json::to_value(auth).unwrap_or(serde_json::Value::Null)
+                && event.payload["assessment"] == coord(assessments[0])
+                && event.payload["consume"] == coord(consumptions[0])).count();
+            if matching != 1 { return Err(ToolError::unknown("original completion call authorization event unavailable")); }
+        }
+        let context = capture.permission_context().ok_or_else(|| ToolError::unknown("original single-call permission context missing"))?;
+        let original_decision = capture.original_decision().ok_or_else(|| ToolError::unknown("original single-call decision missing"))?;
+        if request.execution_decision.as_ref() != Some(&original_decision) {
+            return Err(ToolError::new("original single-call decision changed"));
+        }
+        let control = producer_owner.new_single_commit_control();
+        let proof = VerifiedRootActionOwner {
+            single_producer_events: producer_events,
+            single_control: Some(control),
+            single_permission_context: Some(context),
+            single_original_decision: Some(original_decision),
+            read_ref_target,
+            shared_policy_owner: Some(producer_owner),
+            ticket: ticket.clone(), request: request.clone(), activity, scope: recomputed, lease: step.lease().clone(),
+            step_id: identity.step_id.clone(), call_id: request.tool_use_id.clone(),
+            effect_key: request.idempotency_key.clone(), outer_tool: request.tool_name.clone(), outer_input: input,
+        };
+        crate::agentic::action_invocation::with_verified_root_owner(proof, invoke).await.map_err(ToolError::new)
+    }
+
+}
 impl<C, T> ConversationRuntime<C, T>
 where
     C: ApiClient,
     T: ToolExecutor,
 {
+    pub(crate) fn owned_root_action_issuer(&self, shared_policy_owner: Arc<crate::conversation::SharedPolicyOwner>) -> OwnedRootActionIssuer {
+        OwnedRootActionIssuer {
+            shared_policy_owner,
+            cowd_bus: self.cowd_bus.clone(), runtime_event_store: self.runtime_event_store.clone(),
+            permission_policy: self.permission_policy.clone(), memory_agent_id: self.memory_agent_id.clone(),
+            session_id: self.session_id().to_owned(), tool_lease: self.tool_executor.pin_step_catalog(),
+            fence: self.session_execution_fence.clone(), cancellation: self.cancellation_token(),
+        }
+    }
+
     fn root_effect_context(&self) -> Option<crate::CowdExecutionContext> {
         let bus = self.cowd_bus.as_ref()?;
         if bus
@@ -872,7 +2179,6 @@ where
             prompter,
             iteration,
             &BTreeMap::new(),
-            &BTreeMap::new(),
         )
         .await
     }
@@ -883,7 +2189,6 @@ where
         prompter: &crate::permissions::SharedPrompter,
         iteration: usize,
         replays: &BTreeMap<String, EarlyToolExecutionReceipt>,
-        replay_invocations: &BTreeMap<String, harness_contract::tool::GovernedToolInvocation>,
     ) -> Result<ToolBatchStepResult, RuntimeError>
     where
         C: Sync,
@@ -893,7 +2198,11 @@ where
             prompter,
             iteration,
             replays,
-            replay_invocations,
+            &BTreeMap::new(),
+            None,
+            None,
+            None,
+            None,
             None,
         )
         .await
@@ -906,8 +2215,12 @@ where
         prompter: &crate::permissions::SharedPrompter,
         iteration: usize,
         replays: &BTreeMap<String, EarlyToolExecutionReceipt>,
-        replay_invocations: &BTreeMap<String, harness_contract::tool::GovernedToolInvocation>,
+        evaluation_scope_rejections: &BTreeMap<String, String>,
         owner: Option<&(harness_contract::projection::RuntimeActivityBinding, u32)>,
+        ticket: Option<&crate::execution_core::NodeExecutionTicket>,
+        scope_state: Option<&Arc<tokio::sync::Mutex<crate::host::TurnGraphState>>>,
+        scope_services: Option<&crate::RuntimeServices>,
+        commit_service: Option<&crate::execution_core::graph::ExecutionCommitService>,
     ) -> Result<
         (
             ToolBatchStepResult,
@@ -940,11 +2253,85 @@ where
         }) {
             return Err(RuntimeError::new("tool_step_session_or_turn_mismatch"));
         }
-        if self.cancellation_token.is_cancelled() {
-            return Err(RuntimeError::new("turn cancelled before tool execution"));
+        // Original action replay precedes hooks, new authorization and live
+        // cancellation. Unobserved is never itself admission or rollback.
+        let mut original_replays = BTreeMap::new();
+        if self.root_effect_context().is_some() {
+            if let (Some(ticket), Some(services)) = (ticket, scope_services) {
+                let issuer = self.owned_root_action_issuer(Arc::new(self.shared_policy_owner()));
+                for call in calls {
+                    if replays.contains_key(&call.id)
+                        || !harness_contract::agent_action::AGENT_ACTION_TOOL_IDS.contains(&call.name.as_str()) { continue; }
+                    match crate::host::pregrant_original_action_receipt(&issuer, services, ticket, call) {
+                        Ok(crate::host::OriginalActionReceiptState::Complete(replay)) => { original_replays.insert(call.id.clone(), replay); }
+                        Ok(crate::host::OriginalActionReceiptState::Unobserved) => {},
+                        Ok(crate::host::OriginalActionReceiptState::CommittedPartial(partial, original)) => {
+                            let mut messages = Vec::new();
+                            for item in calls {
+                                if item.id == call.id { messages.push(partial.clone()); }
+                                else if let Some(replay) = original_replays.get(&item.id) {
+                                    messages.push(crate::host::tool_outcome_message(replay.outcome.clone()));
+                                } else if let Some(receipt) = replays.get(&item.id) {
+                                    messages.push(self.prepare_replayed_tool_result(item, receipt).await?);
+                                }
+                            }
+                            let unresolved = calls.iter().filter(|item| !original_replays.contains_key(&item.id) && !replays.contains_key(&item.id))
+                                .map(|item| crate::conversation::ToolBatchUnresolved::Unknown {
+                                    call_id: item.id.clone(), detail: "original action committed; Host delivery incomplete".into(),
+                                    terminal_detail: "original Gateway postprocessing and effect receipt unobserved".into(), commit_error: None,
+                                }).collect();
+                            return Err(RuntimeError::from_tool_effect_unknown(ToolError::unknown("original action delivery incomplete"))
+                                .with_partial_tool_batch(crate::conversation::PartialToolBatch { member_batches: vec![(call.id.clone(), original)], messages, unresolved }));
+                        },
+                        Err(error) => {
+                            let mut messages = Vec::new();
+                            for item in calls {
+                                if let Some(replay) = original_replays.get(&item.id) {
+                                    messages.push(crate::host::tool_outcome_message(replay.outcome.clone()));
+                                } else if let Some(receipt) = replays.get(&item.id) {
+                                    messages.push(self.prepare_replayed_tool_result(item, receipt).await?);
+                                }
+                            }
+                            let unresolved = calls.iter().filter(|item| !original_replays.contains_key(&item.id) && !replays.contains_key(&item.id))
+                                .map(|item| crate::conversation::ToolBatchUnresolved::Unknown {
+                                    call_id: item.id.clone(), detail: error.to_string(),
+                                    terminal_detail: "pre-grant original outcome unresolved".into(), commit_error: None,
+                                }).collect();
+                            return Err(RuntimeError::from_tool_effect_unknown(ToolError::unknown(error.to_string()))
+                                .with_partial_tool_batch(crate::conversation::PartialToolBatch { member_batches: Vec::new(), messages, unresolved }));
+                        },
+                    }
+                }
+            }
+        }
+        if self.cancellation_token.is_cancelled()
+            && calls.iter().any(|call| !original_replays.contains_key(&call.id) && !replays.contains_key(&call.id)) {
+            let mut messages = Vec::new();
+            for call in calls {
+                if let Some(replay) = original_replays.get(&call.id) {
+                    messages.push(crate::host::tool_outcome_message(replay.outcome.clone()));
+                } else if let Some(receipt) = replays.get(&call.id) {
+                    messages.push(self.prepare_replayed_tool_result(call, receipt).await?);
+                }
+            }
+            let unresolved = calls.iter().filter(|call| !original_replays.contains_key(&call.id) && !replays.contains_key(&call.id))
+                .map(|call| crate::conversation::ToolBatchUnresolved::Unknown {
+                    call_id: call.id.clone(), detail: "turn cancelled before new admission".into(),
+                    terminal_detail: "turn cancelled before new admission".into(), commit_error: None,
+                }).collect();
+            return Err(RuntimeError::from_tool_effect_unknown(ToolError::unknown("turn cancelled before new admission"))
+                .with_partial_tool_batch(crate::conversation::PartialToolBatch { member_batches: Vec::new(), messages, unresolved }));
+        }
+        if replays.keys()
+            .any(|id| evaluation_scope_rejections.contains_key(id))
+        {
+            return Err(RuntimeError::new(
+                "evaluation_scope_precompleted_call_cannot_be_certified_undispatched",
+            ));
         }
         self.remember_native_tool_calls(calls)?;
         let mut refused_before_dispatch = Vec::new();
+        let mut member_batches = Vec::new();
         use crate::tool_dispatch::ToolRequest;
 
         // The hard repetition breaker lives in `execute_single_tool`, which this
@@ -957,16 +2344,42 @@ where
         // does, and record each refusal the same way it already records itself.
         let mut refused_ids = std::collections::BTreeSet::new();
         let mut refusal_messages = Vec::new();
+        // The member executor executes a path-normalized input, so the turn's
+        // calls are normalized onto that same byte basis here - before the
+        // governed plan describes each call's effect - keeping the plan, the
+        // authorization, the planned payload and the closure identity on the
+        // bytes that will actually execute (the path_scope security
+        // invariant). The root executor keeps the model's raw bytes. A call
+        // whose input cannot be normalized deterministically is refused here,
+        // exactly like the repetition breaker below, so no effect is admitted
+        // on an unreadable input.
+        let mut normalized_inputs = std::collections::BTreeMap::new();
         for call in calls {
-            if replays.contains_key(&call.id) {
+            match self.tool_executor.normalize_turn_tool_input(&call.name, &call.input) {
+                Ok(input) => {
+                    normalized_inputs.insert(call.id.clone(), input);
+                }
+                Err(error) => {
+                    refused_ids.insert(call.id.clone());
+                    refused_before_dispatch.push((
+                        call.id.clone(),
+                        format!("turn input normalization refused for `{}`: {error}", call.name),
+                    ));
+                }
+            }
+        }
+        for call in calls {
+            if replays.contains_key(&call.id) || original_replays.contains_key(&call.id) {
                 continue;
             }
             let Some(refusal) =
-                self.blocked_repeated_call(&call.name, &call.id, &call.input, iteration)
+                self.blocked_repeated_call(&call.name, &call.id,
+                    normalized_inputs.get(&call.id).unwrap_or(&call.input), iteration)
             else {
                 continue;
             };
-            self.note_refusal_ignored(&call.name, &call.input);
+            self.note_refusal_ignored(&call.name,
+                normalized_inputs.get(&call.id).unwrap_or(&call.input));
             refused_before_dispatch.push((
                 call.id.clone(),
                 "repetition breaker refused before compilation".into(),
@@ -990,6 +2403,8 @@ where
             // model cannot act on.
             return Ok((
                 ToolBatchStepResult {
+                    orchestrated_search_coverage: Some(BTreeSet::new()),
+                    member_batches: Vec::new(),
                     refused_before_dispatch: refused_before_dispatch.into_iter().map(Into::into).collect(),
                     failed: refusal_messages.len(),
                     messages: refusal_messages,
@@ -1005,7 +2420,10 @@ where
             .map(|call| ToolRequest {
                 tool_use_id: call.id.clone(),
                 tool_name: call.name.clone(),
-                input: call.input.clone(),
+                input: normalized_inputs
+                    .get(&call.id)
+                    .cloned()
+                    .unwrap_or_else(|| call.input.clone()),
                 depends_on: call.depends_on.clone(),
             })
             .collect::<Vec<_>>();
@@ -1013,25 +2431,35 @@ where
         let pending = calls
             .iter()
             .filter(|call| !refused_ids.contains(&call.id))
-            .map(|call| (call.id.clone(), call.name.clone(), call.input.clone()))
+            .map(|call| (call.id.clone(), call.name.clone(),
+                normalized_inputs
+                    .get(&call.id)
+                    .cloned()
+                    .unwrap_or_else(|| call.input.clone())))
             .collect::<Vec<_>>();
+        let original_executor: Arc<dyn crate::ToolExecutor> = self.tool_executor.clone();
+        let plan_pin = original_executor.pin_step_catalog().map(Arc::new);
         let mut prepared = Vec::with_capacity(requests.len());
+        let mut original_pins = std::collections::HashMap::new();
         let mut admission_rejections = BTreeMap::new();
         for request in &requests {
-            if let Some(invocation) = replay_invocations.get(&request.tool_use_id) {
-                prepared.push(invocation.clone());
-            } else {
-                match self
-                    .tool_executor
-                    .prepare_step_invocations(std::slice::from_ref(request), calls)
-                {
-                    Ok(invocations) => prepared.extend(invocations),
-                    Err(error) => {
-                        admission_rejections.insert(
-                            request.tool_use_id.clone(),
-                            format!("step admission refused: {error}"),
-                        );
-                    }
+            if admission_rejections.contains_key(&request.tool_use_id) {
+                continue;
+            }
+            match self
+                .tool_executor
+                .prepare_step_invocations(std::slice::from_ref(request), calls, plan_pin.as_ref(), &original_executor)
+            {
+                Ok(invocations) => for item in invocations {
+                    let item = Arc::new(item);
+                    original_pins.insert(item.invocation().invocation_id.clone(), Arc::clone(&item));
+                    prepared.push(item.invocation().clone());
+                },
+                Err(error) => {
+                    admission_rejections.insert(
+                        request.tool_use_id.clone(),
+                        format!("step admission refused: {error}"),
+                    );
                 }
             }
         }
@@ -1064,10 +2492,12 @@ where
                 );
                 let mut messages = Vec::with_capacity(calls.len());
                 for call in calls {
-                    if !replays.contains_key(&call.id) {
+                    if !replays.contains_key(&call.id) && !original_replays.contains_key(&call.id) {
                         refused_before_dispatch.push((call.id.clone(), reason.clone()));
                     }
-                    let message = if let Some(receipt) = replays.get(&call.id) {
+                    let message = if let Some(replay) = original_replays.get(&call.id) {
+                        crate::host::tool_outcome_message(replay.outcome.clone())
+                    } else if let Some(receipt) = replays.get(&call.id) {
                         self.prepare_replayed_tool_result(call, receipt).await?
                     } else {
                         ConversationMessage::tool_result(call.id.clone(), call.name.clone(), reason.clone(), true)
@@ -1084,6 +2514,8 @@ where
                 }
                 return Ok((
                     ToolBatchStepResult {
+                    orchestrated_search_coverage: Some(BTreeSet::new()),
+                    member_batches: Vec::new(),
                         refused_before_dispatch: refused_before_dispatch.into_iter().map(Into::into).collect(),
                         failed: messages.len(),
                         messages,
@@ -1096,10 +2528,13 @@ where
         };
         if let Some(plan) = compilation.plan.as_mut() {
             crate::step_snapshot::bind_plan_calls(plan, calls);
+            for task in &mut plan.tasks {
+                task.original_pin = original_pins.get(&task.tool_call_id).cloned();
+            }
         }
         let mut preflight_messages = Vec::with_capacity(compilation.rejected.len());
         for rejected in &compilation.rejected {
-            if !replays.contains_key(&rejected.tool_call_id) {
+            if !replays.contains_key(&rejected.tool_call_id) && !original_replays.contains_key(&rejected.tool_call_id) {
                 refused_before_dispatch.push((
                     rejected.tool_call_id.clone(),
                     format!(
@@ -1108,7 +2543,9 @@ where
                     ),
                 ));
             }
-            let message = if let Some(receipt) = replays.get(&rejected.tool_call_id) {
+            let message = if let Some(replay) = original_replays.get(&rejected.tool_call_id) {
+                crate::host::tool_outcome_message(replay.outcome.clone())
+            } else if let Some(receipt) = replays.get(&rejected.tool_call_id) {
                 let call = calls.iter().find(|call| call.id == rejected.tool_call_id)
                     .ok_or_else(|| RuntimeError::new("replayed rejection has no original call"))?;
                 self.prepare_replayed_tool_result(call, receipt).await?
@@ -1156,6 +2593,8 @@ where
             let failed = count_failed_tool_results(&messages);
             return Ok((
                 ToolBatchStepResult {
+                    orchestrated_search_coverage: Some(BTreeSet::new()),
+                    member_batches: Vec::new(),
                     refused_before_dispatch: refused_before_dispatch.into_iter().map(Into::into).collect(),
                     failed,
                     messages,
@@ -1172,6 +2611,15 @@ where
         // rather than letting it disappear the way mon6's objective_review did.
         let swallowed = unaccounted_calls(&pending, &plan, &compilation.rejected);
         for (call_id, tool_name) in &swallowed {
+            if let Some(replay) = original_replays.get(call_id) {
+                let message = crate::host::tool_outcome_message(replay.outcome.clone());
+                self.session.write().await.push_message(message.clone()).map_err(|error| RuntimeError::new(error.to_string()))?;
+                let sequence = self.session_head().await.message_count.wrapping_sub(1);
+                self.record_message_event(&message, sequence);
+                self.remember_tool_trace_from_message(&message);
+                preflight_messages.push(message);
+                continue;
+            }
             if let Some(receipt) = replays.get(call_id) {
                 let call = calls.iter().find(|call| call.id == *call_id)
                     .ok_or_else(|| RuntimeError::new("replayed dropped call has no original identity"))?;
@@ -1184,7 +2632,7 @@ where
                 preflight_messages.push(message);
                 continue;
             }
-            if !replays.contains_key(call_id) {
+            if !replays.contains_key(call_id) && !original_replays.contains_key(call_id) {
                 refused_before_dispatch.push((
                     call_id.clone(),
                     "compiler did not schedule this call".into(),
@@ -1236,27 +2684,50 @@ where
         let mut admission_plan = plan.clone();
         admission_plan
             .tasks
-            .retain(|task| !replays.contains_key(&task.tool_call_id));
+            .retain(|task| !replays.contains_key(&task.tool_call_id) && !original_replays.contains_key(&task.tool_call_id));
         let decision = self
             .active_turn_strategy()
             .map(|state| state.decision)
             .ok_or_else(|| RuntimeError::new("tool batch has no admitted turn identity"))?;
         self.tool_executor.bind_execution_decision(decision.clone());
-        let mut validation = admission_plan.validate_against_execution_decision(&decision);
-        if validation.allowed {
-            self.satisfy_tool_strategy_gates(&decision, &admission_plan, &mut validation, prompter)
-                .await;
-        }
+        let validation = admission_plan.validate_against_execution_decision(&decision);
         self.record_tool_strategy_validation(&validation, self.session_head().await.message_count);
         let mut max_concurrency_observed = 0;
         let mut parallel_batches = 0;
+        let mut orchestrated_search_coverage = Some(BTreeSet::new());
         let mut messages = refusal_messages;
         messages.extend(preflight_messages);
         let preflight_refusals = Mutex::new(Vec::new());
         if validation.allowed {
+            if !replays.is_empty() {
+                if let (Some(ticket), Some(scope_state), Some(services)) = (ticket, scope_state, scope_services) {
+                    let state = scope_state.lock().await;
+                    if state.has_evaluation_scope() {
+                        let policy = self.permission_policy.execution_policy_control().snapshot();
+                        for call in calls.iter().filter(|call| replays.contains_key(&call.id)) {
+                            let task = plan.tasks.iter().find(|task| task.tool_call_id == call.id)
+                                .ok_or_else(|| RuntimeError::new("precompleted scope requires its original compiled call"))?;
+                            let parent = self.governed_effect_parent(task, &call.input)?;
+                            let request = self.governed_tool_request(task, &plan.plan_id, plan.revision,
+                                iteration, &call.input, None, policy.sandbox_posture, policy.revision, parent.as_ref())?;
+                            let effect = self.prepare_call_effect_evidence(ticket, &request)?;
+                            match state.evaluate_scope_refusal(ticket, &request, services, &effect) {
+                                Ok(None) => {}
+                                Ok(Some(_)) => return Err(RuntimeError::new("precompleted call exceeds its current evaluation scope")),
+                                Err(error) => return Err(RuntimeError::new(format!("precompleted call scope unresolved: {error}"))),
+                            }
+                        }
+                    }
+                }
+            }
             self.record_tool_schedule(&plan, &requests, self.session_head().await.message_count);
             let mut precompleted = BTreeMap::new();
             for call in calls {
+                if let Some(replay) = original_replays.get(&call.id) {
+                    let message = crate::host::tool_outcome_message(replay.outcome.clone());
+                    precompleted.insert(call.id.clone(), self.collect_tool_result_message(message).1);
+                    continue;
+                }
                 if let Some(receipt) = replays.get(&call.id) {
                     let message = self.prepare_replayed_tool_result(call, receipt).await?;
                     precompleted
@@ -1275,20 +2746,140 @@ where
             let ticket_context = TicketToolContext {
                 inner: &context,
                 owner,
+                ticket,
+                calls,
+                scope_state,
+                services: scope_services,
+                commit_service,
+                scope_facts: Mutex::new(HashMap::new()),
+                packet_scope_facts: Mutex::new(HashMap::new()),
+                bounded_acquisition_facts: Mutex::new(HashMap::new()),
+                policy_refusals: Mutex::new(HashMap::new()),
+                unknown_effects: Mutex::new(HashMap::new()),
+                member_progress: Mutex::new(HashMap::new()),
+                admission_plan: &admission_plan,
+                decision: &decision,
                 preflight_refusals: &preflight_refusals,
+                evaluation_scope_rejections,
             };
             let report = GovernedToolExecutor.execute(&plan, &ticket_context).await;
+            {
+                let progress = ticket_context.member_progress.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                for call in calls.iter().filter(|call| call.name.eq_ignore_ascii_case("tool_orchestrate")) {
+                    let keys = report.outcomes.iter().find(|outcome| outcome.task_id == call.id).and_then(|outcome| {
+                        if !matches!(&outcome.terminal, GovernedToolTaskTerminal::Succeeded(_))
+                            || outcome.terminal_commit_error.is_some() || outcome.receipt.is_none() { return None; }
+                        let request = progress.get(&outcome.task_id)?.lock().ok()?.clone()?;
+                        let auth = request.authorization.as_ref()?;
+                        let invocation = request.compiled_invocation.as_ref()?;
+                        // Executor-owned paths need their own original durable receipt.
+                        if self.executor_owns_governed_effect(&request.tool_name, &invocation.effect) { return None; }
+                        crate::host::original_orchestrated_search_coverage(&request, auth, invocation)
+                    });
+                    match (&mut orchestrated_search_coverage, keys) {
+                        (Some(current), Some(keys)) => current.extend(keys),
+                        _ => { orchestrated_search_coverage = None; break; }
+                    }
+                }
+            }
+            {
+                let progress = ticket_context.member_progress.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                for call in calls {
+                    if let Some(request) = progress.get(&call.id).and_then(|slot|
+                        slot.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone()) {
+                        if request.tool_name == "tool_orchestrate" { continue; }
+                        let carrier = crate::tool_host::OriginalMemberCallCarrier::from_original_request(request);
+                        let cause = ticket_context.unknown_effects.lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .get(&call.id).and_then(|error| error.pending_agent_batch().cloned());
+                        if !carrier.outcomes().is_empty() || carrier.original_request().tool_progress.has_original_member_stop() || cause.is_some() {
+                            let original = crate::PendingAgentBatch::new(
+                                crate::PendingAgentBatchValue::OriginalCall(Arc::new(carrier)));
+                            member_batches.push((call.id.clone(), crate::PendingAgentBatch::with_cause(original, cause)));
+                        }
+                    }
+                }
+            }
             max_concurrency_observed = report.max_active;
             parallel_batches = usize::from(report.max_active > 1);
-            for outcome in report.outcomes {
-                let Some((message, _)) = outcome.receipt else {
-                    return Err(RuntimeError::new(format!(
-                        "governed tool task `{}` reached terminal state without a durable result receipt",
-                        outcome.task_id
-                    )));
+            let unknown_effects = ticket_context.unknown_effects.into_inner()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut unknown_in_order = Vec::new();
+            let mut unresolved = Vec::new();
+            for (_trace_index, outcome) in report.outcomes.into_iter().enumerate() {
+                #[cfg(any(test, feature = "test-fixtures"))]
+                if _trace_index < 32 && std::env::var_os("COWD_R622_TRACE").is_some() {
+                    let disposition = match &outcome.terminal {
+                        GovernedToolTaskTerminal::Succeeded(_) => "succeeded",
+                        GovernedToolTaskTerminal::FailedOutput { .. } => "failed_output",
+                        GovernedToolTaskTerminal::Failed { .. } => "failed",
+                        GovernedToolTaskTerminal::Refused { .. } => "refused",
+                        GovernedToolTaskTerminal::Blocked { .. } => "blocked",
+                        GovernedToolTaskTerminal::Cancelled { .. } => "cancelled",
+                        GovernedToolTaskTerminal::Panicked { .. } => "panicked",
+                    };
+                    let predecessor = match &outcome.terminal { GovernedToolTaskTerminal::Blocked { predecessor_id, .. } => Some(predecessor_id.as_str()), _ => None };
+            crate::execution_core::graph::k05_trace_emit(format!("r622_toolbatch phase=terminal_disposition owner=ticket graph={:?} node={:?} attempt={:?} call={:?} disposition={} predecessor={:?} terminal_receipt={} terminal_commit_error={}",
+                        ticket.map(|t| t.graph_id.chars().take(64).collect::<String>()), ticket.map(|t| t.node_id.chars().take(64).collect::<String>()), ticket.map(|t| t.attempt),
+                        outcome.task_id.chars().take(64).collect::<String>(), disposition, predecessor.map(|id| id.chars().take(64).collect::<String>()), outcome.receipt.is_some(), outcome.terminal_commit_error.is_some()));
+                }
+                let terminal_detail = crate::governed_tool_executor::terminal_reason(&outcome.terminal);
+                let Some(TicketToolReceipt { output: (message, _), .. }) = outcome.receipt else {
+                    if let Some(unknown) = unknown_effects.get(&outcome.task_id) {
+                        unknown_in_order.push((outcome.task_id.clone(), unknown.clone()));
+                        unresolved.push(crate::conversation::ToolBatchUnresolved::Unknown { call_id: outcome.task_id.clone(), detail: unknown.to_string(), terminal_detail: terminal_detail.clone(), commit_error: outcome.terminal_commit_error.clone() });
+                        continue;
+                    }
+                    unresolved.push(crate::conversation::ToolBatchUnresolved::MissingReceipt { call_id: outcome.task_id.clone(), terminal_detail: terminal_detail.clone(), commit_error: outcome.terminal_commit_error.clone() });
+                    continue;
                 };
                 self.remember_tool_trace_from_message(&message);
                 messages.push(message);
+            }
+            if !unknown_in_order.is_empty() {
+                if let Some(ticket) = ticket {
+                    for (call, error) in &unknown_in_order {
+                        if let Some(pending) = error.original_packet_scope_pending(ticket) {
+                            member_batches.push((call.clone(), pending));
+                        }
+                        if error.original_bounded_acquisition_failure().is_some() {
+                            if let Some(pending) = error.pending_agent_batch() {
+                                member_batches.push((call.clone(), pending.clone()));
+                            }
+                        }
+                    }
+                }
+                let members = unknown_in_order.iter().filter_map(|(call, error)|
+                    error.pending_agent_batch().cloned().map(|pending| (call.clone(), pending)))
+                    .collect::<Vec<_>>();
+                let pending = (!members.is_empty()).then(|| crate::PendingAgentBatch::new(
+                    crate::PendingAgentBatchValue::Calls(members),
+                ));
+                let mut errors = unknown_in_order.into_iter();
+                let (first_call, first) = errors.next().expect("unknown list is nonempty");
+                let mut unknown = first.with_unresolved_context(
+                    format!("original unresolved call {first_call}"), pending,
+                );
+                for (call, error) in errors {
+                    unknown = unknown.with_unresolved_cause(&format!("call {call}"), error, None);
+                }
+                // Successful siblings already passed the original consumer;
+                // verify its durable facts before the parent drops its buffer.
+                if let Err(error) = self.verify_completed_sibling_prefix(calls, &messages, None) {
+                    return Err(RuntimeError::from_tool_effect_unknown(unknown.with_unresolved_cause(
+                        "completed sibling retention", ToolError::new(error.to_string()), None,
+                    )).with_partial_tool_batch(crate::conversation::PartialToolBatch { member_batches, messages, unresolved }));
+                }
+                return Err(RuntimeError::from_tool_effect_unknown(unknown).with_partial_tool_batch(
+                    crate::conversation::PartialToolBatch { member_batches, messages, unresolved },
+                ));
+            }
+            if !unresolved.is_empty() {
+                let details = serde_json::to_string(&unresolved)
+                    .map_err(|error| RuntimeError::new(format!("encode missing durable receipts failed: {error}")))?;
+                return Err(RuntimeError::new(format!(
+                    "governed tool tasks reached terminal state without durable result receipts: {details}"
+                )));
             }
         } else {
             let reason = format!(
@@ -1297,10 +2888,12 @@ where
                 validation.findings.join(", ")
             );
             for call in calls {
-                if !replays.contains_key(&call.id) {
+                if !replays.contains_key(&call.id) && !original_replays.contains_key(&call.id) {
                     refused_before_dispatch.push((call.id.clone(), reason.clone()));
                 }
-                let message = if let Some(receipt) = replays.get(&call.id) {
+                let message = if let Some(replay) = original_replays.get(&call.id) {
+                    crate::host::tool_outcome_message(replay.outcome.clone())
+                } else if let Some(receipt) = replays.get(&call.id) {
                     self.prepare_replayed_tool_result(call, receipt).await?
                 } else {
                     ConversationMessage::tool_result(call.id.clone(), call.name.clone(), reason.clone(), true)
@@ -1324,6 +2917,8 @@ where
         let failed = count_failed_tool_results(&messages);
         Ok((
             ToolBatchStepResult {
+                orchestrated_search_coverage,
+                member_batches,
                 refused_before_dispatch: refused_before_dispatch.into_iter().map(Into::into).collect(),
                 messages,
                 failed,
@@ -1354,6 +2949,9 @@ where
         max_tool_concurrency_observed: usize,
         parallel_tool_batches: usize,
         terminal_completion: harness_contract::goal::GoalCompletion,
+        obligation_ledger: Option<
+            crate::execution_core::business_conclusion::ObligationLedgerFact,
+        >,
         defer_post_turn_memory_maintenance: bool,
         recovered_telemetry: Option<crate::RunModelTelemetry>,
     ) -> Result<TurnSummary, RuntimeError> {
@@ -1368,15 +2966,12 @@ where
         if final_answer.trim().is_empty() {
             return Err(RuntimeError::new("model produced an empty final answer"));
         }
-        if self.active_turn_strategy().is_none() {
-            return Err(RuntimeError::new(
-                "turn finalization requires the Host-admitted turn strategy owner",
-            ));
-        }
         let decision = self
             .active_turn_strategy()
             .map(|state| state.decision)
-            .ok_or_else(|| RuntimeError::new("turn finalization has no strategy owner"))?;
+            .ok_or_else(|| RuntimeError::new(
+                "turn finalization requires the Host-admitted turn strategy owner",
+            ))?;
         let mut kernel = RuntimeAiKernel::begin_turn_with_execution_decision(
             self.session_id().to_string(),
             user_input.to_string(),
@@ -1498,10 +3093,12 @@ where
             ai_kernel_trace,
             context_turn_report,
             model_observations: self.turn_model_observations(),
+            early_tool_receipts: self.take_turn_early_tool_receipts(),
             duplicate_tool_calls,
             write_attempt_paths,
             max_tool_concurrency_observed,
             parallel_tool_batches,
+            obligation_ledger,
         };
         self.record_turn_completed(&summary);
         self.record_ai_kernel_trace_event(
@@ -1556,6 +3153,7 @@ where
         Ok(summary)
     }
 
+    #[cfg(test)]
     pub(super) async fn satisfy_tool_strategy_gates(
         &self,
         execution_decision: &crate::execution_core::RuntimeExecutionDecision,
@@ -1563,12 +3161,65 @@ where
         validation: &mut GovernedToolPolicyValidationReport,
         prompter: &crate::permissions::SharedPrompter,
     ) {
+        self.satisfy_tool_strategy_gates_for_call(execution_decision, admission_plan, validation, prompter, None).await;
+    }
+
+    pub(crate) async fn satisfy_original_call_strategy_gate(
+        &self,
+        task: &crate::GovernedToolPlanTask,
+        admission_plan: &crate::GovernedToolPlan,
+        decision: &crate::execution_core::RuntimeExecutionDecision,
+        prompter: &crate::permissions::SharedPrompter,
+        ticket: Option<&crate::execution_core::NodeExecutionTicket>,
+        owner: Option<&(harness_contract::projection::RuntimeActivityBinding, u32)>,
+    ) -> Result<(), String> {
+        let mut call_plan = admission_plan.clone();
+        call_plan.tasks.retain(|candidate| candidate.tool_call_id == task.tool_call_id);
+        if call_plan.tasks.len() != 1 {
+            return Err("checkpoint original call missing or ambiguous".into());
+        }
+        let mut validation = call_plan.validate_against_execution_decision(decision);
+        if validation.allowed && validation.requires_checkpoint {
+            let identity = checkpoint_call_identity(ticket, owner, &admission_plan.plan_id,
+                admission_plan.revision, task)
+                .map_err(|error| format!("checkpoint original call identity: {error}"))?;
+            self.satisfy_tool_strategy_gates_for_call(decision, &call_plan, &mut validation,
+                prompter, Some(&identity)).await;
+            self.record_tool_strategy_validation(&validation, self.session_head().await.message_count);
+        }
+        if validation.allowed { Ok(()) }
+        else { Err(format!("tool checkpoint or strategy gate failed: {}", validation.findings.join(", "))) }
+    }
+
+    async fn satisfy_tool_strategy_gates_for_call(
+        &self,
+        execution_decision: &crate::execution_core::RuntimeExecutionDecision,
+        admission_plan: &crate::GovernedToolPlan,
+        validation: &mut GovernedToolPolicyValidationReport,
+        prompter: &crate::permissions::SharedPrompter,
+        original_call_id: Option<&str>,
+    ) {
         // `requires_approval` is a scheduling signal only. Authorization is
         // deliberately resolved per concrete Tool effect below; a batch-level
         // boolean can never authorize sibling calls with different hashes.
 
         if !validation.requires_checkpoint {
             return;
+        }
+        // Evaluation output is already an isolated `.cowd/evaluation/<hash>`
+        // lease. A workspace checkpoint cannot add protection there, and the
+        // agent's scoped lease has no checkpoint authorization signature.
+        if let Ok(paths) = checkpoint_paths_for_admission(
+            admission_plan,
+            self.tool_executor.pin_step_catalog(),
+        ) {
+            if !paths.is_empty()
+                && paths.iter().all(|path| {
+                    crate::tool_host::is_bounded_evaluation_output_path(std::path::Path::new(path))
+                })
+            {
+                return;
+            }
         }
         if !self.tool_executor.has_tool("checkpoint") {
             validation.allowed = false;
@@ -1591,11 +3242,15 @@ where
                 return;
             }
         };
+        let checkpoint_identity = original_call_id.map_or_else(
+            || execution_decision.lease.lease_id.clone(),
+            |call_id| format!("{}:{}:{call_id}", execution_decision.lease.lease_id.len(), execution_decision.lease.lease_id),
+        );
         let checkpoint_input = serde_json::json!({
             "action": "create",
             "label": format!(
                 "runtime strategy lease {} before high-risk mutation",
-                execution_decision.lease.lease_id
+                checkpoint_identity
             ),
             "paths": paths
         })
@@ -1614,7 +3269,7 @@ where
         let binding = match self.bind_system_tool_call(
             "checkpoint",
             &checkpoint_value,
-            &format!("strategy:{}", execution_decision.lease.lease_id),
+            &format!("strategy:{checkpoint_identity}"),
         ) {
             Ok(binding) => binding,
             Err(error) => {
@@ -1645,7 +3300,7 @@ where
                 format!(
                     "{}:checkpoint:{}",
                     self.session_id().to_string(),
-                    execution_decision.lease.lease_id
+                    checkpoint_identity
                 ),
                 PermissionContext::default(),
                 timeout.as_secs(),
@@ -1733,6 +3388,7 @@ where
         root: Option<&crate::CowdExecutionContext>,
         owner: Option<&(harness_contract::projection::RuntimeActivityBinding, u32)>,
         executor_owns_admission: bool,
+        original_ticket: Option<&crate::execution_core::NodeExecutionTicket>,
         execute: Operation,
     ) -> Result<harness_contract::context::ToolOutputDraft, ToolError>
     where
@@ -1748,9 +3404,62 @@ where
         }
         if let Some(outcome) = commit
             .completed_tool_effect(request, descriptor)
-            .map_err(|error| ToolError::new(error.to_string()))?
+            .map_err(|error| ToolError::unknown(format!("original effect history unavailable: {error}")))?
         {
+            if harness_contract::agent_action::AGENT_ACTION_TOOL_IDS.contains(&request.tool_name.as_str()) {
+                return Err(ToolError::unknown("original Ticket action receipt requires pre-grant replay authentication"));
+            }
             return replay_tool_output(crate::bound_tool_batch::retained_replay_outcome(outcome));
+        }
+        if request.step_binding.is_none() {
+            let original = request.tool_progress.original_governed_hook().map_err(ToolError::new)?
+                .ok_or_else(|| ToolError::new("original unbound call owner missing"))?;
+            if original.original_pinned_lease().is_none() {
+                let native = original.original_authorized_native(request).map_err(ToolError::unknown)?;
+                let executor: Arc<dyn crate::ToolExecutor> = self.tool_executor.clone();
+                if !Arc::ptr_eq(&native, &executor) {
+                    return Err(ToolError::new("original native executor changed"));
+                }
+                if descriptor.spawns_process {
+                    return Err(ToolError::new("native executor has no original physical closure for this effect"));
+                }
+                let resolver = crate::path_identity::WorkspacePathIdentityResolver::discover(&self.governed_workspace_root().map_err(|error| ToolError::new(error.to_string()))?)
+                    .map_err(|error| ToolError::new(error.to_string()))?;
+                let (requests, identities) = crate::bound_tool_batch::bound_effect_lock_requests(&resolver, descriptor)?;
+                let mut physical = Vec::with_capacity(identities.len());
+                for (_, identity) in &identities {
+                    physical.push(resolver.physical_file_identity_at_admission(identity).map_err(|error| ToolError::new(error.to_string()))?);
+                }
+                let _locks = self.tool_execution_plane.scope_locks().acquire(requests, None).await
+                    .map_err(|error| ToolError::new(error.to_string()))?;
+                for ((_, identity), expected) in identities.iter().zip(physical) {
+                    if resolver.physical_file_identity_at_admission(identity).map_err(|error| ToolError::new(error.to_string()))? != expected {
+                        return Err(ToolError::new("native original path identity changed"));
+                    }
+                }
+                self.verify_session_execution_fence(crate::SessionExecutionFencePhase::ToolExecution).await.map_err(|error| ToolError::new(error.to_string()))?;
+                match commit.begin_tool_effect(request, descriptor).map_err(|error| ToolError::new(error.to_string()))? {
+                    crate::execution_core::graph::ToolEffectState::Completed(outcome) => return replay_tool_output(crate::bound_tool_batch::retained_replay_outcome(outcome)),
+                    crate::execution_core::graph::ToolEffectState::Uncertain => return Err(ToolError::unknown("native effect outcome is unknown")),
+                    crate::execution_core::graph::ToolEffectState::Fresh | crate::execution_core::graph::ToolEffectState::NotRequired => (),
+                }
+                let execution = execute().await;
+                if execution.as_ref().err().is_some_and(ToolError::is_unknown) { return execution; }
+                self.verify_session_execution_fence(crate::SessionExecutionFencePhase::ToolCommit).await.map_err(|error| ToolError::new(error.to_string()))?;
+                let outcome = crate::RuntimeToolExecutionOutcome {
+                    pending_agent_batch: None, tool_use_id: request.tool_use_id.clone(), tool_name: request.tool_name.clone(),
+                    status: if execution.is_ok() { crate::RuntimeToolExecutionStatus::Executed } else { crate::RuntimeToolExecutionStatus::Failed },
+                    category: request.category, output: execution.as_ref().ok().map(|value| value.model_text().to_string()),
+                    error: execution.as_ref().err().map(ToString::to_string), evidence_ref: format!("tool-effect:{}", request.idempotency_key),
+                    observed_evidence: execution.as_ref().ok().map(|value| value.observations().to_vec()).unwrap_or_default(),
+                };
+                if descriptor.effect_kind == harness_contract::tool::ToolEffectKind::Read {
+                    commit.commit_readonly_tool_receipts(&[(request.clone(), outcome)]).map_err(|error| ToolError::new(error.to_string()))?;
+                } else {
+                    commit.commit_tool_effect(request, descriptor, &outcome).map_err(|error| ToolError::new(error.to_string()))?;
+                }
+                return execution;
+            }
         }
         if let Some(root) = root {
             #[cfg(test)]
@@ -1780,15 +3489,19 @@ where
             }
             error
         };
-        if request.tool_name == "execute_code" {
-            let lease = self.tool_executor.bounded_process_lease(request)?;
-            let authority = self.tool_executor.bounded_process_authority(request)?;
-            let plane = self
-                .tool_executor
-                .bounded_process_plane()
-                .ok_or_else(|| ToolError::new("bounded process plane unsupported"))?;
+        if tools::tool_orchestrator::effect_is_bounded_read_only_compute(descriptor)
+            || request.tool_name == "execute_code" {
+            let preserve = |stage, error| crate::bound_tool_batch::original_bounded_acquisition_failure(request, commit, stage, error);
+            let lease = self.tool_executor.bounded_process_lease(request)
+                .map_err(|error| preserve(crate::bound_tool_batch::BoundedAcquisitionStage::Lease, error))?;
+            let authority = self.tool_executor.bounded_process_authority(request)
+                .map_err(|error| preserve(crate::bound_tool_batch::BoundedAcquisitionStage::Authority, error))?;
+            let plane = self.tool_executor.bounded_process_plane().ok_or_else(||
+                preserve(crate::bound_tool_batch::BoundedAcquisitionStage::Plane,
+                    ToolError::new("bounded process plane unsupported")))?;
             if !Arc::ptr_eq(plane.scope_locks(), self.tool_execution_plane.scope_locks()) {
-                return Err(ToolError::new("bounded root canonical manager mismatch"));
+                return Err(preserve(crate::bound_tool_batch::BoundedAcquisitionStage::Plane,
+                    ToolError::new("bounded root canonical manager mismatch")));
             }
             let outcome = crate::bound_tool_batch::execute_bounded_process_owned(
                 lease,
@@ -1813,7 +3526,7 @@ where
         let locked = lock_root_effect_scope(
             request,
             descriptor,
-            self.tool_executor.pin_step_catalog(),
+            if request.step_binding.is_some() { self.tool_executor.pin_step_catalog() } else { None },
             self.tool_execution_plane.scope_locks(),
             executor_owns_admission,
         )
@@ -1853,14 +3566,17 @@ where
         .map_err(|error| retain_refusal(ToolError::new(error.to_string())))?;
         #[cfg(test)]
         if std::env::var_os("COWD_R622_TRACE").is_some() && request.tool_name == "tool_search" { eprintln!("r622_toolbatch phase=effect_intent_done call={}", request.tool_use_id); }
-        match state {
+        match &state {
             crate::execution_core::graph::ToolEffectState::Completed(outcome) => {
+                if harness_contract::agent_action::AGENT_ACTION_TOOL_IDS.contains(&request.tool_name.as_str()) {
+                    return Err(ToolError::unknown("original Ticket action receipt requires pre-grant replay authentication"));
+                }
                 return replay_tool_output(crate::bound_tool_batch::retained_replay_outcome(
-                    outcome,
+                    outcome.clone(),
                 ))
             }
             crate::execution_core::graph::ToolEffectState::Uncertain => {
-                return Err(ToolError::new(
+                return Err(ToolError::unknown(
                     "tool effect is uncertain; non-idempotent execution was not replayed",
                 ))
             }
@@ -1877,18 +3593,75 @@ where
             .map_err(|error| ToolError::new(error.to_string()))?;
         #[cfg(test)]
         if std::env::var_os("COWD_R622_TRACE").is_some() && request.tool_name == "tool_search" { eprintln!("r622_toolbatch phase=effect_dispatch_enter call={}", request.tool_use_id); }
-        let execution = execute().await;
+        let read_ref_action = request.tool_name == "read_ref" && current_original_single_capture()
+            .is_some_and(|capture| capture.read_ref_target().is_ok_and(|target| target.is_some()));
+        let execution = if root.is_some() && (read_ref_action || harness_contract::agent_action::AGENT_ACTION_TOOL_IDS.contains(&request.tool_name.as_str())) {
+            let ticket = original_ticket.ok_or_else(|| ToolError::new("unknown: original root ticket unavailable"))?;
+            let capture = TICKET_ORIGINAL_SINGLE_CAPTURE.try_with(Arc::clone)
+                .map_err(|_| ToolError::unknown("original Ticket single-call producer unavailable"))?;
+            let policy_owner = capture.owner().ok_or_else(|| ToolError::unknown("original Ticket policy owner unavailable"))?;
+            let issuer = self.owned_root_action_issuer(policy_owner);
+            issuer.verify_live().await?;
+            match issuer.with_verified_root_action(ticket, request, descriptor, &locked, &state, &capture, |capability| async move {
+                self.tool_executor.execute_root_action_with_invocation(request, &capability).await
+            }).await { Ok(result) => result, Err(error) => Err(error) }
+        } else {
+            execute().await
+        };
         #[cfg(test)]
         if std::env::var_os("COWD_R622_TRACE").is_some() && request.tool_name == "tool_search" { eprintln!("r622_toolbatch phase=effect_dispatch_done call={} ok={}", request.tool_use_id, execution.is_ok()); }
+        // Unknown is an unresolved original effect, not a failed terminal.
+        // Leave its original admission in flight for the owner to settle.
+        if let Err(error) = &execution {
+            if error.is_unknown() { return Err(error.clone()); }
+        }
         self.verify_session_execution_fence(crate::SessionExecutionFencePhase::ToolCommit)
             .await
             .map_err(|error| ToolError::new(error.to_string()))?;
+        // A delegated action's physical child has already settled the same
+        // original effect. Consume that receipt; never append a second one.
+        if root.is_none()
+            && request.parent_execution.is_some()
+            && harness_contract::agent_action::AGENT_ACTION_TOOL_IDS.contains(&request.tool_name.as_str())
+        {
+            // 033 S3 (settled vs unsettled): a delegated child that finished
+            // and was refused for a named reason produced a *settled*
+            // outcome - nothing is in flight and nothing will arrive later.
+            // Reporting it as an unsettled receipt marked the effect unknown,
+            // and an unknown member blocks the whole tool batch: the graph
+            // produced no terminal turn result, the review attempt was
+            // charged to the model, and three attempts later the task was
+            // blocked for a structural fault nobody could read. Only an
+            // effect that is still unknown may be reported as unsettled.
+            let output = execution.as_ref().map_err(delegated_child_outcome_error)?;
+            // A Read-family action's child settles a read receipt, never an
+            // effect receipt; consuming the right durable pair is what keeps
+            // the member's Read action terminal instead of unknown.
+            let receipt = if descriptor.effect_kind == harness_contract::tool::ToolEffectKind::Read {
+                commit.completed_original_delegated_read_action(request, descriptor)
+                    .map_err(|error| ToolError::unknown(error.to_string()))?
+            } else {
+                commit.completed_original_delegated_action(request, descriptor)
+                    .map_err(|error| ToolError::unknown(error.to_string()))?
+            };
+            if receipt.status != crate::RuntimeToolExecutionStatus::Executed
+                || receipt.output.as_deref() != Some(output.model_text())
+            {
+                return Err(ToolError::unknown("original delegated child result differs from receipt"));
+            }
+            return execution;
+        }
         let output = execution
             .as_ref()
             .ok()
             .map(|output| output.model_text().to_string());
         let error = execution.as_ref().err().map(ToString::to_string);
-        let mut outcome = crate::RuntimeToolExecutionOutcome {
+        let pending_agent_batch = (!request.tool_progress.original_members().is_empty()
+            || request.tool_progress.has_original_member_stop())
+            .then(|| crate::PendingAgentBatch::new(
+                crate::PendingAgentBatchValue::RecordedSink(request.tool_progress.clone()),
+            ));
+        let mut outcome = crate::RuntimeToolExecutionOutcome { pending_agent_batch,
             tool_use_id: request.tool_use_id.clone(),
             tool_name: request.tool_name.clone(),
             status: if execution.is_ok() {
@@ -1935,14 +3708,10 @@ where
         if descriptor.effect_kind == harness_contract::tool::ToolEffectKind::Read {
             if let Some(children) = execution.as_ref().ok().and_then(|draft| match draft {
                 harness_contract::context::ToolOutputDraft::InProcess { evidence, .. } =>
-                    evidence.downcast_ref::<Vec<tools::OrchestratedRead>>().map(Vec::as_slice),
+                    evidence.downcast_ref::<tools::OrchestratedChildren>(),
                 _ => None,
             }) {
-                match request.tool_progress.child_reads().map_err(ToolError::new)? {
-                    Some(existing) if existing.as_slice() != children => return Err(ToolError::new("conflicting child read channel")),
-                    Some(_) => {},
-                    None => request.tool_progress.record_child_reads(children.to_vec()).map_err(ToolError::new)?,
-                }
+                request.tool_progress.record_orchestrated_children(children).map_err(ToolError::new)?;
             }
         }
         let committed = if descriptor.effect_kind == harness_contract::tool::ToolEffectKind::Read {
@@ -2017,8 +3786,280 @@ where
             retained_admission,
             None,
             None,
+            None,
+            None,
+            None,
+            None,
         )
         .await
+    }
+
+    pub(crate) fn executor_owns_governed_effect(
+        &self,
+        tool_name: &str,
+        effect: &harness_contract::tool::ToolEffectDescriptor,
+    ) -> bool {
+        self.tool_executor.owns_durable_tool_effect(tool_name)
+            && !tools::tool_orchestrator::effect_is_bounded_read_only_compute(effect)
+    }
+
+    fn governed_effect_parent(
+        &self,
+        task: &crate::governed_tool_plan::GovernedToolPlanTask,
+        effective_input: &str,
+    ) -> Result<Option<(harness_contract::execution_graph::ExecutionParentBinding, u32)>, RuntimeError> {
+        let activity = self.cowd_bus.as_ref().and_then(|bus| bus.current_activity_binding());
+        let parent = if self.executor_owns_governed_effect(&task.tool_name, &task.effect)
+            && !crate::agentic::action_invocation::is_directory_read(&task.tool_name, effective_input) {
+            None
+        } else {
+            checked_delegated_effect_parent(
+                self.tool_executor.durable_tool_effect_parent(),
+                task.step_binding.as_ref().and_then(|binding| binding.snapshot.identity.run_ref.as_deref()),
+                self.execution_identity.as_ref(), activity.as_ref(), self.session_id(),
+            )?
+        };
+        if parent.is_some() && self.root_effect_context().is_some() {
+            return Err(RuntimeError::new("delegated tool effect cannot use root effect context"));
+        }
+        Ok(parent)
+    }
+
+    pub(crate) fn prepare_governed_hook(
+        &self,
+        task: &crate::governed_tool_plan::GovernedToolPlanTask,
+        input: &str,
+    ) -> Result<PreparedGovernedHook, RuntimeError> {
+        self.prepare_governed_hook_inner(task, input, false)
+    }
+
+    fn prepare_governed_hook_inner(
+        &self, task: &crate::governed_tool_plan::GovernedToolPlanTask,
+        input: &str, allow_bound_revalidation: bool,
+    ) -> Result<PreparedGovernedHook, RuntimeError> {
+        let tool_name = task.tool_name.as_str();
+        let (pre_hook_result, effective_input, model_delivery_requirement, mut permission_context) =
+            self.prepare_tool_call(tool_name, input);
+        let effective_value = harness_contract::step::parse_strict_json(&effective_input)
+            .map_err(|error| RuntimeError::new(error.to_string()))?;
+        if !allow_bound_revalidation && effective_value != task.invocation.intent.normalized_input {
+            return Err(RuntimeError::new("effective_input_requires_replan"));
+        }
+        if pre_hook_result.is_cancelled() {
+            permission_context = PermissionContext::new(
+                Some(crate::permissions::PermissionOverride::Deny),
+                Some(format!("PreToolUse hook cancelled tool `{tool_name}`")),
+            );
+        } else if pre_hook_result.is_failed() {
+            let hook_msgs = pre_hook_result.messages().join("; ");
+            permission_context = PermissionContext::new(
+                Some(crate::permissions::PermissionOverride::Deny),
+                Some(if hook_msgs.is_empty() { format!("PreToolUse hook failed for tool `{tool_name}`") } else { format!("PreToolUse hook failed for tool `{tool_name}`: {hook_msgs}") }),
+            );
+        } else if pre_hook_result.is_denied() {
+            permission_context = PermissionContext::new(
+                Some(crate::permissions::PermissionOverride::Deny),
+                Some(format!("PreToolUse hook denied tool `{tool_name}`")),
+            );
+        }
+        let profile_timeout = Duration::from_secs(task.safety_category.default_timeout_secs());
+        let tool_timeout = self.tool_timeout.map_or(profile_timeout, |timeout| timeout.min(profile_timeout));
+        Ok(PreparedGovernedHook { pre_hook_result, effective_input, model_delivery_requirement, permission_context, tool_timeout })
+    }
+
+    pub(crate) fn bind_original_governed_hook(
+        &self, ticket: &crate::execution_core::NodeExecutionTicket,
+        task: &crate::governed_tool_plan::GovernedToolPlanTask, model: &str,
+        hook: &PreparedGovernedHook, request: &mut crate::RuntimeToolExecutionRequest,
+        plan_id: &str, plan_revision: u64,
+    ) -> Result<(), RuntimeError> {
+        let pinned = task.original_pin.as_ref().ok_or_else(|| RuntimeError::new("original compiled catalogue unavailable"))?;
+        if plan_id.is_empty() || plan_revision == 0 || request.governed_plan_id != plan_id
+            || request.governed_plan_revision != plan_revision || request.session_id.as_deref() != Some(self.session_id()) {
+            return Err(RuntimeError::new("original plan or Session differs"));
+        }
+        if task.step_binding.is_none()
+            && !unbound_ticket_parent_matches(
+                ticket,
+                request.parent_execution.as_ref(),
+                request.parent_execution_attempt,
+            )
+        {
+            return Err(RuntimeError::new("original unbound ticket parent differs"));
+        }
+        if pinned.invocation().invocation_id != task.tool_call_id {
+            return Err(RuntimeError::new("original pinned invocation differs"));
+        }
+        let original_executor: Arc<dyn crate::ToolExecutor> = self.tool_executor.clone();
+        if pinned.executor().is_none_or(|owner| !Arc::ptr_eq(&owner, &original_executor)) {
+            return Err(RuntimeError::new("original tool executor differs from plan"));
+        }
+        let model_input = harness_contract::step::parse_strict_json(model).map_err(|error| RuntimeError::new(error.to_string()))?;
+        let effective_input = harness_contract::step::parse_strict_json(&hook.effective_input).map_err(|error| RuntimeError::new(error.to_string()))?;
+        if model_input != task.invocation.intent.normalized_input {
+            return Err(RuntimeError::new("original hook model input differs from plan"));
+        }
+        let mut invocation = if let Some(lease) = pinned.lease() {
+            if let Some(binding) = task.step_binding.as_ref() {
+                let step = binding.resolve(Some(lease.as_ref().clone()))?;
+                let now = chrono::Utc::now().timestamp_millis();
+                if step.validate_call(&binding.origin, self.session_id(), &task.tool_call_id, &task.tool_name, model, now)? != model_input
+                    || step.validate_call(&binding.origin, self.session_id(), &task.tool_call_id, &task.tool_name, &hook.effective_input, now)? != effective_input {
+                    return Err(RuntimeError::new("original Step input differs"));
+                }
+            } else {
+                if task.tool_name == "agent_action_batch" || harness_contract::agent_action::AGENT_ACTION_TOOL_IDS.contains(&task.tool_name.as_str()) {
+                    return Err(RuntimeError::new("original action Step binding missing"));
+                }
+                lease.validate_input(&task.tool_name, &model_input).map_err(|error| RuntimeError::new(error.to_string()))?;
+                lease.validate_input(&task.tool_name, &effective_input).map_err(|error| RuntimeError::new(error.to_string()))?;
+            }
+            if lease.describe_effect_resolution(&task.tool_name, &model_input) != lease.describe_effect_resolution(&task.tool_name, &effective_input) {
+                return Err(RuntimeError::new("effective_input_requires_replan"));
+            }
+            let mut result = lease.prepare_governed_invocation(&task.tool_call_id, &task.tool_name, &effective_input, &[]);
+            result.origin = task.step_binding.as_ref().map(|binding| binding.origin.clone());
+            result
+        } else {
+            if task.step_binding.is_some() || task.tool_name == "agent_action_batch" || harness_contract::agent_action::AGENT_ACTION_TOOL_IDS.contains(&task.tool_name.as_str()) {
+                return Err(RuntimeError::new("original action Step binding missing"));
+            }
+            let validated = original_executor.validate_tool_input(&task.tool_name, &hook.effective_input).map_err(|error| RuntimeError::new(error.to_string()))?;
+            if harness_contract::step::parse_strict_json(&validated).map_err(|error| RuntimeError::new(error.to_string()))? != effective_input {
+                return Err(RuntimeError::new("native hook input requires replan"));
+            }
+            if effective_input == model_input {
+                pinned.invocation().clone()
+            } else {
+                let original_request = crate::tool_dispatch::ToolRequest { tool_use_id: task.tool_call_id.clone(), tool_name: task.tool_name.clone(), input: hook.effective_input.clone(), depends_on: Vec::new() };
+                let mut derived = original_executor.prepare_governed_invocations(std::slice::from_ref(&original_request));
+                if derived.len() != 1 { return Err(RuntimeError::new("native effect owner unavailable")); }
+                derived.remove(0)
+            }
+        };
+        invocation.explicit_dependencies = task.invocation.explicit_dependencies.clone();
+        invocation.compiled_dependencies = task.invocation.compiled_dependencies.clone();
+        let mut expected = task.invocation.clone();
+        expected.intent.normalized_input = effective_input.clone();
+        if invocation != expected || task.effect != invocation.effect {
+            return Err(RuntimeError::new("effective_input_requires_replan"));
+        }
+        request.compiled_invocation = Some(invocation.clone());
+        request.tool_progress.install_original_governed_hook(Arc::new(OriginalGovernedHook {
+            ticket: ticket.clone(), step: task.step_binding.clone(), pinned: Arc::clone(pinned),
+            authorization: std::sync::OnceLock::new(), plan_id: plan_id.to_string(), plan_revision,
+            session_id: self.session_id().to_string(), parent: request.parent_execution.clone(),
+            attempt: request.parent_execution_attempt, model_input, effective_input, invocation,
+        })).map_err(RuntimeError::new)?;
+        Ok(())
+    }
+
+    // Prepare hook, input and policy once, so an eventual pre-dispatch owner
+    // decision can hand the exact result to execution without rerunning hooks.
+    async fn prepare_governed_tool_call(
+        &self,
+        task: &crate::governed_tool_plan::GovernedToolPlanTask,
+        plan_id: &str,
+        plan_revision: u64,
+        input: &str,
+        prompter: &crate::permissions::SharedPrompter,
+        iterations: usize,
+        ticket: Option<&crate::execution_core::NodeExecutionTicket>,
+        hook: Option<PreparedGovernedHook>,
+        prepared_effect: Option<PreparedCallEffect>,
+        original_request: Option<crate::RuntimeToolExecutionRequest>,
+    ) -> Result<PreparedGovernedToolCall, RuntimeError> {
+        let PreparedGovernedHook { pre_hook_result, effective_input, model_delivery_requirement, permission_context, tool_timeout } =
+            match hook { Some(hook) => hook, None => self.prepare_governed_hook(task, input)? };
+        let authorization_id = format!("{}:{plan_id}:{plan_revision}:{}:{iterations}", self.session_id(), task.tool_call_id);
+        let bound_request = if let Some(request) = original_request {
+            Some(request)
+        } else if ticket.is_some() {
+            return Err(RuntimeError::new("tool batch original prepared request is missing"));
+        } else { None };
+        let single_capture = if ticket.is_some() && (task.tool_name == "read_ref" || harness_contract::agent_action::AGENT_ACTION_TOOL_IDS.contains(&task.tool_name.as_str())) {
+            Some(Arc::new(OriginalSingleProducerCapture::default()))
+        } else { None };
+        let negotiate = async {
+            match (ticket, bound_request.as_ref()) {
+                (Some(ticket), Some(request)) if request.step_binding.is_some() => self.negotiate_tool_authorization_for_call(
+                    &task.effect, &effective_input, authorization_id, permission_context, tool_timeout.as_secs(), prompter,
+                    crate::execution_core::graph::CallRefusalOwner::Node(ticket), request, prepared_effect.as_ref(),
+                ).await,
+                _ => self.negotiate_tool_authorization(
+                    &task.effect, &effective_input, authorization_id, permission_context, tool_timeout.as_secs(), prompter,
+                ).await,
+            }
+        };
+        let authorization_decision = match &single_capture {
+            Some(capture) => Arc::clone(capture).scope(negotiate).await?,
+            None => negotiate.await?,
+        };
+        Ok(PreparedGovernedToolCall { single_capture, pre_hook_result, effective_input, model_delivery_requirement, tool_timeout, authorization_decision, bound_request })
+    }
+
+    // Both execution and a pre-dispatch decision must use the same original
+    // request identity. The caller supplies the real policy result and parent;
+    // neither is reconstructed from a receipt or error message.
+    #[allow(clippy::too_many_arguments)]
+    fn governed_tool_request(
+        &self,
+        task: &crate::governed_tool_plan::GovernedToolPlanTask,
+        plan_id: &str,
+        plan_revision: u64,
+        iterations: usize,
+        input: &str,
+        authorization: Option<harness_contract::tool::ToolExecutionAuthorization>,
+        sandbox_posture: harness_contract::policy::SandboxPosture,
+        policy_revision: u64,
+        effect_parent: Option<&(harness_contract::execution_graph::ExecutionParentBinding, u32)>,
+    ) -> Result<crate::RuntimeToolExecutionRequest, RuntimeError> {
+        let tool_use_id = task.tool_call_id.as_str();
+        let tool_name = task.tool_name.as_str();
+        let mut request = crate::RuntimeToolExecutionRequest {
+            compiled_invocation: Some(task.invocation.clone()),
+            step_binding: task.step_binding.clone(),
+            governed_plan_id: plan_id.to_string(),
+            governed_plan_revision: plan_revision,
+            observation_wave_sequence: u64::try_from(iterations).unwrap_or(u64::MAX).max(1),
+            idempotency_key: task.step_binding.as_ref()
+                .map(crate::step_snapshot::StepCallBinding::effect_idempotency_key)
+                .unwrap_or_else(|| format!("{}:{plan_id}:{plan_revision}:{tool_use_id}:{iterations}", self.session_id())),
+            tool_use_id: tool_use_id.to_string(),
+            tool_name: tool_name.to_string(),
+            input: input.to_string(),
+            category: task.safety_category,
+            authorization,
+            session_id: Some(self.session_id().to_string()),
+            sandbox_posture,
+            policy_revision,
+            authorized_scopes: vec![format!("session:{}", self.session_id())],
+            memory_context: Some(self.memory_turn_context()),
+            reality_context: self.reality_data_lease(),
+            model_lease: None,
+            parent_execution: effect_parent.map(|(parent, _)| parent.clone()),
+            parent_execution_attempt: effect_parent.map(|(_, attempt)| *attempt),
+            execution_decision: None,
+            evaluation_isolated: false,
+            managed_invocation: None,
+            tool_progress: crate::ToolProgressSink::new(self.cowd_bus.as_ref().map(|bus| {
+                let bus = bus.clone();
+                let id = tool_use_id.to_string();
+                let name = tool_name.to_string();
+                let callback: std::sync::Arc<dyn Fn(&str) + Send + Sync> =
+                    std::sync::Arc::new(move |progress| bus.emit_tool_progress(&id, &name, progress));
+                callback
+            })),
+        };
+        if tools::tool_orchestrator::effect_is_bounded_read_only_compute(&task.effect) {
+            self.tool_executor.bind_bounded_process_request(&mut request)
+                .map_err(|error| {
+                    if error.original_packet_scope_denial().is_some() { RuntimeError::from_original_packet_scope_error(error) }
+                    else if error.is_unknown() { RuntimeError::from_tool_effect_unknown(error) }
+                    else { RuntimeError::new(error.to_string()) }
+                })?;
+        }
+        Ok(request)
     }
 
     #[inline(never)]
@@ -2032,7 +4073,11 @@ where
         iterations: usize,
         retained_admission: &'tool mut Option<crate::ToolExecutionAdmission>,
         caller_owner: Option<&'tool (harness_contract::projection::RuntimeActivityBinding, u32)>,
+        caller_ticket: Option<&'tool crate::execution_core::NodeExecutionTicket>,
+        caller_decision: Option<&'tool crate::execution_core::RuntimeExecutionDecision>,
         preflight_refusals: Option<&'tool Mutex<Vec<(String, String)>>>,
+        prepared: Option<PreparedGovernedToolCall>,
+        original_node_state: Option<&'tool Arc<tokio::sync::Mutex<crate::host::TurnGraphState>>>,
     ) -> GovernedToolFuture<'tool, Result<ConversationMessage, RuntimeError>>
     where
         C: Sync,
@@ -2045,74 +4090,15 @@ where
                 self.note_refusal_ignored(tool_name, input);
                 return Ok(refusal);
             }
-            let (
-                pre_hook_result,
-                effective_input,
-                model_delivery_requirement,
-                tool_timeout,
-                authorization_decision,
-            ) = boxed_tool_future(|| async {
-                let (
-                    pre_hook_result,
-                    effective_input,
-                    model_delivery_requirement,
-                    mut permission_context,
-                ) = self.prepare_tool_call(tool_name, input);
-                let effective_value = harness_contract::step::parse_strict_json(&effective_input)
-                    .map_err(|error| RuntimeError::new(error.to_string()))?;
-                if effective_value != task.invocation.intent.normalized_input {
-                    return Err(RuntimeError::new("effective_input_requires_replan"));
-                }
-                if pre_hook_result.is_cancelled() {
-                    permission_context = PermissionContext::new(
-                        Some(crate::permissions::PermissionOverride::Deny),
-                        Some(format!("PreToolUse hook cancelled tool `{tool_name}`")),
-                    );
-                } else if pre_hook_result.is_failed() {
-                    let hook_msgs = pre_hook_result.messages().join("; ");
-                    permission_context = PermissionContext::new(
-                        Some(crate::permissions::PermissionOverride::Deny),
-                        Some(if hook_msgs.is_empty() {
-                            format!("PreToolUse hook failed for tool `{tool_name}`")
-                        } else {
-                            format!("PreToolUse hook failed for tool `{tool_name}`: {hook_msgs}")
-                        }),
-                    );
-                } else if pre_hook_result.is_denied() {
-                    permission_context = PermissionContext::new(
-                        Some(crate::permissions::PermissionOverride::Deny),
-                        Some(format!("PreToolUse hook denied tool `{tool_name}`")),
-                    );
-                }
-                let profile_timeout =
-                    Duration::from_secs(task.safety_category.default_timeout_secs());
-                let tool_timeout = self
-                    .tool_timeout
-                    .map_or(profile_timeout, |timeout| timeout.min(profile_timeout));
-                let authorization_id = format!(
-                    "{}:{plan_id}:{plan_revision}:{tool_use_id}:{iterations}",
-                    self.session_id()
-                );
-                let authorization_decision = self
-                    .negotiate_tool_authorization(
-                        &task.effect,
-                        &effective_input,
-                        authorization_id,
-                        permission_context,
-                        tool_timeout.as_secs(),
-                        prompter,
-                    )
-                    .await?;
-
-                Ok::<_, RuntimeError>((
-                    pre_hook_result,
-                    effective_input,
-                    model_delivery_requirement,
-                    tool_timeout,
-                    authorization_decision,
-                ))
-            })
-            .await?;
+            let PreparedGovernedToolCall {
+                pre_hook_result, effective_input, model_delivery_requirement,
+                tool_timeout, authorization_decision, bound_request, single_capture,
+            } = match prepared {
+                Some(prepared) => prepared,
+                None => boxed_tool_future(|| self.prepare_governed_tool_call(
+                    task, plan_id, plan_revision, input, prompter, iterations, None, None, None, None,
+                )).await?,
+            };
 
             match authorization_decision {
                 ToolAuthorizationDecision::Authorized(authorization) => {
@@ -2124,31 +4110,11 @@ where
                         authorization.authorization.policy_revision, execution_policy.revision
                     )));
                 }
-                let executor_owns_durable_effect =
-                    self.tool_executor.owns_durable_tool_effect(tool_name);
+                // A bounded read-only process must use the original sandbox
+                // owner even when an executor generally owns other effects.
+                let executor_owns_durable_effect = self.executor_owns_governed_effect(tool_name, &task.effect);
                 let root = self.root_effect_context();
-                let activity = self
-                    .cowd_bus
-                    .as_ref()
-                    .and_then(|bus| bus.current_activity_binding());
-                let effect_parent = if executor_owns_durable_effect {
-                    None
-                } else {
-                    checked_delegated_effect_parent(
-                        self.tool_executor.durable_tool_effect_parent(),
-                        task.step_binding
-                            .as_ref()
-                            .and_then(|binding| binding.snapshot.identity.run_ref.as_deref()),
-                        self.execution_identity.as_ref(),
-                        activity.as_ref(),
-                        self.session_id(),
-                    )?
-                };
-                if effect_parent.is_some() && root.is_some() {
-                    return Err(RuntimeError::new(
-                        "delegated tool effect cannot use root effect context",
-                    ));
-                }
+                let effect_parent = self.governed_effect_parent(task, &effective_input)?;
                 let root_owner = if !executor_owns_durable_effect && root.is_some() {
                     Some(match caller_owner {
                         Some(owner) => owner.clone(),
@@ -2196,50 +4162,72 @@ where
                 let plane = Arc::clone(&self.tool_execution_plane);
                 let executor_owns_admission =
                     self.tool_executor.owns_tool_resource_admission(tool_name);
-                let effect_request = crate::RuntimeToolExecutionRequest {
-                    compiled_invocation: Some(task.invocation.clone()),
-                    step_binding: task.step_binding.clone(),
-                    governed_plan_id: plan_id.to_string(),
-                    governed_plan_revision: plan_revision,
-                    observation_wave_sequence: u64::try_from(iterations).unwrap_or(u64::MAX).max(1),
-                    idempotency_key: task
-                        .step_binding
-                        .as_ref()
-                        .map(crate::step_snapshot::StepCallBinding::effect_idempotency_key)
-                        .unwrap_or_else(|| {
-                            format!(
-                                "{}:{plan_id}:{plan_revision}:{tool_use_id}:{iterations}",
-                                self.session_id()
-                            )
-                        }),
-                    tool_use_id: tool_use_id.to_string(),
-                    tool_name: tool_name.to_string(),
-                    input: effective_input.clone(),
-                    category: task.safety_category,
-                    authorization: Some(authorization.authorization.clone()),
-                    session_id: Some(self.session_id().to_string()),
-                    sandbox_posture: execution_policy.sandbox_posture,
-                    policy_revision: authorization.authorization.policy_revision,
-                    authorized_scopes: vec![format!("session:{}", self.session_id())],
-                    memory_context: Some(self.memory_turn_context()),
-                    reality_context: self.reality_data_lease(),
-                    model_lease: None,
-                    parent_execution: effect_parent.as_ref().map(|(parent, _)| parent.clone()),
-                    parent_execution_attempt: effect_parent.as_ref().map(|(_, attempt)| *attempt),
-                    execution_decision: None,
-                    evaluation_isolated: false,
-                    managed_invocation: None,
-                    tool_progress: crate::ToolProgressSink::new(self.cowd_bus.as_ref().map(|bus| {
-                        let bus = bus.clone();
-                        let id = tool_use_id.to_string();
-                        let name = tool_name.to_string();
-                        let callback: std::sync::Arc<dyn Fn(&str) + Send + Sync> =
-                            std::sync::Arc::new(move |progress| {
-                                bus.emit_tool_progress(&id, &name, progress);
-                            });
-                        callback
-                    })),
+                // The request observed by the original policy owner is the
+                // execution request. Reconstructing it after approval can
+                // substitute a different owner context or capability carrier.
+                let mut effect_request = match bound_request {
+                    Some(request) => {
+                        if request.authorization.is_some()
+                            || request.session_id.as_deref() != Some(self.session_id())
+                            || request.tool_use_id != tool_use_id
+                            || request.tool_name != tool_name
+                            || request.input != effective_input
+                            || request.governed_plan_id != plan_id
+                            || request.governed_plan_revision != plan_revision
+                            || request.step_binding != task.step_binding
+                            || (request.compiled_invocation.as_ref() != Some(&task.invocation)
+                                && !caller_ticket.is_some_and(|ticket|
+                                    request.tool_progress.original_governed_hook().ok().flatten()
+                                        .is_some_and(|hook| hook.matches(ticket, &request, &task.normalized_input))))
+                            || request.policy_revision != authorization.authorization.policy_revision
+                            || request.sandbox_posture != execution_policy.sandbox_posture
+                            || request.parent_execution.as_ref() != effect_parent.as_ref().map(|(parent, _)| parent)
+                            || request.parent_execution_attempt != effect_parent.as_ref().map(|(_, attempt)| *attempt)
+                        {
+                            return Err(RuntimeError::new("prepared tool request differs from its original authorization context"));
+                        }
+                        request
+                    }
+                    None => self.governed_tool_request(
+                        task, plan_id, plan_revision, iterations, &effective_input,
+                        None, execution_policy.sandbox_posture,
+                        authorization.authorization.policy_revision, effect_parent.as_ref(),
+                    )?,
                 };
+                effect_request.authorization = Some(authorization.authorization.clone());
+                if effect_request.step_binding.is_none() {
+                    effect_request.tool_progress.original_governed_hook().map_err(RuntimeError::new)?
+                        .ok_or_else(|| RuntimeError::new("original unbound call owner missing"))?
+                        .bind_original_authorization(&effect_request).map_err(RuntimeError::new)?;
+                }
+                effect_request.execution_decision = caller_decision.cloned();
+                // Retain the actual non-read call and its same sink before
+                // the original node permits physical execution.
+                if tool_name != "agent_action_batch"
+                    && task.effect.effect_kind != harness_contract::tool::ToolEffectKind::Read {
+                    if let Some(ticket) = caller_ticket {
+                        let state = original_node_state.ok_or_else(|| RuntimeError::new("original Ticket node custody unavailable"))?;
+                        crate::execution_core::graph::executors::agent_tool::validate_original_call_request(ticket, &effect_request)
+                            .map_err(|error| RuntimeError::new(error.to_string()))?;
+                        let carrier = crate::tool_host::OriginalMemberCallCarrier::from_original_request(Arc::new(effect_request.clone()));
+                        let pending = crate::PendingAgentBatch::new(crate::PendingAgentBatchValue::OriginalCall(Arc::new(carrier)));
+                        crate::host::retain_original_member_batches(state, ticket, &[(tool_use_id.to_string(), pending)])
+                            .await.map_err(|error| RuntimeError::new(error.to_string()))?;
+                        effect_request.tool_progress.install_original_effect_custody(
+                            crate::tool_host::OriginalEffectCustodyOrigin::ToolBatch(ticket.clone()),
+                        ).map_err(RuntimeError::new)?;
+                    }
+                }
+                if tool_name == "tool_orchestrate" || tool_name == "agent_action_batch"
+                    || harness_contract::agent_action::AGENT_ACTION_TOOL_IDS.contains(&tool_name)
+                    || (executor_owns_durable_effect && crate::agentic::action_invocation::is_directory_read(tool_name, &effective_input)) {
+                    crate::tool_host::ORIGINAL_EFFECT_REQUEST.try_with(|slot| {
+                        let mut original = slot.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                        if original.is_some() { return Err(RuntimeError::new("original effective request already captured")); }
+                        *original = Some(Arc::new(effect_request.clone()));
+                        Ok(())
+                    }).unwrap_or(Ok(()))?;
+                }
                 let effect_commit = (!executor_owns_durable_effect)
                     .then(|| {
                         self.runtime_event_store.as_ref().map(|store| {
@@ -2285,10 +4273,10 @@ where
                         ))
                     }
                     Ok(crate::execution_core::graph::ToolEffectState::Uncertain) => {
-                        return Err(RuntimeError::new(format!(
+                        return Err(RuntimeError::from_tool_effect_unknown(ToolError::unknown(format!(
                             "tool effect `{}` is uncertain; non-idempotent execution was not replayed",
                             effect_request.idempotency_key
-                        )));
+                        ))));
                     }
                     Ok(
                         crate::execution_core::graph::ToolEffectState::Fresh
@@ -2329,19 +4317,23 @@ where
                                         )
                                         .await
                                 } else {
-                                    tool_exec
-                                        .execute_step_authorized_invocation_output(
+                                    crate::tool_host::ORIGINAL_MEMBER_PROGRESS.scope(
+                                        effect_request.tool_progress.clone(),
+                                        tool_exec.execute_step_authorized_invocation_output(
                                             step_binding.as_ref(),
                                             &provider_invocation_id,
                                             &authorization.authorization,
                                             &tname,
                                             &tinput,
-                                        )
-                                        .await
+                                        ),
+                                    ).await
                                 }
                             });
                             if executor_owns_durable_effect {
-                                execute().await
+                                match &single_capture {
+                                    Some(capture) => TICKET_ORIGINAL_SINGLE_CAPTURE.scope(Arc::clone(capture), execute()).await,
+                                    None => execute().await,
+                                }
                             } else {
                                 let effect_commit = effect_commit.ok_or_else(|| {
                                     ToolError::new("tool execution lost its durable ledger")
@@ -2353,12 +4345,17 @@ where
                                     root,
                                     root_owner,
                                     executor_owns_admission,
+                                    caller_ticket,
                                     execute,
                                 ));
-                                if task.effect.effect_kind == harness_contract::tool::ToolEffectKind::Read {
-                                    crate::bound_tool_batch::with_outer_read_receipt_owner(effect_request, work).await
-                                } else {
-                                    work.await
+                                let invoke = async {
+                                    if task.effect.effect_kind == harness_contract::tool::ToolEffectKind::Read {
+                                        crate::bound_tool_batch::with_outer_read_receipt_owner(effect_request, work).await
+                                    } else { work.await }
+                                };
+                                match &single_capture {
+                                    Some(capture) => TICKET_ORIGINAL_SINGLE_CAPTURE.scope(Arc::clone(capture), invoke).await,
+                                    None => invoke.await,
                                 }
                             }
                         });
@@ -2385,8 +4382,19 @@ where
                 }).await?;
                     boxed_tool_future(|| async {
                 let (output_draft, mut is_error, mut failure_kind) = match execution {
+                    Ok(Err(error)) if error.is_unknown() => {
+                        #[cfg(any(test, feature = "test-fixtures"))]
+                        r622_ticket_stage(caller_ticket, tool_use_id, task.original_call_index, "execute", "tool_result", "unknown", false);
+                        return Err(RuntimeError::from_tool_effect_unknown(error));
+                    }
                     Ok(Ok(output)) => model_tool_output_feedback(tool_name, output),
+                    Ok(Err(error)) if error.original_bounded_acquisition_failure().is_some() => {
+                        return Err(RuntimeError::from_original_bounded_acquisition_error(error));
+                    }
                     Ok(Err(error)) => {
+                        #[cfg(any(test, feature = "test-fixtures"))]
+                        r622_ticket_stage(caller_ticket, tool_use_id, task.original_call_index, "execute", "tool_result",
+                            if error.pre_effect_refusal_for(tool_use_id, tool_name, &effective_input, task.step_binding.as_ref()).is_some() { "pre_effect_matched" } else { "other" }, false);
                         if let Some(refusals) = preflight_refusals {
                             if let Some(reason) = error.pre_effect_refusal_for(
                                 tool_use_id,
@@ -2780,6 +4788,69 @@ where
             None,
         )
         .await
+    }
+
+    /// Verify the original completed sibling lifecycle after its ordinary
+    /// message/evidence consumer ran. Missing owner or durable facts are not
+    /// reconstructed from the message or from the event being checked.
+    pub(crate) fn verify_completed_sibling_prefix(
+        &self, calls: &[ModelToolCall], messages: &[ConversationMessage],
+        invocations: Option<&std::collections::HashMap<String, ToolInvocationRecord>>,
+    ) -> Result<(), RuntimeError> {
+        if messages.is_empty() { return Ok(()); }
+        let store = self.runtime_event_store.as_ref().ok_or_else(|| RuntimeError::new("completed sibling event store unavailable"))?;
+        let observations = self.turn_tool_observations();
+        let stream = format!("session:{}", self.session_id());
+        let mut seen = std::collections::BTreeSet::new();
+        for message in messages {
+            let (call_id, tool_name, output, is_error) = message.blocks.iter().find_map(|block| match block {
+                ContentBlock::ToolResult { tool_use_id, tool_name, output, is_error } =>
+                    Some((tool_use_id.as_str(), tool_name.as_str(), output.as_str(), *is_error)),
+                _ => None,
+            }).ok_or_else(|| RuntimeError::new("completed sibling original tool message missing"))?;
+            if !seen.insert(call_id.to_string()) { return Err(RuntimeError::new("completed sibling call repeated")); }
+            let mut original_calls = calls.iter().filter(|call| call.id == call_id && call.name == tool_name);
+            let call = original_calls.next().ok_or_else(|| RuntimeError::new("completed sibling original call missing"))?;
+            if original_calls.next().is_some() { return Err(RuntimeError::new("completed sibling original call ambiguous")); }
+            let input_hash = crate::tool_invocation::stable_hash(&call.input);
+            let retained_record = invocations.and_then(|records| records.get(call_id));
+            let expected_owner = if let Some(record) = retained_record {
+                if record.tool_call_id != call_id || record.tool_name != tool_name || record.input_hash != input_hash {
+                    return Err(RuntimeError::new("completed sibling original invocation mismatch"));
+                }
+                record.original_producer.clone().ok_or_else(|| RuntimeError::new("completed sibling original producer missing"))?
+            } else {
+                self.native_tool_activity_owner(call_id, tool_name, &input_hash)?
+                    .or_else(|| self.cowd_bus().and_then(|bus| bus.current_tool_activity_binding(call_id, tool_name)))
+                    .ok_or_else(|| RuntimeError::new("completed sibling original producer unavailable"))?
+            };
+            let kind = if is_error { "tool.invocation.failed" } else { "tool.invocation.completed" };
+            let mut verified = 0usize;
+            for observed in observations.iter().filter(|observed| observed.tool_name == tool_name && observed.model_summary == output) {
+                if retained_record.is_some() && observed.invocation_id != call_id { continue; }
+                let invocation_id = retained_record.map_or(observed.invocation_id.as_str(), |record| record.invocation_id.as_str());
+                let key = format!("tool-lifecycle:{invocation_id}:{kind}");
+                let Some(event) = store.event_by_idempotency_key(&stream, &key)
+                    .map_err(|error| RuntimeError::new(error.to_string()))? else { continue };
+                let Some(access) = observed.output_envelope.as_ref().and_then(|envelope| envelope.evidence_ref.as_ref()) else { continue };
+                let raw = &event.payload["runtime_raw_content_v1"];
+                if expected_owner.validate().is_ok()
+                    && event.scope == RuntimeEventScope::Tool && event.schema_version == 1
+                    && event.idempotency_key.as_deref() == Some(key.as_str())
+                    && event.status.as_deref() == Some(if is_error { "failed" } else { "completed" })
+                    && event.kind == kind && event.activity_binding().as_ref() == Some(&expected_owner)
+                    && event.payload["invocation_id"] == invocation_id
+                    && event.payload["tool_call_id"] == call_id && event.payload["tool_name"] == tool_name
+                    && event.payload["input_hash"] == input_hash && access.is_durable()
+                    && access.visibility_scope == format!("session:{}", self.session_id())
+                    && raw["selector"] == access.retrieval_selector && raw["byte_count"] == access.bytes
+                    && raw["sha256"].as_str().is_some_and(|digest| digest.trim_start_matches("sha256:") == access.sha256.trim_start_matches("sha256:")) {
+                    verified += 1;
+                }
+            }
+            if verified != 1 { return Err(RuntimeError::new(format!("completed sibling `{call_id}` original durable lifecycle unavailable or ambiguous"))); }
+        }
+        Ok(())
     }
 
     pub(crate) async fn prepare_governed_tool_result_with_invocation(
@@ -3491,40 +5562,8 @@ where
         plan: &GovernedToolPlan,
     ) -> Result<(), RuntimeError> {
         if let Some(store) = self.runtime_event_store.as_ref() {
-            let mut refs = vec![RuntimeEventRef {
-                kind: "governed_tool_plan".to_string(),
-                id: plan.plan_id.clone(),
-            }];
-            if let Some(context) = self
-                .cowd_bus()
-                .and_then(crate::CowdEventBus::current_execution_context)
-            {
-                refs.extend([
-                    RuntimeEventRef {
-                        kind: "execution".into(),
-                        id: context.execution_id,
-                    },
-                    RuntimeEventRef {
-                        kind: "session".into(),
-                        id: context.session_id,
-                    },
-                    RuntimeEventRef {
-                        kind: "turn".into(),
-                        id: context.turn_id,
-                    },
-                ]);
-            }
-            store.append(RuntimeEventInput {
-                stream_id: format!("session:{}", self.session_id()),
-                scope: RuntimeEventScope::Tool,
-                kind: "tool.execution_plan.created".into(),
-                status: Some("planned".into()),
-                actor: Some("conversation_runtime".into()),
-                refs,
-                payload: serde_json::to_value(plan)
-                    .map_err(|error| RuntimeError::new(error.to_string()))?,
-            })
-            .map_err(RuntimeError::new)?;
+            let context = self.cowd_bus().and_then(crate::CowdEventBus::current_execution_context);
+            persist_governed_tool_plan_event(store, self.session_id(), context.as_ref(), plan)?;
         }
         if let Ok(mut plans) = self.turn_governed_tool_plans.lock() {
             plans.push(plan.projection());
@@ -4262,7 +6301,7 @@ mod agentic_action_body_tests {
             model_observation: None,
             workspace_prior_state: None,
         };
-        let outcome = crate::RuntimeToolExecutionOutcome {
+        let outcome = crate::RuntimeToolExecutionOutcome { pending_agent_batch: None,
             tool_use_id: "original-use".into(),
             tool_name: "execute_code".into(),
             status: crate::RuntimeToolExecutionStatus::Executed,
@@ -4726,17 +6765,39 @@ mod agentic_action_body_tests {
                 )
                 .unwrap()
                 .graph;
-            let owner = store
+            let original = store
                 .latest_for_stream("scope2-graph:node:original-node")
                 .unwrap()
-                .unwrap()
-                .activity_binding()
                 .unwrap();
+            let owner = original.activity_binding().unwrap();
+            let start_revision = original.payload["graph_revision"].as_u64().unwrap();
+            let start = store.list_stream_after(&graph.id, start_revision - 1, start_revision, 1, 4 * 1024 * 1024)
+                .unwrap().remove(0);
+            assert_eq!(start.transaction_id, original.transaction_id);
+            assert_eq!(start.commit_cursor, original.commit_cursor);
+            let start_event = super::original_ticket_start_event(&store, &start).unwrap();
+            let binding = match start_event {
+                crate::execution_core::graph::ExecutionGraphEvent::NodeTransitioned { node_id, binding: Some(binding), .. }
+                    if node_id == "original-node" => binding,
+                other => panic!("original node start missing binding: {other:?}"),
+            };
+            let spec = graph.nodes.iter().find(|node| node.id == "original-node").unwrap();
+            let ticket = crate::execution_core::NodeExecutionTicket {
+                graph_id: graph.id.clone(),
+                node_id: spec.id.clone(),
+                executor_kind: binding.executor_kind,
+                service_class: graph.service_class,
+                attempt: binding.attempt,
+                idempotency_key: binding.ticket_idempotency_key,
+                payload_ref: spec.payload_ref.clone(),
+            };
             let root = crate::CowdExecutionContext {
-                execution_id: graph.id,
+                execution_id: graph.id.clone(),
                 session_id: "scope2-session".into(),
                 turn_id: "scope2-turn".into(),
             };
+            let bus = crate::CowdEventBus::new();
+            let _scope = bus.enter_execution_with_activity(root.clone(), Some(owner.clone()));
             let mut session = Session::new();
             session.session_id = "scope2-session".into();
             let runtime = ConversationRuntime::new(
@@ -4747,7 +6808,9 @@ mod agentic_action_body_tests {
                 vec![],
             )
             .without_memory()
-            .with_runtime_event_store(store.clone());
+            .with_runtime_event_store(store.clone())
+            .with_cowd_event_bus(bus);
+            assert_eq!(runtime.root_effect_owner_for_ticket(&ticket).unwrap(), (owner.clone(), ticket.attempt));
             let plane = runtime.tool_execution_plane.clone();
             let locks = plane.scope_locks().clone();
             let resolver =
@@ -4784,6 +6847,7 @@ mod agentic_action_body_tests {
                                 Some(&root),
                                 Some(&effect_owner),
                                 false,
+                                Some(&ticket),
                                 || async {
                                     Err(ToolError::new(
                                         "cancelled canonical waiter unexpectedly reached the tool",
@@ -4806,7 +6870,7 @@ mod agentic_action_body_tests {
             let entered = tokio::sync::Notify::new();
             let operation = async {
                 entered.notify_one();
-                runtime.execute_scoped_root_effect(&service, &request, effect, Some(&root), Some(&effect_owner), false, || async {
+                runtime.execute_scoped_root_effect(&service, &request, effect, Some(&root), Some(&effect_owner), false, Some(&ticket), || async {
                     assert!(locks.acquire(vec![writer_request.clone()], Some(Duration::from_millis(5))).await.is_err());
                     tokio::time::sleep(Duration::from_millis(120)).await;
                     assert!(locks.acquire(vec![writer_request.clone()], Some(Duration::from_millis(5))).await.is_err());
@@ -5349,6 +7413,38 @@ mod delegated_effect_parent_tests {
             );
         }
     }
+
+    #[test]
+    fn unbound_executor_owned_effect_needs_no_parent_but_a_foreign_parent_is_refused() {
+        let ticket = crate::execution_core::NodeExecutionTicket {
+            graph_id: "agent-graph".into(),
+            node_id: "agent-node".into(),
+            executor_kind: "tool_batch".into(),
+            service_class: harness_contract::execution_graph::ExecutionServiceClass::Interactive,
+            attempt: 7,
+            idempotency_key: "ticket".into(),
+            payload_ref: "payload".into(),
+        };
+        assert!(unbound_ticket_parent_matches(&ticket, None, None));
+        let (parent, attempt) = parent();
+        assert!(unbound_ticket_parent_matches(
+            &ticket,
+            Some(&parent),
+            Some(attempt)
+        ));
+        let mut foreign = parent.clone();
+        foreign.node_id = "other-node".into();
+        assert!(!unbound_ticket_parent_matches(
+            &ticket,
+            Some(&foreign),
+            Some(attempt)
+        ));
+        assert!(!unbound_ticket_parent_matches(
+            &ticket,
+            Some(&parent),
+            Some(attempt + 1)
+        ));
+    }
 }
 
 #[cfg(test)]
@@ -5746,5 +7842,45 @@ mod checkpoint_scope_366_tests {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod s3_settled_child_outcome_tests {
+    use super::ToolError;
+    use super::delegated_child_outcome_error;
+
+    /// 033 S3: a delegated child's named refusal is a settled outcome and
+    /// stays a named failure; only an effect that is still unknown is
+    /// reported as an unsettled receipt.
+    #[test]
+    fn s3_a_settled_child_refusal_is_not_reported_as_an_unsettled_receipt() {
+        let refused = delegated_child_outcome_error(&ToolError::new(
+            "agent action event store failed: proof_actual_input_extent_unsupported: actual read lacks an original physical extent",
+        ));
+        assert!(
+            !refused.is_unknown(),
+            "a settled refusal must not poison the batch as an unknown effect: {refused:?}"
+        );
+        assert!(
+            refused.to_string().contains("proof_actual_input_extent_unsupported"),
+            "the named reason stays readable: {refused:?}"
+        );
+        assert!(
+            !refused.to_string().contains("original child receipt remains unsettled"),
+            "a settled refusal is not an unsettled receipt: {refused:?}"
+        );
+
+        let unknown = delegated_child_outcome_error(&ToolError::unknown(
+            "original tool effect remains unknown",
+        ));
+        assert!(
+            unknown.is_unknown(),
+            "an unknown effect stays unknown: {unknown:?}"
+        );
+        assert!(
+            unknown.to_string().contains("original child receipt remains unsettled"),
+            "an unknown effect is still reported as an unsettled receipt: {unknown:?}"
+        );
     }
 }

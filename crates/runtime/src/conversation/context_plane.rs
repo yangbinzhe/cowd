@@ -613,6 +613,9 @@ where
         if let Ok(mut guard) = self.turn_native_tool_sources.lock() {
             guard.clear();
         }
+        if let Ok(mut guard) = self.turn_original_root_calls.lock() {
+            guard.clear();
+        }
         if let Ok(mut guard) = self.turn_native_root_owners.lock() {
             guard.clear();
         }
@@ -743,7 +746,7 @@ where
             .get(provider_invocation_id)
             .filter(|source| source.call.name == tool_name)
             .cloned();
-        let has_nested = tool_name == "tool_orchestrate" && source.as_ref()
+        let has_nested = matches!(tool_name, "tool_orchestrate" | "grep_search") && source.as_ref()
             .and_then(|source| source.call.binding.as_ref())
             .and_then(|binding| {
                 let key = binding.effect_idempotency_key();
@@ -800,6 +803,42 @@ where
             )));
         }
         receipts.push(generated);
+        Ok(())
+    }
+
+    /// Capture root calls only from the original provider-result path.
+    /// Replays and downstream consumers must not mint this producer handle.
+    pub(super) fn remember_original_root_calls(
+        &self, calls: &[ModelToolCall],
+    ) -> Result<(), RuntimeError> {
+        let Some(bus) = self.cowd_bus.as_ref() else { return Ok(()); };
+        let Some(execution) = bus.current_execution_context() else { return Ok(()); };
+        if let Some(owner) = bus.current_activity_binding().filter(|owner| {
+            owner.agent_run_id.is_none() && owner.root_execution_id == execution.execution_id
+                && owner.session_id == execution.session_id && owner.turn_id == execution.turn_id
+        }) {
+            let mut originals = self.turn_original_root_calls.lock()
+                .map_err(|_| RuntimeError::new("original root tool source projection poisoned"))?;
+            for call in calls {
+                let Some(binding) = call.binding.as_ref() else { continue; };
+                if binding.snapshot.identity.session_id != self.session_id()
+                    || binding.snapshot.identity.turn_id != execution.turn_id
+                    || binding.snapshot.identity.execution_id.as_deref() != Some(execution.execution_id.as_str())
+                    || binding.origin.origin_step_id != binding.snapshot.identity.step_id
+                    || binding.origin.call_id != call.id || binding.origin.catalog_digest != binding.snapshot.catalog_digest
+                    || !matches!(&binding.origin.source, harness_contract::step::CallSource::Provider { attempt_id }
+                        if attempt_id == &binding.snapshot.provider_attempt.attempt_id) {
+                    continue;
+                }
+                let original = OriginalRootCall { call:call.clone(), execution:execution.clone(), owner:owner.clone() };
+                let original_key = binding.effect_idempotency_key();
+                if originals.get(&original_key).is_some_and(|existing|
+                    existing.call != original.call || existing.execution != original.execution) {
+                    return Err(RuntimeError::new("original root tool call identity conflict"));
+                }
+                originals.entry(original_key).or_insert(original);
+            }
+        }
         Ok(())
     }
 
@@ -861,6 +900,33 @@ where
             );
         }
         Ok(())
+    }
+
+    /// Retrieve only a call actually captured from this turn's original
+    /// provider result; the caller cannot synthesize a handle from a request.
+    pub(crate) fn original_root_call(
+        &self,
+        request: &crate::RuntimeToolExecutionRequest,
+        context: &crate::CowdExecutionContext,
+        owner: &harness_contract::projection::RuntimeActivityBinding,
+    ) -> Result<OriginalRootCall, RuntimeError> {
+        let original = self.turn_original_root_calls.lock()
+            .map_err(|_| RuntimeError::new("original root tool source projection poisoned"))?
+            .get(&request.idempotency_key).cloned()
+            .ok_or_else(|| RuntimeError::new("original root tool call unavailable"))?;
+        let effective = harness_contract::step::parse_strict_json(&request.input)
+            .map_err(|error| RuntimeError::new(error.to_string()))?;
+        let initial = harness_contract::step::parse_strict_json(&original.call.input)
+            .map_err(|error| RuntimeError::new(error.to_string()))?;
+        let invocation = request.compiled_invocation.as_ref()
+            .ok_or_else(|| RuntimeError::new("original root call invocation missing"))?;
+        if !original.matches_owner(context, owner) || original.call.name != request.tool_name
+            || original.call.binding != request.step_binding || initial != effective
+            || effective != invocation.intent.normalized_input
+            || request.step_binding.as_ref().is_none_or(|binding| binding.effect_idempotency_key() != request.idempotency_key) {
+            return Err(RuntimeError::new("original root call binding mismatch"));
+        }
+        Ok(original)
     }
 
     pub(super) fn capture_native_root_owner(
@@ -945,6 +1011,7 @@ where
     #[cfg(test)]
     pub(crate) fn clear_native_replay_cache_for_test(&self) {
         self.turn_native_tool_sources.lock().unwrap().clear();
+        self.turn_original_root_calls.lock().unwrap().clear();
         self.turn_native_root_owners.lock().unwrap().clear();
     }
 
@@ -1264,7 +1331,7 @@ where
         &self,
         source: &NativeToolSource,
     ) -> Result<Option<(NativeReadAcquisition, Vec<serde_json::Value>)>, RuntimeError> {
-        if source.call.name != "tool_orchestrate" { return Ok(None); }
+        if !matches!(source.call.name.as_str(), "tool_orchestrate" | "grep_search") { return Ok(None); }
         let Some(store) = self.runtime_event_store.as_ref() else { return Ok(None); };
         let Some(binding) = source.call.binding.as_ref() else { return Ok(None); };
         let key = binding.effect_idempotency_key();
@@ -1731,7 +1798,7 @@ where
             else {
                 continue;
             };
-            if receipt.tool_name == "tool_orchestrate" {
+            if matches!(receipt.tool_name.as_str(), "tool_orchestrate" | "grep_search") {
                 let Some(source) = receipt.source.as_ref() else { continue; };
                 if crate::context_evidence::read_sha256(receipt.presentation.as_bytes()) != candidate.model_receipt_sha256
                     || receipt.presentation.len() as u64 != receipt.presentation_bytes
@@ -1746,7 +1813,10 @@ where
                         &source.call.input, &receipt.presentation, &child) else { continue; };
                     let Some(step_index) = child["step_index"].as_u64() else { continue; };
                     let Some(position) = child["position"].as_u64() else { continue; };
-                    let key = format!("native-child-read:{}:{}:{step_index}:{position}", wire.request_id, candidate.provider_invocation_id);
+                    let suffix = if child["tool_name"] == "grep_search" {
+                        format!(":grep:{}:{}", child["batch_index"], child["window_index"])
+                    } else { String::new() };
+                    let key = format!("native-child-read:{}:{}:{step_index}:{position}{suffix}", wire.request_id, candidate.provider_invocation_id);
                     let mut parent_identity = serde_json::to_value(&parent.seal).map_err(|e| RuntimeError::new(e.to_string()))?;
                     parent_identity.as_object_mut().ok_or_else(|| RuntimeError::new("nested parent identity invalid"))?.remove("body");
                     let payload = serde_json::json!({"schema_version":1,"parent":parent_identity,"source_input":source.call.input,
@@ -2015,6 +2085,36 @@ where
             .lock()
             .map(|guard| guard.clone())
             .unwrap_or_default()
+    }
+
+    pub(super) fn record_turn_early_tool_receipts(
+        &self,
+        receipts: &[crate::conversation::EarlyToolExecutionReceipt],
+    ) {
+        let mut guard = self
+            .turn_early_tool_receipts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for receipt in receipts {
+            if receipt.outcome.status == crate::RuntimeToolExecutionStatus::Executed
+                && !guard
+                    .iter()
+                    .any(|existing| existing.call.id == receipt.call.id)
+            {
+                guard.push(receipt.clone());
+            }
+        }
+    }
+
+    pub(super) fn take_turn_early_tool_receipts(
+        &self,
+    ) -> Vec<crate::conversation::EarlyToolExecutionReceipt> {
+        std::mem::take(
+            &mut *self
+                .turn_early_tool_receipts
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
     }
 
     pub(super) fn existing_evidence_access(
@@ -4034,6 +4134,7 @@ mod immutable_native_acquisition_tests {
                 error: None,
                 evidence_ref: "immutable-original".into(),
                 observed_evidence: vec![],
+                pending_agent_batch: None,
             };
             if scoped {
                 let resolver =
@@ -4065,6 +4166,7 @@ mod immutable_native_acquisition_tests {
                 .unwrap();
             let mut session = Session::new();
             session.session_id = "scope2-session".into();
+            let bus = crate::CowdEventBus::new();
             let runtime = ConversationRuntime::new(
                 session,
                 AcquisitionApi,
@@ -4073,7 +4175,33 @@ mod immutable_native_acquisition_tests {
                 vec![],
             )
             .without_memory()
+            .with_cowd_event_bus(bus.clone())
             .with_runtime_event_store(store.clone());
+            let _execution = bus.enter_execution(crate::CowdExecutionContext {
+                execution_id: "scope2-graph".into(),
+                session_id: "scope2-session".into(),
+                turn_id: "scope2-turn".into(),
+            });
+            let input = crate::host::normalize_native_read_input(
+                "evidence_retrieve", r#"{"evidence_ref":"artifact:original"}"#,
+            );
+            assert_eq!(input, request.input);
+            let original = ModelToolCall {
+                id: request.tool_use_id.clone(), name: request.tool_name.clone(), input,
+                depends_on: vec![], binding: request.step_binding.clone(),
+            };
+            runtime.remember_native_tool_calls(std::slice::from_ref(&original)).unwrap();
+            runtime.remember_native_tool_calls(std::slice::from_ref(&original)).unwrap();
+            let mut foreign = original.clone();
+            foreign.input = r#"{"evidence_ref":"artifact://foreign"}"#.into();
+            assert!(runtime.remember_native_tool_calls(&[foreign]).is_err());
+            let mut foreign_step = original.clone();
+            foreign_step.binding.as_mut().unwrap().origin.origin_step_id = "foreign-step".into();
+            assert!(runtime.remember_native_tool_calls(&[foreign_step]).is_err());
+            let mut foreign_call = original.clone();
+            foreign_call.binding.as_mut().unwrap().origin.call_id = "foreign-call".into();
+            assert!(runtime.remember_native_tool_calls(&[foreign_call]).is_err());
+            assert_eq!(runtime.turn_native_tool_sources.lock().unwrap()[&original.id].call, original);
             let source = NativeToolSource {
                 call: ModelToolCall {
                     id: request.tool_use_id.clone(),

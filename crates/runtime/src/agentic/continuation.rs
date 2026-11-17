@@ -244,6 +244,12 @@ fn revision_seed(
         task.claim_execution_id = None;
         task.claimed_at_ms = None;
         task.lease_expires_at_ms = None;
+        // 032 K3 (B8): the continuation re-seed must not erase outstanding
+        // attempt facts. Every attempt leaving the active set without a
+        // durable terminal keeps its full identity in the unsettled list,
+        // exactly like the rework release path in work_market.
+        task.unsettled_released_attempts
+            .extend(task.active_attempts.values().cloned());
         task.active_attempts.clear();
         // Counters bound an authorization's physical retries, not all future
         // user-authorized attempts. Historical failures remain in the source.
@@ -263,6 +269,7 @@ mod tests {
     fn actor(turn: &str, root: &str) -> AgentActorBinding {
         let objective_id = root_objective_id("continuation-session", turn);
         AgentActorBinding {
+            original_execution: None,
             program_id: program_id_for_objective(&objective_id),
             objective_id,
             session_id: "continuation-session".into(),
@@ -821,6 +828,116 @@ mod tests {
         assert!(
             pending
                 .unresolved
+                .iter()
+                .any(|gap| gap.starts_with("continuation_effect_reconciliation:"))
+        );
+    }
+
+    /// Path 4 - a continuation cannot carry an uncertain claim across the
+    /// turn.  The fence it inherits is fenced forward: the generation moves so
+    /// the old execution's token cannot be replayed, the claim fields are
+    /// cleared, the attempts are settled by name into the task's unsettled
+    /// ledger (032 K3/B8: a re-seed must not erase attempt facts), and the
+    /// Task waits for an explicit reconciliation instead of looking busy.
+    #[test]
+    fn a_continuation_fences_the_claim_it_cannot_carry_over() {
+        let mut source = crate::AgenticProgramProjection::empty("program", "objective");
+        source.tasks.insert(
+            "task".to_string(),
+            crate::AgenticTaskProjection {
+                obligations: Vec::new(),
+                rework_directives: Vec::new(),
+                unsettled_released_attempts: Vec::new(),
+                terminal_note: None,
+                task_id: "task".to_string(),
+                team_id: "team".to_string(),
+                title: "task".to_string(),
+                objective: "objective".to_string(),
+                acceptance: "durable evidence".to_string(),
+                acceptance_checks: Vec::new(),
+                criterion_source: Default::default(),
+                required_capabilities: Vec::new(),
+                obligation_refs: Vec::new(),
+                purpose: Default::default(),
+                execution_requirements: Vec::new(),
+                expertise_hints: Vec::new(),
+                depends_on: Vec::new(),
+                status: AgenticTaskStatus::Claimed,
+                claimant: Some("agent".to_string()),
+                claim_generation: 5,
+                claim_execution_id: Some("old-root".to_string()),
+                claimed_at_ms: Some(1_000),
+                lease_expires_at_ms: Some(91_000),
+                claim_renewal_streak: 0,
+                active_attempts: Default::default(),
+                artifact_refs: Vec::new(),
+                evidence_refs: Vec::new(),
+                unresolved: Vec::new(),
+                review_reason: None,
+                reviewed_by: None,
+                failed_attempts: 0,
+                review_generation: 0,
+                failed_review_attempts: 0,
+                structural_execution_stalls: 0,
+                structural_review_stalls: 0,
+                reviews_applied: 0,
+                review_obligation: None,
+                reviews_accepted: 0,
+                last_failure: None,
+                replacement_task_refs: Vec::new(),
+                supersede_evidence_refs: Vec::new(),
+                superseded_reason: None,
+                superseded_by: None,
+                cancel_requested_by: None,
+                cancel_reason_ref: None,
+                cancel_evidence_refs: Vec::new(),
+                pending_retirement: None,
+            },
+        );
+        source
+            .tasks
+            .get_mut("task")
+            .expect("task")
+            .active_attempts
+            .insert(
+                "old-root".to_string(),
+                crate::agentic::AgenticTaskAttemptProjection {
+                    execution_id: "old-root".to_string(),
+                    agent_id: "agent".to_string(),
+                    membership_id: "membership:agent:team".to_string(),
+                    mode: harness_contract::agent_action::AgentAttemptMode::Execute,
+                    generation: 4,
+                },
+            );
+        let binding = harness_contract::turn::CollaborationContinuationBinding {
+            source_session_id: "continuation-session".to_string(),
+            source_turn_id: "old-turn".to_string(),
+            source_root_id: "old-root".to_string(),
+            team_set_ref: "team".to_string(),
+            delivery_revision: 1,
+            result_refs: Vec::new(),
+            current_ingress: "ingress".to_string(),
+            candidate_revision: 1,
+            binding_digest: "digest".to_string(),
+            authorization: ContinuationAuthorization::Authorized,
+            authorization_revision: 1,
+            handoff_id: None,
+        };
+        let seed = revision_seed(&source, &binding, &actor("new-turn", "new-root")).unwrap();
+        let task = &seed.tasks["task"];
+        assert_eq!(task.status, AgenticTaskStatus::Blocked);
+        assert_eq!(task.claim_generation, 6);
+        assert_eq!(task.claimant, None);
+        assert_eq!(task.claim_execution_id, None);
+        assert_eq!(task.claimed_at_ms, None);
+        assert_eq!(task.lease_expires_at_ms, None);
+        assert!(task.active_attempts.is_empty());
+        let settled = &task.unsettled_released_attempts;
+        assert_eq!(settled.len(), 1, "the released attempt keeps its identity");
+        assert_eq!(settled[0].execution_id, "old-root");
+        assert_eq!(settled[0].generation, 4);
+        assert!(
+            task.unresolved
                 .iter()
                 .any(|gap| gap.starts_with("continuation_effect_reconciliation:"))
         );

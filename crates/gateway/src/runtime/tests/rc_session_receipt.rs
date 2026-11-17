@@ -1,14 +1,30 @@
 //! Drive a real Host/Graph terminal through the public Session receipt routes.
 use super::*;
 
-#[tokio::test]
-async fn rc_real_host_graph_public_session_ack_and_revocation() {
-    Box::pin(public_receipt_case(false)).await;
+#[test]
+fn rc_real_host_graph_replay_then_public_session_ack() {
+    public_receipt_case_on_a_large_stack(true);
 }
 
-#[tokio::test]
-async fn rc_real_host_graph_replay_then_public_session_ack() {
-    Box::pin(public_receipt_case(true)).await;
+/// The case drives a real Host/Graph turn through a deep future. Its debug
+/// state machine does not fit the 2 MiB stack libtest gives a test thread, so
+/// a plain `#[tokio::test]` aborts before the product can answer. Run the same
+/// body on a thread sized for the case: this is a harness property, not a
+/// product budget change.
+fn public_receipt_case_on_a_large_stack(restart_before_outbox_ack: bool) {
+    std::thread::Builder::new()
+        .name("rc-public-receipt".into())
+        .stack_size(64 * 1024 * 1024)
+        .spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("current-thread runtime")
+                .block_on(public_receipt_case(restart_before_outbox_ack))
+        })
+        .expect("large-stack thread")
+        .join()
+        .expect("public receipt case panicked");
 }
 
 async fn public_receipt_case(restart_before_outbox_ack: bool) {

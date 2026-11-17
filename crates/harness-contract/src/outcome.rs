@@ -424,6 +424,14 @@ pub struct ExecutionOutcome {
     #[serde(default)]
     pub evidence_refs: Vec<EvidenceRef>,
     pub evidence_completeness: EvidenceCompleteness,
+    /// Durable verified business conclusion.
+    ///
+    /// This field is additive: an older Outcome event carries no verified
+    /// conclusion, and such an event is never rewritten.  A consumer that
+    /// cannot read a verified conclusion must treat the business verdict as
+    /// Unknown rather than as success.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verified: Option<VerifiedBusinessOutcome>,
     pub schema_revision: u32,
 }
 
@@ -620,10 +628,51 @@ pub struct OutcomeUsage {
     pub max_observed_concurrency: u64,
 }
 
+/// Verified business conclusion of a terminal execution.
+///
+/// A model presentation can describe a successful run, but only durable
+/// Runtime facts may decide the business verdict.  This value is the durable
+/// record of that decision; consumers read it instead of re-interpreting the
+/// model's wording.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum VerifiedBusinessVerdict {
+    /// Durable facts prove the business objective was satisfied.
+    Satisfied,
+    /// Durable facts prove the business objective was not satisfied.
+    Unsatisfied,
+    /// The verification conclusion did not arrive; no terminal value is claimed.
+    Unknown,
+}
+
+/// One durable fact the verified business conclusion was derived from.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct VerifiedBusinessBasis {
+    /// Typed kind of the durable fact, for example `goal_conclusion`,
+    /// `acceptance_evaluation` or `obligation_ledger`.
+    pub kind: String,
+    /// Opaque durable reference of that fact.
+    pub reference: String,
+}
+
+/// The verified business conclusion carried by an Outcome event.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct VerifiedBusinessOutcome {
+    pub verdict: VerifiedBusinessVerdict,
+    /// The model's own terminal wording, preserved verbatim.  It is a
+    /// presentation field: it never decides the verdict.
+    pub reason: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub basis: Vec<VerifiedBusinessBasis>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "class", content = "reason")]
 pub enum OutcomeTerminalClass {
     Succeeded(String),
+    /// The execution completed, but no durable fact verified the business
+    /// objective.  The reason keeps the terminal wording verbatim.
+    Unsatisfied(String),
     Failed(String),
     Cancelled(String),
     Blocked(String),
@@ -640,6 +689,7 @@ impl OutcomeTerminalClass {
     pub const fn class_name(&self) -> &'static str {
         match self {
             Self::Succeeded(_) => "succeeded",
+            Self::Unsatisfied(_) => "unsatisfied",
             Self::Failed(_) => "failed",
             Self::Cancelled(_) => "cancelled",
             Self::Blocked(_) => "blocked",

@@ -44,6 +44,7 @@ use memory::MemoryScope;
 use session::{SessionRecord, UnifiedSessionStore};
 
 mod agent_routes;
+pub(crate) mod slash_controller;
 mod app_routes;
 mod approval_routes;
 mod audit_routes;
@@ -1112,6 +1113,7 @@ pub mod test_support {
                     providers: HashMap::from([(
                         "test".to_string(),
                         ProviderConfig {
+                            reasoning_effort: None,
                             name: "test".to_string(),
                             // The black-box harness validates model ownership
                             // but never submits requests to this closed endpoint.

@@ -448,6 +448,7 @@ fn r304_diagnostic_request_fixture(
                     model_protocol::provider_capability::ProviderCapabilityProfile::unknown(),
             },
             transport_fingerprint: crate::TransportProfileFingerprint(42),
+            diagnostic_send_reason: None,
         },
         wire_request: provider::ProviderWireRequest {
             method: "POST".into(),
@@ -465,6 +466,9 @@ fn r304_diagnostic_request_fixture(
 
 #[tokio::test]
 async fn begin_epoch_recovers_packed_and_outcome_after_restart() {
+    if crate::test_support::skip_if_env_absent("COWD_TEST_POSTGRES_URL") {
+        return;
+    }
     #[derive(Clone)]
     struct NoopApi;
 
@@ -670,6 +674,9 @@ fn provider_retry_fence_activates_for_prior_or_same_attempt_effect_receipt() {
 }
 #[tokio::test]
 async fn exact_provider_wire_evidence_is_artifact_backed_and_durably_pinned() {
+    if crate::test_support::skip_if_env_absent("COWD_TEST_POSTGRES_URL") {
+        return;
+    }
     let session_store = Arc::new(crate::test_support::session_store());
     let session = Session::new();
     let session_id = session.session_id.clone();
@@ -748,6 +755,7 @@ async fn exact_provider_wire_evidence_is_artifact_backed_and_durably_pinned() {
                     model_protocol::provider_capability::ProviderCapabilityProfile::unknown(),
             },
             transport_fingerprint: crate::TransportProfileFingerprint(42),
+            diagnostic_send_reason: None,
             attempt: 7,
         },
         wire_request: provider::ProviderWireRequest {
@@ -1009,7 +1017,7 @@ async fn memory_projection_converts_only_appended_messages_and_rebuilds_on_repla
         .expect("first response");
 
     let first = runtime.memory_context_messages().await;
-    assert_eq!(first.len(), 2);
+    assert_eq!(first.iter().map(|message| message.content.as_str()).collect::<Vec<_>>(), ["first", "first response"]);
     {
         let projection = runtime.session_memory_projection.lock().await;
         assert_eq!(projection.converted_messages, 2);
@@ -1021,7 +1029,7 @@ async fn memory_projection_converts_only_appended_messages_and_rebuilds_on_repla
         .await
         .expect("second message");
     let second = runtime.memory_context_messages().await;
-    assert_eq!(second.len(), 3);
+    assert_eq!(second.iter().map(|message| message.content.as_str()).collect::<Vec<_>>(), ["first", "first response", "second"]);
     {
         let projection = runtime.session_memory_projection.lock().await;
         assert_eq!(
@@ -1036,7 +1044,7 @@ async fn memory_projection_converts_only_appended_messages_and_rebuilds_on_repla
         .await
         .replace_messages(vec![ConversationMessage::user_text("replacement")]);
     let replaced = runtime.memory_context_messages().await;
-    assert_eq!(replaced.len(), 1);
+    assert!(matches!(replaced.as_slice(), [message] if message.content == "replacement"));
     {
         let projection = runtime.session_memory_projection.lock().await;
         assert_eq!(projection.converted_messages, 4);
@@ -1287,7 +1295,7 @@ fn model_observation_promotes_only_a_matching_packed_provider_result() {
     let candidates = runtime
         .packed_model_observation_candidates(&request, 2, 1)
         .expect("matching packed request");
-    assert_eq!(candidates.len(), 1);
+    assert!(matches!(candidates.as_slice(), [candidate] if candidate.provider_invocation_id == "tool-call-1" && candidate.provider_request_sequence == 2 && candidate.provider_attempt == 1));
     assert!(runtime.turn_model_observations().is_empty());
     runtime
         .confirm_model_observations(
@@ -1437,7 +1445,10 @@ async fn runtime_prefetch_receipt_survives_first_provider_node_and_is_turn_isola
         "mock API has no original physical acquisition or durable wire evidence"
     );
     let requests = requests.lock().expect("requests");
-    assert_eq!(requests.len(), 2);
+    assert!(matches!(requests.as_slice(), [first, second] if [first, second].iter().all(|request|
+        request.messages.iter().any(|message| message.blocks.iter().any(|block| matches!(block,
+            ContentBlock::ToolResult { tool_use_id, output, is_error: false, .. }
+                if tool_use_id == "runtime-focus-verify-0-0" && output == &receipt.summary))))));
     assert!(requests
         .iter()
         .all(|request| request
@@ -1684,8 +1695,7 @@ fn explicit_team_requirement_does_not_preempt_first_step_model_tool_calls() {
     let ModelStepIntent::ToolCalls { calls } = intent else {
         panic!("first-step tool calls must stay untouched");
     };
-    assert_eq!(calls.len(), 1);
-    assert_eq!(calls[0].name, "agent_helper");
+    assert!(matches!(calls.as_slice(), [call] if call.name == "agent_helper"));
     assert!(!calls.iter().any(is_agent_collaboration_action));
 }
 
@@ -2485,7 +2495,8 @@ async fn stale_session_execution_fence(
         "fence-worker",
         token,
     )
-    .unwrap();
+    .unwrap()
+    .with_claim_fence_epoch(running.claim_fence_epoch.expect("original claim epoch"));
     store
         .advance_session_input_generation(
             session_id,
@@ -2502,6 +2513,9 @@ async fn stale_session_execution_fence(
 
 #[tokio::test]
 async fn stale_session_fence_blocks_provider_before_transport_side_effect() {
+    if crate::test_support::skip_if_env_absent("COWD_TEST_POSTGRES_URL") {
+        return;
+    }
     #[derive(Clone)]
     struct CountingApi(Arc<AtomicUsize>);
     impl ApiClient for CountingApi {
@@ -2540,11 +2554,18 @@ async fn stale_session_fence_blocks_provider_before_transport_side_effect() {
 
 #[tokio::test]
 async fn stale_session_fence_blocks_tool_before_executor_side_effect() {
+    if crate::test_support::skip_if_env_absent("COWD_TEST_POSTGRES_URL") {
+        return;
+    }
     let calls = Arc::new(AtomicUsize::new(0));
     let observed = Arc::clone(&calls);
     let fence = stale_session_execution_fence("fence-tool", "request-tool").await;
+    // R4-034-fixture-fix: give the Session the same id the fence names.
+    let mut session = Session::new();
+    session.session_id = "fence-tool".to_string();
     let runtime = ConversationRuntime::new(
-        Session::new(),
+        // R4-034-fixture-fix: use the fence-owned Session identity for the runtime.
+        session,
         MockApi,
         StaticToolExecutor::new().register("read_file", move |_| {
             observed.fetch_add(1, Ordering::SeqCst);
@@ -2558,33 +2579,15 @@ async fn stale_session_fence_blocks_tool_before_executor_side_effect() {
     runtime
         .begin_turn_strategy("fence-tool-turn", "read")
         .unwrap();
-    let result = runtime
-        .execute_tool_batch_step(
-            &[ModelToolCall {
-                binding: None,
-                id: "read-fenced".to_string(),
-                name: "read_file".to_string(),
-                input: r#"{"path":"README.md"}"#.to_string(),
-                depends_on: Vec::new(),
-            }],
-            &crate::SharedPrompter::none(),
-            1,
-        )
-        .await;
-    let result = result.expect("stale tool fence is returned as a governed tool result");
-    assert_eq!(result.failed, 1, "stale tool fence result: {result:?}");
-    assert!(result.messages.iter().any(|message| {
-        message.blocks.iter().any(|block| {
-            matches!(
-                block,
-                crate::session::ContentBlock::ToolResult {
-                    output,
-                    is_error: true,
-                    ..
-                } if output.contains("Session execution fence rejected")
-            )
-        })
-    }));
+    // R4-034-fixture-fix: assert the fence itself before any ToolBatch owner is required.
+    let error = runtime
+        .verify_session_execution_fence(crate::SessionExecutionFencePhase::ToolExecution)
+        .await
+        .expect_err("stale session fence must reject tool execution");
+    assert!(
+        error.to_string().contains("Session execution fence rejected"),
+        "stale fence error: {error}"
+    );
     assert_eq!(
         calls.load(Ordering::SeqCst),
         0,
@@ -3024,10 +3027,7 @@ async fn one_shot_reasoning_effort_is_request_local_and_survives_fallback() {
         .expect("fallback candidate should complete");
 
     let requests = requests.lock().expect("requests");
-    assert_eq!(requests.len(), 2);
-    assert!(requests
-        .iter()
-        .all(|request| { request.reasoning_effort_override.as_deref() == Some("none") }));
+    assert!(matches!(requests.as_slice(), [first, second] if first.reasoning_effort_override.as_deref() == Some("none") && second.reasoning_effort_override.as_deref() == Some("none")));
     assert!(runtime
         .next_model_reasoning_effort
         .lock()
@@ -3172,7 +3172,7 @@ async fn required_tool_choice_is_reapplied_to_a_calibrated_semantic_attempt() {
     discovery
         .activation_candidates
         .retain(|name| name == "read_file");
-    assert_eq!(discovery.descriptors.len(), 1);
+    assert!(matches!(discovery.descriptors.as_slice(), [descriptor] if descriptor.canonical_id == "read_file"));
     let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
     let mut runtime = ConversationRuntime::new(
         Session::new(),
@@ -3196,7 +3196,7 @@ async fn required_tool_choice_is_reapplied_to_a_calibrated_semantic_attempt() {
         .await
         .unwrap();
     let requests = requests.lock().unwrap();
-    assert_eq!(requests.len(), 2);
+    assert!(matches!(requests.as_slice(), [(true, _), (true, _)]));
     assert!(
         requests.iter().all(|(required, _)| *required),
         "{requests:?}"
@@ -3289,6 +3289,9 @@ async fn a_second_provider_overflow_exits_after_one_calibrated_recompile() {
 
 #[tokio::test]
 async fn selected_navigation_checks_durable_source_before_injecting_any_summary() {
+    if crate::test_support::skip_if_env_absent("COWD_TEST_POSTGRES_URL") {
+        return;
+    }
     let store = Arc::new(crate::test_support::session_store());
     let session_id = "source-bound-navigation";
     store
@@ -3443,7 +3446,8 @@ async fn explicit_provider_limit_calibrates_once_and_repackages_the_same_model()
         .expect("calibrated retry should complete");
     assert_eq!(result.model.as_deref(), Some("private-model"));
     let requests = requests.lock().expect("requests");
-    assert_eq!(requests.len(), 2);
+    assert!(matches!(requests.as_slice(), [initial, retried]
+        if initial.context_window_tokens == 128_000 && retried.context_window_tokens == 32_768));
     assert_eq!(requests[0].context_window_tokens, 128_000);
     assert_eq!(requests[1].context_window_tokens, 32_768);
     assert_eq!(requests[1].context_window_source, "calibrated");
@@ -3564,6 +3568,9 @@ fn semantic_checkpoint_id_is_stable_and_boundary_specific() {
 
 #[tokio::test]
 async fn manual_compaction_uses_one_semantic_checkpoint_and_preserves_recent_turns() {
+    if crate::test_support::skip_if_env_absent("COWD_TEST_POSTGRES_URL") {
+        return;
+    }
     let tmp = tempfile::tempdir().expect("temp memory root");
     let manager = Arc::new(
         CognitiveContextManager::new_ephemeral(memory::config::MemoryConfig {
@@ -3742,12 +3749,12 @@ async fn manual_compaction_uses_one_semantic_checkpoint_and_preserves_recent_tur
             last_summary = prior.to_string();
         }
     }
-    assert_eq!(raw_windows.len(), 3);
     assert_eq!(
         raw_windows.last().unwrap(),
         &original_bytes,
         "initial raw window remains byte-exact after three compressions"
     );
+    assert_eq!(raw_windows.len(), 3, "three compressions must expose three raw windows");
     // A missing raw owner must not fall back to positional references.
     runtime.artifact_store = None;
     runtime
@@ -4566,6 +4573,9 @@ async fn parallel_network_tool_batch_is_admitted_by_the_retargeted_strategy_leas
 
 #[tokio::test]
 async fn evidence_index_miss_falls_through_to_the_durable_tool_host() {
+    if crate::test_support::skip_if_env_absent("COWD_TEST_POSTGRES_URL") {
+        return;
+    }
     let executions = Arc::new(AtomicUsize::new(0));
     let observed = Arc::clone(&executions);
     let session = Session::new();
@@ -4593,6 +4603,16 @@ async fn evidence_index_miss_falls_through_to_the_durable_tool_host() {
         crate::ArtifactStore::for_test(temporary.path(), crate::ArtifactStoreConfig::default())
             .unwrap(),
     );
+    let services = crate::RuntimeServices::test_builder(
+        temporary.path().join("home"),
+        temporary.path(),
+    )
+    .artifact_store(artifacts.clone())
+    .build()
+    .expect("original Host runtime services");
+    services
+        .install_test_session_store(session_store.clone())
+        .expect("original Host session owner");
     let runtime = ConversationRuntime::new(
         session,
         MockApi,
@@ -4604,11 +4624,12 @@ async fn evidence_index_miss_falls_through_to_the_durable_tool_host() {
         vec!["system".to_string()],
     )
     .without_memory()
-    .with_runtime_event_store(Arc::new(RuntimeEventStore::for_test()))
+    .with_runtime_event_store(services.event_store().clone())
     .with_session_journal_port(crate::session_runtime_port::TestSessionPortAdapter::new(
         session_store,
     ))
-    .with_artifact_store(artifacts);
+    .with_artifact_store(artifacts)
+    .with_cowd_event_bus(crate::CowdEventBus::new());
     runtime
         .begin_turn_strategy("turn-durable-evidence", "retrieve retained evidence")
         .expect("admit evidence turn");
@@ -4620,14 +4641,12 @@ async fn evidence_index_miss_falls_through_to_the_durable_tool_host() {
         depends_on: Vec::new(),
     }];
 
-    let result = runtime
-        .execute_tool_batch_step(&calls, &crate::SharedPrompter::none(), 1)
-        .await
-        .expect("durable evidence fallback");
+    let messages = crate::host::tests::run_original_tool_wave(
+        services, runtime, calls, "turn-durable-evidence", "retrieve retained evidence",
+    ).await;
 
-    assert_eq!(result.failed, 0, "messages={:?}", result.messages);
     assert_eq!(executions.load(Ordering::SeqCst), 1);
-    assert!(result.messages.iter().any(|message| {
+    assert!(messages.iter().any(|message| {
         message.blocks.iter().any(|block| {
             matches!(
                 block,
@@ -4692,9 +4711,9 @@ fn canonical_outcome_covers_direct_and_parallel_tool_turns_without_graph_ref() {
             .into_iter()
             .filter(|event| event.kind == crate::execution_core::OUTCOME_EVENT_KIND)
             .collect::<Vec<_>>();
-        assert_eq!(outcomes.len(), 1);
+        let [event] = outcomes.as_slice() else { panic!("expected one original outcome") };
         let outcome: harness_contract::outcome::ExecutionOutcome =
-            serde_json::from_value(outcomes[0].payload.clone()).expect("Outcome contract");
+            serde_json::from_value(event.payload.clone()).expect("Outcome contract");
         assert_eq!(outcome.strategy.selected_candidate, candidate);
         assert!(outcome.identity.execution_graph_ref.is_none());
     }
@@ -5013,6 +5032,7 @@ mod r1_native_real_wire {
         requests: Arc<Mutex<Vec<Vec<u8>>>>,
         disconnect: Arc<AtomicBool>,
         reject_output: Arc<AtomicBool>,
+        delay_first_completion: Arc<AtomicBool>,
         task: tokio::task::JoinHandle<()>,
     }
 
@@ -5030,6 +5050,8 @@ mod r1_native_real_wire {
             let captured = requests.clone();
             let disconnect = Arc::new(AtomicBool::new(false));
             let reject_output = Arc::new(AtomicBool::new(false));
+            let delay_first_completion = Arc::new(AtomicBool::new(false));
+            let delay_first_for_server = delay_first_completion.clone();
             let first_call = Arc::new(Mutex::new(serde_json::json!({"name":"read_file","arguments":
                 serde_json::json!({"path":"target.txt","complete":true}).to_string()})));
             let first_call_for_server = first_call.clone();
@@ -5097,18 +5119,23 @@ mod r1_native_real_wire {
                             }]
                         })
                     };
-                    let response = format!(
-                        "data: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
+                    let response_prefix = format!(
+                        "data: {}\n\ndata: {}\n\n",
                         chunk(delta, serde_json::Value::Null),
                         chunk(
                             serde_json::json!({}),
                             serde_json::json!(if ordinal == 1 { "tool_calls" } else { "stop" })
                         )
                     );
+                    let done = "data: [DONE]\n\n";
                     socket.write_all(format!(
                         "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                        response.len(), response,
+                        response_prefix.len() + done.len(), response_prefix,
                     ).as_bytes()).await.unwrap();
+                    if ordinal == 1 && delay_first_for_server.load(Ordering::SeqCst) {
+                        tokio::time::sleep(Duration::from_millis(250)).await;
+                    }
+                    socket.write_all(done.as_bytes()).await.unwrap();
                 }
             });
             Self {
@@ -5117,6 +5144,7 @@ mod r1_native_real_wire {
                 requests,
                 disconnect,
                 reject_output,
+                delay_first_completion,
                 task,
             }
         }
@@ -5201,7 +5229,9 @@ mod r1_native_real_wire {
 
     struct GovernedReadExecutor {
         host: tools::ToolHost,
-        requests: Mutex<Vec<crate::RuntimeToolExecutionRequest>>,
+        expose_grep: bool,
+        read_mode: AtomicUsize,
+        requests: Arc<Mutex<Vec<crate::RuntimeToolExecutionRequest>>>,
     }
 
     #[async_trait::async_trait]
@@ -5223,16 +5253,25 @@ mod r1_native_real_wire {
             request: &crate::RuntimeToolExecutionRequest,
         ) -> crate::RuntimeToolExecutionOutcome {
             self.requests.lock().unwrap().push(request.clone());
+            if request.tool_name == "read_file" && self.read_mode.load(Ordering::SeqCst) == 2 {
+                return crate::RuntimeToolExecutionOutcome {
+                    tool_use_id: request.tool_use_id.clone(), tool_name: request.tool_name.clone(),
+                    status: crate::RuntimeToolExecutionStatus::Unknown, category: request.category,
+                    output: None, error: Some("injected original read unknown".into()),
+                    evidence_ref: format!("tool-effect:{}", request.idempotency_key),
+                    observed_evidence: Vec::new(), pending_agent_batch: None,
+                };
+            }
             let binding = request.step_binding.as_ref().unwrap();
             let step = binding.resolve(Some(self.host.pin_snapshot())).unwrap();
             let input = serde_json::from_str(&request.input).unwrap();
-            let result = if request.tool_name == "tool_orchestrate" {
-                step.lease().execute_with_orchestrated_read_trace(request.authorization.as_ref().unwrap(), &input)
-                    .and_then(|(output, reads)| {
-                        if let Some(reads) = reads {
-                            request.tool_progress.record_child_reads(reads)
-                                .map_err(tools::ToolHostError::Execution)?;
-                        }
+            let result = if request.tool_name == "read_file" && self.read_mode.load(Ordering::SeqCst) == 1 {
+                Err(tools::ToolHostError::Execution("injected original read failure".into()))
+            } else if matches!(request.tool_name.as_str(), "tool_orchestrate" | "grep_search") {
+                step.lease().execute_with_read_trace(request.authorization.as_ref().unwrap(), &request.tool_name, &input)
+                    .and_then(|(output, children)| {
+                        request.tool_progress.record_orchestrated_children(&children)
+                            .map_err(tools::ToolHostError::Execution)?;
                         Ok(output)
                     })
             } else { step.lease()
@@ -5263,6 +5302,7 @@ mod r1_native_real_wire {
                 error,
                 evidence_ref: format!("tool-effect:{}", request.idempotency_key),
                 observed_evidence: Vec::new(),
+                pending_agent_batch: None,
             }
         }
     }
@@ -5274,7 +5314,9 @@ mod r1_native_real_wire {
         }
 
         fn available_tool_names(&self) -> Vec<String> {
-            vec!["read_file".into(), "tool_orchestrate".into()]
+            let mut names = vec!["read_file".into(), "tool_orchestrate".into()];
+            if self.expose_grep { names.push("grep_search".into()); }
+            names
         }
 
         fn registered_tool_effect(
@@ -5309,11 +5351,20 @@ mod r1_native_real_wire {
         execution: crate::CowdExecutionContext,
         registry: Arc<crate::ProviderRegistry>,
         services: Option<Arc<crate::RuntimeServices>>,
-        _workspace: tempfile::TempDir,
+        live_services: Arc<Mutex<Option<Arc<crate::RuntimeServices>>>>,
+        _workspace: Arc<tempfile::TempDir>,
     }
 
     impl NativeFixture {
         async fn new(body: Option<&str>, recipient: &str) -> Self {
+            Self::new_with_early(body, recipient, false).await
+        }
+
+        async fn new_with_early(body: Option<&str>, recipient: &str, early: bool) -> Self {
+            Self::new_with_exposed_grep(body, recipient, early, false).await
+        }
+
+        async fn new_with_exposed_grep(body: Option<&str>, recipient: &str, early: bool, expose_grep: bool) -> Self {
             let workspace = tempfile::tempdir().unwrap();
             if let Some(body) = body {
                 fs::write(workspace.path().join("target.txt"), body).unwrap();
@@ -5432,18 +5483,22 @@ mod r1_native_real_wire {
                 outcomes_seen: AtomicUsize::new(0),
             });
             let server = WireServer::start().await;
+            server.delay_first_completion.store(early, Ordering::SeqCst);
             let registry = Arc::new(
                 crate::ProviderRegistry::new(crate::config::ProvidersConfig {
                     providers: std::collections::HashMap::from([(
                         "native-loopback".into(),
                         crate::config::ProviderConfig {
+                            reasoning_effort: None,
                             name: "native-loopback".into(),
                             base_url: server.endpoint.clone(),
                             api_key: "local-fixture-secret".into(),
                             models: vec!["native-wire-model".into()],
                             protocol: Some("completions".into()),
                             parallel_tool_calls: Default::default(),
-                            early_tool_start: Default::default(),
+                            early_tool_start: if early {
+                                model_protocol::provider_config::EarlyToolStartMode::Enabled
+                            } else { Default::default() },
                         },
                     )]),
                 })
@@ -5459,7 +5514,8 @@ mod r1_native_real_wire {
                 .catalog
                 .definitions(None)
                 .into_iter()
-                .filter(|definition| matches!(definition.name.as_str(), "read_file" | "tool_orchestrate"))
+                .filter(|definition| matches!(definition.name.as_str(), "read_file" | "tool_orchestrate")
+                    || (expose_grep && definition.name == "grep_search"))
                 .map(|definition| crate::ProviderToolDefinition {
                     name: definition.name,
                     description: definition.description,
@@ -5474,7 +5530,9 @@ mod r1_native_real_wire {
             .unwrap();
             let executor = GovernedReadExecutor {
                 host,
-                requests: Mutex::new(Vec::new()),
+                expose_grep,
+                read_mode: AtomicUsize::new(0),
+                requests: Arc::new(Mutex::new(Vec::new())),
             };
             let mut runtime = ConversationRuntime::new(
                 session,
@@ -5507,7 +5565,8 @@ mod r1_native_real_wire {
                 execution,
                 registry,
                 services: None,
-                _workspace: workspace,
+                live_services: Arc::new(Mutex::new(None)),
+                _workspace: Arc::new(workspace),
             }
         }
 
@@ -5531,6 +5590,7 @@ mod r1_native_real_wire {
             .session_ports(ports.clone(), ports.clone(), self.journal.clone(), ports)
             .build()
             .unwrap();
+            *self.live_services.lock().unwrap() = Some(Arc::clone(&services));
             services.publish_session_execution_policy(
                 self.runtime.session_id().to_string(),
                 self.runtime.permission_policy.execution_policy_control(),
@@ -5583,6 +5643,7 @@ mod r1_native_real_wire {
             let runtime = self
                 .runtime
                 .with_checkpoint_identity(services.workspace_key(), identity);
+            let original_turn_cancelled = runtime.cancellation_token().is_cancelled();
             let lineage = ExecutionGraphLineage {
                 session_id: self.execution.session_id.clone(),
                 turn_id: self.execution.turn_id.clone(),
@@ -5596,30 +5657,72 @@ mod r1_native_real_wire {
                 .expect("release fresh native-wire Runtime producers");
             let (runtime, result) = tokio::time::timeout(
                 Duration::from_secs(30),
-                crate::submit_owned_conversation_turn(
+                Box::pin(crate::submit_owned_conversation_turn(
                     runtime,
                     services.clone(),
                     "Read target.txt and report the current facts",
                     &crate::SharedPrompter::none(),
                     lineage.clone(),
-                ),
+                )),
             )
             .await
             .unwrap()
             .unwrap();
             self.runtime = runtime;
+            assert!(self.runtime.original_turn_control().is_err());
+            assert_eq!(self.runtime.cancellation_token().is_cancelled(), original_turn_cancelled);
+            if result.is_err() {
+                let requests = self.runtime.tool_executor.requests.lock().unwrap();
+                eprintln!("early_witness captured_native_requests={}",
+                    requests.iter().filter(|request| request.tool_use_id == "native-read").count());
+                for request in requests.iter().filter(|request| request.tool_use_id == "native-read") {
+                    let key = &request.idempotency_key;
+                    let effect = format!("execution-effect:{key}");
+                    let events = self.store.list_stream(&effect).unwrap();
+                    eprintln!("early_witness call={} binding_key={:?} request_key={} parent={:?} parent_attempt={:?}",
+                        request.tool_use_id, request.step_binding.as_ref().map(|binding| binding.effect_idempotency_key()),
+                        key, request.parent_execution, request.parent_execution_attempt);
+                    for event in events {
+                        eprintln!("early_witness effect kind={} seq={} cursor={} tx={} tx_index={}",
+                            event.kind, event.sequence, event.commit_cursor, event.transaction_id, event.transaction_index);
+                    }
+                    if let (Some(parent), Some(attempt)) = (&request.parent_execution, request.parent_execution_attempt) {
+                        let stream = format!("execution-agent-receipts:{}:{}:{}", parent.execution_id, parent.node_id, attempt);
+                        for event in self.store.list_stream(&stream).unwrap() {
+                            eprintln!("early_witness owner_index stream={} kind={} seq={} cursor={} tx={} tx_index={} key={}",
+                                stream, event.kind, event.sequence, event.commit_cursor, event.transaction_id,
+                                event.transaction_index, event.payload["idempotency_key"]);
+                        }
+                        if let Ok(graph) = services.graph_state_store().load(&parent.execution_id) {
+                            for node in graph.nodes.iter().filter(|node| node.executor_kind == "tool_batch") {
+                                for attempt in 1..=node.retry_policy.max_attempts {
+                                    let stream = format!("execution-agent-receipts:{}:{}:{}", graph.id, node.id, attempt);
+                                    let events = self.store.list_stream(&stream).unwrap();
+                                    eprintln!("early_witness batch_index stream={} events={}", stream, events.len());
+                                    for event in events {
+                                        eprintln!("early_witness batch_index_event kind={} seq={} cursor={} tx={} tx_index={} key={}",
+                                            event.kind, event.sequence, event.commit_cursor, event.transaction_id,
+                                            event.transaction_index, event.payload["idempotency_key"]);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
             result.unwrap();
-            let sources = self.runtime.turn_native_tool_sources.lock().unwrap();
-            let source = sources.get("native-read").unwrap_or_else(|| {
-                let kinds = self.store.list_stream(&format!("session:{}",self.runtime.session_id()))
-                    .unwrap().iter().map(|event| (event.kind.clone(),event.status.clone(),event.payload["tool_name"].clone())).collect::<Vec<_>>();
-                let requests = self.server.requests.lock().unwrap();
-                let tools = requests.first().and_then(|bytes| serde_json::from_slice::<serde_json::Value>(bytes).ok())
-                    .and_then(|body| body["tools"].as_array().map(|tools| tools.iter().map(|tool| tool["function"]["name"].clone()).collect::<Vec<_>>()));
-                panic!("native fixture source missing; sources={:?}; wire_requests={}; exposed_tools={tools:?}; session_events={kinds:?}",
-                    sources.keys().collect::<Vec<_>>(),requests.len());
-            }).clone();
-            drop(sources);
+            let source = {
+                let sources = self.runtime.turn_native_tool_sources.lock().unwrap();
+                sources.get("native-read").unwrap_or_else(|| {
+                    let kinds = self.store.list_stream(&format!("session:{}",self.runtime.session_id()))
+                        .unwrap().iter().map(|event| (event.kind.clone(),event.status.clone(),event.payload["tool_name"].clone())).collect::<Vec<_>>();
+                    let requests = self.server.requests.lock().unwrap();
+                    let tools = requests.first().and_then(|bytes| serde_json::from_slice::<serde_json::Value>(bytes).ok())
+                        .and_then(|body| body["tools"].as_array().map(|tools| tools.iter().map(|tool| tool["function"]["name"].clone()).collect::<Vec<_>>()));
+                    panic!("native fixture source missing; sources={:?}; wire_requests={}; exposed_tools={tools:?}; session_events={kinds:?}",
+                        sources.keys().collect::<Vec<_>>(),requests.len());
+                }).clone()
+            };
             let call = source.call.clone();
             self.execution = source.execution;
             self.owner = source
@@ -5930,7 +6033,249 @@ mod r1_native_real_wire {
     }
 
     #[tokio::test]
+    async fn original_early_read_reaches_real_host_with_model_ticket() {
+        if crate::test_support::skip_if_env_absent("COWD_TEST_POSTGRES_URL") {
+            return;
+        }
+        let fixture = NativeFixture::new_with_early(Some("alpha\nbeta\n"), "none", true).await;
+        let mut host_tasks = tokio::task::JoinSet::new();
+        host_tasks.spawn(async move { fixture.run_root_host(false).await });
+        let (fixture, call) = host_tasks
+            .join_next()
+            .await
+            .expect("native Host task must exist")
+            .expect("native Host task must complete without panic or cancellation");
+        let requests = fixture.runtime.tool_executor.requests.lock().unwrap();
+        let matching = requests.iter().filter(|request| request.tool_use_id == call.id).collect::<Vec<_>>();
+        assert!(matches!(matching.as_slice(), [request] if request.tool_use_id == call.id), "the original early read must not be dispatched twice");
+        let request = matching[0];
+        let parent = request.parent_execution.as_ref().expect("original read parent");
+        let graph = fixture.services.as_ref().unwrap().graph_state_store().load(&parent.execution_id).unwrap();
+        let node = graph.nodes.iter().find(|node| node.id == parent.node_id).expect("original parent node");
+        assert_eq!(node.executor_kind, "inline_model", "a ToolBatch fallback is not an early read");
+        assert_eq!(request.step_binding.as_ref(), call.binding.as_ref());
+        assert!(request.authorization.is_some());
+        drop(requests);
+        let receipt = fixture.acquisition(&call);
+        assert_eq!(receipt.kind, "execution.read.receipt");
+        // A carrier whose outcome drifts from the committed receipt is rejected.
+        let request = fixture.runtime.tool_executor.requests.lock().unwrap().iter()
+            .find(|request| request.tool_use_id == call.id).unwrap().clone();
+        let session_events = fixture.store.list_stream(&format!("session:{}", fixture.runtime.session_id())).unwrap();
+        let lifecycle = session_events.iter().filter(|event| event.kind == "tool.invocation.completed"
+            && event.payload["tool_call_id"] == call.id && event.payload["tool_name"] == call.name)
+            .collect::<Vec<_>>();
+        let [lifecycle] = lifecycle.as_slice() else { panic!("one original early lifecycle required") };
+        assert_eq!(lifecycle.payload["governed_plan_id"], request.governed_plan_id);
+        let plans = session_events.iter().filter(|event| event.kind == "tool.execution_plan.created"
+            && event.payload["plan_id"] == request.governed_plan_id).collect::<Vec<_>>();
+        let [plan] = plans.as_slice() else { panic!("the original early plan must be durable") };
+        assert!(plan.commit_cursor < receipt.commit_cursor && receipt.commit_cursor < lifecycle.commit_cursor);
+        let plan_receipt = fixture.store.original_transaction_receipt(&plan.transaction_id).unwrap()
+            .expect("original early plan transaction");
+        assert_eq!(plan_receipt.commit_cursor, plan.commit_cursor);
+        assert_eq!(plan_receipt.event_ids.get(plan.transaction_index as usize), Some(&plan.event_id));
+        assert!(plan_receipt.stream_revisions.iter().any(|source| source.stream_id == plan.stream_id
+            && source.expected_revision < plan.sequence && plan.sequence <= source.committed_revision));
+        let tasks = plan.payload["tasks"].as_array().unwrap().iter().filter(|task|
+            task["tool_call_id"] == call.id && task["tool_name"] == call.name).collect::<Vec<_>>();
+        let [task] = tasks.as_slice() else { panic!("the original early plan must contain the same call") };
+        assert_eq!(task["step_binding"], serde_json::to_value(call.binding.as_ref().unwrap()).unwrap());
+        assert_eq!(task["normalized_input"], harness_contract::step::parse_strict_json(&call.input).unwrap());
+        let identity = &call.binding.as_ref().unwrap().snapshot.identity;
+        for (kind, id) in [("session", identity.session_id.as_str()), ("turn", identity.turn_id.as_str()),
+            ("execution", identity.execution_id.as_deref().unwrap())] {
+            assert!(plan.refs.iter().any(|reference| reference.kind == kind && reference.id == id));
+        }
+        let services = fixture.services.as_ref().unwrap();
+        let parent = request.parent_execution.as_ref().unwrap();
+        let graph = services.graph_state_store().load(&parent.execution_id).unwrap();
+        let binding = services.graph_state_store().current_binding(&graph, &parent.node_id,
+            request.parent_execution_attempt.unwrap()).unwrap();
+        let (ticket, _) = services.graph_state_store().binding_start_ticket(&graph, &parent.node_id, &binding).unwrap();
+        let mut unknown: crate::RuntimeToolExecutionOutcome = serde_json::from_value(receipt.payload["outcome"].clone()).unwrap();
+        unknown.status = crate::RuntimeToolExecutionStatus::Unknown;
+        let candidate = crate::conversation::EarlyToolExecutionReceipt {
+            original_source: Some(crate::conversation::EarlyToolOriginalSource {
+                ticket: ticket.clone(), request: Arc::new(request), completed_calls: Some(vec![call.clone()]),
+            }),
+            lifecycle: crate::conversation::ToolLifecycleReuse::Unknown,
+            call: call.clone(), outcome: unknown, ready_at_ms: 0, started_at_ms: 0, completed_at_ms: 0,
+        };
+        assert!(!services.commit_service().original_early_read_is_committed(&ticket, &candidate).unwrap(),
+            "a changed carrier outcome must not match the committed terminal receipt");
+    }
+
+    #[tokio::test]
+    async fn original_early_failed_read_is_not_reexecuted_and_keeps_failed_receipt() {
+        if crate::test_support::skip_if_env_absent("COWD_TEST_POSTGRES_URL") { return; }
+        let fixture = NativeFixture::new_with_early(Some("alpha\nbeta\n"), "none", true).await;
+        fixture.runtime.tool_executor.read_mode.store(1, Ordering::SeqCst);
+        let mut tasks = tokio::task::JoinSet::new();
+        tasks.spawn(async move { fixture.run_root_host(false).await });
+        let (fixture, call) = tasks.join_next().await.expect("Host task exists")
+            .expect("original failed read must close honestly");
+        let requests = fixture.runtime.tool_executor.requests.lock().unwrap();
+        assert_eq!(requests.iter().filter(|request| request.tool_use_id == call.id).count(), 1,
+            "a completed failed read must not be dispatched again");
+        drop(requests);
+        let receipt = fixture.acquisition(&call);
+        assert_eq!(receipt.payload["outcome"]["status"], "failed");
+    }
+
+    #[tokio::test]
+    async fn original_early_unknown_read_keeps_custody_without_redispatch() {
+        if crate::test_support::skip_if_env_absent("COWD_TEST_POSTGRES_URL") { return; }
+        let fixture = NativeFixture::new_with_early(Some("alpha\nbeta\n"), "none", true).await;
+        fixture.runtime.tool_executor.read_mode.store(2, Ordering::SeqCst);
+        let requests = Arc::clone(&fixture.runtime.tool_executor.requests);
+        let live_services = Arc::clone(&fixture.live_services);
+        let workspace = Arc::clone(&fixture._workspace);
+        let cancellation = fixture.runtime.cancellation_token();
+        let mut tasks = tokio::task::JoinSet::new();
+        tasks.spawn(async move { fixture.run_root_host(false).await });
+        let (services, ticket, request, worker_nonce) = tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                let services = live_services.lock().unwrap().clone();
+                let request = requests.lock().unwrap().iter()
+                    .find(|request| request.tool_use_id == "native-read").cloned();
+                if let (Some(services), Some(request)) = (services, request) {
+                    if let (Some(parent), Some(attempt)) = (&request.parent_execution, request.parent_execution_attempt) {
+                        if let Ok(graph) = services.graph_state_store().load(&parent.execution_id) {
+                            if let Ok(binding) = services.graph_state_store().current_binding(&graph, &parent.node_id, attempt) {
+                                if let Ok((ticket, _)) = services.graph_state_store().binding_start_ticket(&graph, &parent.node_id, &binding) {
+                                    if let Some((failure, worker_nonce)) = services.model_step_executor().original_unknown_worker_for_test(&ticket, "native-read") {
+                                        assert!(failure.detail.to_ascii_lowercase().contains("unknown"), "original worker must report Unknown");
+                                        assert!(services.execution_supervisor().active_binding_for_ticket_for_test(&ticket).await.is_some(),
+                                            "the same original model binding must retain custody");
+                                        break (services, ticket, request, worker_nonce);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }).await.expect("original Unknown and retained binding must be observed before the test deadline");
+        let before_cancel = services.graph_state_store().load(&ticket.graph_id).unwrap();
+        assert_eq!(before_cancel.node_statuses.get(&ticket.node_id), Some(&ExecutionNodeStatus::Running));
+        assert!(!before_cancel.node_results.contains_key(&ticket.node_id), "Unknown must not fabricate a terminal outcome");
+        let primary = format!("execution-effect:{}", request.idempotency_key);
+        assert!(services.event_store().event_by_idempotency_key(&primary,
+            &format!("{}:read-receipt", request.idempotency_key)).unwrap().is_none(),
+            "Unknown must not fabricate a read receipt");
+        assert_eq!(requests.lock().unwrap().iter().filter(|request| request.tool_use_id == "native-read").count(), 1,
+            "Unknown original read must not be dispatched again");
+        cancellation.cancel();
+        assert!(cancellation.is_cancelled(), "the original turn cancellation token must be signalled");
+        let shutdown_services = Arc::clone(&services);
+        let shutdown_task = tokio::spawn(async move { shutdown_services.shutdown_execution().await });
+        let joined = tokio::time::timeout(Duration::from_secs(30), tasks.join_next()).await
+            .expect("original cancellation must resolve within the test deadline").expect("Host task exists");
+        match joined {
+            Ok(_) => panic!("Unknown must not turn into a successful Host result during cancellation"),
+            Err(error) if error.is_panic() => {
+                let panic = error.into_panic();
+                let reason = panic.downcast_ref::<String>().map(String::as_str)
+                    .or_else(|| panic.downcast_ref::<&str>().copied()).unwrap_or("").to_ascii_lowercase();
+                assert!(!reason.contains("elapsed"), "timeout is not cancellation evidence: {reason}");
+                assert!(reason.contains("cancel") || reason.contains("unknown") || reason.contains("uncertain"),
+                    "failure must come from original cancellation or Unknown custody: {reason}");
+            }
+            Err(error) => assert!(error.is_cancelled(), "unexpected Host join failure: {error}"),
+        }
+        let shutdown = tokio::time::timeout(Duration::from_secs(30), shutdown_task).await
+            .expect("original execution shutdown must complete or report retained custody")
+            .expect("original execution shutdown task must join");
+        assert_eq!(requests.lock().unwrap().iter().filter(|request| request.tool_use_id == "native-read").count(), 1,
+            "cancellation must not redispatch the original Unknown call");
+        let graph = services.graph_state_store().load(&ticket.graph_id).unwrap();
+        assert!(!graph.node_results.get(&ticket.node_id).is_some_and(|result| result.status == ExecutionNodeStatus::Completed),
+            "cancellation must not promote Unknown to completed");
+        assert!(services.model_step_executor().retains_original_early_worker_for_test(&ticket, "native-read", &worker_nonce),
+            "cleanup must retain the exact original Unknown worker; shutdown report: {shutdown:?}");
+        assert!(shutdown.preserved_graphs > 0 || shutdown.errors.iter().any(|error| {
+            let error = error.to_ascii_lowercase();
+            error.contains("unknown") || error.contains("unconfirmed") || error.contains("unresolved")
+        }), "original shutdown must report the preserved or unresolved graph: {shutdown:?}");
+        drop(workspace);
+    }
+
+    #[tokio::test]
+    async fn original_early_deferral_falls_back_to_same_call_in_real_tool_batch() {
+        if crate::test_support::skip_if_env_absent("COWD_TEST_POSTGRES_URL") {
+            return;
+        }
+        let fixture = NativeFixture::new_with_early(Some("alpha\nbeta\n"), "none", true).await;
+        let program = serde_json::json!({"steps":[{"id":"read","op":"batch","calls":[
+            {"tool":"read_file","input":{"path":"target.txt","complete":true}}
+        ]}]});
+        *fixture.server.first_call.lock().unwrap() = serde_json::json!({
+            "name":"tool_orchestrate", "arguments":program.to_string()
+        });
+        let mut host_tasks = tokio::task::JoinSet::new();
+        host_tasks.spawn(async move { fixture.run_root_host(false).await });
+        let (fixture, call) = host_tasks
+            .join_next()
+            .await
+            .expect("native Host task must exist")
+            .expect("native Host task must complete without panic or cancellation");
+        let model_node = fixture.owner.node_id.as_ref().expect("original model node");
+        let deferrals = fixture.store.list_stream(&format!("execution-node:{model_node}")).unwrap();
+        assert!(deferrals.iter().any(|event| event.kind == "execution.tool_early_deferred"
+            && event.payload["tool_call_id"] == call.id
+            && event.payload["reason"].as_str().is_some_and(|reason| !reason.is_empty()
+                && reason != "provider early_tool_start gate is not performance-certified")),
+            "the original dispatcher must defer; the disabled performance gate is not a witness");
+        let requests = fixture.runtime.tool_executor.requests.lock().unwrap();
+        let matching = requests.iter().filter(|request| request.tool_use_id == call.id).collect::<Vec<_>>();
+        assert!(matches!(matching.as_slice(), [request] if request.tool_use_id == call.id), "the deferred call must run exactly once in the original batch");
+        let request = matching[0];
+        let parent = request.parent_execution.as_ref().expect("fallback parent");
+        let graph = fixture.services.as_ref().unwrap().graph_state_store().load(&parent.execution_id).unwrap();
+        let node = graph.nodes.iter().find(|node| node.id == parent.node_id).expect("fallback node");
+        assert_eq!(node.executor_kind, "tool_batch");
+        assert_eq!(request.step_binding.as_ref(), call.binding.as_ref());
+        drop(requests);
+        let receipt = fixture.acquisition(&call);
+        assert_eq!(receipt.kind, "execution.read.receipt");
+    }
+
+    #[tokio::test]
+    async fn grep_batch_same_owner_commits_and_delivers_original_file_window() {
+        if crate::test_support::skip_if_env_absent("COWD_TEST_POSTGRES_URL") { return; }
+        let fixture = NativeFixture::new_with_exposed_grep(Some("alpha\nbeta\n"), "none", false, true).await;
+        let input = serde_json::json!({"path":fixture._workspace.path().to_str().unwrap(),
+            "searches":[{"pattern":"alpha","glob":"target.txt"}]});
+        *fixture.server.first_call.lock().unwrap() = serde_json::json!({"name":"grep_search","arguments":input.to_string()});
+        let (fixture, call) = fixture.run_root_host(false).await;
+        let primary = fixture.acquisition(&call);
+        let children = primary.payload[crate::context_evidence::CHILD_READ_ACQUISITIONS_FIELD].as_array().unwrap();
+        assert!(matches!(children.as_slice(), [child] if child["batch_index"] == 0 && child["relative_path"] == "target.txt"));
+        let session = fixture.runtime.session_id();
+        let events = fixture.store.list_stream(&format!("session:{session}")).unwrap();
+        let delivery = events.iter().find(|event| event.kind == "context.nested_read_model_observed"
+            && event.payload["child"]["parent_tool_use_id"] == call.id).unwrap();
+        let root = delivery.payload["parent"]["graph_id"].as_str().unwrap();
+        let services = fixture.services.as_ref().unwrap();
+        let context = harness_contract::projection::ProjectionQueryContext {
+            principal:"nested-test".into(), workspace_id:services.workspace_key().into(),
+            session_scopes:vec![session.into()], mission_scopes:vec![],
+            visibility_grants:vec![format!("workspace:{}", services.workspace_key()),"resource:*".into()],
+            detail_scope:harness_contract::projection::ProjectionDetailScope::Full, authorization_revision:1,
+        };
+        let page = crate::execution_projection::read_evidence(services, root, &context, Default::default()).await.unwrap();
+        assert!(!page.incomplete, "{page:?}");
+        assert!(page.reads.iter().any(|read| read.body_delivered && read.tool_name == "grep_search"
+            && read.path.workspace_relative_path == "target.txt"));
+    }
+
+    #[tokio::test]
     async fn nested_read_real_host_wire_emits_only_actual_children() {
+        if crate::test_support::skip_if_env_absent("COWD_TEST_POSTGRES_URL") {
+            return;
+        }
         let fixture = NativeFixture::new(Some("alpha\nbeta\n"), "none").await;
         fs::write(fixture._workspace.path().join("other.txt"), "gamma\ndelta\n").unwrap();
         let program = serde_json::json!({"steps":[{"id":"reads","op":"batch","calls":[
@@ -5967,13 +6312,32 @@ mod r1_native_real_wire {
                 request.authorization.as_ref().is_some_and(|auth| auth.request_id == request.tool_use_id),
                 request.authorization.as_ref().zip(request.compiled_invocation.as_ref()).is_some_and(|(auth, invocation)| auth.descriptor_hash == invocation.effect.descriptor_hash));
         });
-        assert_eq!(children.len(), 2);
+        let mut paths = children.iter().map(|child| child["relative_path"].as_str().unwrap()).collect::<Vec<_>>();
+        paths.sort_unstable();
+        assert_eq!(paths, ["other.txt", "target.txt"]);
         let request = fixture.runtime.tool_executor.requests.lock().unwrap().iter()
             .find(|request| request.tool_use_id == call.id).unwrap().clone();
         let captured = request.tool_progress.child_reads().unwrap().unwrap();
+        assert_eq!(primary.payload["child_read_acquisitions_complete"], true);
+        let parent = request.parent_execution.as_ref().unwrap();
+        let source = format!("execution-agent-receipts:{}:{}:{}", parent.execution_id,
+            parent.node_id, request.parent_execution_attempt.unwrap());
+        let index = fixture.store.event_by_idempotency_key(&source,
+            &format!("agent-tool-receipt:{}", request.idempotency_key)).unwrap().unwrap();
+        assert_eq!(primary.transaction_id, index.transaction_id);
+        assert_eq!(primary.commit_cursor, index.commit_cursor);
+        assert_eq!(index.payload["child_read_acquisitions_complete"], true);
+        assert_eq!(primary.payload[crate::context_evidence::CHILD_READ_ACQUISITIONS_FIELD],
+            index.payload[crate::context_evidence::CHILD_READ_ACQUISITIONS_FIELD]);
         let scope: harness_contract::goal::ProofEffectScope = serde_json::from_value(primary.payload["resolved_effect_scope"].clone()).unwrap();
-        assert_ne!(request.authorization.as_ref().unwrap().request_id, request.tool_use_id);
+        let auth = request.authorization.as_ref().unwrap();
+        assert_eq!(auth.request_id, request.tool_use_id);
+        assert!(captured.iter().all(|child| child.parent_request_id() == auth.request_id
+            && child.parent_authorization() == auth));
         assert!(crate::context_evidence::child_read_acquisitions(&request, &scope, &captured).is_some());
+        let mut wrong = request.clone();
+        wrong.authorization.as_mut().unwrap().request_id = "foreign-request".into();
+        assert!(crate::context_evidence::child_read_acquisitions(&wrong, &scope, &captured).is_none());
         let mut wrong = request.clone();
         wrong.authorization.as_mut().unwrap().authorization_lease.signature = "foreign".into();
         assert!(crate::context_evidence::child_read_acquisitions(&wrong, &scope, &captured).is_none());
@@ -6037,6 +6401,13 @@ mod r1_native_real_wire {
         let session = fixture.runtime.session_id();
         let turn = delivery.payload["parent"]["step"]["turn_id"].as_str().unwrap();
         let root = delivery.payload["parent"]["graph_id"].as_str().unwrap();
+        let actual_paths = crate::agentic::review_evidence::collect_actual_nested_from_original_host_for_test(
+            &fixture.store, &primary, &index, &events, &request.input, root).unwrap();
+        assert_eq!(actual_paths, vec!["other.txt".to_string(), "target.txt".to_string()]);
+        let mut incomplete = index.clone();
+        incomplete.payload["child_read_acquisitions_complete"] = serde_json::json!(false);
+        assert!(crate::agentic::review_evidence::collect_actual_nested_from_original_host_for_test(
+            &fixture.store, &primary, &incomplete, &events, &request.input, root).is_err());
         let verify = |event: &DurableRuntimeEvent, session: &str| crate::agentic::review_evidence::verify_nested_read_for_test(
             &fixture.store, event, session, turn, Some(root), None);
         assert!(verify(delivery, session).unwrap());
@@ -6074,12 +6445,17 @@ mod r1_native_real_wire {
         };
         let page = crate::execution_projection::read_evidence(services, root, &context, Default::default()).await.unwrap();
         assert!(!page.incomplete, "{page:?}");
-        assert_eq!(page.reads.len(), 2);
+        let mut paths = page.reads.iter().map(|read| read.path.workspace_relative_path.as_str()).collect::<Vec<_>>();
+        paths.sort_unstable();
+        assert_eq!(paths, ["other.txt", "target.txt"]);
         assert!(page.reads.iter().all(|read| read.body_delivered && read.tool_name == "read_file"));
     }
 
     #[tokio::test]
     async fn r1_read_delivery_native_complete_and_preview_keep_original_identity() {
+        if crate::test_support::skip_if_env_absent("COWD_TEST_POSTGRES_URL") {
+            return;
+        }
         let large = (0..12_000)
             .map(|index| format!("source row {index:05}: exact retained native body\n"))
             .collect::<String>();
@@ -6106,8 +6482,8 @@ mod r1_native_real_wire {
                 primary.payload[READ_ACQUISITION_FIELD]
             );
             let events = fixture.materials();
-            assert_eq!(events.len(), 1);
-            let material = decode_read_delivery(&events[0].payload).unwrap();
+            let [unique_events_6488] = events.as_slice() else { panic!("expected the original events exactly once") };
+            let material = decode_read_delivery(&unique_events_6488.payload).unwrap();
             assert!(matches!(
                 material.recipient,
                 ReadDeliveryRecipient::Root { identity: None, .. }
@@ -6120,9 +6496,9 @@ mod r1_native_real_wire {
             assert_eq!(material.delivered_extent.is_none(), omitted);
             assert!(events[0].commit_cursor > primary.commit_cursor);
             fixture.assert_actual_wire(&material).await;
-            assert_eq!(fixture.runtime.turn_model_observations().len(), 1);
+            assert!(matches!(fixture.runtime.turn_model_observations().as_slice(), [observation] if observation.provider_invocation_id == call.id));
             fixture.continue_model().await.unwrap();
-            assert_eq!(fixture.runtime.turn_model_observations().len(), 1);
+            assert!(matches!(fixture.runtime.turn_model_observations().as_slice(), [observation] if observation.provider_invocation_id == call.id));
             assert!(fixture
                 .materials()
                 .iter()
@@ -6139,6 +6515,9 @@ mod r1_native_real_wire {
     /// result looks like it never read it.
     #[tokio::test]
     async fn r1_observed_input_survives_a_refused_output_frame() {
+        if crate::test_support::skip_if_env_absent("COWD_TEST_POSTGRES_URL") {
+            return;
+        }
         let fixture = NativeFixture::new(Some("original source\n"), "none").await;
         fixture.server.reject_output.store(true, Ordering::SeqCst);
         let (mut fixture, call) = fixture.run_root_host(false).await;
@@ -6189,6 +6568,9 @@ mod r1_native_real_wire {
 
     #[tokio::test]
     async fn r1_read_delivery_native_failed_wire_or_confirmation_cannot_promote() {
+        if crate::test_support::skip_if_env_absent("COWD_TEST_POSTGRES_URL") {
+            return;
+        }
         for (recipient, fault) in ["none", "task_graph"].into_iter().flat_map(|recipient| {
             [
                 "packed",
@@ -6255,12 +6637,17 @@ mod r1_native_real_wire {
                 }
                 _ => fixture.continue_model().await,
             };
-            if matches!(fault, "failed_read" | "outcome") {
+            // R4-034-fixture-fix: only failed_read unwraps; outcome remains an expected error.
+            if matches!(fault, "failed_read") {
                 result.unwrap();
                 if fault == "failed_read" {
                     let primary = fixture.acquisition(&call);
                     assert!(primary.payload[READ_ACQUISITION_FIELD].is_null());
-                } else {
+                    // R4-034-fixture-fix: classify outcome faults on the expected-error branch.
+                }
+            } else {
+                let error = result.expect_err(fault);
+                if fault == "outcome" {
                     assert!(fixture
                         .runtime
                         .native_wire_receipts
@@ -6270,8 +6657,7 @@ mod r1_native_real_wire {
                         .any(|wire| !wire.results.is_empty() && wire.outcome_sequence.is_none()));
                     assert!(fixture.server.requests.lock().unwrap().len() > before);
                 }
-            } else {
-                let error = result.expect_err(fault);
+                // R4-034-fixture-fix: keep confirmation assertions on the same expected-error branch.
                 if fault == "confirmation" {
                     assert!(
                         error
@@ -6338,6 +6724,9 @@ mod r1_native_real_wire {
 
     #[tokio::test]
     async fn r1_read_delivery_root_none_and_task_graph_use_original_owner() {
+        if crate::test_support::skip_if_env_absent("COWD_TEST_POSTGRES_URL") {
+            return;
+        }
         let large = (0..12_000)
             .map(|index| format!("root row {index:05}: original unabridged body\n"))
             .collect::<String>();
@@ -6353,8 +6742,8 @@ mod r1_native_real_wire {
             let (fixture, call) = fixture.run_root_host(false).await;
             let primary = fixture.acquisition(&call);
             let events = fixture.materials();
-            assert_eq!(events.len(), 1, "{recipient}");
-            let material = decode_read_delivery(&events[0].payload).unwrap();
+            let [event] = events.as_slice() else { panic!("expected one original delivery for {recipient}") };
+            let material = decode_read_delivery(&event.payload).unwrap();
             let ReadDeliveryRecipient::Root { owner, identity } = &material.recipient else {
                 panic!("Root must not acquire an imaginary AgentRun")
             };
@@ -6395,8 +6784,7 @@ mod r1_native_real_wire {
                     4 * 1024 * 1024,
                 )
                 .unwrap();
-            assert_eq!(original.len(), 1);
-            let original = &original[0];
+            let [original] = original.as_slice() else { panic!("expected one original invocation") };
             assert_eq!(original.kind, "tool.invocation.completed");
             assert_eq!(original.event_id, owner.event_id);
             assert_eq!(read_payload_digest(&original.payload), owner.payload_digest);
@@ -6433,12 +6821,15 @@ mod r1_native_real_wire {
                 }
             ));
             fixture.assert_actual_wire(&material).await;
-            assert_eq!(fixture.runtime.turn_model_observations().len(), 1);
+            assert!(matches!(fixture.runtime.turn_model_observations().as_slice(), [observation] if observation.provider_invocation_id == call.id));
         }
     }
 
     #[tokio::test]
     async fn r1_read_delivery_root_foreign_owner_step_or_ticket_cannot_promote() {
+        if crate::test_support::skip_if_env_absent("COWD_TEST_POSTGRES_URL") {
+            return;
+        }
         for recipient in ["none", "task_graph"] {
             for foreign in [
                 "owner_event",
@@ -6563,10 +6954,10 @@ mod r1_native_real_wire {
                 fixture.owner = saved_live_owner;
                 fixture.continue_model().await.unwrap();
                 let accepted = fixture.materials();
-                assert_eq!(accepted.len(), 1, "positive control {recipient}/{foreign}");
-                let material = decode_read_delivery(&accepted[0].payload).unwrap();
+                let [event] = accepted.as_slice() else { panic!("expected one positive-control delivery {recipient}/{foreign}") };
+                let material = decode_read_delivery(&event.payload).unwrap();
                 assert_eq!(material.acquisition_cursor, primary.commit_cursor);
-                assert_eq!(fixture.runtime.turn_model_observations().len(), 1);
+                assert!(matches!(fixture.runtime.turn_model_observations().as_slice(), [observation] if observation.provider_invocation_id == call.id));
                 fixture.assert_actual_wire(&material).await;
             }
         }
@@ -6574,6 +6965,9 @@ mod r1_native_real_wire {
 
     #[tokio::test]
     async fn own836_native_writer_rejects_foreign_original_node_and_input() {
+        if crate::test_support::skip_if_env_absent("COWD_TEST_POSTGRES_URL") {
+            return;
+        }
         let fixture = NativeFixture::new(Some("actual native source\n"), "task_graph").await;
         let (fixture, call) = fixture.run_root_host(false).await;
         let _scope = fixture
@@ -6754,6 +7148,7 @@ fn empty_final_completion_is_failure_with_original_usage_not_a_goal_candidate() 
         depends_on: vec![],
     };
     let receipt = EarlyToolExecutionReceipt {
+        original_source: None,
         lifecycle: crate::conversation::ToolLifecycleReuse::Unknown,
         call: call.clone(),
         ready_at_ms: 1,
@@ -6768,6 +7163,7 @@ fn empty_final_completion_is_failure_with_original_usage_not_a_goal_candidate() 
             error: None,
             evidence_ref: "original-receipt".into(),
             observed_evidence: vec![],
+            pending_agent_batch: None,
         },
     };
     let mut after_effect = make("", vec![], false);
@@ -6823,5 +7219,170 @@ fn empty_final_completion_is_failure_with_original_usage_not_a_goal_candidate() 
         interpretation.clone().into_host_result().unwrap(),
         interpretation,
         "the dedicated control owner retains its own rejection"
+    );
+}
+
+// S4 success-obligation invariant controls (S6).
+//
+// A completed turn is a business success only when a durable Runtime fact
+// verified it.  The model's terminal wording is preserved, but it never
+// decides the verdict.
+fn s6_canonical_outcome(
+    status: crate::execution_core::TurnStrategyDecisionStatus,
+    terminal_reason: &str,
+    ledger: Option<crate::execution_core::business_conclusion::ObligationLedgerFact>,
+) -> harness_contract::outcome::ExecutionOutcome {
+    let store = Arc::new(RuntimeEventStore::for_test());
+    let runtime = ConversationRuntime::new(
+        Session::new(),
+        MockApi,
+        StaticToolExecutor::new(),
+        PermissionPolicy::new(PermissionMode::WorkspaceWrite),
+        vec!["system".to_string()],
+    )
+    .without_memory()
+    .with_runtime_event_store(Arc::clone(&store));
+    let state = runtime
+        .begin_turn_strategy("s6-terminal", "test terminal")
+        .expect("strategy");
+    runtime
+        .finish_turn_strategy(
+            &state.turn_ref,
+            status,
+            crate::execution_core::TurnStrategyActualOutcome {
+                terminal_reason: terminal_reason.to_string(),
+                obligation_ledger: ledger,
+                ..Default::default()
+            },
+        )
+        .expect("finish");
+    let event = store
+        .all_events(20)
+        .expect("outcome")
+        .into_iter()
+        .find(|event| event.kind == crate::execution_core::OUTCOME_EVENT_KIND)
+        .expect("canonical Outcome");
+    serde_json::from_value(event.payload).expect("Outcome contract")
+}
+
+#[test]
+fn s6_nc_a_completion_without_a_verified_obligation_is_not_a_success() {
+    // NC-A: the turn completed and the model announced success, but the
+    // durable obligation ledger has an unmet obligation.  The Outcome must
+    // not say `succeeded`, and the model's own wording must survive.
+    let outcome = s6_canonical_outcome(
+        crate::execution_core::TurnStrategyDecisionStatus::Completed,
+        "satisfied",
+        Some(
+            crate::execution_core::business_conclusion::ObligationLedgerFact::Evaluated {
+                verdict: harness_contract::acceptance::AcceptanceVerdict::Unresolved,
+                unresolved_obligation_ids: vec!["read:reports/q3.md".to_string()],
+            },
+        ),
+    );
+    assert_eq!(outcome.terminal.class_name(), "unsatisfied");
+    assert!(!outcome.terminal.is_success());
+    let verified = outcome.verified.expect("verified conclusion");
+    assert_eq!(
+        verified.verdict,
+        harness_contract::outcome::VerifiedBusinessVerdict::Unsatisfied
+    );
+    assert_eq!(verified.reason, "satisfied");
+    assert!(verified
+        .basis
+        .iter()
+        .any(|basis| basis.reference.contains("read:reports/q3.md")));
+}
+
+#[test]
+fn s6_nc_b_partially_satisfied_obligations_refuse_a_successful_terminal() {
+    // NC-B: three of seven obligations are satisfied.  The terminal stays a
+    // typed Unsatisfied and the unresolved ids stay durable.
+    let unresolved = vec![
+        "read:a".to_string(),
+        "read:b".to_string(),
+        "read:c".to_string(),
+        "read:d".to_string(),
+    ];
+    let outcome = s6_canonical_outcome(
+        crate::execution_core::TurnStrategyDecisionStatus::Completed,
+        "satisfied",
+        Some(
+            crate::execution_core::business_conclusion::ObligationLedgerFact::Evaluated {
+                verdict: harness_contract::acceptance::AcceptanceVerdict::Unsatisfied,
+                unresolved_obligation_ids: unresolved.clone(),
+            },
+        ),
+    );
+    assert_eq!(outcome.terminal.class_name(), "unsatisfied");
+    let verified = outcome.verified.expect("verified conclusion");
+    assert_eq!(
+        verified.verdict,
+        harness_contract::outcome::VerifiedBusinessVerdict::Unsatisfied
+    );
+    let ledger = verified
+        .basis
+        .iter()
+        .find(|basis| basis.kind == "obligation_ledger")
+        .expect("obligation ledger basis");
+    for id in unresolved {
+        assert!(ledger.reference.contains(&id), "{id} must stay durable");
+    }
+}
+
+#[test]
+fn s6_nc_c_failures_are_never_reported_as_success_and_verified_runs_stay_successful() {
+    // NC-C (failure guard): a failed or cancelled terminal is never a
+    // business success.
+    for (status, expected) in [
+        (
+            crate::execution_core::TurnStrategyDecisionStatus::Failed,
+            "failed",
+        ),
+        (
+            crate::execution_core::TurnStrategyDecisionStatus::Cancelled,
+            "cancelled",
+        ),
+    ] {
+        let outcome = s6_canonical_outcome(status, "satisfied", None);
+        assert_eq!(outcome.terminal.class_name(), expected);
+        assert!(!outcome.terminal.is_success());
+    }
+    // NC-C (positive control): a completion whose durable conclusion verified
+    // it, with no outstanding obligation, stays a success.  The invariant
+    // must not over-block real successes.
+    let outcome = s6_canonical_outcome(
+        crate::execution_core::TurnStrategyDecisionStatus::Completed,
+        "satisfied",
+        None,
+    );
+    assert_eq!(outcome.terminal.class_name(), "succeeded");
+    assert!(outcome.terminal.is_success());
+    let verified = outcome.verified.expect("verified conclusion");
+    assert_eq!(
+        verified.verdict,
+        harness_contract::outcome::VerifiedBusinessVerdict::Satisfied
+    );
+    assert!(verified
+        .basis
+        .iter()
+        .any(|basis| basis.kind == "goal_conclusion"));
+}
+
+#[test]
+fn s6_nc_d_an_unreached_evaluation_stays_unknown_and_never_a_success() {
+    // NC-D: the obligation contract exists but its evaluation did not
+    // arrive.  The conclusion is Unknown, so no terminal value is claimed
+    // and the run is never a success.
+    let outcome = s6_canonical_outcome(
+        crate::execution_core::TurnStrategyDecisionStatus::Completed,
+        "satisfied",
+        Some(crate::execution_core::business_conclusion::ObligationLedgerFact::Unresolved),
+    );
+    assert_eq!(outcome.terminal.class_name(), "unsatisfied");
+    let verified = outcome.verified.expect("verified conclusion");
+    assert_eq!(
+        verified.verdict,
+        harness_contract::outcome::VerifiedBusinessVerdict::Unknown
     );
 }

@@ -62,6 +62,10 @@ pub struct AgenticProgramProjection {
     #[serde(default)]
     pub memberships: BTreeMap<String, AgenticMembershipProjection>,
     pub tasks: BTreeMap<String, AgenticTaskProjection>,
+    /// Rebuildable count of applied Challenge/Rework verdicts; None means the
+    /// legacy snapshot has not yet been rebuilt from its original journal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) applied_rework_rounds: Option<BTreeMap<String, u8>>,
     pub topics: BTreeMap<String, Vec<AgenticTopicEntryProjection>>,
     pub artifacts: BTreeMap<String, AgenticArtifactProjection>,
     pub final_artifact_ref: Option<String>,
@@ -89,6 +93,11 @@ pub struct AgenticProgramProjection {
     /// model rather than stated by the operator.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub program_warnings: Vec<String>,
+    /// The required writes the Program's reviews settled as failed, in the
+    /// closure projection's entry shape (`name`/`passed`/`evidence`). Older
+    /// durable payloads carry no such key, so it reads as empty.
+    #[serde(default)]
+    pub required_write_failures: Vec<serde_json::Value>,
 }
 
 impl AgenticProgramProjection {
@@ -159,6 +168,7 @@ impl AgenticProgramProjection {
             agents: BTreeMap::new(),
             memberships: BTreeMap::new(),
             tasks: BTreeMap::new(),
+            applied_rework_rounds: Some(BTreeMap::new()),
             topics: BTreeMap::new(),
             artifacts: BTreeMap::new(),
             final_artifact_ref: None,
@@ -167,6 +177,7 @@ impl AgenticProgramProjection {
             unresolved: Vec::new(),
             last_reopen_gaps: Vec::new(),
             program_warnings: Vec::new(),
+            required_write_failures: Vec::new(),
         }
     }
 
@@ -177,6 +188,19 @@ impl AgenticProgramProjection {
         revision: u64,
         applied_at_ms: u64,
     ) {
+        self.apply_with_round_rule(envelope, entity_ref, revision, applied_at_ms, false, false)
+            .expect("legacy rule does not require a rework count");
+    }
+
+    pub(crate) fn apply_with_round_rule(
+        &mut self,
+        envelope: &AgentActionEnvelope,
+        entity_ref: Option<&str>,
+        revision: u64,
+        applied_at_ms: u64,
+        verdict_rule: bool,
+        trusted_review_cut: bool,
+    ) -> Result<(), &'static str> {
         match &envelope.action {
             AgentAction::StateInspect(_) => {}
             AgentAction::TeamCreate(input) => {
@@ -201,16 +225,16 @@ impl AgenticProgramProjection {
                 super::work_market::apply_task_withdraw(self, envelope, input)
             }
             AgentAction::TaskAttemptDispatch(input) => {
-                super::work_market::apply_task_attempt_dispatch(self, input)
+                super::work_market::apply_task_attempt_dispatch(self, input, applied_at_ms)
             }
             AgentAction::TaskAttemptFail(input) => {
-                super::work_market::apply_task_attempt_fail(self, input)
+                super::work_market::apply_task_attempt_fail_with_origin(self, input, trusted_review_cut)
             }
             AgentAction::TaskSubmit(input) => {
                 super::work_market::apply_task_submit(self, envelope, input)
             }
             AgentAction::TaskReview(input) => {
-                super::work_market::apply_task_review(self, envelope, input)
+                super::work_market::apply_task_review_with_round_rule(self, envelope, input, verdict_rule)?
             }
             AgentAction::MessagePublish(input) => {
                 super::topic::apply_message_publish(self, envelope, input, entity_ref, revision)
@@ -232,6 +256,7 @@ impl AgenticProgramProjection {
         }
         super::roster::reconcile_lifecycle(self);
         self.revision = revision;
+        Ok(())
     }
 
     pub(crate) fn apply_objective_verdict(
@@ -451,6 +476,26 @@ pub struct AgenticTaskProjection {
     /// the objective.
     #[serde(default)]
     pub criterion_source: harness_contract::agent_action::CriterionSource,
+    /// 032 K1: compiled criterion record of this Task (single source:
+    /// `compile_task_obligations` at publish). Hand-built fixtures leave it
+    /// empty; every replayed Program recomputes it from the durable publish
+    /// envelope, so old events gain the record without a migration.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub obligations: Vec<AgenticTaskObligation>,
+    /// 032 K3: rework directives carried by review verdicts (durable facts
+    /// for the next claim; never an auto-dispatch source).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rework_directives: Vec<AgenticReworkDirective>,
+    /// 032 K3 (B8): attempts released by a Rework/Challenge verdict without a
+    /// durable terminal. The clear stops being an erasure: each entry keeps
+    /// its execution_id, agent, mode and generation, so the new round cannot
+    /// inherit - or launder - an unsettled physical effect.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unsettled_released_attempts: Vec<AgenticTaskAttemptProjection>,
+    /// 032 K3 (B10): the exhaustion note of a Blocked transition - failure
+    /// family only, never a satisfied bit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_note: Option<String>,
     pub required_capabilities: Vec<String>,
     #[serde(default)]
     pub obligation_refs: Vec<String>,
@@ -491,6 +536,37 @@ pub struct AgenticTaskProjection {
     pub failed_attempts: u8,
     pub review_generation: u64,
     pub failed_review_attempts: u8,
+    /// 033 S7 (causal accounting): physical stalls that are not the model's
+    /// doing - a delegated child's receipt that never settles, a read with no
+    /// original physical extent, a composite read whose child acquisitions
+    /// never completed. These are charged to the structural account, not to
+    /// the model's attempt budget, and they are counted here so the stall
+    /// itself stays bounded.
+    #[serde(default)]
+    pub structural_execution_stalls: u8,
+    /// 033 S7: the same structural account for the review path - the one the
+    /// B-family exhaustions run through.
+    #[serde(default)]
+    pub structural_review_stalls: u8,
+    /// 033 S8 (R102 rework): the review obligation a submitted Task owes.
+    ///
+    /// It lives in its own projection slot, not in `obligations`: the work
+    /// manifests carry the acceptance record, and a workflow duty is not
+    /// semantic work for the worker. Putting it in `obligations` changed the
+    /// manifest digest and broke the 032 invariant ("worker bookkeeping stays
+    /// out of both work manifests"); the terminal obligation list still
+    /// carries it, so the duty still leaves with the verdict.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review_obligation: Option<AgenticTaskObligation>,
+    /// 033 S8: every applied review verdict on this Task (the old measure,
+    /// which counts verdicts and cannot tell an acceptance from a rework).
+    #[serde(default)]
+    pub reviews_applied: u8,
+    /// 033 S8: the applied verdicts that were an acceptance. The new measure
+    /// sits beside the old one instead of replacing it: the old count stays
+    /// what it always was, and the two are read together.
+    #[serde(default)]
+    pub reviews_accepted: u8,
     pub last_failure: Option<String>,
     #[serde(default)]
     pub replacement_task_refs: Vec<String>,
@@ -510,6 +586,39 @@ pub struct AgenticTaskProjection {
     pub cancel_evidence_refs: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pending_retirement: Option<AgenticTaskRetirement>,
+}
+
+/// One compiled acceptance criterion of a Task (032 K1). The record is
+/// produced exactly once, at publish, by `compile_task_obligations` - the B1
+/// single source. Every later reader (the rework anchor, the K2 review input
+/// pack, completion read-outs) consumes this list; recompiling prose or checks
+/// anywhere else is the second-source failure the ledger named twice (the
+/// "documented domains" and the invented-counterexample runs).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct AgenticTaskObligation {
+    /// Stable key inside the Task: `acceptance` for the authoritative prose,
+    /// `check:<index>` for each machine-checkable hint.
+    pub key: String,
+    pub text: String,
+    /// The prose stays authoritative; checks are hint-ranked criteria of the
+    /// same compiled record, never a second standard (B2).
+    pub authoritative: bool,
+    /// Provenance travels with every criterion (B3): an agent-invented
+    /// statement was never the operator's requirement.
+    pub criterion_source: harness_contract::agent_action::CriterionSource,
+}
+
+/// A rework directive carried by a review verdict (032 K3). Durable fact for
+/// the next claim; Runtime never auto-dispatches from it - dispatch stays with
+/// the root/supervisor owners, so the verdict channel cannot become a second
+/// admission path (v2 audit red line three).
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
+pub struct AgenticReworkDirective {
+    pub source_action_id: String,
+    #[serde(default)]
+    pub gaps: Vec<String>,
+    #[serde(default)]
+    pub directed_actions: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -619,4 +728,19 @@ pub struct AgenticArtifactProjection {
     /// Monotonic generation of the Task claim that authorized this artifact.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub claim_generation: Option<u64>,
+}
+
+/// Business generation from the exact Program owner registration. Physical
+/// node attempt and fence must be checked independently by the caller.
+pub(crate) fn registered_attempt_generation(
+    task: &AgenticTaskProjection,
+    scope: &harness_contract::agent::AgenticExecutionBinding,
+    execution_id: &str,
+    mode: harness_contract::agent_action::AgentAttemptMode,
+) -> Option<u64> {
+    task.active_attempts.get(execution_id).filter(|attempt| {
+        task.team_id == scope.task_team_id && attempt.execution_id == execution_id
+            && attempt.agent_id == scope.agent_id
+            && attempt.membership_id == scope.membership_id && attempt.mode == mode
+    }).map(|attempt| attempt.generation)
 }

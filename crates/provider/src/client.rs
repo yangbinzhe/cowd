@@ -543,6 +543,7 @@ mod tests {
 
     fn configured_provider(api_key: &str) -> ProviderConfig {
         ProviderConfig {
+            reasoning_effort: None,
             base_url: "https://provider.example/v1".to_string(),
             api_key: api_key.to_string(),
             models: vec!["test-model".to_string()],

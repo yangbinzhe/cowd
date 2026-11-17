@@ -514,6 +514,7 @@ fn integration_search_flow() {
     assert!(!state.app.timeline.search_active);
     assert!(!state.app.timeline.search_matches.is_empty());
 
+    assert_eq!(state.app.timeline.search_matches.iter().collect::<std::collections::BTreeSet<_>>().len(), 2);
     assert_eq!(state.app.timeline.search_matches.len(), 2);
     state.process_raw_key(KeyEvent::new(KeyCode::F(3), KeyModifiers::NONE));
     assert_eq!(state.app.timeline.search_current, 1);

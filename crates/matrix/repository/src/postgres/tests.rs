@@ -48,7 +48,7 @@ fn real_postgres_bounded_recall_matches_authorization_order_and_limit_contract()
             1,
         ))
         .expect("bounded recall succeeds");
-    assert_eq!(recalled.len(), 1);
+    assert_eq!(recalled.iter().map(|fact| fact.fact_id.as_str()).collect::<Vec<_>>(), vec!["matrix-pg-recall-high"]);
     assert_eq!(recalled[0].fact_id, "matrix-pg-recall-high");
 }
 

@@ -8,7 +8,7 @@ use crate::command::slash::{
 use crate::runtime_service::RuntimeService;
 use harness_contract::{reality::EvidenceRef, task::TaskStatus};
 
-use super::{ServiceEnvelope, TaskService};
+use crate::services::{ServiceEnvelope, TaskService};
 
 const GATEWAY_SLASH_OPERATIONS: [&str; 5] = [
     "runtime.status",

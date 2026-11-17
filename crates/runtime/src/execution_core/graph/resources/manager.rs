@@ -912,6 +912,13 @@ impl ExecutionResourceManager {
         self.admit_with_timeout(request, None).await
     }
 
+    pub(crate) async fn try_admit(
+        &self,
+        request: ResourceAdmissionRequest,
+    ) -> Result<ResourceAdmissionDecision, ResourceAcquireError> {
+        self.admit_inner(request, None, true).await
+    }
+
     /// Wait for one admission-state transition without exposing queue
     /// ownership. Durable graph pumps use this only after typed overload; the
     /// bounded fallback closes the `notify_waiters` registration race without
@@ -935,8 +942,17 @@ impl ExecutionResourceManager {
 
     async fn admit_with_timeout(
         &self,
+        request: ResourceAdmissionRequest,
+        timeout: Option<Duration>,
+    ) -> Result<ResourceAdmissionDecision, ResourceAcquireError> {
+        self.admit_inner(request, timeout, false).await
+    }
+
+    async fn admit_inner(
+        &self,
         mut request: ResourceAdmissionRequest,
         timeout: Option<Duration>,
+        try_once: bool,
     ) -> Result<ResourceAdmissionDecision, ResourceAcquireError> {
         request.demands = normalize_demands(request.demands);
         if request.fairness_key.trim().is_empty() {
@@ -1124,6 +1140,28 @@ impl ExecutionResourceManager {
                             released: false,
                         },
                         receipt,
+                    });
+                }
+                AdmissionAttempt::Deferred { wait_reason, blocker, .. }
+                    if try_once && wait_reason != ResourceWaitReason::DeadlineExpired => {
+                    registration.defer();
+                    self.observe_admission(ResourceAdmissionObservation::from_request(
+                        &request,
+                        ResourceAdmissionObservationStatus::Deferred,
+                        resolved_service_class,
+                        Some(enqueue_sequence),
+                        Some(enqueued_at_ms),
+                        now_ms(),
+                        duration_millis(started.elapsed()),
+                        Some(wait_reason),
+                        blocker,
+                        policy_revision,
+                        self.pending_count(),
+                    ));
+                    return Ok(ResourceAdmissionDecision::Deferred {
+                        request_id: request.request_id,
+                        wait_reason,
+                        policy_revision,
                     });
                 }
                 AdmissionAttempt::Deferred {
@@ -1805,6 +1843,17 @@ struct WaiterRegistration {
 }
 
 impl WaiterRegistration {
+    fn defer(&mut self) {
+        if !self.active { return; }
+        {
+            let mut guard = self.shared.state.lock().unwrap_or_else(|error| error.into_inner());
+            guard.waiters.retain(|waiter| waiter.id != self.waiter_id);
+            remove_drained_resources(&mut guard);
+        }
+        self.active = false;
+        self.shared.changed.notify_waiters();
+    }
+
     fn finish(&mut self, result_class: ResourceResultClass) {
         if !self.active {
             return;
@@ -3274,6 +3323,25 @@ mod tests {
             Err(ResourceAcquireError::TimedOut { .. })
         ));
         drop((first, second));
+    }
+
+    #[tokio::test]
+    async fn immediate_admission_preserves_real_deadlines_and_does_not_record_busy_as_cancelled() {
+        let manager = manager(1);
+        let lease = manager.acquire(ExecutionResourceKind::Tool, None).await.unwrap();
+        let request = || ResourceAdmissionRequest::new(
+            ExecutionServiceClass::Foreground, [(ExecutionResourceKind::Tool, 1)],
+        );
+        assert!(matches!(manager.try_admit(request()).await.unwrap(),
+            ResourceAdmissionDecision::Deferred { wait_reason: ResourceWaitReason::Capacity, .. }));
+        let snapshot = manager.snapshot(&ExecutionResourceKind::Tool).unwrap();
+        assert_eq!(snapshot.queued_waiters, 0);
+        assert_eq!(snapshot.cancelled_rate_basis_points, None);
+        assert!(matches!(manager.try_admit(request().with_deadline_at_ms(now_ms().saturating_sub(1))).await.unwrap(),
+            ResourceAdmissionDecision::Deferred { wait_reason: ResourceWaitReason::DeadlineExpired, .. }));
+        drop(lease);
+        assert!(matches!(manager.try_admit(request()).await.unwrap(),
+            ResourceAdmissionDecision::Granted { .. }));
     }
 
     #[tokio::test]

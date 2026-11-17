@@ -20,6 +20,8 @@ pub enum NodeExecutorError {
     },
     #[error("executor rejected node `{node_id}`: {reason}")]
     Invalid { node_id: String, reason: String },
+    /// Ticket preparation definitively failed before any execution effect.
+    /// Uncertain physical custody must use `OriginalCustodyUnknown` instead.
     #[error("executor failed to start node `{node_id}`: {reason}")]
     Start { node_id: String, reason: String },
     #[error("executor failed while awaiting node `{node_id}`: {reason}")]
@@ -30,6 +32,9 @@ pub enum NodeExecutorError {
     Recover { node_id: String, reason: String },
     #[error("executor effect for node `{node_id}` has uncertain completion: {reason}")]
     Uncertain { node_id: String, reason: String },
+    /// The original executor still owns call custody; no empty outcome exists.
+    #[error("original call custody for node `{node_id}` remains unknown: {reason}")]
+    OriginalCustodyUnknown { node_id: String, reason: String },
 }
 
 #[derive(Debug, Clone)]
@@ -51,6 +56,79 @@ pub struct NodeExecutionTicket {
     pub payload_ref: String,
 }
 
+#[derive(Clone)]
+pub(crate) struct OriginalBatchPrefix(pub(crate) Arc<crate::tool_host::AuthenticatedBatchPrefix>);
+impl std::fmt::Debug for OriginalBatchPrefix {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str("OriginalBatchPrefix") }
+}
+impl PartialEq for OriginalBatchPrefix {
+    fn eq(&self, other: &Self) -> bool { Arc::ptr_eq(&self.0, &other.0) }
+}
+impl Eq for OriginalBatchPrefix {}
+
+#[derive(Clone)]
+pub(crate) struct OriginalPendingBatch {
+    pub(crate) carrier: Arc<crate::tool_host::OriginalMemberCallCarrier>,
+    pub(crate) publication: Option<Arc<crate::tool_host::OriginalStopPublication>>,
+}
+impl std::fmt::Debug for OriginalPendingBatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str("OriginalPendingBatch") }
+}
+impl PartialEq for OriginalPendingBatch {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.carrier, &other.carrier) && match (&self.publication, &other.publication) {
+            (Some(a), Some(b)) => Arc::ptr_eq(a, b), (None, None) => true, _ => false,
+        }
+    }
+}
+impl Eq for OriginalPendingBatch {}
+
+#[derive(Clone)]
+pub(crate) struct OriginalAgentChild(pub(crate) Arc<super::executors::OriginalAgentChildCall>);
+impl std::fmt::Debug for OriginalAgentChild {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str("OriginalAgentChild") }
+}
+impl PartialEq for OriginalAgentChild {
+    fn eq(&self, other: &Self) -> bool { Arc::ptr_eq(&self.0, &other.0) }
+}
+impl Eq for OriginalAgentChild {}
+
+#[derive(Clone)]
+pub(crate) struct OriginalReplayedAction(pub(crate) Arc<crate::agentic::OriginalReplayedAction>);
+impl std::fmt::Debug for OriginalReplayedAction {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str("OriginalReplayedAction") }
+}
+impl PartialEq for OriginalReplayedAction {
+    fn eq(&self, other: &Self) -> bool { Arc::ptr_eq(&self.0, &other.0) }
+}
+impl Eq for OriginalReplayedAction {}
+
+#[derive(Clone)]
+pub(crate) struct OriginalTerminalOwner(pub(crate) Arc<crate::execution_core::services::OriginalTerminalCommitOwner>);
+impl std::fmt::Debug for OriginalTerminalOwner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str("OriginalTerminalOwner") }
+}
+impl PartialEq for OriginalTerminalOwner { fn eq(&self, other: &Self) -> bool { Arc::ptr_eq(&self.0, &other.0) } }
+impl Eq for OriginalTerminalOwner {}
+
+#[async_trait]
+pub(crate) trait OriginalSynthesizeReplan: Send + Sync {
+    async fn prepare(&self, ticket: &NodeExecutionTicket, original: &NodeExecutionOutcome)
+        -> Result<NodeExecutionOutcome, String>;
+    async fn committed(&self, ticket: &NodeExecutionTicket, original: &NodeExecutionOutcome)
+        -> Result<(), String>;
+}
+
+#[derive(Clone)]
+pub(crate) struct OriginalSynthesizeReplanHandle(pub(crate) Arc<dyn OriginalSynthesizeReplan>);
+impl std::fmt::Debug for OriginalSynthesizeReplanHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str("OriginalSynthesizeReplanHandle") }
+}
+impl PartialEq for OriginalSynthesizeReplanHandle {
+    fn eq(&self, other: &Self) -> bool { Arc::ptr_eq(&self.0, &other.0) }
+}
+impl Eq for OriginalSynthesizeReplanHandle {}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NodeExecutionOutcome {
     pub result: ExecutionNodeResult,
@@ -66,6 +144,18 @@ pub struct NodeExecutionOutcome {
     /// through the public execution outcome API.
     #[serde(skip)]
     pub(crate) domain_events: Vec<crate::runtime_event_store::RuntimeTransactionEventInput>,
+    #[serde(skip)]
+    pub(crate) original_batch_prefixes: Vec<OriginalBatchPrefix>,
+    #[serde(skip)]
+    pub(crate) original_pending_batches: Vec<OriginalPendingBatch>,
+    #[serde(skip)]
+    pub(crate) original_replayed_actions: Vec<OriginalReplayedAction>,
+    #[serde(skip)]
+    pub(crate) original_agent_child: Option<OriginalAgentChild>,
+    #[serde(skip)]
+    pub(crate) original_terminal_owner: Option<OriginalTerminalOwner>,
+    #[serde(skip)]
+    pub(crate) original_synthesize_replan: Option<OriginalSynthesizeReplanHandle>,
     #[serde(skip)]
     pub(crate) source_revisions: BTreeMap<String, u64>,
     #[serde(skip)]
@@ -88,6 +178,19 @@ pub struct ExecutionGraphReplan {
 }
 
 impl NodeExecutionOutcome {
+    pub(crate) fn attach_original_terminal_owner(&mut self, owner: Arc<crate::execution_core::services::OriginalTerminalCommitOwner>) -> Result<(), String> {
+        if self.original_terminal_owner.is_some() { return Err("original terminal owner already attached".into()); }
+        self.original_terminal_owner = Some(OriginalTerminalOwner(owner));
+        Ok(())
+    }
+
+    /// Carry the live Scoped owner; it is not an externally supplied proof.
+    pub(crate) fn attach_original_agent_child(&mut self, child: Arc<super::executors::OriginalAgentChildCall>) -> Result<(), String> {
+        if self.original_agent_child.is_some() { return Err("original Agent child owner already attached".into()); }
+        self.original_agent_child = Some(OriginalAgentChild(child));
+        Ok(())
+    }
+
     #[must_use]
     pub fn new(result: ExecutionNodeResult) -> Self {
         Self {
@@ -95,6 +198,12 @@ impl NodeExecutionOutcome {
             delivery_envelope: None,
             terminal_presentation: None,
             domain_events: Vec::new(),
+            original_batch_prefixes: Vec::new(),
+            original_pending_batches: Vec::new(),
+            original_replayed_actions: Vec::new(),
+            original_agent_child: None,
+            original_terminal_owner: None,
+            original_synthesize_replan: None,
             source_revisions: BTreeMap::new(),
             no_dispatch: None,
             replan: None,
@@ -117,6 +226,10 @@ pub trait NodeExecutor: Send + Sync {
         true
     }
     fn validate(&self, node: &ExecutionNodeSpec) -> Result<(), NodeExecutorError>;
+    /// Prepare a ticket only. Execution effects begin in `poll_or_await`,
+    /// after the Runner durably admits the binding. `Start` certifies that
+    /// preparation failed without executing; an uncertain effect must retain
+    /// its original custody and return `OriginalCustodyUnknown`.
     async fn start(
         &self,
         context: NodeExecutionContext,
@@ -125,6 +238,9 @@ pub trait NodeExecutor: Send + Sync {
         &self,
         ticket: &NodeExecutionTicket,
     ) -> Result<NodeExecutionOutcome, NodeExecutorError>;
+    /// Install/remove only the original in-process binding around graph admission.
+    fn prepare_original_binding(&self, _ticket: &NodeExecutionTicket) -> Result<(), NodeExecutorError> { Ok(()) }
+    fn rollback_original_binding(&self, _ticket: &NodeExecutionTicket) -> Result<(), NodeExecutorError> { Ok(()) }
     /// Revalidate a post-tool Goal observation using the original owner. This
     /// must never dispatch or replay the physical operation. Unknown remains
     /// unknown and leaves the original source fence in force.
@@ -178,6 +294,10 @@ pub trait NodeExecutor: Send + Sync {
     /// either committed or definitively failed. Implementations must not
     /// mutate durable graph state from this callback.
     fn cancellation_finalized(&self, _ticket: &NodeExecutionTicket) {}
+    /// Called only after the original graph binding and physical closure close.
+    fn original_binding_released(&self, _ticket: &NodeExecutionTicket) -> Result<(), NodeExecutorError> {
+        Ok(())
+    }
     /// Query an authenticated, already durable outcome of this exact attempt.
     /// Must not start work, invoke a Provider, or re-interpret business input.
     /// The recovery owner still commits through the original source fences and
@@ -185,6 +305,12 @@ pub trait NodeExecutor: Send + Sync {
     async fn recover_known_outcome(
         &self,
         _ticket: &NodeExecutionTicket,
+    ) -> Result<Option<NodeExecutionOutcome>, NodeExecutorError> {
+        Ok(None)
+    }
+    /// Re-read only the original in-process owner's facts, never re-execute.
+    async fn reconcile_original_custody(
+        &self, _ticket: &NodeExecutionTicket,
     ) -> Result<Option<NodeExecutionOutcome>, NodeExecutorError> {
         Ok(None)
     }
@@ -249,6 +375,14 @@ impl NodeExecutorRegistry {
         self.get("tool_batch")
             .filter(|registered| Arc::ptr_eq(registered, &expected))?;
         Some(owner)
+    }
+
+    /// Borrow only the still-live builtin owner's same-ticket observation.
+    pub(super) fn builtin_binding_witness(
+        &self,
+        ticket: &NodeExecutionTicket,
+    ) -> Option<super::executors::agent_tool::NoDispatchWitness> {
+        self.builtin_tool_batch()?.binding_observation(ticket)?.witness()
     }
 
     pub(crate) fn is_builtin_tool_batch(&self, executor: &Arc<dyn NodeExecutor>) -> bool {

@@ -439,7 +439,7 @@ mod tests {
     #[test]
     fn mock_terminal_buffer_lines_count() {
         let terminal = MockTerminal::new(80, 30);
-        assert_eq!(terminal.buffer_lines().len(), 30);
+        assert_eq!(terminal.buffer_lines().len(), terminal.dimensions().1 as usize);
     }
 
     #[test]

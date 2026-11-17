@@ -5,6 +5,233 @@ use harness_contract::execution_graph::ExecutionParentBinding;
 use crate::tool_dispatch::ToolRequest;
 use crate::tool_orchestrator::ToolSafetyCategory;
 
+/// Original node owner's publication state; it carries no execution authority.
+#[derive(Debug, Default)]
+pub(crate) struct OriginalMemberSettlement(std::sync::atomic::AtomicBool);
+impl OriginalMemberSettlement {
+    pub(crate) fn is_settled(&self) -> bool { self.0.load(std::sync::atomic::Ordering::Acquire) }
+    pub(crate) fn mark_settled(&self) { self.0.store(true, std::sync::atomic::Ordering::Release); }
+}
+
+/// Sealed only by the original node owner at the atomic custody handoff.
+pub(crate) struct OriginalEffectReleaseProof {
+    pub(crate) owner: std::sync::Arc<crate::execution_core::graph::OriginalFreshEffectOwner>,
+    pub(crate) ticket: crate::execution_core::NodeExecutionTicket,
+    pub(crate) observation: std::sync::Weak<crate::execution_core::graph::executors::agent_tool::NoDispatchObservation>,
+    pub(crate) members: Vec<std::sync::Weak<OriginalMemberSettlement>>,
+    pub(crate) facts: Vec<serde_json::Value>,
+    pub(crate) pending: Option<serde_json::Value>,
+    pub(crate) publication: Option<std::sync::Arc<OriginalStopPublication>>,
+    pub(crate) outer_receipt: crate::AppendTransactionReceipt,
+}
+
+/// Same-call transport retained by the Runtime producer. This is not proof of
+/// ownership: the original node owner must authenticate the ticket and Step.
+#[derive(Clone)]
+pub struct OriginalMemberCallCarrier {
+    original_request: std::sync::Arc<RuntimeToolExecutionRequest>,
+    original_host_call_set: Option<(crate::execution_core::NodeExecutionTicket, Vec<crate::conversation::ModelToolCall>)>,
+    outcomes: Vec<(usize, std::sync::Arc<OriginalMemberSubmitOutcome>)>,
+    stop_publications: Vec<std::sync::Arc<OriginalStopPublication>>,
+    host_members: std::sync::Arc<std::sync::Mutex<std::collections::BTreeMap<usize, (std::sync::Arc<crate::conversation::OriginalHostPreparedMember>, std::sync::Arc<OriginalMemberSettlement>)>>>,
+    host_release: std::sync::Arc<std::sync::Mutex<Option<std::sync::Arc<OriginalEffectReleaseProof>>>>,
+}
+impl OriginalMemberCallCarrier {
+    pub(crate) fn from_original_request(original_request: std::sync::Arc<RuntimeToolExecutionRequest>) -> Self {
+        let outcomes = original_request.tool_progress.original_members();
+        let stop_publications = original_request.tool_progress.original_stop_publications();
+        Self { original_request, original_host_call_set: None, outcomes, stop_publications, host_members: Default::default(), host_release: Default::default() }
+    }
+    /// Capture the original complete node call set before this request is dispatched.
+    pub(crate) fn with_original_host_call_set(
+        mut self,
+        ticket: &crate::execution_core::NodeExecutionTicket,
+        calls: &[crate::conversation::ModelToolCall],
+    ) -> Result<Self, String> {
+        if ticket.executor_kind != "tool_batch" {
+            return Err("original Host call set requires its ToolBatch ticket".into());
+        }
+        let (original, _) = crate::host::decode_tool_batch(&ticket.payload_ref)
+            .map_err(|error| error.to_string())?;
+        if original != calls
+            || calls.iter().filter(|call| call.id == self.original_request.tool_use_id
+                && call.name == self.original_request.tool_name
+                && call.binding == self.original_request.step_binding).count() != 1
+        {
+            return Err("original Host call set differs from the ticket".into());
+        }
+        self.original_host_call_set = Some((ticket.clone(), calls.to_vec()));
+        Ok(self)
+    }
+    pub(crate) fn original_host_call_set(
+        &self,
+    ) -> Option<(&crate::execution_core::NodeExecutionTicket, &[crate::conversation::ModelToolCall])> {
+        self.original_host_call_set.as_ref().map(|(ticket, calls)| (ticket, calls.as_slice()))
+    }
+    /// Retain the exact Host preparation under its original node carrier.
+    pub(crate) fn retain_host_member(
+        &self,
+        ticket: &crate::execution_core::NodeExecutionTicket,
+        member: &std::sync::Arc<crate::conversation::OriginalHostPreparedMember>,
+        observation: &crate::execution_core::graph::executors::agent_tool::NoDispatchObservation,
+    ) -> Result<(), String> {
+        let request = member.original_request();
+        let original = self.original_request.as_ref();
+        let index = member.prepared().index;
+        if index >= 25 || member.ticket() != ticket || request != original
+            || !request.tool_progress.same_original_channels(&original.tool_progress)
+            || request.step_binding.as_ref() != Some(member.step()) {
+            return Err("original Host member carrier identity differs".into());
+        }
+        let unit = {
+            let members = self.host_members.lock().map_err(|_| "original Host member carrier unavailable")?;
+            match members.get(&index) {
+                Some((existing, unit)) if std::sync::Arc::ptr_eq(existing, member) => std::sync::Arc::clone(unit),
+                Some(_) => return Err("original Host member carrier conflicts".into()),
+                None => std::sync::Arc::new(OriginalMemberSettlement::default()),
+            }
+        };
+        observation.register_member_custody(ticket, &original.tool_use_id, index, std::sync::Arc::clone(&unit))?;
+        let mut members = self.host_members.lock().map_err(|_| "original Host member carrier unavailable")?;
+        match members.get(&index) {
+            Some((existing, previous)) if std::sync::Arc::ptr_eq(existing, member) && std::sync::Arc::ptr_eq(previous, &unit) => Ok(()),
+            Some(_) => Err("original Host member carrier conflicts".into()),
+            None => { members.insert(index, (std::sync::Arc::clone(member), unit)); Ok(()) }
+        }
+    }
+    pub(crate) fn verify_host_physical_members(
+        &self, ticket: &crate::execution_core::NodeExecutionTicket,
+        close: &crate::execution_core::graph::executors::OriginalPhysicalClose,
+    ) -> Result<(), String> {
+        let members = self.host_members.lock().map_err(|_| "original Host member carrier unavailable")?;
+        let expected = members.iter().map(|(index, (_, unit))| (*index, std::sync::Arc::clone(unit))).collect::<Vec<_>>();
+        close.verify_member_custody(ticket, &self.original_request.tool_use_id, &expected)
+    }
+    pub(crate) fn host_release_slot(&self) -> &std::sync::Mutex<Option<std::sync::Arc<OriginalEffectReleaseProof>>> {
+        &self.host_release
+    }
+    /// Reuse only the original owner's sealed completion for this same close.
+    pub(crate) fn verified_host_release(
+        &self, ticket: &crate::execution_core::NodeExecutionTicket,
+        close: &crate::execution_core::graph::executors::OriginalPhysicalClose,
+        store: &std::sync::Arc<crate::RuntimeEventStore>, facts: &[serde_json::Value],
+        pending: Option<&serde_json::Value>, publication: Option<&std::sync::Arc<OriginalStopPublication>>,
+    ) -> Result<Option<Vec<std::sync::Arc<OriginalMemberSettlement>>>, String> {
+        let proof = self.host_release.lock().map_err(|_| "original Host release proof unavailable")?.clone();
+        let Some(proof) = proof else { return Ok(None); };
+        let same_publication = match (&proof.publication, publication) {
+            (Some(left), Some(right)) => std::sync::Arc::ptr_eq(left, right),
+            (None, None) => true, _ => false,
+        };
+        if &proof.ticket != ticket || !close.matches_original_ticket(ticket) || !close.matches_observation(&proof.observation)
+            || !proof.owner.matches_original(store, &self.original_request) || proof.facts != facts
+            || proof.pending.as_ref() != pending || !same_publication || proof.outer_receipt.commit_cursor == 0 {
+            return Err("original Host release proof differs".into());
+        }
+        self.verify_host_physical_members(ticket, close)?;
+        let members = self.host_members.lock().map_err(|_| "original Host member carrier unavailable")?;
+        if members.len() != proof.members.len() { return Err("original Host release member set differs".into()); }
+        let mut units = Vec::with_capacity(members.len());
+        for ((_, (_, unit)), expected) in members.iter().zip(&proof.members) {
+            if !std::sync::Weak::ptr_eq(expected, &std::sync::Arc::downgrade(unit)) {
+                return Err("original Host release member identity differs".into());
+            }
+            units.push(std::sync::Arc::clone(unit));
+        }
+        Ok(Some(units))
+    }
+    pub(crate) fn has_unsettled_host_members(&self) -> bool {
+        match self.host_members.lock() {
+            Ok(members) => members.values().any(|(_, unit)| !unit.is_settled()),
+            Err(_) => true,
+        }
+    }
+    /// Transfer only members already authenticated in this node's committed prefix.
+    pub(crate) fn verified_host_settlements(
+        &self, ticket: &crate::execution_core::NodeExecutionTicket,
+        store: &std::sync::Arc<crate::RuntimeEventStore>, facts: &[serde_json::Value], pending: Option<&serde_json::Value>,
+    ) -> Result<Vec<std::sync::Arc<OriginalMemberSettlement>>, String> {
+        let outcomes = self.original_request.tool_progress.original_members();
+        let members = self.host_members.lock().map_err(|_| "original Host member carrier unavailable")?;
+        if outcomes.len() != facts.len() || outcomes.iter().any(|(index, _)| !members.contains_key(index)) {
+            return Err("original Host committed prefix registration differs".into());
+        }
+        if let Some(pending) = pending {
+            let index = pending.get("index").and_then(serde_json::Value::as_u64)
+                .and_then(|value| usize::try_from(value).ok()).ok_or("original Host terminal index unavailable")?;
+            if !matches!(pending.get("state").and_then(serde_json::Value::as_str), Some("confirmed_noncommit" | "before_outcome_unknown" | "before_outcome_error" | "before_outcome_store_unknown")) {
+                return Err("original Host terminal member custody unavailable".into());
+            }
+            if !members.contains_key(&index) {
+                // Preparation may fail before a hook/member unit exists. Only its
+                // sealed fence terminal can prove there is no unit to drain.
+                let publications = self.original_request.tool_progress.checked_original_stop_publications()?;
+                let [publication] = publications.as_slice() else { return Err("original preparation stop unavailable".into()); };
+                let OriginalStopPublication::Recorded(stop) = publication.as_ref() else { return Err("original preparation stop unresolved".into()); };
+                let OriginalBatchMemberStopReason::ConfirmedNoncommit(terminal) = stop.reason() else { return Err("original preparation unresolved".into()); };
+                let OriginalStopRead::Available(Some(current)) = self.original_request.tool_progress.original_member_stop() else { return Err("original preparation stop slot unavailable".into()); };
+                if !std::sync::Arc::ptr_eq(stop, &current)
+                    || terminal.checked_request().is_some() || !terminal.matches_request(&self.original_request)
+                    || !stop.recorded_in_original_sink() || !stop.belongs_to_original_sink(&self.original_request.tool_progress)
+                    || stop.coordinate().index() != index || stop.coordinate().ticket() != ticket {
+                    return Err("original preparation custody differs".into());
+                }
+                store.validate_original_member_noncommit_node(terminal, ticket, &self.original_request.idempotency_key, index as u64, pending)
+                    .map_err(|_| "original preparation terminal differs")?;
+            }
+        }
+        for (index, (original, _)) in members.iter() {
+            if original.ticket() != ticket || original.prepared().index != *index {
+                return Err("original Host member settlement identity differs".into());
+            }
+            let mut matching = outcomes.iter().filter(|(actual, _)| actual == index);
+            let Some((_, outcome)) = matching.next() else {
+                let pending = pending.ok_or("original Host member result unavailable")?;
+                let publications = self.original_request.tool_progress.checked_original_stop_publications()?;
+                let [publication] = publications.as_slice() else { return Err("original Host terminal publications conflict".into()); };
+                let OriginalStopPublication::Recorded(stop) = publication.as_ref() else { return Err("original Host terminal publication unresolved".into()); };
+                let OriginalStopRead::Available(Some(current)) = self.original_request.tool_progress.original_member_stop() else { return Err("original Host terminal slot unavailable".into()); };
+                if !std::sync::Arc::ptr_eq(stop, &current) || !stop.recorded_in_original_sink()
+                    || !stop.belongs_to_original_sink(&self.original_request.tool_progress)
+                    || stop.coordinate().ticket() != ticket || stop.coordinate().index() != *index
+                    || stop.coordinate().call_id() != self.original_request.tool_use_id
+                    || stop.coordinate().outer_key() != self.original_request.idempotency_key
+                    || stop.coordinate().step() != self.original_request.step_binding.as_ref() {
+                    return Err("original Host terminal stop differs".into());
+                }
+                let OriginalBatchMemberStopReason::ConfirmedNoncommit(terminal) = stop.reason() else { return Err("original Host terminal unresolved".into()); };
+                store.validate_original_member_noncommit_node(terminal, ticket, &self.original_request.idempotency_key, *index as u64, pending)
+                    .map_err(|_| "original Host terminal node fact differs")?;
+                if !terminal.matches_prepared(&original.prepared().identity, &self.original_request) {
+                    return Err("original Host terminal member differs".into());
+                }
+                continue;
+            };
+            if matching.next().is_some() { return Err("original Host member results conflict".into()); }
+            if pending.is_some_and(|fact| fact.get("index").and_then(serde_json::Value::as_u64)
+                == u64::try_from(*index).ok()) {
+                return Err("original Host terminal conflicts with committed member".into());
+            }
+            let OriginalMemberSubmitOutcome::Committed(member) = outcome.as_ref() else {
+                return Err("original Host member result remains unresolved".into());
+            };
+            if member.index() != *index
+                || member.action().payload().pointer("/member_admission/prepared/identity").and_then(serde_json::Value::as_str)
+                    != Some(original.prepared().identity.as_str()) {
+                return Err("original Host member result differs".into());
+            }
+            let fact = member.node_commit_fact(store, ticket)?;
+            if !facts.iter().any(|committed| committed == &fact) {
+                return Err("original Host member is absent from committed node".into());
+            }
+        }
+        Ok(members.values().map(|(_, unit)| std::sync::Arc::clone(unit)).collect())
+    }
+    pub fn original_request(&self) -> &RuntimeToolExecutionRequest { &self.original_request }
+    pub fn outcomes(&self) -> &[(usize, std::sync::Arc<OriginalMemberSubmitOutcome>)] { &self.outcomes }
+    pub fn stop_publications(&self) -> &[std::sync::Arc<OriginalStopPublication>] { &self.stop_publications }
+}
+
 /// In-process progress sink for long-running tools such as bash (T4). The
 /// wrapper keeps the request struct's derives (Debug/PartialEq) valid while
 /// serde always skips the callback; only its presence is ever compared.
@@ -19,34 +246,923 @@ pub(crate) struct ToolLifecycleAnchor {
     pub producer: harness_contract::projection::RuntimeActivityBinding,
 }
 
+/// Result of resolving a previously committed member before new authorization.
+pub enum AgentBatchMemberResolution {
+    Replay(AuthenticatedBatchMember),
+    Unknown(BatchMemberUnknown),
+    Conflict(BatchMemberConflict),
+}
+
+/// A candidate is non-consuming preparation and carries no Fresh decision.
+/// Only the original checked action owner may resolve it to a commit.
+pub enum AgentBatchMemberPregrant {
+    Replay(AuthenticatedBatchMember),
+    /// The original member has a terminal noncommit; outer and physical close still apply.
+    Terminal(std::sync::Arc<OriginalStopPublication>),
+    Candidate(crate::step_snapshot::OriginalPreparedMemberCapability),
+    /// A stop exists only after the original ticket/call was verified.
+    Unknown { failure: BatchMemberUnknown, stop: Option<OriginalStopPublication> },
+}
+
+// Type erasure here keeps the stop from recursively containing its own
+// mutex type; the channel is still the original request's single sink.
+trait OriginalStopSink: Send + Sync {
+    fn record(&self, stop: std::sync::Arc<OriginalBatchMemberStop>) -> OriginalStopPublication;
+    fn current(&self) -> Option<std::sync::Arc<OriginalBatchMemberStop>>;
+}
+
+#[derive(Default)]
+pub(crate) struct OriginalStopChannel {
+    slot: std::sync::Mutex<Option<std::sync::Arc<OriginalBatchMemberStop>>>,
+}
+
+impl OriginalStopSink for OriginalStopChannel {
+    fn record(&self, stop: std::sync::Arc<OriginalBatchMemberStop>) -> OriginalStopPublication {
+        OriginalStopPublication::record(stop, &self.slot)
+    }
+    fn current(&self) -> Option<std::sync::Arc<OriginalBatchMemberStop>> {
+        match self.slot.lock() {
+            Ok(slot) => slot.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        }
+    }
+}
+
+/// Original owner-authenticated coordinates; callers cannot construct them.
+pub struct OriginalBatchMemberCoordinate {
+    outer_key: String,
+    call_id: String,
+    ticket: crate::execution_core::NodeExecutionTicket,
+    step: Option<crate::step_snapshot::StepCallBinding>,
+    sink: std::sync::Weak<dyn OriginalStopSink>,
+    index: usize,
+}
+impl OriginalBatchMemberCoordinate {
+    pub(crate) fn from_original(original: &RuntimeToolExecutionRequest, ticket: &crate::execution_core::NodeExecutionTicket, index: usize) -> Self {
+        let sink: std::sync::Arc<dyn OriginalStopSink> = original.tool_progress.member_stop.clone();
+        Self { outer_key: original.idempotency_key.clone(), call_id: original.tool_use_id.clone(),
+            ticket: ticket.clone(), step: original.step_binding.clone(), sink: std::sync::Arc::downgrade(&sink), index }
+    }
+    pub fn outer_key(&self) -> &str { &self.outer_key }
+    pub fn call_id(&self) -> &str { &self.call_id }
+    pub fn index(&self) -> usize { self.index }
+    pub fn ticket(&self) -> &crate::execution_core::NodeExecutionTicket { &self.ticket }
+    pub fn step(&self) -> Option<&crate::step_snapshot::StepCallBinding> { self.step.as_ref() }
+}
+
+/// Stop at this exact member; the prefix and this fact are independent.
+pub struct OriginalBatchMemberStop {
+    coordinate: OriginalBatchMemberCoordinate,
+    reason: OriginalBatchMemberStopReason,
+    resolution: std::sync::OnceLock<OriginalBatchMemberStopReason>,
+    recovered_effect_fence: std::sync::OnceLock<std::sync::Arc<crate::runtime_event_store::OriginalMemberEffectFence>>,
+    recorded: std::sync::atomic::AtomicBool,
+    reservation: Option<std::sync::Arc<crate::runtime_event_store::OriginalMemberReservation>>,
+    effect_fence: Option<std::sync::Arc<crate::runtime_event_store::OriginalMemberEffectFence>>,
+}
+impl OriginalBatchMemberStop {
+    pub(crate) fn publish(coordinate: OriginalBatchMemberCoordinate, reason: OriginalBatchMemberStopReason) -> OriginalStopPublication {
+        Self::publish_owned(coordinate, reason, None, None)
+    }
+    pub(crate) fn publish_with_reservation(coordinate: OriginalBatchMemberCoordinate, reason: OriginalBatchMemberStopReason,
+        reservation: std::sync::Arc<crate::runtime_event_store::OriginalMemberReservation>) -> OriginalStopPublication {
+        if let Ok(Some(fence)) = reservation.recover_effect_fence() {
+            return Self::publish_with_owners(coordinate, reason, reservation, fence);
+        }
+        Self::publish_owned(coordinate, reason, Some(reservation), None)
+    }
+    pub(crate) fn publish_with_owners(coordinate: OriginalBatchMemberCoordinate, reason: OriginalBatchMemberStopReason,
+        reservation: std::sync::Arc<crate::runtime_event_store::OriginalMemberReservation>,
+        effect_fence: std::sync::Arc<crate::runtime_event_store::OriginalMemberEffectFence>) -> OriginalStopPublication {
+        let reason = match reason {
+            OriginalBatchMemberStopReason::BeforeOutcomeUnknown(_)
+            | OriginalBatchMemberStopReason::BeforeOutcomeError(_)
+            | OriginalBatchMemberStopReason::BeforeOutcomeStoreError(_) => {
+                match effect_fence.settle_stop(&reservation) {
+                    Ok(Some(crate::runtime_event_store::OriginalStoppedMember::Noncommit(terminal))) =>
+                        OriginalBatchMemberStopReason::ConfirmedNoncommit(terminal),
+                    Ok(Some(crate::runtime_event_store::OriginalStoppedMember::Winner(handle))) =>
+                        OriginalBatchMemberStopReason::CommittedUnbound(OriginalMemberUnboundCommit {
+                            handle, reason: "original winner awaits owner reconciliation".into(),
+                        }),
+                    Ok(None) | Err(_) => reason,
+                }
+            }
+            _ => reason,
+        };
+        let publication = Self::publish_owned(coordinate, reason, Some(reservation), Some(effect_fence));
+        publication.current().reconcile_original();
+        publication
+    }
+    fn publish_owned(coordinate: OriginalBatchMemberCoordinate, reason: OriginalBatchMemberStopReason,
+        reservation: Option<std::sync::Arc<crate::runtime_event_store::OriginalMemberReservation>>,
+        effect_fence: Option<std::sync::Arc<crate::runtime_event_store::OriginalMemberEffectFence>>) -> OriginalStopPublication {
+        let sink = coordinate.sink.upgrade();
+        let stop = std::sync::Arc::new(Self { coordinate, reason, resolution: std::sync::OnceLock::new(), recovered_effect_fence: std::sync::OnceLock::new(), recorded: std::sync::atomic::AtomicBool::new(false), reservation, effect_fence });
+        match sink {
+            Some(sink) => sink.record(stop),
+            None => OriginalStopPublication::Unknown { current: stop, previous: None, failure: OriginalStopRecordFailure::SinkUnavailable },
+        }
+    }
+    pub fn coordinate(&self) -> &OriginalBatchMemberCoordinate { &self.coordinate }
+    pub fn reason(&self) -> &OriginalBatchMemberStopReason { self.resolution.get().unwrap_or(&self.reason) }
+    pub(crate) fn rejected_observation(&self) -> Option<&harness_contract::agent_action::AgentActionObservation> {
+        match (&self.reason, self.resolution.get()) {
+            (OriginalBatchMemberStopReason::UnknownNoReceipt(observation),
+             Some(OriginalBatchMemberStopReason::ConfirmedNoncommit(_)))
+                if observation.status == harness_contract::agent_action::AgentActionStatus::Rejected => Some(observation),
+            _ => None,
+        }
+    }
+    pub(crate) fn reconcile_original(&self) {
+        if self.resolution.get().is_some() || !matches!(&self.reason,
+            OriginalBatchMemberStopReason::BeforeOutcomeUnknown(_) | OriginalBatchMemberStopReason::BeforeOutcomeError(_)
+            | OriginalBatchMemberStopReason::BeforeOutcomeStoreError(_)
+            | OriginalBatchMemberStopReason::UnknownNoReceipt(harness_contract::agent_action::AgentActionObservation {
+                status: harness_contract::agent_action::AgentActionStatus::Rejected, ..
+            })) { return; }
+        let Some(reservation) = &self.reservation else { return; };
+        if self.original_effect_fence().is_none() {
+            if let Ok(Some(fence)) = reservation.recover_effect_fence() { let _ = self.recovered_effect_fence.set(fence); }
+        }
+        let Some(fence) = self.original_effect_fence() else { return; };
+        let reason = match fence.settle_stop(reservation) {
+            Ok(Some(crate::runtime_event_store::OriginalStoppedMember::Noncommit(terminal))) => OriginalBatchMemberStopReason::ConfirmedNoncommit(terminal),
+            Ok(Some(crate::runtime_event_store::OriginalStoppedMember::Winner(handle))) => OriginalBatchMemberStopReason::CommittedUnbound(
+                OriginalMemberUnboundCommit { handle, reason: "original winner awaits owner reconciliation".into() }),
+            Ok(None) | Err(_) => return,
+        };
+        let _ = self.resolution.set(reason);
+    }
+    pub fn recorded_in_original_sink(&self) -> bool { self.recorded.load(std::sync::atomic::Ordering::Acquire) }
+    pub fn has_original_reservation(&self) -> bool { self.reservation.is_some() }
+    pub fn has_original_effect_fence(&self) -> bool { self.original_effect_fence().is_some() }
+    pub(crate) fn original_reservation(&self) -> Option<&std::sync::Arc<crate::runtime_event_store::OriginalMemberReservation>> { self.reservation.as_ref() }
+    pub(crate) fn original_effect_fence(&self) -> Option<&std::sync::Arc<crate::runtime_event_store::OriginalMemberEffectFence>> { self.effect_fence.as_ref().or_else(|| self.recovered_effect_fence.get()) }
+    /// Checks the original sink identity only; publication may have failed.
+    pub fn belongs_to_original_sink(&self, sink: &ToolProgressSink) -> bool {
+        let original: std::sync::Arc<dyn OriginalStopSink> = sink.member_stop.clone();
+        std::sync::Weak::ptr_eq(&self.coordinate.sink, &std::sync::Arc::downgrade(&original))
+    }
+}
+/// Publication failure never discards the new stop. A conflicting or
+/// poisoned slot also returns its existing stop to the original caller.
+#[derive(Clone)]
+pub enum OriginalStopPublication {
+    Recorded(std::sync::Arc<OriginalBatchMemberStop>),
+    Unknown {
+        current: std::sync::Arc<OriginalBatchMemberStop>,
+        previous: Option<std::sync::Arc<OriginalBatchMemberStop>>,
+        failure: OriginalStopRecordFailure,
+    },
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OriginalStopRecordFailure { SinkUnavailable, Poisoned, Occupied, WrongSink }
+/// Reading a poisoned slot returns its retained stop and does not clear it.
+pub enum OriginalStopRead {
+    Available(Option<std::sync::Arc<OriginalBatchMemberStop>>),
+    Poisoned(Option<std::sync::Arc<OriginalBatchMemberStop>>),
+}
+impl OriginalStopRead {
+    pub fn retained(&self) -> Option<&std::sync::Arc<OriginalBatchMemberStop>> {
+        match self { Self::Available(stop) | Self::Poisoned(stop) => stop.as_ref() }
+    }
+    pub fn is_poisoned(&self) -> bool { matches!(self, Self::Poisoned(_)) }
+}
+impl OriginalStopPublication {
+    fn record(stop: std::sync::Arc<OriginalBatchMemberStop>, sink: &std::sync::Mutex<Option<std::sync::Arc<OriginalBatchMemberStop>>>) -> Self {
+        match sink.lock() {
+            Ok(mut slot) => {
+                if let Some(previous) = slot.as_ref() {
+                    if std::sync::Arc::ptr_eq(previous, &stop) {
+                        return Self::Recorded(stop);
+                    }
+                    return Self::Unknown { current: stop, previous: Some(std::sync::Arc::clone(previous)), failure: OriginalStopRecordFailure::Occupied };
+                }
+                stop.recorded.store(true, std::sync::atomic::Ordering::Release);
+                *slot = Some(std::sync::Arc::clone(&stop));
+                Self::Recorded(stop)
+            }
+            Err(poisoned) => {
+                let previous = poisoned.into_inner().clone();
+                Self::Unknown { current: stop, previous, failure: OriginalStopRecordFailure::Poisoned }
+            }
+        }
+    }
+    pub fn current(&self) -> &std::sync::Arc<OriginalBatchMemberStop> {
+        match self { Self::Recorded(current) | Self::Unknown { current, .. } => current }
+    }
+    pub fn previous(&self) -> Option<&std::sync::Arc<OriginalBatchMemberStop>> {
+        match self { Self::Recorded(_) => None, Self::Unknown { previous, .. } => previous.as_ref() }
+    }
+    pub fn failure(&self) -> Option<OriginalStopRecordFailure> {
+        match self { Self::Recorded(_) => None, Self::Unknown { failure, .. } => Some(*failure) }
+    }
+    pub fn into_parts(self) -> (std::sync::Arc<OriginalBatchMemberStop>, Option<std::sync::Arc<OriginalBatchMemberStop>>, Option<OriginalStopRecordFailure>) {
+        match self {
+            Self::Recorded(current) => (current, None, None),
+            Self::Unknown { current, previous, failure } => (current, previous, Some(failure)),
+        }
+    }
+}
+pub enum OriginalBatchMemberStopReason {
+    BeforeOutcomeUnknown(String),
+    BeforeOutcomeError(crate::agentic::AgentActionServiceError),
+    /// The original backend authenticated this member's noncommit terminal.
+    /// Node and physical closure remain independently required.
+    ConfirmedNoncommit(std::sync::Arc<crate::OriginalMemberNoncommit>),
+    BeforeOutcomeStoreError(std::sync::Arc<crate::RuntimeEventStoreError>),
+    UnknownNoReceipt(harness_contract::agent_action::AgentActionObservation),
+    /// The action committed at this index, but its observation is unavailable.
+    CommittedObservationUnavailable(AuthenticatedBatchMember),
+    /// The original commit exists; owner reconciliation/binding is pending.
+    CommittedUnbound(OriginalMemberUnboundCommit),
+}
+pub enum PreparedMemberSubmitOutcome {
+    Committed(AuthenticatedBatchMember),
+    Stopped(OriginalStopPublication),
+}
+
+/// Reading a committed prefix never grants admission for any member.
+pub enum AgentBatchCommittedPrefixRead {
+    /// All members have committed; individual Host deliveries may be pending.
+    AllCommitted(AuthenticatedBatchPrefix),
+    /// A later member could not be resolved. Earlier committed members may
+    /// independently have pending Host delivery.
+    Stopped(IncompleteAgentBatch),
+}
+
+impl AgentBatchCommittedPrefixRead {
+    pub fn committed(&self) -> &AuthenticatedBatchPrefix {
+        match self {
+            Self::AllCommitted(prefix) => prefix,
+            Self::Stopped(incomplete) => incomplete.prefix(),
+        }
+    }
+
+    pub fn pending_deliveries(&self) -> impl Iterator<Item = BatchMemberDeliveryPending<'_>> {
+        self.committed().pending_deliveries()
+    }
+
+    /// The next member which could not be resolved, if any. This is separate
+    /// from delivery of any previously committed member.
+    pub fn stopped_at(&self) -> Option<&AgentBatchMemberFailure> {
+        match self {
+            Self::AllCommitted(_) => None,
+            Self::Stopped(incomplete) => Some(incomplete.failure()),
+        }
+    }
+}
+
+/// A committed action and its original member receipt, authenticated by the
+/// action owner. Private fields prevent a consumer from turning a projection
+/// or an arbitrary event into a replay.
+#[derive(Clone)]
+pub struct AuthenticatedBatchMember(std::sync::Arc<AuthenticatedBatchMemberFacts>);
+
+struct AuthenticatedBatchMemberFacts {
+    source: OriginalMemberCommitSource,
+    delivery: BatchMemberDelivery,
+}
+
+enum OriginalMemberCommitSource {
+    Recovered(std::sync::Arc<crate::host::OriginalMemberReplayWitness>),
+    SameOwner { handle: std::sync::Arc<crate::agentic::OriginalCommittedMember>, index: usize, action_index: usize },
+}
+
+impl AuthenticatedBatchMember {
+    /// Borrow only the original in-process checked owner; a recovered
+    /// witness cannot be promoted into a same-owner submission handle.
+    pub(crate) fn same_owner_committed(&self) -> Option<&std::sync::Arc<crate::agentic::OriginalCommittedMember>> {
+        match &self.0.source {
+            OriginalMemberCommitSource::SameOwner { handle, .. } => Some(handle),
+            OriginalMemberCommitSource::Recovered(_) => None,
+        }
+    }
+
+    /// Only the original owner can mint the private witness. This constructor
+    /// never accepts a caller-supplied receipt or a projected observation.
+    pub(crate) fn from_original_witness(witness: std::sync::Arc<crate::host::OriginalMemberReplayWitness>) -> Self {
+        Self(std::sync::Arc::new(AuthenticatedBatchMemberFacts {
+            source: OriginalMemberCommitSource::Recovered(witness), delivery: BatchMemberDelivery::Incomplete,
+        }))
+    }
+
+    /// The handle is private to the original checked append owner. Its request
+    /// and receipt are borrowed directly; no database read or DTO can mint it.
+    pub(crate) fn from_original_committed(
+        handle: std::sync::Arc<crate::agentic::OriginalCommittedMember>,
+        store: &std::sync::Arc<crate::RuntimeEventStore>,
+        envelope: &harness_contract::agent_action::AgentActionEnvelope,
+    ) -> Result<Self, (std::sync::Arc<crate::agentic::OriginalCommittedMember>, String)> {
+        let verify = || -> Result<(usize, usize), String> {
+        if !handle.belongs_to(store) { return Err("original member store mismatch".into()); }
+        let transaction = &handle.request().transaction;
+        let mut indices = transaction.events.iter().filter(|event| event.event.kind == "agentic.batch_member.index");
+        let marker = indices.next().ok_or("original member index missing from checked request")?;
+        if indices.next().is_some() { return Err("original member index ambiguous".into()); }
+        let index = marker.event.payload["member_index"].as_u64()
+            .and_then(|value| usize::try_from(value).ok()).ok_or("original member index invalid")?;
+        let action_index = marker.event.payload["program_event_index"].as_u64()
+            .and_then(|value| usize::try_from(value).ok()).ok_or("original member action position invalid")?;
+        let action = transaction.events.get(action_index).ok_or("original member action absent")?;
+        let facts = action.event.payload.get("member_admission").ok_or("original member facts absent")?;
+        // The member admission facts are read back from the same-source batch
+        // payload the action event keeps.
+        let facts = crate::step_snapshot::rebuild_member_admission_facts(facts)?;
+        let facts: &serde_json::Value = &facts;
+        let outer = facts.pointer("/prepared/outer_key").and_then(serde_json::Value::as_str)
+            .filter(|value| !value.is_empty()).ok_or("original member outer missing")?;
+        let identity = facts.pointer("/prepared/identity").and_then(serde_json::Value::as_str)
+            .filter(|value| !value.is_empty()).ok_or("original member identity missing")?;
+        let original: harness_contract::agent_action::AgentActionEnvelope = serde_json::from_value(
+            action.event.payload.get("envelope").cloned().ok_or("original member envelope absent")?,
+        ).map_err(|error| error.to_string())?;
+        let receipt = &handle.receipt().commit;
+        // The original store owner sealed this exact post-validation request
+        // with its append receipt; do not hash it again in the same owner.
+        if original != *envelope || transaction.transaction_id != receipt.transaction_id
+            || receipt.commit_cursor == 0
+            || receipt.event_ids.len() != transaction.events.len()
+            || marker.event.stream_id != format!("execution-effect:{outer}")
+            || marker.event.scope != crate::RuntimeEventScope::ExecutionNode
+            || marker.event.actor.as_deref() != Some("runtime.agentic_action")
+            || marker.event.status.as_deref() != Some("committed") || marker.schema_version != 1
+            || marker.idempotency_key.as_deref() != Some(format!("agentic-member:{index}").as_str())
+            || marker.event.payload["outer_key"] != outer
+            || marker.event.payload["member_identity"] != identity
+            || facts.pointer("/prepared/index").and_then(serde_json::Value::as_u64) != u64::try_from(index).ok()
+            || facts.get("ticket").is_none_or(serde_json::Value::is_null)
+            || marker.event.payload.get("ticket") != facts.get("ticket")
+            || action.event.stream_id != format!("agentic-program:{}", envelope.actor.program_id)
+            || action.event.scope != crate::RuntimeEventScope::Program || action.schema_version != 1
+            || action.event.actor.as_deref() != Some(envelope.actor.actor_id.as_str())
+            || marker.event.payload["program_stream"] != action.event.stream_id
+            || marker.event.payload["program_event_kind"] != action.event.kind
+            || marker.event.payload["program_event_key"].as_str() != action.idempotency_key.as_deref()
+            || !matches!(action.event.kind.as_str(), "agentic.action_applied" | "agentic.completion_rejected")
+            || (action.event.kind == "agentic.action_applied" && action.event.status.as_deref() != Some("applied"))
+            || (action.event.kind == "agentic.completion_rejected" && action.event.status.as_deref() != Some("rejected"))
+        { return Err("original checked member transaction mismatch".into()); }
+        Ok((index, action_index))
+        };
+        let (index, action_index) = match verify() {
+            Ok(indices) => indices,
+            Err(reason) => return Err((handle, reason)),
+        };
+        Ok(Self(std::sync::Arc::new(AuthenticatedBatchMemberFacts {
+            source: OriginalMemberCommitSource::SameOwner { handle, index, action_index },
+            delivery: BatchMemberDelivery::Incomplete,
+        })))
+    }
+
+    /// Facts for the original node owner; callers cannot manufacture this
+    /// from a deserialized receipt. Delivery is still pending until the node
+    /// transaction and its existing after_commit publication have succeeded.
+    pub(crate) fn node_commit_fact(
+        &self,
+        store: &std::sync::Arc<crate::RuntimeEventStore>,
+        ticket: &crate::execution_core::NodeExecutionTicket,
+    ) -> Result<serde_json::Value, String> {
+        let (source_ticket, event_id, outer_key) = match &self.0.source {
+            OriginalMemberCommitSource::Recovered(witness) => {
+                if !witness.belongs_to_store(store) { return Err("member store mismatch".into()); }
+                (serde_json::to_value(witness.ticket()).map_err(|e| e.to_string())?, witness.action().event_id.clone(), witness.prepared().outer_key.clone())
+            }
+            OriginalMemberCommitSource::SameOwner { handle, action_index, .. } => {
+                if !handle.belongs_to(store) { return Err("member store mismatch".into()); }
+                let marker = handle.request().transaction.events.iter()
+                    .find(|event| event.event.kind == "agentic.batch_member.index")
+                    .ok_or("member index missing")?;
+                let ticket = marker.event.payload.get("ticket").cloned().ok_or("member ticket missing")?;
+                let event_id = handle.receipt().commit.event_ids.get(*action_index)
+                    .cloned().ok_or("member event identity missing")?;
+                (ticket, event_id, marker.event.payload["outer_key"].as_str().filter(|key| !key.is_empty()).ok_or("outer key missing")?.to_owned())
+            }
+        };
+        if source_ticket != serde_json::to_value(ticket).map_err(|e| e.to_string())? {
+            return Err("member original node ticket mismatch".into());
+        }
+        if !matches!(self.delivery(), BatchMemberDelivery::Incomplete) {
+            return Err("completed member delivery requires its original Host receipt".into());
+        }
+        let fact = self.committed_fact().ok_or("member original action fact missing")?;
+        let business = match fact {
+            OriginalMemberCommittedFact::Applied { .. } => "applied",
+            OriginalMemberCommittedFact::Rejected { .. } => "rejected",
+        };
+        let observation = match self.observation() {
+            OriginalMemberObservation::Available(value) => serde_json::json!({"state":"available", "value":value}),
+            OriginalMemberObservation::Unavailable => serde_json::json!({"state":"unavailable"}),
+        };
+        let receipt = self.receipt();
+        Ok(serde_json::json!({"member_index":self.index(), "outer_key":outer_key, "ticket":source_ticket,
+            "action_event_id":event_id, "action_transaction_id":receipt.transaction_id,
+            "action_commit_cursor":receipt.commit_cursor, "business":business,
+            "observation":observation, "delivery":"pending"}))
+    }
+
+    pub fn index(&self) -> usize { match &self.0.source {
+        OriginalMemberCommitSource::Recovered(witness) => witness.index(),
+        OriginalMemberCommitSource::SameOwner { index, .. } => *index,
+    }}
+    pub fn action(&self) -> OriginalMemberEvent<'_> { match &self.0.source {
+        OriginalMemberCommitSource::Recovered(witness) => OriginalMemberEvent::Recovered(witness.action()),
+        OriginalMemberCommitSource::SameOwner { handle, action_index, .. } =>
+            OriginalMemberEvent::SameOwner(&handle.request().transaction.events[*action_index].event),
+    }}
+    pub fn receipt(&self) -> &crate::AppendTransactionReceipt { match &self.0.source {
+        OriginalMemberCommitSource::Recovered(witness) => witness.action_receipt(),
+        OriginalMemberCommitSource::SameOwner { handle, .. } => &handle.receipt().commit,
+    }}
+    pub fn delivery(&self) -> &BatchMemberDelivery { &self.0.delivery }
+
+    /// Business-result availability is independent from Host delivery. In
+    /// particular, post-commit processing may fail without undoing the commit.
+    pub fn observation(&self) -> OriginalMemberObservation<'_> {
+        match &self.0.source {
+            OriginalMemberCommitSource::SameOwner { handle, .. } => match handle.observation() {
+                Some(observation) => OriginalMemberObservation::Available(observation),
+                None => OriginalMemberObservation::Unavailable,
+            },
+            OriginalMemberCommitSource::Recovered(_) => OriginalMemberObservation::Unavailable,
+        }
+    }
+
+    pub fn observation_error(&self) -> Option<&str> { match &self.0.source {
+        OriginalMemberCommitSource::SameOwner { handle, .. } => handle.observation_error(),
+        OriginalMemberCommitSource::Recovered(_) => None,
+    }}
+
+    /// Only facts present in the original committed event. This does not
+    /// reconstruct an observation from the current Program projection.
+    pub fn committed_fact(&self) -> Option<OriginalMemberCommittedFact<'_>> {
+        let event = self.action();
+        match event.kind() {
+            "agentic.action_applied" => Some(OriginalMemberCommittedFact::Applied { event }),
+            "agentic.completion_rejected" => Some(OriginalMemberCommittedFact::Rejected {
+                event,
+                code: event.payload().get("code")?.as_str()?,
+                reason: event.payload().get("gap")?.as_str()?,
+            }),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+pub enum OriginalMemberEvent<'a> {
+    /// Re-entered storage, authenticated once by the original owner.
+    Recovered(&'a crate::DurableRuntimeEvent),
+    /// Exact input and receipt returned from this owner's checked append.
+    SameOwner(&'a crate::RuntimeEventInput),
+}
+impl<'a> OriginalMemberEvent<'a> {
+    pub fn kind(self) -> &'a str { match self { Self::Recovered(event) => &event.kind, Self::SameOwner(event) => &event.kind } }
+    pub fn payload(self) -> &'a serde_json::Value { match self { Self::Recovered(event) => &event.payload, Self::SameOwner(event) => &event.payload } }
+}
+
+/// NoCommittedReceipt remains unresolved and is never a Fresh grant.
+pub enum OriginalMemberSubmitOutcome {
+    Committed(AuthenticatedBatchMember),
+    /// A checked append committed, but its identity could not be bound to the
+    /// requested member. Keep the sealed owner handle for reconciliation.
+    CommittedUnbound(OriginalMemberUnboundCommit),
+    NoCommittedReceipt(harness_contract::agent_action::AgentActionObservation),
+}
+
+impl OriginalMemberSubmitOutcome {
+    /// Called by Runtime ingress with the actual owner result. In particular,
+    /// a binding error retains the sealed committed handle rather than
+    /// turning an already committed action into a retryable failure.
+    pub(crate) fn from_original_submission(
+        submission: crate::agentic::OriginalMemberSubmission,
+        store: &std::sync::Arc<crate::RuntimeEventStore>,
+        envelope: &harness_contract::agent_action::AgentActionEnvelope,
+    ) -> Self {
+        match submission {
+            crate::agentic::OriginalMemberSubmission::Committed(handle) => {
+                match AuthenticatedBatchMember::from_original_committed(handle, store, envelope) {
+                    Ok(member) => Self::Committed(member),
+                    Err((handle, reason)) => Self::CommittedUnbound(OriginalMemberUnboundCommit { handle, reason }),
+                }
+            }
+            crate::agentic::OriginalMemberSubmission::NoCommittedReceipt(observation) =>
+                Self::NoCommittedReceipt(observation),
+        }
+    }
+}
+
+pub struct OriginalMemberUnboundCommit {
+    pub(crate) handle: std::sync::Arc<crate::agentic::OriginalCommittedMember>,
+    pub(crate) reason: String,
+}
+impl OriginalMemberUnboundCommit {
+    pub fn reason(&self) -> &str { &self.reason }
+    pub(crate) fn original(&self) -> &std::sync::Arc<crate::agentic::OriginalCommittedMember> { &self.handle }
+}
+
+pub enum OriginalMemberObservation<'a> {
+    Available(&'a harness_contract::agent_action::AgentActionObservation),
+    Unavailable,
+}
+
+/// A partial original business result, not a completed Host delivery or a
+/// replacement for the original full observation.
+pub enum OriginalMemberCommittedFact<'a> {
+    Applied { event: OriginalMemberEvent<'a> },
+    Rejected { event: OriginalMemberEvent<'a>, code: &'a str, reason: &'a str },
+}
+
+/// Business commit and Host delivery are distinct facts.
+pub enum BatchMemberDelivery {
+    Incomplete,
+}
+
+/// An already-committed member whose Host delivery is not proven complete.
+/// The borrowed member carries the original action and transaction receipt;
+/// creating this view does not create another receipt or authorize dispatch.
+pub struct BatchMemberDeliveryPending<'a> {
+    member: &'a AuthenticatedBatchMember,
+}
+
+impl<'a> BatchMemberDeliveryPending<'a> {
+    pub fn index(&self) -> usize { self.member.index() }
+    pub fn member(&self) -> &'a AuthenticatedBatchMember { self.member }
+}
+
+pub struct BatchMemberUnknown {
+    pub index: usize,
+    pub reason: BatchMemberUnknownReason,
+}
+
+pub enum BatchMemberUnknownReason {
+    /// The original ticket or request could not be authenticated.
+    OriginalRequestNotAuthenticated(String),
+    /// The action owner has not supplied the same-transaction member facts.
+    OriginalTransactionFactsUnavailable,
+    /// The original non-consuming preparation could not be completed.
+    Preparation(String),
+    /// Preserve an original owner store error and its Unknown status.
+    OriginalOwnerStore(std::sync::Arc<crate::RuntimeEventStoreError>),
+    /// Preserve the original transaction error, including an unknown commit.
+    Commit(crate::agentic::AgentActionServiceError),
+}
+
+pub struct BatchMemberConflict {
+    pub index: usize,
+    pub reason: String,
+}
+
+/// In-process delivery carrier for an ordered prefix of original, authenticated
+/// transaction receipts. It is not a durable ledger or proof of Host delivery.
+#[derive(Default)]
+pub struct AuthenticatedBatchPrefix {
+    members: Vec<AuthenticatedBatchMember>,
+}
+
+impl AuthenticatedBatchPrefix {
+    pub fn new() -> Self { Self::default() }
+
+    pub fn push(&mut self, member: AuthenticatedBatchMember) -> Result<(), AuthenticatedBatchMember> {
+        if member.index() != self.members.len() { return Err(member); }
+        self.members.push(member);
+        Ok(())
+    }
+
+    pub fn members(&self) -> &[AuthenticatedBatchMember] { &self.members }
+    pub fn into_members(self) -> Vec<AuthenticatedBatchMember> { self.members }
+
+    pub fn pending_deliveries(&self) -> impl Iterator<Item = BatchMemberDeliveryPending<'_>> {
+        self.members.iter().map(|member| BatchMemberDeliveryPending { member })
+    }
+}
+
+/// Carries only authenticated prefix facts; later indices have not been resolved.
+pub struct IncompleteAgentBatch {
+    prefix: AuthenticatedBatchPrefix,
+    failure: AgentBatchMemberFailure,
+}
+
+pub enum AgentBatchMemberFailure {
+    Unknown(BatchMemberUnknown),
+    Conflict(BatchMemberConflict),
+    Commit { index: usize, error: crate::agentic::AgentActionServiceError },
+}
+
+impl AgentBatchMemberFailure {
+    pub fn index(&self) -> usize {
+        match self {
+            Self::Unknown(failure) => failure.index,
+            Self::Conflict(failure) => failure.index,
+            Self::Commit { index, .. } => *index,
+        }
+    }
+}
+
+impl IncompleteAgentBatch {
+    pub fn new(prefix: AuthenticatedBatchPrefix, failure: AgentBatchMemberFailure)
+        -> Result<Self, (AuthenticatedBatchPrefix, AgentBatchMemberFailure)> {
+        let index = failure.index();
+        if index != prefix.members.len() { return Err((prefix, failure)); }
+        Ok(Self { prefix, failure })
+    }
+
+    pub fn prefix(&self) -> &AuthenticatedBatchPrefix { &self.prefix }
+    pub fn failure(&self) -> &AgentBatchMemberFailure { &self.failure }
+    pub fn into_parts(self) -> (AuthenticatedBatchPrefix, AgentBatchMemberFailure) {
+        (self.prefix, self.failure)
+    }
+    pub fn pending_deliveries(&self) -> impl Iterator<Item = BatchMemberDeliveryPending<'_>> {
+        self.prefix.pending_deliveries()
+    }
+}
+
+/// The original Runtime policy owner issues one independently assessed member.
+#[async_trait::async_trait]
+pub trait AgentBatchPolicyOwner: Send + Sync {
+    async fn prepare_member_pregrant(&self, original: &RuntimeToolExecutionRequest, index: usize)
+        -> AgentBatchMemberPregrant;
+
+}
+
+tokio::task_local! {
+    pub(crate) static DELEGATED_BATCH_POLICY_OWNER: std::sync::Arc<dyn AgentBatchPolicyOwner>;
+    pub(crate) static ORIGINAL_MEMBER_PROGRESS: ToolProgressSink;
+    pub(crate) static ORIGINAL_EFFECT_REQUEST: std::sync::Arc<std::sync::Mutex<Option<std::sync::Arc<RuntimeToolExecutionRequest>>>>;
+}
+
+/// Same-call origin installed only by the original execution producer.
+#[derive(Clone)]
+pub(crate) enum OriginalEffectCustodyOrigin {
+    ToolBatch(crate::execution_core::NodeExecutionTicket),
+    DirectProcess,
+}
+
 #[derive(Clone, Default)]
-pub struct ToolProgressSink(
-    pub Option<std::sync::Arc<dyn Fn(&str) + Send + Sync>>,
-    std::sync::Arc<std::sync::Mutex<Option<Vec<tools::OrchestratedRead>>>>,
-    std::sync::Arc<std::sync::Mutex<Option<ToolLifecycleAnchor>>>,
-);
+pub struct ToolProgressSink {
+    callback: Option<std::sync::Arc<dyn Fn(&str) + Send + Sync>>,
+    child_reads: std::sync::Arc<std::sync::Mutex<Option<Option<Vec<tools::OrchestratedRead>>>>>,
+    child_searches: std::sync::Arc<std::sync::Mutex<Option<Option<Vec<tools::OrchestratedSearch>>>>>,
+    lifecycle_anchor: std::sync::Arc<std::sync::Mutex<Option<ToolLifecycleAnchor>>>,
+    batch_policy_owner: std::sync::Arc<std::sync::Mutex<Option<std::sync::Weak<dyn AgentBatchPolicyOwner>>>>,
+    original_fresh_effect: std::sync::Arc<std::sync::Mutex<Option<std::sync::Weak<crate::execution_core::graph::OriginalFreshEffectOwner>>>>,
+    original_effect_custody: std::sync::Arc<std::sync::Mutex<Option<OriginalEffectCustodyOrigin>>>,
+    original_conclusions: std::sync::Arc<std::sync::Mutex<Vec<(Option<usize>, std::sync::Arc<crate::agentic::OriginalCommittedConclusion>)>>>,
+    original_singles: std::sync::Arc<std::sync::Mutex<Vec<std::sync::Arc<crate::agentic::OriginalCommittedSingle>>>>,
+    original_governed_hook: std::sync::Arc<std::sync::Mutex<Option<std::sync::Arc<crate::conversation::tool_plane::OriginalGovernedHook>>>>,
+    member_results: std::sync::Arc<std::sync::Mutex<Vec<(usize, std::sync::Arc<OriginalMemberSubmitOutcome>)>>>,
+    member_stop: std::sync::Arc<OriginalStopChannel>,
+    stop_publications: std::sync::Arc<std::sync::Mutex<Vec<std::sync::Arc<OriginalStopPublication>>>>,
+}
 
 impl ToolProgressSink {
     pub fn new(callback: Option<std::sync::Arc<dyn Fn(&str) + Send + Sync>>) -> Self {
-        Self(callback, Default::default(), Default::default())
+        Self { callback, ..Self::default() }
     }
-    pub fn record_child_reads(&self, reads: Vec<tools::OrchestratedRead>) -> Result<(), String> {
-        let mut slot = self.1.lock().map_err(|_| "child read channel poisoned")?;
-        if slot.is_some() { return Err("child read channel already populated".into()); }
-        *slot = Some(reads);
+    pub(crate) fn same_original_channels(&self, other: &Self) -> bool {
+        std::sync::Arc::ptr_eq(&self.child_reads, &other.child_reads)
+            && std::sync::Arc::ptr_eq(&self.child_searches, &other.child_searches)
+            && std::sync::Arc::ptr_eq(&self.lifecycle_anchor, &other.lifecycle_anchor)
+            && std::sync::Arc::ptr_eq(&self.batch_policy_owner, &other.batch_policy_owner)
+            && std::sync::Arc::ptr_eq(&self.original_fresh_effect, &other.original_fresh_effect)
+            && std::sync::Arc::ptr_eq(&self.original_effect_custody, &other.original_effect_custody)
+            && std::sync::Arc::ptr_eq(&self.original_conclusions, &other.original_conclusions)
+            && std::sync::Arc::ptr_eq(&self.original_singles, &other.original_singles)
+            && std::sync::Arc::ptr_eq(&self.original_governed_hook, &other.original_governed_hook)
+            && std::sync::Arc::ptr_eq(&self.member_results, &other.member_results)
+            && std::sync::Arc::ptr_eq(&self.member_stop, &other.member_stop)
+            && std::sync::Arc::ptr_eq(&self.stop_publications, &other.stop_publications)
+            && match (&self.callback, &other.callback) {
+                (Some(left), Some(right)) => std::sync::Arc::ptr_eq(left, right),
+                (None, None) => true,
+                _ => false,
+            }
+    }
+    pub fn callback(&self) -> Option<&std::sync::Arc<dyn Fn(&str) + Send + Sync>> {
+        self.callback.as_ref()
+    }
+    pub(crate) fn original_read_ref_identity(&self) -> std::sync::Weak<OriginalStopChannel> {
+        std::sync::Arc::downgrade(&self.member_stop)
+    }
+    pub(crate) fn install_original_effect_custody(&self, origin: OriginalEffectCustodyOrigin) -> Result<(), String> {
+        let mut slot = self.original_effect_custody.lock().map_err(|_| "original custody channel poisoned")?;
+        if slot.is_some() { return Err("original effect custody already installed".into()); }
+        *slot = Some(origin);
         Ok(())
     }
+    pub(crate) fn original_effect_custody(&self) -> Result<Option<OriginalEffectCustodyOrigin>, String> {
+        self.original_effect_custody.lock().map(|value| value.clone()).map_err(|_| "original custody channel poisoned".into())
+    }
+    pub(crate) fn install_original_fresh_effect(
+        &self,
+        owner: std::sync::Arc<crate::execution_core::graph::OriginalFreshEffectOwner>,
+    ) -> Result<(), String> {
+        let mut slot = self.original_fresh_effect.lock().map_err(|_| "original effect owner channel poisoned")?;
+        if slot.is_some() { return Err("original effect admission already installed".into()); }
+        *slot = Some(std::sync::Arc::downgrade(&owner));
+        Ok(())
+    }
+    pub(crate) fn original_fresh_effect(
+        &self,
+    ) -> Result<Option<std::sync::Arc<crate::execution_core::graph::OriginalFreshEffectOwner>>, String> {
+        let slot = self.original_fresh_effect.lock().map_err(|_| "original effect owner channel poisoned")?;
+        match slot.as_ref() {
+            Some(owner) => owner.upgrade().map(Some).ok_or_else(|| "original effect owner no longer retained".into()),
+            None => Ok(None),
+        }
+    }
+    /// Preserve the original checked result under its single call or batch member index.
+    /// This channel is not proof of physical delivery.
+    pub(crate) fn record_original_conclusion(
+        &self, index: Option<usize>, result: std::sync::Arc<crate::agentic::OriginalCommittedConclusion>,
+    ) -> Result<(), String> {
+        let poisoned = self.original_conclusions.is_poisoned();
+        let mut values = self.original_conclusions.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let wrong_index = result.member_index() != index;
+        let conflict = values.iter().any(|(old_index, old)|
+            (*old_index == index || old.action_id() == result.action_id())
+                && !(*old_index == index && old.same_original_commit(&result)));
+        if !values.iter().any(|(old_index, old)| *old_index == index && old.same_original_commit(&result)) {
+            values.push((index, result));
+        }
+        if poisoned { return Err("original conclusion channel poisoned".into()); }
+        if wrong_index { return Err("original conclusion member index differs".into()); }
+        if conflict { return Err("original conclusion channel conflict".into()); }
+        Ok(())
+    }
+    pub(crate) fn original_conclusion(
+        &self, index: Option<usize>, action_id: &str,
+    ) -> Result<Option<std::sync::Arc<crate::agentic::OriginalCommittedConclusion>>, String> {
+        let values = self.original_conclusions.lock().map_err(|_| "original conclusion channel poisoned")?;
+        let mut matches = values.iter().filter(|(old_index, old)| *old_index == index || old.action_id() == action_id);
+        let Some((old_index, result)) = matches.next() else { return Ok(None); };
+        if matches.next().is_some() || *old_index != index || result.member_index() != index || result.action_id() != action_id {
+            return Err("original conclusion channel conflict".into());
+        }
+        Ok(Some(std::sync::Arc::clone(result)))
+    }
+    /// Snapshot only original same-call conclusion handles; not dispatch authority.
+    pub(crate) fn original_conclusion_entries(
+        &self,
+    ) -> Result<Vec<(Option<usize>, std::sync::Arc<crate::agentic::OriginalCommittedConclusion>)>, String> {
+        let values = self.original_conclusions.lock().map_err(|_| "original conclusion channel poisoned")?;
+        Ok(values.clone())
+    }
+    /// Same-call checked result transport; this does not attest physical delivery.
+    pub(crate) fn record_original_single(
+        &self, result: std::sync::Arc<crate::agentic::OriginalCommittedSingle>,
+    ) -> Result<(), String> {
+        let poisoned = self.original_singles.is_poisoned();
+        let mut values = self.original_singles.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !values.iter().any(|old| std::sync::Arc::ptr_eq(old, &result)) { values.push(result); }
+        if poisoned { return Err("original single channel poisoned".into()); }
+        if values.len() != 1 { return Err("original single channel conflict".into()); }
+        Ok(())
+    }
+    pub(crate) fn original_single(
+        &self,
+    ) -> Result<Option<std::sync::Arc<crate::agentic::OriginalCommittedSingle>>, String> {
+        let values = self.original_singles.lock().map_err(|_| "original single channel poisoned")?;
+        if values.len() > 1 { return Err("original single channel conflict".into()); }
+        Ok(values.first().cloned())
+    }
+    /// In-process transport only: values were minted by the original owner.
+    /// This slot is not a durable receipt, admission, or proof of delivery.
+    /// Exactly one owner outcome is kept per member index: a later observation
+    /// of an already recorded index is a duplicate and is not appended, so the
+    /// one-outcome-per-index invariant stays intact for the Host and Process
+    /// validators.
+    pub fn record_original_member(&self, index: usize, result: std::sync::Arc<OriginalMemberSubmitOutcome>) {
+        let mut values = self.member_results.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if values.iter().any(|(recorded, _)| *recorded == index) { return; }
+        values.push((index, result));
+    }
+    pub(crate) fn checked_original_members(&self) -> Result<Vec<(usize, std::sync::Arc<OriginalMemberSubmitOutcome>)>, String> {
+        self.member_results.lock().map(|values| values.clone())
+            .map_err(|_| "original member results unavailable".into())
+    }
+    pub fn original_members(&self) -> Vec<(usize, std::sync::Arc<OriginalMemberSubmitOutcome>)> {
+        self.member_results.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
+    }
+    /// A poisoned stop slot is unresolved even if it contains no value.
+    /// This only selects same-call transport; it establishes no authority.
+    pub fn has_original_member_stop(&self) -> bool {
+        !self.stop_publications.lock().unwrap_or_else(std::sync::PoisonError::into_inner).is_empty()
+            || !matches!(self.original_member_stop(), OriginalStopRead::Available(None))
+    }
+    /// Same-call transport for direct owner publications; it grants nothing.
+    pub fn record_original_stop_publication(&self, publication: std::sync::Arc<OriginalStopPublication>) {
+        let mut values = self.stop_publications.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !values.iter().any(|old| std::sync::Arc::ptr_eq(old, &publication)
+            || matches!((old.as_ref(), publication.as_ref()), (OriginalStopPublication::Recorded(a), OriginalStopPublication::Recorded(b))
+                if std::sync::Arc::ptr_eq(a, b))) { values.push(publication); }
+    }
+    /// Re-enter only this call's already recorded stop before replaying its prefix.
+    /// No coordinates or decoded request can create a settlement owner here.
+    pub fn reconcile_original_member_stop(&self) {
+        let Ok(publications) = self.checked_original_stop_publications() else { return; };
+        let [publication] = publications.as_slice() else { return; };
+        let OriginalStopPublication::Recorded(stop) = publication.as_ref() else { return; };
+        let OriginalStopRead::Available(Some(current)) = self.original_member_stop() else { return; };
+        if std::sync::Arc::ptr_eq(stop, &current) && stop.recorded_in_original_sink() && stop.belongs_to_original_sink(self) {
+            stop.reconcile_original();
+        }
+    }
+    pub fn original_stop_publications(&self) -> Vec<std::sync::Arc<OriginalStopPublication>> {
+        self.stop_publications.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
+    }
+    pub(crate) fn checked_original_stop_publications(&self) -> Result<Vec<std::sync::Arc<OriginalStopPublication>>, String> {
+        self.stop_publications.lock().map(|values| values.clone())
+            .map_err(|_| "original stop publications unavailable".into())
+    }
+    /// Publish an owner-created stop only to the original request's own sink.
+    pub fn record_original_member_stop(&self, stop: std::sync::Arc<OriginalBatchMemberStop>) -> OriginalStopPublication {
+        if !stop.belongs_to_original_sink(self) {
+            let previous = stop.coordinate.sink.upgrade().and_then(|sink| sink.current());
+            return OriginalStopPublication::Unknown { current: stop, previous, failure: OriginalStopRecordFailure::WrongSink };
+        }
+        OriginalStopPublication::record(stop, &self.member_stop.slot)
+    }
+    pub fn original_member_stop(&self) -> OriginalStopRead {
+        match self.member_stop.slot.lock() {
+            Ok(slot) => OriginalStopRead::Available(slot.clone()),
+            Err(poisoned) => OriginalStopRead::Poisoned(poisoned.into_inner().clone()),
+        }
+    }
+    /// The node owner takes the stop after incorporating it in its original
+    /// transaction/after_commit path; this also releases the sink's copy.
+    pub fn take_original_member_stop(&self) -> OriginalStopRead {
+        match self.member_stop.slot.lock() {
+            Ok(mut slot) => OriginalStopRead::Available(slot.take()),
+            Err(poisoned) => OriginalStopRead::Poisoned(poisoned.into_inner().clone()),
+        }
+    }
+    pub(crate) fn install_original_governed_hook(
+        &self,
+        hook: std::sync::Arc<crate::conversation::tool_plane::OriginalGovernedHook>,
+    ) -> Result<(), String> {
+        let mut slot = self.original_governed_hook.lock().map_err(|_| "original hook channel poisoned")?;
+        if slot.is_some() { return Err("original governed hook already installed".into()); }
+        *slot = Some(hook);
+        Ok(())
+    }
+    pub(crate) fn original_governed_hook(
+        &self,
+    ) -> Result<Option<std::sync::Arc<crate::conversation::tool_plane::OriginalGovernedHook>>, String> {
+        Ok(self.original_governed_hook.lock().map_err(|_| "original hook channel poisoned")?.clone())
+    }
+    pub fn install_batch_policy_owner(&self, owner: std::sync::Arc<dyn AgentBatchPolicyOwner>) -> Result<(), String> {
+        let mut slot = self.batch_policy_owner.lock().map_err(|_| "batch policy channel poisoned")?;
+        if slot.is_some() { return Err("batch policy owner already installed".into()); }
+        *slot = Some(std::sync::Arc::downgrade(&owner));
+        Ok(())
+    }
+    pub fn batch_policy_owner(&self) -> Result<Option<std::sync::Arc<dyn AgentBatchPolicyOwner>>, String> {
+        let slot = self.batch_policy_owner.lock().map_err(|_| "batch policy channel poisoned")?;
+        match slot.as_ref() {
+            Some(owner) => owner.upgrade().map(Some).ok_or_else(|| "original batch policy owner unavailable".into()),
+            None => Ok(None),
+        }
+    }
+    /// Bind actual child candidates to this original per-call channel, not a durable receipt.
+    pub fn record_orchestrated_children(&self, children: &tools::OrchestratedChildren) -> Result<(), String> {
+        {
+            let mut slot = self.child_reads.lock().map_err(|_| "child read channel poisoned")?;
+            match (&*slot, &children.reads) {
+                (_, None) => *slot = Some(None),
+                (Some(Some(existing)), Some(reads)) if existing != reads => {
+                    *slot = Some(None);
+                    return Err("conflicting child read channel".into());
+                }
+                (None, Some(reads)) => *slot = Some(Some(reads.clone())),
+                _ => {},
+            }
+        }
+        if let Ok(mut slot) = self.child_searches.lock() {
+            match (&*slot, &children.searches) {
+                (_, None) => *slot = Some(None),
+                (Some(Some(existing)), Some(searches)) if existing != searches => *slot = Some(None),
+                (None, Some(searches)) => *slot = Some(Some(searches.clone())),
+                _ => {},
+            }
+        }
+        Ok(())
+    }
+    pub(crate) fn child_searches(&self) -> Result<Option<Vec<tools::OrchestratedSearch>>, String> {
+        self.child_searches.lock().map(|slot| slot.clone().flatten()).map_err(|_| "child search channel poisoned".into())
+    }
     pub(crate) fn child_reads(&self) -> Result<Option<Vec<tools::OrchestratedRead>>, String> {
-        Ok(self.1.lock().map_err(|_| "child read channel poisoned")?.clone())
+        Ok(self.child_reads.lock().map_err(|_| "child read channel poisoned")?.clone().flatten())
     }
     pub(crate) fn record_lifecycle_anchor(&self, anchor: ToolLifecycleAnchor) -> Result<(), String> {
-        let mut slot = self.2.lock().map_err(|_| "tool lifecycle channel poisoned")?;
+        let mut slot = self.lifecycle_anchor.lock().map_err(|_| "tool lifecycle channel poisoned")?;
         if slot.is_some() { return Err("tool lifecycle anchor already populated".into()); }
         *slot = Some(anchor);
         Ok(())
     }
     pub(crate) fn lifecycle_anchor(&self) -> Result<Option<ToolLifecycleAnchor>, String> {
-        Ok(self.2.lock().map_err(|_| "tool lifecycle channel poisoned")?.clone())
+        Ok(self.lifecycle_anchor.lock().map_err(|_| "tool lifecycle channel poisoned")?.clone())
     }
 }
 
@@ -54,14 +1170,14 @@ impl std::fmt::Debug for ToolProgressSink {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_tuple("ToolProgressSink")
-            .field(&self.0.is_some())
+            .field(&self.callback.is_some())
             .finish()
     }
 }
 
 impl PartialEq for ToolProgressSink {
     fn eq(&self, other: &Self) -> bool {
-        self.0.is_some() == other.0.is_some()
+        self.callback.is_some() == other.callback.is_some()
     }
 }
 
@@ -192,6 +1308,8 @@ pub enum RuntimeToolExecutionStatus {
     Executed,
     BlockedPermission,
     Failed,
+    /// The owner cannot yet determine whether the effect committed.
+    Unknown,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -207,6 +1325,10 @@ pub struct RuntimeToolExecutionOutcome {
     /// failures, cancellation and unknown physical outcomes.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub observed_evidence: Vec<harness_contract::context::ObservedEvidence>,
+    /// The original call's in-process batch facts, carried to the node owner.
+    /// This is neither serialized nor a durable receipt or authorization.
+    #[serde(skip)]
+    pub pending_agent_batch: Option<crate::PendingAgentBatch>,
 }
 
 impl RuntimeToolExecutionOutcome {
@@ -614,6 +1736,25 @@ pub trait RuntimeExecutionHost: Send + Sync {
         request: &RuntimeToolExecutionRequest,
     ) -> RuntimeToolExecutionOutcome;
 
+    /// Explicit in-process carrier; adapters must forward it or fail closed.
+    async fn execute_runtime_tool_with_action_invocation(
+        &self,
+        request: &RuntimeToolExecutionRequest,
+        _capability: &crate::agentic::action_invocation::VerifiedActionInvocation,
+    ) -> RuntimeToolExecutionOutcome {
+        RuntimeToolExecutionOutcome {
+            tool_use_id: request.tool_use_id.clone(),
+            tool_name: request.tool_name.clone(),
+            status: RuntimeToolExecutionStatus::BlockedPermission,
+            category: request.category,
+            output: None,
+            error: Some("host cannot forward original action invocation".into()),
+            evidence_ref: String::new(),
+            observed_evidence: Vec::new(),
+            pending_agent_batch: None,
+        }
+    }
+
     fn delegated_tool_definitions(
         &self,
         tool_names: &[String],
@@ -729,11 +1870,23 @@ pub(crate) fn effect_file_accesses(
     // targeted Tool/Session scope says nothing about which files the child
     // touches, so a process-spawning tool that declares no bounded file scope
     // still reads the workspace and must keep the widening.
-    let declares_bounded_file_scope = descriptor.scopes.iter().any(|scope| {
-        scope.resource == PermissionResource::File
-            && scope.target.as_deref().is_some_and(|t| !t.trim().is_empty())
+    // The widening follows the tool's own declared effect: a process that
+    // declares an unbounded scope (a file scope without a target, or any
+    // shell scope) can reach the workspace, so the workspace root is added.
+    // A process that declares *bounded* file scopes - the read-only sandboxed
+    // compute, whose only file content is its declared `input_files` - or no
+    // file scope at all - the same compute with an empty file set, which
+    // materialises no project file - is already confined and must not be
+    // widened. Widening it would demand a whole-workspace lease for a
+    // computation that observes exactly what it declared.
+    let declares_unbounded_scope = descriptor.scopes.iter().any(|scope| {
+        match scope.resource {
+            PermissionResource::File => scope.target.as_deref().map(str::trim).unwrap_or("").is_empty(),
+            PermissionResource::Shell => true,
+            _ => false,
+        }
     });
-    if descriptor.spawns_process && !declares_bounded_file_scope {
+    if descriptor.spawns_process && declares_unbounded_scope {
         accesses.push((".".to_string(), false));
     }
     accesses.sort();
@@ -782,6 +1935,35 @@ pub(crate) fn whole_workspace_resource_lease(scopes: &[String], write: bool) -> 
             matches!(target.trim(), "." | "./")
                 && (matches!(mode, "write" | "workspace") || (!write && mode == "read"))
         })
+    })
+}
+
+/// The isolated evaluation output scope is the one bounded `.cowd` subtree
+/// that may participate in a scoped write/checkpoint. Every other `.cowd`
+/// path remains control-plane data and is rejected by the callers below.
+pub(crate) fn is_bounded_evaluation_output_path(relative: &std::path::Path) -> bool {
+    let mut components = relative.components();
+    let Some(std::path::Component::Normal(first)) = components.next() else {
+        return false;
+    };
+    if first != ".cowd" {
+        return false;
+    }
+    let Some(std::path::Component::Normal(second)) = components.next() else {
+        return false;
+    };
+    if second != "evaluation" {
+        return false;
+    }
+    let Some(std::path::Component::Normal(hash)) = components.next() else {
+        return false;
+    };
+    let hash = hash.to_str().unwrap_or_default();
+    if hash.len() != 64 || !hash.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return false;
+    }
+    components.all(|component| {
+        matches!(component, std::path::Component::Normal(part) if part != ".cowd")
     })
 }
 
@@ -839,8 +2021,14 @@ pub(crate) struct DelegatedCatalogProjection<'lease> {
             harness_contract::tool::ToolPermissionMode,
         ),
     >,
-    descriptors:
-        std::collections::BTreeMap<&'lease str, &'lease harness_contract::tool::ToolDescriptorRef>,
+    descriptors: std::collections::BTreeMap<
+        &'lease str,
+        Option<&'lease harness_contract::tool::ToolDescriptorRef>,
+    >,
+    original_descriptors: std::collections::BTreeMap<
+        String,
+        harness_contract::tool::ToolDescriptorRef,
+    >,
 }
 
 impl<'lease> DelegatedCatalogProjection<'lease> {
@@ -871,12 +2059,17 @@ impl<'lease> DelegatedCatalogProjection<'lease> {
                     )
                 })
                 .collect(),
-            descriptors: metadata
-                .descriptors
-                .iter()
-                .filter(|descriptor| requested.contains(&descriptor.canonical_id))
-                .map(|descriptor| (descriptor.canonical_id.as_str(), descriptor))
-                .collect(),
+            descriptors: {
+                let mut descriptors = std::collections::BTreeMap::new();
+                for descriptor in metadata.descriptors.iter().filter(|d| requested.contains(&d.canonical_id)) {
+                    descriptors.entry(descriptor.canonical_id.as_str())
+                        .and_modify(|entry| *entry = None)
+                        .or_insert(Some(descriptor));
+                }
+                descriptors
+            },
+            original_descriptors: lease.catalog_receipt().descriptors.into_iter()
+                .map(|descriptor| (descriptor.canonical_id.clone(), descriptor)).collect(),
         }
     }
 
@@ -898,7 +2091,7 @@ impl<'lease> DelegatedCatalogProjection<'lease> {
         definition: &crate::ProviderToolDefinition,
         requested: &std::collections::BTreeSet<String>,
         permission_ceiling: harness_contract::tool::ToolPermissionMode,
-        scopes: Option<&[String]>,
+        _scopes: Option<&[String]>,
     ) -> Option<harness_contract::tool::ToolDescriptorRef> {
         use harness_contract::tool::ToolDescriptorHealth;
 
@@ -918,57 +2111,31 @@ impl<'lease> DelegatedCatalogProjection<'lease> {
         {
             return None;
         }
-        let descriptor = *self.descriptors.get(tool_name.as_str())?;
+        let descriptor = (*self.descriptors.get(tool_name.as_str())?)?;
         if descriptor.health != ToolDescriptorHealth::Healthy
             || !permission_ceiling.permits(*floor)
             || !permission_ceiling.permits(descriptor.required_permission)
+            || self.original_descriptors.get(tool_name) != Some(descriptor)
         {
             return None;
         }
         let resolver = catalog.effect_resolver(tool_name);
-        let family = matches!(
-            (tool_name.as_str(), resolver.resolver_id.as_str()),
-            ("read_file", "builtin.readonly")
-                | ("tool_orchestrate", "builtin.orchestrate")
-                | ("edit", "runtime.action_edit")
-        ) && resolver == tools::builtin_effect_resolver_spec(tool_name)
-            && descriptor.source == "builtin";
-        if family {
-            let eligible = scopes.is_none_or(|scopes| {
-                scopes.iter().any(|scope| {
-                    if tool_name == "tool_orchestrate" && scope == "network:*" {
-                        return true;
-                    }
-                    scope.split_once(':').is_some_and(|(mode, target)| {
-                        matches!(mode, "read" | "write" | "workspace")
-                            && !target.trim().is_empty()
-                            && crate::governed_tool_plan::validate_relative_scope_path(
-                                &target.trim().replace('\\', "/"),
-                            )
-                            .is_ok()
-                    })
-                })
-            });
-            return eligible.then(|| descriptor.clone());
-        }
-        let effect = lease.describe_effect(tool_name, &serde_json::json!({}));
-        let control = harness_contract::agent_action::AGENT_ACTION_TOOL_IDS
-            .contains(&tool_name.as_str())
-            || matches!(
-                tool_name.as_str(),
-                "context_retrieve"
-                    | "working_context"
-                    | "private_note"
-                    | "evidence_retrieve"
-                    | "artifact_publish"
-            );
-        (permission_ceiling.permits(effect.required_permission)
-            && delegated_tool_effect_is_bounded(&effect)
-            && (control
-                || scopes.is_none_or(|scopes| {
-                    effect_has_resource_lease(&effect, scopes, lexical_resource_path_is_authorized)
-                })))
-        .then(|| descriptor.clone())
+        // Discovery authenticates the registered interface, not the effect of
+        // a fictional empty invocation. Actual input and scope are checked by
+        // the original per-call admission before any effect can run.
+        let registered_resolver = match descriptor.source.as_str() {
+            "builtin" => resolver == tools::builtin_effect_resolver_spec(tool_name)
+                && resolver.resolver_id != "builtin.unknown",
+            "runtime" => catalog.has_runtime_tool(tool_name)
+                && resolver.resolver_id.starts_with("runtime.")
+                && resolver.resolver_id != "runtime.unknown"
+                // `runtime.action_*` resolvers describe a particular builtin
+                // action and cannot be transplanted into a runtime registration.
+                && !resolver.resolver_id.starts_with("runtime.action_")
+                && resolver.resolver_version != 0,
+            _ => false,
+        };
+        registered_resolver.then(|| descriptor.clone())
     }
 }
 
@@ -992,6 +2159,105 @@ pub(crate) fn discover_delegated_tool(
 #[cfg(test)]
 mod resource_projection_tests {
     use super::*;
+
+    #[test]
+    fn rejected_member_without_owner_stays_unknown() {
+        let sink: std::sync::Arc<dyn OriginalStopSink> = std::sync::Arc::new(OriginalStopChannel::default());
+        let ticket = crate::execution_core::NodeExecutionTicket {
+            graph_id: "graph".into(), node_id: "node".into(), executor_kind: "tool".into(),
+            service_class: Default::default(), attempt: 1, idempotency_key: "attempt".into(), payload_ref: "payload".into(),
+        };
+        let observation: harness_contract::agent_action::AgentActionObservation = serde_json::from_value(serde_json::json!({
+            "receipt_id":"receipt", "action_id":"action", "action":"agent_invite", "program_id":"program",
+            "revision":4, "status":"rejected", "changed_refs":[], "actionable":[],
+            "error":{"code":"unknown_existing_agent_ref", "message":"invalid reference", "recoverable":true}
+        })).unwrap();
+        let coordinate = OriginalBatchMemberCoordinate {
+            outer_key:"outer".into(), call_id:"call".into(), ticket, step:None,
+            sink:std::sync::Arc::downgrade(&sink), index:0,
+        };
+        let publication = OriginalBatchMemberStop::publish(coordinate, OriginalBatchMemberStopReason::UnknownNoReceipt(observation));
+        publication.current().reconcile_original();
+        assert!(matches!(publication.current().reason(), OriginalBatchMemberStopReason::UnknownNoReceipt(_)));
+        assert!(publication.current().rejected_observation().is_none());
+    }
+
+    #[test]
+    fn child_read_overflow_stays_unknown_on_same_channel() {
+        let sink = ToolProgressSink::default();
+        let complete = tools::OrchestratedChildren { reads: Some(Vec::new()), searches: None };
+        let incomplete = tools::OrchestratedChildren { reads: None, searches: None };
+        sink.record_orchestrated_children(&complete).unwrap();
+        assert!(sink.child_reads().unwrap().is_some());
+        sink.record_orchestrated_children(&incomplete).unwrap();
+        assert!(sink.child_reads().unwrap().is_none());
+        sink.record_orchestrated_children(&complete).unwrap();
+        assert!(sink.child_reads().unwrap().is_none());
+    }
+
+    #[test]
+    fn child_search_overflow_stays_unknown_on_same_channel() {
+        let sink = ToolProgressSink::default();
+        let complete = tools::OrchestratedChildren { reads: None, searches: Some(Vec::new()) };
+        let overflow = tools::OrchestratedChildren { reads: None, searches: None };
+        sink.record_orchestrated_children(&complete).unwrap();
+        assert!(sink.child_searches().unwrap().is_some());
+        sink.record_orchestrated_children(&overflow).unwrap();
+        assert!(sink.child_searches().unwrap().is_none());
+        sink.record_orchestrated_children(&complete).unwrap();
+        assert!(sink.child_searches().unwrap().is_none());
+    }
+
+    /// A process that declares exactly its own file scope is not widened to
+    /// the workspace root: the sandbox copies only those files, so demanding a
+    /// whole-workspace lease for it would be a wider authority than the tool
+    /// can actually use.
+    #[test]
+    fn a_bounded_process_is_not_widened_to_the_workspace_root() {
+        let mut descriptor = harness_contract::tool::ToolEffectDescriptor {
+            tool_id: "execute_code".to_string(),
+            descriptor_hash: "sha256:bounded".to_string(),
+            effect_kind: harness_contract::tool::ToolEffectKind::Process,
+            idempotency: harness_contract::tool::ToolIdempotency::Unknown,
+            scopes: vec![harness_contract::policy::PermissionScope {
+                resource: harness_contract::policy::PermissionResource::File,
+                operation: harness_contract::policy::PermissionOperation::Read,
+                target: Some("crates/tools/src/lib.rs".to_string()),
+            }],
+            required_permission: harness_contract::tool::ToolPermissionMode::ReadOnly,
+            approval_class: harness_contract::tool::ToolApprovalClass::Policy,
+            uses_network: false,
+            spawns_process: true,
+            mutates_packages: false,
+            mutates_system: false,
+            assessment: Default::default(),
+        };
+        let accesses = effect_file_accesses(&descriptor);
+        assert!(
+            !accesses.iter().any(|(target, _)| target == "."),
+            "a bounded compute must not be widened: {accesses:?}"
+        );
+        // A process that declares no file scope at all observes no project
+        // file either (the sandbox materialises none), so it is not widened.
+        descriptor.scopes.clear();
+        let accesses = effect_file_accesses(&descriptor);
+        assert!(
+            !accesses.iter().any(|(target, _)| target == "."),
+            "a compute with no project file must not be widened: {accesses:?}"
+        );
+        // An unbounded scope is still widened: the process can reach the
+        // workspace, so the honest scope is the workspace root.
+        descriptor.scopes.push(harness_contract::policy::PermissionScope {
+            resource: harness_contract::policy::PermissionResource::File,
+            operation: harness_contract::policy::PermissionOperation::Read,
+            target: None,
+        });
+        let accesses = effect_file_accesses(&descriptor);
+        assert!(
+            accesses.iter().any(|(target, _)| target == "."),
+            "an unbounded process must keep the workspace root: {accesses:?}"
+        );
+    }
 
     #[test]
     fn process_frame_projection_preserves_each_mutation_and_network_grant() {
@@ -1225,6 +2491,12 @@ mod resource_projection_tests {
             Some(&scopes)
         )
         .is_some());
+        let mut duplicate = metadata.clone();
+        duplicate.descriptors.push(metadata.descriptors.iter()
+            .find(|descriptor| descriptor.canonical_id == definition.name).unwrap().clone());
+        assert!(discover_delegated_tool(
+            &lease, &duplicate, &definition, &requested, ToolPermissionMode::ReadOnly, Some(&scopes)
+        ).is_none(), "duplicate catalog identity must not be resolved by map overwrite");
         let mut forged = definition.clone();
         forged.name = "unregistered_discovery_call".to_string();
         let mut forged_metadata = metadata.clone();
@@ -1302,6 +2574,34 @@ mod resource_projection_tests {
     }
 
     #[test]
+    fn parameterized_discovery_does_not_authorize_unbounded_or_out_of_scope_calls() {
+        let directory = tempfile::tempdir().unwrap();
+        let host = tools::ToolHost::builtin("bounded-discovery", directory.path());
+        let lease = host.pin_snapshot();
+        let metadata = lease.catalog_receipt();
+        let name = "execute_code";
+        let definition = lease.snapshot().catalog.kernel_definitions(None).into_iter()
+            .find(|definition| definition.name == name).unwrap();
+        let definition = crate::ProviderToolDefinition {
+            name: definition.name, description: definition.description, input_schema: definition.input_schema,
+        };
+        let requested = std::collections::BTreeSet::from([name.to_string()]);
+        let scope = vec!["read:src/a.rs".to_string()];
+        assert!(discover_delegated_tool(&lease, &metadata, &definition, &requested,
+            ToolPermissionMode::ReadOnly, Some(&scope)).is_some());
+        let input = serde_json::json!({"language":"python","code":"print(1)","input_files":["src/a.rs"]});
+        let outside = serde_json::json!({"language":"python","code":"print(1)","input_files":["src/b.rs"]});
+        assert!(effect_has_resource_lease(&lease.describe_effect(name, &input), &scope,
+            lexical_resource_path_is_authorized));
+        assert!(!effect_has_resource_lease(&lease.describe_effect(name, &outside), &scope,
+            lexical_resource_path_is_authorized));
+        let mut forged = metadata.clone();
+        forged.descriptors.iter_mut().find(|d| d.canonical_id == name).unwrap().source = "runtime".into();
+        assert!(discover_delegated_tool(&lease, &forged, &definition, &requested,
+            ToolPermissionMode::ReadOnly, Some(&scope)).is_none());
+    }
+
+    #[test]
     fn r1_composite_discovery_edit_family_keeps_concrete_checkpoint_authority() {
         let directory = tempfile::tempdir().unwrap();
         let host = tools::ToolHost::builtin("edit-discovery-contract", directory.path())
@@ -1376,7 +2676,7 @@ mod resource_projection_tests {
                 ToolPermissionMode::WorkspaceWrite,
                 &allowed
             )
-            .is_none());
+            .is_some(), "discovery does not authorize a particular input");
         }
         for mutation in 0..5 {
             let mut altered = metadata.clone();
@@ -1417,6 +2717,7 @@ mod resource_projection_tests {
         }
         let input = serde_json::json!({"action":"write","path":"out/a","content":"actual target"});
         let concrete = lease.describe_effect("edit", &input);
+        assert!(!effect_has_resource_lease(&concrete, &[], lexical_resource_path_is_authorized));
         assert_eq!(
             concrete.assessment.data_sensitivity,
             harness_contract::policy::DataClassification::Internal

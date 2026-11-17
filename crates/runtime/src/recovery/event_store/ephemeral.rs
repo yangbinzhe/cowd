@@ -172,6 +172,41 @@ mod bounded_read_contract_tests {
     use super::*;
 
     #[test]
+    fn transaction_rejects_duplicate_stream_key_atomically() {
+        let backend = EphemeralRuntimeEventStore::new();
+        let event = |stream: &str, key: Option<&str>| RuntimeTransactionEventInput {
+            event: RuntimeEventInput {
+                stream_id: stream.into(), scope: RuntimeEventScope::Agent,
+                kind: "test.event".into(), status: None, actor: None,
+                refs: Vec::new(), payload: serde_json::json!({}),
+            },
+            idempotency_key: key.map(str::to_owned), schema_version: 1,
+        };
+        let request = AppendTransactionRequest {
+            transaction_id: "duplicate-in-request".into(),
+            expected_streams: vec![ExpectedStreamRevision { stream_id: "agent:one".into(), expected_revision: 0 }],
+            events: vec![event("agent:one", Some("same")), event("agent:one", Some("same"))],
+        };
+        assert!(matches!(backend.append_transaction(request), Err(RuntimeEventStoreError::InvalidTransaction(_))));
+        assert_eq!(backend.stream_revision("agent:one").unwrap(), 0);
+        assert!(backend.event_by_idempotency_key("agent:one", "same").unwrap().is_none());
+        let request = AppendTransactionRequest {
+            transaction_id: "duplicate-in-request".into(),
+            expected_streams: vec![
+                ExpectedStreamRevision { stream_id: "agent:one".into(), expected_revision: 0 },
+                ExpectedStreamRevision { stream_id: "agent:two".into(), expected_revision: 0 },
+            ],
+            events: vec![event("agent:one", Some("same")), event("agent:two", Some("same")),
+                event("agent:one", None), event("agent:one", None)],
+        };
+        let receipt = backend.append_transaction(request.clone()).unwrap();
+        assert!(!receipt.duplicate);
+        assert!(backend.append_transaction(request).unwrap().duplicate);
+        assert_eq!(backend.stream_revision("agent:one").unwrap(), 3);
+        assert_eq!(backend.stream_revision("agent:two").unwrap(), 1);
+    }
+
+    #[test]
     fn fixture_evidence_try_lock_and_bytes_reject_before_clone() {
         let backend = Arc::new(EphemeralRuntimeEventStore::new());
         let store = RuntimeEventStore::from_backend(backend.clone());
@@ -425,7 +460,15 @@ impl EphemeralRuntimeEventStore {
                 state.checked_evidence.get(&request.transaction_id).cloned(),
             ));
         }
+        let mut request_keys = BTreeSet::new();
         for input in &request.events {
+            if let Some(key) = input.idempotency_key.as_deref() {
+                if !request_keys.insert((input.event.stream_id.as_str(), key)) {
+                    return Err(RuntimeEventStoreError::InvalidTransaction(
+                        "event idempotency key repeated within transaction".into(),
+                    ));
+                }
+            }
             if input.idempotency_key.as_ref().is_some_and(|key| {
                 state.events.iter().any(|event| {
                     event.stream_id == input.event.stream_id
@@ -903,6 +946,24 @@ impl RuntimeEventStoreBackend for EphemeralRuntimeEventStore {
         }
         Ok(lines)
     }
+    fn original_transaction_receipt(&self, transaction_id: &str)
+        -> RuntimeEventStoreResult<Option<AppendTransactionReceipt>> {
+        let state = self.state.lock()
+            .map_err(|_| RuntimeEventStoreError::Corrupt("event lock poisoned".into()))?;
+        Ok(state.transactions.get(transaction_id).cloned())
+    }
+
+    fn original_checked_transaction_receipt(&self, transaction_id: &str)
+        -> RuntimeEventStoreResult<Option<CheckedAppendReceipt>> {
+        let state = self.state.lock().map_err(|_| RuntimeEventStoreError::Corrupt("event lock poisoned".into()))?;
+        match (state.transactions.get(transaction_id), state.checked_evidence.get(transaction_id)) {
+            (None, None) => Ok(None),
+            (Some(commit), Some(validation)) => Ok(Some(CheckedAppendReceipt { commit: commit.clone(), validation: validation.clone() })),
+            (Some(_), None) => Err(RuntimeEventStoreError::InvalidTransaction("original transaction is not checked".into())),
+            (None, Some(_)) => Err(RuntimeEventStoreError::Corrupt("orphan checked evidence".into())),
+        }
+    }
+
     fn transaction_stream_revision_exact(
         &self,
         transaction_id: &str,
@@ -984,8 +1045,28 @@ impl RuntimeEventStoreBackend for EphemeralRuntimeEventStore {
                         primary, node, graph, artifact,
                     ));
                 }
+                if kind == "execution.read.receipt" || kind == "execution.effect.receipt" {
+                    let primary = event(stream_id, idempotency_key);
+                    let index = primary.and_then(|primary|
+                        RuntimeEventStore::process_closure_index_identity(&primary.payload, &primary.refs).ok())
+                        .and_then(|(stream, key)| event(&stream, &key));
+                    return Ok(RuntimeEventStore::delegated_outcome_root(primary, index, artifact));
+                }
                 match event(stream_id, idempotency_key) {
                     None => PreparedContentRoot::Absent,
+                    Some(event) if kind == "execution_node.transitioned"
+                        && event.kind == *kind && event.schema_version == 1
+                        && event.scope == RuntimeEventScope::ExecutionNode => {
+                        if event.activity_binding().is_none_or(|binding|
+                            artifact.visibility_scope != format!("session:{}", binding.session_id)) {
+                            return Ok(PreparedContentRoot::Blocked);
+                        }
+                        match event.payload["result"]["result_ref"].as_str() {
+                            Some(value) => RuntimeEventStore::prepared_agent_tool_outcome_root(
+                                value, stream_id, idempotency_key, artifact),
+                            None => PreparedContentRoot::Blocked,
+                        }
+                    }
                     Some(event) if &event.kind == kind && event.schema_version == 2 => {
                         let session = if kind == "goal.observation" {
                             event.payload["session_id"].as_str().map(str::to_string)
@@ -1282,6 +1363,87 @@ impl RuntimeEventStoreBackend for EphemeralRuntimeEventStore {
             })?,
         })
     }
+    fn original_checked_terminal_winner(
+        &self,
+        request: &CheckedAppendRequest,
+        terminal: &SessionTerminalInput,
+        validator: &dyn CheckedSourceValidator,
+    ) -> RuntimeEventStoreResult<Option<CheckedAppendReceipt>> {
+        if validator.frame_digest() != request.frame_digest {
+            return Err(RuntimeEventStoreError::InvalidTransaction(
+                "source frame mismatch".into(),
+            ));
+        }
+        let exists = self
+            .state
+            .lock()
+            .map_err(|_| RuntimeEventStoreError::Corrupt("event store lock poisoned".into()))?
+            .transactions
+            .contains_key(&request.transaction.transaction_id);
+        if !exists {
+            return Ok(None);
+        }
+        let (commit, validation) = self.append_inner_checked(
+            request.transaction.clone(),
+            Some(terminal.clone()),
+            Some((request, validator)),
+        )?;
+        if !commit.duplicate {
+            return Err(RuntimeEventStoreError::Corrupt(
+                "terminal winner was not duplicate".into(),
+            ));
+        }
+        Ok(Some(CheckedAppendReceipt {
+            commit,
+            validation: validation.ok_or_else(|| {
+                RuntimeEventStoreError::Corrupt("checked terminal evidence missing".into())
+            })?,
+        }))
+    }
+    fn append_checked_terminal_cancellable(
+        &self,
+        request: CheckedAppendRequest,
+        terminal: SessionTerminalInput,
+        validator: &dyn CheckedSourceValidator,
+        control: &dyn RuntimeTransactionCommitControl,
+        _claim: &RuntimeOriginalSessionClaim<'_>,
+    ) -> RuntimeEventStoreResult<Option<CheckedAppendReceipt>> {
+        if !control
+            .begin()
+            .map_err(RuntimeEventStoreError::InvalidTransaction)?
+        {
+            return Ok(None);
+        }
+        control.before_commit();
+        if !control
+            .commit_wins()
+            .map_err(RuntimeEventStoreError::InvalidTransaction)?
+        {
+            control.finish(RuntimeTransactionOutcome::RolledBack);
+            return Ok(None);
+        }
+        match self.append_inner_checked(
+            request.transaction.clone(),
+            Some(terminal),
+            Some((&request, validator)),
+        ) {
+            Ok((commit, validation)) => {
+                control.finish(RuntimeTransactionOutcome::Committed);
+                Ok(Some(CheckedAppendReceipt {
+                    commit,
+                    validation: validation.ok_or_else(|| {
+                        RuntimeEventStoreError::Corrupt(
+                            "checked terminal evidence missing".into(),
+                        )
+                    })?,
+                }))
+            }
+            Err(error) => {
+                control.finish(RuntimeTransactionOutcome::RolledBack);
+                Err(error)
+            }
+        }
+    }
     fn append_transaction_with_terminal(
         &self,
         request: AppendTransactionRequest,
@@ -1289,6 +1451,95 @@ impl RuntimeEventStoreBackend for EphemeralRuntimeEventStore {
     ) -> RuntimeEventStoreResult<AppendTransactionReceipt> {
         self.append_inner(request, Some(terminal))
     }
+
+    /// Settle an original member that never committed.
+    ///
+    /// The process-local backend answers the same question the durable
+    /// backend answers: the member's terminal fact is written on the
+    /// call's own effect stream, and every field of that fact is checked
+    /// against the preparation it settles before it is written. A member
+    /// with a checked request needs the backend's checked-source owner,
+    /// which this backend does not have, so it fails closed there.
+    fn settle_original_member(
+        &self,
+        checked: Option<&CheckedAppendRequest>,
+        member: OriginalMemberDecisionInput,
+        claim: &RuntimeOriginalSessionClaim<'_>,
+    ) -> RuntimeEventStoreResult<OriginalMemberDecision> {
+        let invalid =
+            || RuntimeEventStoreError::InvalidTransaction("original member settlement identity unavailable".into());
+        if checked.is_some() {
+            return Err(invalid());
+        }
+        let [preparation] = member.preparation.events.as_slice() else { return Err(invalid()); };
+        let payload = &preparation.event.payload;
+        let outer = payload["outer_key"].as_str().filter(|value| !value.is_empty()).ok_or_else(invalid)?;
+        let index = payload["member_index"].as_u64().ok_or_else(invalid)?;
+        let stream = format!("execution-effect:{outer}");
+        let preparation_key = format!("agentic-member-preparation:{index}");
+        let terminal_key = format!("agentic-member:{index}");
+        let preparation_hash = super::domain::request_hash(&member.preparation)
+            .map_err(|error| RuntimeEventStoreError::InvalidTransaction(error.to_string()))?;
+        // The preparation this settlement settles must be the durable fact
+        // that was written, with the receipt that wrote it.
+        let stored = self
+            .event_by_idempotency_key(&stream, &preparation_key)
+            .map_err(|error| RuntimeEventStoreError::InvalidTransaction(error.to_string()))?
+            .ok_or_else(invalid)?;
+        if stored.transaction_id != member.preparation.transaction_id
+            || stored.commit_cursor != member.preparation_receipt.commit_cursor
+            || member.preparation_receipt.transaction_id != member.preparation.transaction_id
+            || member.preparation_receipt.request_hash != preparation_hash
+            || member.preparation_receipt.commit_cursor == 0
+            || member.preparation_receipt.event_ids.len() != 1
+            || member.preparation_receipt.event_ids.first() != Some(&stored.event_id)
+        {
+            return Err(invalid());
+        }
+        // The claim must be the turn the preparation names.
+        if payload["session_id"].as_str() != Some(claim.session_id)
+            || payload["turn_id"].as_str() != Some(claim.turn_id)
+        {
+            return Err(invalid());
+        }
+        // The terminal fact continues the preparation's own, on the same
+        // stream and under the same call.
+        let terminal = &member.terminal_event;
+        if member.terminal_transaction_id != format!("member-preparation-noncommit:{preparation_hash}")
+            || terminal.event.stream_id != stream
+            || terminal.event.scope != RuntimeEventScope::ExecutionNode
+            || terminal.event.kind != "execution.effect.member_noncommit"
+            || terminal.event.status.as_deref() != Some("not_committed")
+            || terminal.event.actor.as_deref() != Some("execution_commit_service")
+            || terminal.event.refs != preparation.event.refs
+            || terminal.schema_version != 1
+            || terminal.idempotency_key.as_deref() != Some(terminal_key.as_str())
+        {
+            return Err(invalid());
+        }
+        let revision = self.stream_revision(&stream)?;
+        let mut terminal_event = terminal.clone();
+        {
+            let terminal_payload = terminal_event
+                .event
+                .payload
+                .as_object_mut()
+                .ok_or_else(invalid)?;
+            terminal_payload.insert("noncommit_reason".into(), serde_json::json!("abandoned"));
+            terminal_payload.insert("noncommit_error_kind".into(), serde_json::json!("original_owner_stopped"));
+        }
+        let transaction = AppendTransactionRequest {
+            transaction_id: member.terminal_transaction_id.clone(),
+            expected_streams: vec![ExpectedStreamRevision {
+                stream_id: stream.clone(),
+                expected_revision: revision,
+            }],
+            events: vec![terminal_event],
+        };
+        let receipt = self.append_transaction(transaction.clone())?;
+        Ok(OriginalMemberDecision::ConfirmedNoncommit { receipt, transaction })
+    }
+
     fn consume_verified_decision_lease(
         &self,
         lease_id: &str,

@@ -386,7 +386,8 @@ impl ApiError {
             | Self::CompatibilityToolProtocol(_)
             | Self::BackoffOverflow { .. }
             | Self::NoProviderConfigured { .. }
-            | Self::InvalidProviderConfig { .. } => false,
+            | Self::InvalidProviderConfig { .. }
+            => false,
         }
     }
 
@@ -489,7 +490,8 @@ impl ApiError {
             | Self::CompatibilityToolProtocol(_)
             | Self::BackoffOverflow { .. }
             | Self::NoProviderConfigured { .. }
-            | Self::InvalidProviderConfig { .. } => false,
+            | Self::InvalidProviderConfig { .. }
+            => false,
         }
     }
 
@@ -523,7 +525,8 @@ impl ApiError {
             | Self::CompatibilityToolProtocol(_)
             | Self::BackoffOverflow { .. }
             | Self::NoProviderConfigured { .. }
-            | Self::InvalidProviderConfig { .. } => false,
+            | Self::InvalidProviderConfig { .. }
+            => false,
         }
     }
 
@@ -555,7 +558,8 @@ impl ApiError {
             | Self::CompatibilityToolProtocol(_)
             | Self::BackoffOverflow { .. }
             | Self::NoProviderConfigured { .. }
-            | Self::InvalidProviderConfig { .. } => None,
+            | Self::InvalidProviderConfig { .. }
+            => None,
         }
     }
 
@@ -578,7 +582,8 @@ impl ApiError {
             | Self::CompatibilityToolProtocol(_)
             | Self::BackoffOverflow { .. }
             | Self::NoProviderConfigured { .. }
-            | Self::InvalidProviderConfig { .. } => None,
+            | Self::InvalidProviderConfig { .. }
+            => None,
         }
     }
 
@@ -636,7 +641,8 @@ impl ApiError {
             | Self::CompatibilityToolProtocol(_)
             | Self::BackoffOverflow { .. }
             | Self::NoProviderConfigured { .. }
-            | Self::InvalidProviderConfig { .. } => false,
+            | Self::InvalidProviderConfig { .. }
+            => false,
         }
     }
 }

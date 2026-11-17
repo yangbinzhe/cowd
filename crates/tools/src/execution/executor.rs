@@ -16,7 +16,7 @@ use crate::checkpoint::{
     CheckpointCreateInput, CheckpointDiffInput, CheckpointRestoreInput,
 };
 use crate::file_ops::{
-    edit_file, glob_search_with_options, grep_search, read_file, write_file, GrepSearchInput,
+    edit_file, glob_search_with_options, read_file, write_file, GrepSearchInput,
     SearchOptions,
 };
 use crate::lane_events::{LaneEvent, LaneEventName, LaneEventStatus, LaneFailureClass};
@@ -1251,8 +1251,14 @@ fn run_glob_search(lease: &ToolHostLease, input: GlobSearchInputValue) -> Result
 }
 
 #[allow(clippy::needless_pass_by_value)]
-fn run_grep_search(lease: &ToolHostLease, input: GrepSearchInput) -> Result<String, String> {
-    to_pretty_json(grep_search(lease.path_policy(), &input).map_err(io_to_string)?)
+fn run_grep_search(lease: &ToolHostLease, input: GrepSearchInput, original: &Value) -> Result<String, String> {
+    let (page, windows) = crate::file_ops::grep_search_with_windows(lease.path_policy(), &input, lease.captures_reads(), lease.grep_bounded_root()).map_err(io_to_string)?;
+    let windows = if page.scan_complete && !page.truncated && page.omissions.is_empty()
+        && input.cursor.is_none() && input.offset.unwrap_or(0) == 0 { windows } else { None };
+    let output = to_pretty_json(page)?;
+    // Auxiliary evidence failure cannot replace a successful business result.
+    let _ = lease.record_grep_windows(original, &output, windows);
+    Ok(output)
 }
 
 #[derive(Debug, Deserialize)]
@@ -1282,10 +1288,12 @@ fn run_glob_search_many(
 fn run_grep_search_batch(
     lease: &ToolHostLease,
     input: GrepSearchBatchInput,
+    original: &Value,
 ) -> Result<String, String> {
     require_batch_bound("grep_search", input.searches.len())?;
-    let results = run_ordered_batch(input.searches, input.max_concurrency, |item| {
-        let output = run_grep_search(lease, item)?;
+    let results = run_ordered_batch(input.searches.into_iter().enumerate().collect(), input.max_concurrency, |(index, item)| {
+        let child = original["searches"].get(index).ok_or("original grep batch member absent")?;
+        let output = run_grep_search(&lease.with_grep_batch_index(index), item, child)?;
         serde_json::from_str(&output).or(Ok(Value::String(output)))
     });
     to_pretty_json(batch_output("grep_search", results))

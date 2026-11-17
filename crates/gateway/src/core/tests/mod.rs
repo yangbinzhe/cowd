@@ -2851,9 +2851,7 @@ fn converts_tool_roundtrip_messages() {
     ];
 
     let converted = super::convert_messages(&messages);
-    assert_eq!(converted.len(), 3);
-    assert_eq!(converted[1].role, "assistant");
-    assert_eq!(converted[2].role, "user");
+    assert_eq!(converted.iter().map(|message| message.role.as_str()).collect::<Vec<_>>(), ["user", "assistant", "user"]);
 }
 #[test]
 fn tui_help_mentions_history_completion_and_multiline() {
@@ -3195,9 +3193,9 @@ fn runtime_bootstrap_state_merges_plugin_hooks_into_runtime_features() {
     )
     .expect("plugin state should load");
     let pre_hooks = state.feature_config.hooks().pre_tool_use();
-    assert_eq!(pre_hooks.len(), 1);
+    let [unique_pre_hooks_3198] = pre_hooks else { panic!("expected the original pre_hooks exactly once") };
     assert!(
-        pre_hooks[0].ends_with("hooks/pre.sh"),
+        unique_pre_hooks_3198.ends_with("hooks/pre.sh"),
         "expected installed plugin hook path, got {pre_hooks:?}"
     );
 
@@ -3535,6 +3533,7 @@ fn create_runtime_entry_runs_plugin_lifecycle_init_and_shutdown() {
         providers: std::collections::HashMap::from([(
             "test".to_string(),
             ProviderConfig {
+                reasoning_effort: None,
                 name: "test".to_string(),
                 base_url: "http://127.0.0.1:9/v1".to_string(),
                 api_key: "test".to_string(),

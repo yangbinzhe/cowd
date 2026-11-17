@@ -1715,7 +1715,7 @@
             .await
             .unwrap();
         let entries_json: serde_json::Value = serde_json::from_slice(&entries_body).unwrap();
-        assert_eq!(entries_json["entries"].as_array().unwrap().len(), 1);
+        assert!(matches!(entries_json["entries"].as_array().unwrap().as_slice(), [entry] if entry["title"] == "Durable Decision Candidate"));
         assert_eq!(
             entries_json["entries"][0]["title"],
             "Durable Decision Candidate"

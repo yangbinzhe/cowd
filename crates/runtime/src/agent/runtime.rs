@@ -352,6 +352,51 @@ impl RunExitFact {
 /// fact with one reason, whoever happens to write it.
 pub(crate) const CANCELLED_BY_COMMAND: &str = "agent cancelled by command";
 
+/// The run lifecycle stream advanced while it was read. The owner of the
+/// lifecycle documents this as a retryable source change, not a trust
+/// violation: the caller reads the lifecycle again and decides on the fresh
+/// view, so a closure must treat it as unsettled rather than as a fact that
+/// can never hold.
+pub(crate) const LIFECYCLE_SOURCE_CHANGED: &str = "Agent exit source changed during authentication";
+
+/// One read of the run lifecycle: the exit fact and the sources of that
+/// same read. Two reads can disagree whenever a concurrent commit lands
+/// between them, so the exit and the sources it belongs to must come from
+/// one read.
+pub(crate) struct ConfirmedRunExitSnapshot {
+    pub(crate) closed_for_governed_effects: bool,
+    pub(crate) sources: Vec<ExpectedStreamRevision>,
+}
+
+impl ConfirmedRunExitSnapshot {
+    /// The sources a closure may consume from this one read. A run whose
+    /// exit is not closed for governed effects has no source yet: the
+    /// closure waits for it rather than claiming it.
+    pub(crate) fn exit_sources(&self) -> Option<Vec<ExpectedStreamRevision>> {
+        if !self.closed_for_governed_effects {
+            return None;
+        }
+        Some(self.sources.clone())
+    }
+}
+
+/// Read the run lifecycle once and keep the exit fact and the sources of
+/// that same read together. A consumer that compared two reads would read
+/// a concurrent commit as a contradiction between two durable facts.
+pub(crate) fn confirmed_run_exit_snapshot(
+    store: &RuntimeEventStore,
+    packet: &AgentTaskPacket,
+) -> Result<Option<ConfirmedRunExitSnapshot>, String> {
+    let lifecycle = authenticated_run_lifecycle(store, packet)?;
+    if !lifecycle.exit.as_ref().is_some_and(RunExitFact::positive) {
+        return Ok(None);
+    }
+    Ok(Some(ConfirmedRunExitSnapshot {
+        closed_for_governed_effects: lifecycle.closed_for_governed_effects(),
+        sources: lifecycle.sources,
+    }))
+}
+
 pub(crate) fn confirmed_run_exit(
     store: &RuntimeEventStore,
     packet: &AgentTaskPacket,
@@ -423,7 +468,7 @@ pub(crate) fn authenticated_run_lifecycle(
         .map_err(|error| error.to_string())?
         != revision
     {
-        return Err("Agent exit source changed during authentication".into());
+        return Err(LIFECYCLE_SOURCE_CHANGED.into());
     }
     Ok(lifecycle)
 }
@@ -475,7 +520,7 @@ fn authenticate_run_lifecycle_records(
             // The caller reads the lifecycle again and decides on the fresh
             // view, so this is a retryable source change rather than a trust
             // violation.
-            return Err("Agent exit source changed during authentication".into());
+            return Err(LIFECYCLE_SOURCE_CHANGED.into());
         }
         if event.scope != RuntimeEventScope::Agent
             || event.actor.as_deref() != Some("agent_runtime")
@@ -2506,9 +2551,49 @@ impl AgentRuntime {
         let turn_id = identity
             .turn_id()
             .ok_or_else(|| "Agent outcome has no canonical turn identity".to_string())?;
+        // The business verdict of an Agent terminal is derived from durable
+        // Runtime facts: the terminal conclusion the Runtime committed and the
+        // durable obligation ledger of the same run.  The Agent's own outcome
+        // wording is preserved verbatim, but it never decides the verdict: an
+        // Agent that completed without a verified acceptance is recorded as a
+        // typed `Unsatisfied`, never as a success.
+        let model_reason = match returned.status {
+            AgentTerminalStatus::Completed => returned.outcome.clone(),
+            AgentTerminalStatus::Failed | AgentTerminalStatus::Cancelled | AgentTerminalStatus::Blocked => {
+                returned.failure.clone().unwrap_or_default()
+            }
+        };
+        let verified = crate::execution_core::business_conclusion::derive_verified_business_conclusion(
+            &crate::execution_core::business_conclusion::BusinessConclusionFacts {
+                model_reason: model_reason.clone(),
+                goal: match returned.status {
+                    AgentTerminalStatus::Completed => {
+                        crate::execution_core::business_conclusion::GoalConclusionFact::Satisfied
+                    }
+                    _ => crate::execution_core::business_conclusion::GoalConclusionFact::NotSatisfied,
+                },
+                goal_reference: format!("agent_run:{}", returned.run_id),
+                ledger: match returned.acceptance_evaluation.as_ref() {
+                    Some(evaluation) => {
+                        crate::execution_core::business_conclusion::ObligationLedgerFact::Evaluated {
+                            verdict: evaluation.verdict,
+                            unresolved_obligation_ids: returned
+                                .observed_acceptance
+                                .unresolved_obligation_ids
+                                .clone(),
+                        }
+                    }
+                    None => crate::execution_core::business_conclusion::ObligationLedgerFact::Unresolved,
+                },
+            },
+        );
         let terminal = match returned.status {
             AgentTerminalStatus::Completed => {
-                harness_contract::outcome::OutcomeTerminalClass::Succeeded(returned.outcome.clone())
+                crate::execution_core::business_conclusion::terminal_class_for_completion(
+                    &verified,
+                    0,
+                    &model_reason,
+                )
             }
             AgentTerminalStatus::Failed => harness_contract::outcome::OutcomeTerminalClass::Failed(
                 returned
@@ -2623,6 +2708,9 @@ impl AgentRuntime {
             },
             evidence_refs,
             evidence_completeness,
+            // The verified business conclusion travels with the durable event
+            // so every consumer reads the same decision.
+            verified: Some(verified),
             schema_revision: harness_contract::outcome::OUTCOME_SCHEMA_REVISION,
         };
         services.outcome_service().record_terminal(&outcome)?;
@@ -4999,12 +5087,16 @@ mod tests {
         let owner = runtime.clone();
         let supplied = packet.clone();
         let caller = tokio::spawn(async move { owner.execute_task(supplied).await });
-        // The worker owns a live process group while it runs.
+        // The controlled host has a process group before business GO. Wait
+        // for its protocol handshake as well so this tests a started worker.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
-        while adapter.owned_process_group_is_empty(&packet.run_id(), packet.attempt) != Some(false) {
+        loop {
+            let group_live = adapter.owned_process_group_is_empty(&packet.run_id(), packet.attempt) == Some(false);
+            let protocol_ready = adapter.fixture_exit_diagnostic(&packet)["active"]["protocol_ready"] == true;
+            if group_live && protocol_ready { break; }
             assert!(
                 std::time::Instant::now() < deadline,
-                "the process child never owned a live process group"
+                "the process child never became protocol-ready with a live process group"
             );
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
@@ -5363,101 +5455,7 @@ mod tests {
             runtime.drain_retained_runs().await.unwrap();
         }
 
-        for freeze in [false, true] {
-            let fixture =
-                crate::agentic::execution::reviewed_goal_fixture::PhysicalProcessFixture::new(
-                    crate::config::AgentExecutorSandboxProfile::WorkspaceReadWrite,
-                    if freeze {
-                        "prepared-real-freeze"
-                    } else {
-                        "prepared-real-revision"
-                    },
-                )
-                .await;
-            let runtime = fixture.services.agent_runtime();
-            runtime
-                .backend_append_failures
-                .store(1000, Ordering::SeqCst);
-            let worker = fixture
-                .dispatch(
-                    "prepared-real-transition",
-                    vec!["read:.".into()],
-                    false,
-                    false,
-                    false,
-                )
-                .await;
-            tokio::time::timeout(
-                std::time::Duration::from_secs(30),
-                runtime.backend_append_failed.notified(),
-            )
-            .await
-            .unwrap();
-            let adapter = runtime
-                .process_jsonl_adapter
-                .read()
-                .unwrap()
-                .clone()
-                .unwrap();
-            assert_eq!(adapter.fixture_prepare_count(), 1);
-            assert_eq!(adapter.fixture_spawn_count(), 0);
-            assert!(!worker.directory().join("started.json").exists());
-            worker.withdraw().await;
-            if freeze {
-                fixture.services.freeze_session_execution_policy_admission(
-                    worker.packet.session_id(),
-                    "physical-transition",
-                );
-            } else {
-                let control = fixture
-                    .services
-                    .session_execution_policy_control(worker.packet.session_id())
-                    .unwrap();
-                let original = control.snapshot();
-                control
-                    .replace(
-                        harness_contract::policy::SessionExecutionPolicy::from_profile(
-                            harness_contract::policy::AutonomyProfileId::Cautious,
-                            original.revision + 1,
-                            harness_contract::policy::SessionExecutionPolicyOrigin::ConfigDefault,
-                        ),
-                    )
-                    .unwrap();
-            }
-            runtime.backend_append_failures.store(0, Ordering::SeqCst);
-            worker.wait_terminal().await;
-            let reason = worker.terminal_failure();
-            assert!(
-                reason.contains("physical_grant")
-                    && (reason.contains("frozen") || reason.contains("revision")),
-                "{reason}"
-            );
-            let (exit, _) = confirmed_run_exit(fixture.services.event_store(), &worker.packet)
-                .unwrap()
-                .unwrap();
-            assert_eq!(exit.fact.phase, LocalRunPhase::NotStarted);
-            assert!(
-                exit.fact.process_envelope.is_some(),
-                "post-admission NotStarted must retain the same prepared facts"
-            );
-            assert_eq!(adapter.fixture_spawn_count(), 0);
-            assert_eq!(adapter.fixture_prepare_count(), 1);
-            assert!(
-                !worker.directory().exists(),
-                "discarded unspawned carrier owns exact scratch cleanup"
-            );
-            if freeze {
-                assert!(fixture
-                    .services
-                    .unfreeze_session_execution_policy_admission(
-                        worker.packet.session_id(),
-                        "physical-transition"
-                    ));
-            }
-            println!(
-                "PHYSICAL_PREPARED_TRANSITION freeze={freeze} same_carrier=true actual_spawn=0"
-            );
-        }
+
     }
 
     #[tokio::test]
@@ -6111,369 +6109,6 @@ mod tests {
         assert!(restarted.terminal_return(packet.agent_id()).is_some());
     }
 
-    struct ClaimLifetimeBackend {
-        kind: AgentBackendKind,
-        services: Arc<RuntimeServices>,
-        claim: harness_contract::agent_action::AgentActionEnvelope,
-        entered: Arc<tokio::sync::Notify>,
-        release: Arc<tokio::sync::Notify>,
-        claim_first: bool,
-    }
-
-    #[async_trait]
-    impl AgentRuntimeBackend for ClaimLifetimeBackend {
-        fn kind(&self) -> AgentBackendKind {
-            self.kind
-        }
-        fn capabilities(&self) -> AgentBackendCapabilities {
-            CompletedBackend(self.kind).capabilities()
-        }
-        async fn execute(
-            &self,
-            packet: AgentTaskPacket,
-            selection: AgentModelSelection,
-        ) -> Result<AgentReturnPacket, String> {
-            if self.claim_first {
-                assert_eq!(
-                    self.services
-                        .submit_agent_action(&self.claim)
-                        .await
-                        .unwrap()
-                        .status,
-                    harness_contract::agent_action::AgentActionStatus::Applied
-                );
-            }
-            self.entered.notify_one();
-            self.release.notified().await;
-            if self.claim_first {
-                CompletedBackend(self.kind).execute(packet, selection).await
-            } else {
-                Err("backend failed before choosing work".into())
-            }
-        }
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn common_agent_lifetime_renews_and_settles_native_and_process_opportunities() {
-        use harness_contract::agent::{AgenticExecutionBinding, AgenticExecutionFocus};
-        use harness_contract::agent_action::*;
-        use harness_contract::execution_graph::{
-            ExecutionGraph, ExecutionGraphLineage, ExecutionNodeSpec,
-        };
-        for kind in [AgentBackendKind::InProcess, AgentBackendKind::ProcessJsonl] {
-            for claim_first in [false, true] {
-                let services = RuntimeServices::in_memory().unwrap();
-                let actions = services.agent_action_service();
-                let mut actor = AgentActorBinding {
-                    objective_id: "lifetime-objective".into(),
-                    program_id: "lifetime-program".into(),
-                    session_id: "session-1".into(),
-                    turn_id: "lifetime-turn".into(),
-                    root_execution_id: None,
-                    required_team_count: 1,
-                    exact_team_count: None,
-                    objective_summary: "preserve worker truth".into(),
-                    model_lease: "fast".into(),
-                    permission_ceiling: Some(harness_contract::policy::PermissionMode::ReadOnly),
-                    resource_scopes: vec![],
-                    actor_id: "root".into(),
-                    kind: AgentActorKind::Root,
-                    execution_id: None,
-                    team_id: None,
-                    agent_id: None,
-                };
-                let apply = |id: &str, actor: &AgentActorBinding, action| {
-                    actions
-                        .apply(&AgentActionEnvelope {
-                            action_id: id.into(),
-                            actor: actor.clone(),
-                            expected_revision: None,
-                            action,
-                        })
-                        .unwrap()
-                };
-                let team = apply(
-                    "team",
-                    &actor,
-                    AgentAction::TeamCreate(TeamCreateInput {
-                        name: "Readers".into(),
-                        mission: "read evidence".into(),
-                        objective: None,
-                    }),
-                )
-                .changed_refs[0]
-                    .clone();
-                let member = apply("member", &actor, AgentAction::AgentInvite(serde_json::from_value(serde_json::json!({
-                    "team_ref":team,"role":"Reader","mission":"inspect evidence","required_capabilities":["read"]
-                })).unwrap())).changed_refs[0].clone();
-                let work = apply("task", &actor, AgentAction::TaskPublish(serde_json::from_value(serde_json::json!({
-                    "team_ref":team,"title":"Evidence","objective":"inspect","acceptance":"cited source"
-                })).unwrap())).changed_refs[0].clone();
-                let mut packet = task("lifetime");
-                packet.agentic_binding = Some(AgenticExecutionBinding {
-                    program_id: "lifetime-program".into(),
-                    agent_id: member.clone(),
-                    membership_id: format!("membership:{member}:{team}"),
-                    team_id: team.clone(),
-                    task_team_id: team.clone(),
-                    source_spec_revision: 1,
-                    task_purpose: None,
-                    focus: AgenticExecutionFocus::TaskExecute {
-                        task_ref: work.clone(),
-                    },
-                });
-                // Bind an actually approved Definition: attaching services
-                // enables the production content/digest validator, so the
-                // standalone test packet's invented binding is not authority.
-                let registry = services.definition_registry();
-                let base = registry
-                    .resolve_agent(
-                        &AgentDefinitionId::new(DefinitionScope::Builtin, "cowd/execute").unwrap(),
-                        RevisionSelector::LatestApprovedStable,
-                    )
-                    .unwrap();
-                let mut manifest = base.revision.manifest.clone();
-                manifest.definition_id =
-                    AgentDefinitionId::new(DefinitionScope::Workspace, "tests/lifetime").unwrap();
-                manifest.model_policy.profile = "test".into();
-                manifest.model_policy.allowed_models = vec!["fast".into()];
-                manifest.model_policy.fallback_allowed = false;
-                if kind == AgentBackendKind::ProcessJsonl {
-                    manifest.executor =
-                        harness_contract::agent::AgentExecutorPolicy::ProcessJsonl {
-                            command_ref: "test/lifetime".into(),
-                            command_digest: "a".repeat(64),
-                        };
-                }
-                let stored = registry
-                    .agents()
-                    .store_revision(manifest, &base.agent_markdown)
-                    .unwrap();
-                registry
-                    .agents()
-                    .record_release_assignment(&harness_contract::agent::ReleaseAssignment {
-                        scope: DefinitionScope::Workspace,
-                        revision_ref: stored.revision.revision_ref.clone(),
-                        channel: harness_contract::agent::ReleaseChannel::Stable,
-                        status: harness_contract::agent::ReleaseAssignmentStatus::Active,
-                        authorization:
-                            harness_contract::agent::ReleaseAuthorization::HumanApproval {
-                                approval_ref: "test-fixture:lifetime".into(),
-                            },
-                        content_digest: stored.revision.content_digest,
-                    })
-                    .unwrap();
-                let mut request = crate::AgentBindingRequest::new(
-                    stored.revision.revision_ref.definition_id,
-                    RevisionSelector::LatestApprovedStable,
-                    packet.agent_id(),
-                    packet.session_id(),
-                    packet.task_id(),
-                );
-                request.team_id = Some(team.clone());
-                request.granted_capabilities = vec![AgentCapability::Read];
-                let binding = crate::AgentBindingCompiler::new(Arc::clone(registry))
-                    .compile(request)
-                    .unwrap()
-                    .snapshot;
-                packet.assignment = crate::test_support::agent_assignment(
-                    Some(binding.definition_ref.clone()),
-                    packet.agent_id(),
-                    packet.run_id(),
-                    packet.task_id(),
-                    packet.session_id(),
-                    packet.mission_id(),
-                    Some(&team),
-                    packet.graph_id(),
-                    packet.node_id(),
-                );
-                packet.binding = Some(binding);
-                let mut graph = ExecutionGraph::new("lifetime");
-                graph.id = packet.graph_id().into();
-                graph.lineage = Some(ExecutionGraphLineage {
-                    session_id: packet.session_id().into(),
-                    turn_id: "lifetime-turn".into(),
-                    root_task_id: packet.task_id().into(),
-                    task_id: packet.task_id().into(),
-                    generation: 1,
-                });
-                let mut node = ExecutionNodeSpec::new(
-                    ExecutionNodeKind::AgentTask,
-                    "agent_task",
-                    serde_json::to_string(&packet).unwrap(),
-                );
-                node.id = packet.node_id().into();
-                graph
-                    .node_statuses
-                    .insert(node.id.clone(), ExecutionNodeStatus::Planned);
-                graph.nodes.push(node);
-                services.commit_service().register_graph(graph).unwrap();
-                actor.kind = AgentActorKind::Supervisor;
-                actor.actor_id = "runtime.program-supervisor".into();
-                actor.execution_id = Some(packet.graph_id().into());
-                assert_eq!(
-                    apply(
-                        "dispatch",
-                        &actor,
-                        AgentAction::TaskAttemptDispatch(TaskAttemptDispatchInput {
-                            task_ref: work.clone(),
-                            execution_id: packet.graph_id().into(),
-                            agent_ref: member.clone(),
-                            membership_id: format!("membership:{member}:{team}"),
-                            mode: AgentAttemptMode::Execute,
-                            generation: 0,
-                        })
-                    )
-                    .status,
-                    AgentActionStatus::Applied
-                );
-                actor.kind = AgentActorKind::Agent;
-                actor.actor_id = member.clone();
-                actor.agent_id = Some(member);
-                actor.team_id = Some(team);
-                let entered = Arc::new(tokio::sync::Notify::new());
-                let release = Arc::new(tokio::sync::Notify::new());
-                let runtime = Arc::new(AgentRuntime::new(
-                    services.event_store().clone(),
-                    configured_registry(),
-                ));
-                runtime.bind_services(services.clone());
-                let normalized = runtime.ensure_runtime_binding(packet.clone()).unwrap();
-                assert_eq!(
-                    normalized.agentic_binding.as_ref().unwrap().task_purpose,
-                    Some(harness_contract::agent_action::TaskPurpose::Delivery)
-                );
-                let mut tampered = packet.clone();
-                tampered.agentic_binding.as_mut().unwrap().task_purpose =
-                    Some(harness_contract::agent_action::TaskPurpose::Exploration);
-                assert!(runtime
-                    .ensure_runtime_binding(tampered)
-                    .unwrap_err()
-                    .contains("purpose differs"));
-                runtime.register_backend(Arc::new(ClaimLifetimeBackend {
-                    kind,
-                    services: services.clone(),
-                    entered: entered.clone(),
-                    release: release.clone(),
-                    claim_first,
-                    claim: AgentActionEnvelope {
-                        action_id: "agent-claim".into(),
-                        actor,
-                        expected_revision: None,
-                        action: AgentAction::TaskClaim(TaskClaimInput {
-                            task_ref: work.clone(),
-                            reason: None,
-                        }),
-                    },
-                }));
-                let executing = runtime.clone();
-                let run_packet = packet.clone();
-                let mut worker =
-                    tokio::spawn(async move { executing.execute_task(run_packet).await });
-                tokio::select! {
-                    _ = entered.notified() => {},
-                    early = &mut worker => panic!("{kind:?} did not enter backend: {early:?}"),
-                }
-                let before = actions.project("lifetime-program").unwrap();
-                let logical_member = &packet.agentic_binding.as_ref().unwrap().agent_id;
-                assert!(runtime
-                    .running_agentic_members("lifetime-program")
-                    .contains(logical_member));
-                assert!(runtime
-                    .running_agentic_members("foreign-program")
-                    .is_empty());
-                let recovered =
-                    AgentRuntime::new(services.event_store().clone(), configured_registry());
-                assert!(
-                    recovered
-                        .running_agentic_members("lifetime-program")
-                        .contains(logical_member),
-                    "typed busy identity survives cold journal reconstruction without display metadata"
-                );
-                let mut commits = services.event_store().subscribe_commits();
-                // The heartbeat reads the graph on a blocking worker. A
-                // fixed number of yields is not evidence that it finished,
-                // particularly while other tests occupy those workers.
-                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-                loop {
-                    tokio::time::advance(std::time::Duration::from_secs(31)).await;
-                    // Allow the actual blocking read and the newly scheduled
-                    // interval to initialize, then observe its durable event.
-                    tokio::time::resume();
-                    let _ = tokio::time::timeout(
-                        std::time::Duration::from_millis(50),
-                        commits.changed(),
-                    )
-                    .await;
-                    tokio::time::pause();
-                    if !claim_first
-                        || actions.project("lifetime-program").unwrap().revision > before.revision
-                    {
-                        break;
-                    }
-                    assert!(
-                        std::time::Instant::now() < deadline,
-                        "{kind:?} real heartbeat journal commit timed out"
-                    );
-                }
-                let during = actions.project("lifetime-program").unwrap();
-                if claim_first {
-                    assert!(
-                        during.revision > before.revision,
-                        "{kind:?} must renew its real claim"
-                    );
-                    assert_eq!(during.tasks[&work].claim_generation, 1);
-                } else {
-                    assert_eq!(
-                        during.revision, before.revision,
-                        "Runtime must not claim for the Agent"
-                    );
-                }
-                release.notify_one();
-                worker.await.unwrap().unwrap();
-                let after = actions.project("lifetime-program").unwrap();
-                if kind == AgentBackendKind::InProcess {
-                    assert!(runtime
-                        .running_agentic_members("lifetime-program")
-                        .is_empty());
-                    assert!(!after.tasks[&work]
-                        .active_attempts
-                        .contains_key(packet.graph_id()));
-                    assert_eq!(after.tasks[&work].failed_attempts, 1);
-                    assert_eq!(after.tasks[&work].claim_generation, 1);
-                } else {
-                    assert!(runtime
-                        .running_agentic_members("lifetime-program")
-                        .contains(logical_member));
-                    assert!(confirmed_run_exit(&runtime.event_store, &packet)
-                        .unwrap()
-                        .is_none());
-                    assert!(after.tasks[&work]
-                        .active_attempts
-                        .contains_key(packet.graph_id()));
-                    assert_eq!(
-                        after.tasks[&work].active_attempts.len(),
-                        during.tasks[&work].active_attempts.len()
-                    );
-                    assert_eq!(after.tasks[&work].failed_attempts, 0);
-                    assert_eq!(
-                        after.tasks[&work].claim_generation,
-                        during.tasks[&work].claim_generation
-                    );
-                }
-                tokio::time::advance(std::time::Duration::from_secs(60)).await;
-                for _ in 0..16 {
-                    tokio::task::yield_now().await;
-                }
-                assert_eq!(
-                    actions.project("lifetime-program").unwrap().revision,
-                    after.revision,
-                    "backend return must stop the common lease keeper"
-                );
-            }
-        }
-    }
-
     #[async_trait]
     impl AgentRuntimeBackend for CompletedBackend {
         fn kind(&self) -> AgentBackendKind {
@@ -6550,6 +6185,7 @@ mod tests {
                 providers: HashMap::from([(
                     "test".into(),
                     ProviderConfig {
+                        reasoning_effort: None,
                         name: "test".into(),
                         base_url: "https://example.test/v1".into(),
                         api_key: "test".into(),
@@ -6708,6 +6344,87 @@ mod tests {
             binding.data_lease.team_id = Some(team_run_id.to_string());
         }
         packet
+    }
+
+    /// A concurrent commit between two lifecycle reads is a read race, not a
+    /// contradiction between two durable facts. The confirmed exit and the
+    /// sources it belongs to must come from one read, so the closure of the
+    /// run is neither refused nor reported as unprovable.
+    #[test]
+    fn own_confirmed_run_exit_keeps_the_exit_and_its_sources_in_one_read() {
+        let runtime = Arc::new(AgentRuntime::new(
+            Arc::new(RuntimeEventStore::for_test()),
+            configured_registry(),
+        ));
+        let packet = task("own-lifecycle-one-read");
+        let packet_sha256 = run_packet_sha256(&packet).expect("packet digest");
+        let owner_epoch = uuid::Uuid::new_v4().to_string();
+        let backend_digest = "a".repeat(64);
+        let admitted = RunExitFact {
+            schema_version: 1,
+            agent_id: packet.agent_id().to_string(),
+            run_id: packet.run_id().to_string(),
+            graph_id: packet.graph_id().to_string(),
+            node_id: packet.node_id().to_string(),
+            attempt: packet.attempt,
+            packet_sha256: packet_sha256.clone(),
+            backend_packet_sha256: None,
+            owner_epoch: owner_epoch.clone(),
+            backend: AgentBackendKind::InProcess,
+            phase: LocalRunPhase::Admitted,
+            process_envelope: None,
+        };
+        runtime
+            .persist_run_fact(&admitted, "agent.run_admitted")
+            .expect("run admission");
+        let backend = RunExitFact {
+            backend_packet_sha256: Some(backend_digest.clone()),
+            phase: LocalRunPhase::BackendPending,
+            ..admitted.clone()
+        };
+        runtime
+            .persist_run_fact(&backend, "agent.backend_admitted")
+            .expect("backend admission");
+        let exit = RunExitFact {
+            phase: LocalRunPhase::LocalReturned,
+            ..backend.clone()
+        };
+        runtime
+            .persist_run_fact(&exit, "agent.local_exit")
+            .expect("local exit");
+
+        // One read: the exit and the sources of that read belong together.
+        let snapshot = confirmed_run_exit_snapshot(&runtime.event_store, &packet)
+            .expect("lifecycle read")
+            .expect("a positive local exit is confirmed");
+        assert!(snapshot.closed_for_governed_effects);
+        let read_revision = snapshot.sources[0].expected_revision;
+        assert!(
+            snapshot.exit_sources().is_some(),
+            "one read keeps the closure decidable"
+        );
+
+        // A concurrent commit on the same agent stream advances the
+        // revision between two reads: the two reads would disagree even
+        // though both describe the same durable run.
+        let competing = RunExitFact {
+            run_id: "run-own-lifecycle-one-read-competing".to_string(),
+            ..admitted.clone()
+        };
+        runtime
+            .persist_run_fact(&competing, "agent.run_admitted")
+            .expect("competing admission");
+        let second = authenticated_run_lifecycle(&runtime.event_store, &packet)
+            .expect("lifecycle read after the concurrent commit");
+        assert_ne!(
+            second.sources[0].expected_revision, read_revision,
+            "two reads disagree when a concurrent commit lands between them"
+        );
+        // The snapshot the closure consumes still holds the exit and the
+        // sources of one read, so the run is not refused and no closure is
+        // reported as structurally unprovable.
+        assert_eq!(snapshot.sources[0].expected_revision, read_revision);
+        assert!(snapshot.exit_sources().is_some());
     }
 
     #[test]

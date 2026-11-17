@@ -334,7 +334,7 @@ async fn cowd_full_capability_eval_covers_document_memory_fact_session_agents_an
     let timeline = execution_events
         .list_stream(session_id)
         .expect("timeline loads");
-    assert_eq!(timeline.len(), 4);
+    assert_eq!(timeline.iter().map(|event| event.kind.as_str()).collect::<Vec<_>>(), ["agent.evidence", "agent.evidence", "agent.evidence", "agent.review"]);
     assert!(timeline.iter().any(|event| event.kind == "agent.evidence"));
     assert!(timeline.iter().any(|event| event.kind == "agent.review"));
 

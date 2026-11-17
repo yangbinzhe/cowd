@@ -14,6 +14,52 @@ fn unreclaimed_turn_error<Summary>(
     }
 }
 
+// Construct the original activity binding before entering the turn await.
+// The returned scope remains owned by the existing turn task.
+fn enter_ingress_execution_scope(
+    execution_bus: Option<CowdEventBus>,
+    execution_id: String,
+    ingress: &TurnIngressRef,
+) -> Option<crate::CowdExecutionScope> {
+    execution_bus.map(|bus| {
+        let activity_id =
+            format!("activity:execution:{execution_id}");
+        bus.enter_execution_with_activity(
+            crate::CowdExecutionContext {
+                execution_id: execution_id.clone(),
+                session_id: ingress.session_id.clone(),
+                turn_id: ingress.turn_id.clone(),
+            },
+            Some(
+                harness_contract::projection::RuntimeActivityBinding {
+                    root_execution_id: execution_id,
+                    session_id: ingress.session_id.clone(),
+                    turn_id: ingress.turn_id.clone(),
+                    root_task_id: ingress.root_task_id.clone(),
+                    task_id: ingress.primary_task_id.clone(),
+                    activity_id,
+                    node_id: None,
+                    parent_activity_id: None,
+                    initiator_activity_id: None,
+                    team_run_id: None,
+                    agent_instance_id: None,
+                    agent_run_id: None,
+                    skill_id: None,
+                    skill_revision: None,
+                    skill_activation_id: None,
+                    tool_contract_id: None,
+                    tool_call_id: None,
+                    approval_id: None,
+                    parallel_group_id: None,
+                    revision: ingress.claim_revision.max(1),
+                    fence: ingress.session_generation.max(1),
+                    generation: ingress.session_generation.max(1),
+                },
+            ),
+        )
+    })
+}
+
 /// Whether the provider tool schema must stay byte-stable across steps.
 ///
 /// Delegated leaves already use a stable schema (their tool set is fixed). The
@@ -149,7 +195,7 @@ where
 
         Ok(Self {
             hook_scope: runtime.hook_execution_scope(),
-            runtime: Some(runtime),
+            runtime: Some(Box::new(runtime)),
             poisoned: false,
             inflight_turn: None,
             services,
@@ -176,11 +222,7 @@ where
         reason = "the private runtime slot is only empty while an exclusive &mut submit call owns it"
     )]
     pub fn with_hook_abort_signal(mut self, hook_abort_signal: HookAbortSignal) -> Self {
-        let runtime = self
-            .runtime
-            .take()
-            .expect("runtime should exist before installing hook abort signal");
-        self.runtime = Some(runtime.with_hook_abort_signal(hook_abort_signal));
+        self.runtime.as_mut().expect("runtime should exist before installing hook abort signal").set_in_place_hook_abort_signal(hook_abort_signal);
         self
     }
 
@@ -216,15 +258,9 @@ where
                 );
             }
         }
-        let runtime = self
-            .runtime
-            .take()
-            .expect("runtime should exist before installing turn control");
-        self.runtime = Some(
-            runtime
-                .with_cancellation_token(cancellation_token)
-                .with_hook_abort_signal(hook_abort_signal),
-        );
+        let runtime = self.runtime.as_mut().expect("runtime should exist before installing turn control");
+        runtime.set_in_place_cancellation_token(cancellation_token);
+        runtime.set_in_place_hook_abort_signal(hook_abort_signal);
     }
 
     pub fn install_provider_cancellation_control(
@@ -233,6 +269,18 @@ where
     ) -> Result<(), RuntimeError> {
         self.runtime_mut()
             .install_provider_cancellation_control(control)
+    }
+
+    pub(crate) fn set_original_session_claim(&mut self, claim: Option<Arc<crate::execution_core::services::OriginalSessionClaim>>) {
+        self.runtime_mut().set_original_session_claim(claim);
+    }
+
+    pub(crate) fn set_session_execution_fence(&mut self, fence: crate::SessionExecutionFence) {
+        self.runtime_mut().set_session_execution_fence(fence);
+    }
+
+    pub(crate) fn install_original_policy_input_context(&mut self, input: crate::SessionInputStream, requested: Arc<crate::conversation::OriginalTurnInputControl>) {
+        self.runtime_mut().install_original_policy_input_context(input, requested);
     }
 
     /// The original host keeps this same scope when its turn controls change.
@@ -365,7 +413,7 @@ where
                 "previous Hook physical scope is not closed",
             ));
         }
-        self.runtime.as_ref().ok_or_else(|| RuntimeError::new(
+        self.runtime.as_deref().ok_or_else(|| RuntimeError::new(
             "conversation runtime is unavailable while its turn owner holds it; Host control is refused",
         ))
     }
@@ -492,7 +540,7 @@ where
     /// running long enough to send the runtime back.
     pub(super) async fn start_turn(
         &mut self,
-        runtime: crate::ConversationRuntime<ProviderRuntimeClient, T>,
+        runtime: Box<crate::ConversationRuntime<ProviderRuntimeClient, T>>,
         content: &str,
         prompter: &SharedPrompter,
         ingress: Option<(TurnIngressRef, String)>,
@@ -515,9 +563,9 @@ where
         let recovered_tool_receipts_require_text_only =
             self.recovered_tool_receipts_require_text_only;
         let (runtime_sender, runtime_receiver) =
-            tokio::sync::oneshot::channel::<crate::ConversationRuntime<ProviderRuntimeClient, T>>();
+            tokio::sync::oneshot::channel::<Box<crate::ConversationRuntime<ProviderRuntimeClient, T>>>();
         let (completion_sender, completion_receiver) = tokio::sync::oneshot::channel::<(
-            Option<crate::ConversationRuntime<ProviderRuntimeClient, T>>,
+            Option<Box<crate::ConversationRuntime<ProviderRuntimeClient, T>>>,
             Result<TurnSummary, RuntimeError>,
         )>();
         let execution_supervisor = Arc::clone(services.execution_supervisor());
@@ -540,12 +588,11 @@ where
                     item.authority = crate::ContextAuthority::Tool;
                     runtime.push_next_model_context_item(item);
                 }
-                let (runtime, result) = match ingress {
+                // Prepare the original ingress owner before constructing the
+                // single submit future. Both guards remain in this task through
+                // that await and are dropped in their original order.
+                let (prepared, execution_scope, execution_bus_lease) = match ingress {
                     Some((ingress, execution_id)) => {
-                        // Scope every provider/tool/approval event to the
-                        // deterministic SessionIngress execution. The guard lives
-                        // in the owning task, so it also clears if the caller has
-                        // already been cancelled.
                         let execution_bus = runtime.cowd_bus().cloned();
                         let execution_bus_lease = match execution_bus.as_ref() {
                             Some(bus) => match services
@@ -560,44 +607,10 @@ where
                             },
                             None => None,
                         };
-                        let execution_scope = execution_bus.map(|bus| {
-                            let activity_id =
-                                format!("activity:execution:{execution_id}");
-                            bus.enter_execution_with_activity(
-                                crate::CowdExecutionContext {
-                                    execution_id: execution_id.clone(),
-                                    session_id: ingress.session_id.clone(),
-                                    turn_id: ingress.turn_id.clone(),
-                                },
-                                Some(
-                                    harness_contract::projection::RuntimeActivityBinding {
-                                        root_execution_id: execution_id,
-                                        session_id: ingress.session_id.clone(),
-                                        turn_id: ingress.turn_id.clone(),
-                                        root_task_id: ingress.root_task_id.clone(),
-                                        task_id: ingress.primary_task_id.clone(),
-                                        activity_id,
-                                        node_id: None,
-                                        parent_activity_id: None,
-                                        initiator_activity_id: None,
-                                        team_run_id: None,
-                                        agent_instance_id: None,
-                                        agent_run_id: None,
-                                        skill_id: None,
-                                        skill_revision: None,
-                                        skill_activation_id: None,
-                                        tool_contract_id: None,
-                                        tool_call_id: None,
-                                        approval_id: None,
-                                        parallel_group_id: None,
-                                        revision: ingress.claim_revision.max(1),
-                                        fence: ingress.session_generation.max(1),
-                                        generation: ingress.session_generation.max(1),
-                                    },
-                                ),
-                            )
-                        });
-                        let runtime = runtime;
+                        let execution_scope = enter_ingress_execution_scope(
+                            execution_bus, execution_id, &ingress,
+                        );
+                        let mut runtime = runtime;
                         let fence = match usize::try_from(ingress.input_sequence) {
                             Ok(input_sequence) => match services.session_query_port() {
                                 Some(query) => crate::SessionExecutionFence::from_claim(
@@ -619,48 +632,48 @@ where
                                 ingress.input_sequence
                             )),
                         };
-                        let (runtime, result) = match fence {
-                            Ok(fence) => match submit_owned_conversation_turn_with_ingress(
-                                runtime.with_session_execution_fence(fence),
-                                services,
-                                &content,
-                                &prompter,
-                                Some(ingress),
-                                execution_parent,
-                                execution_lineage,
-                                execution_role,
-                                recovered_tool_receipt_count,
-                                recovered_tool_receipts_require_text_only,
-                            )
-                            .await
+                        let prepared = match fence {
+                            Ok(fence) => match execution_bus_lease.as_ref()
+                                .map(|lease| runtime.original_turn_control().and_then(|control| {
+                                    let (input, requested) = runtime.original_policy_input_context(&ingress.turn_id);
+                                    lease.install_session_fence(&ingress, fence.clone().with_claim_fence_epoch(ingress.claim_revision), control, input, requested, runtime.permission_policy().clone())
+                                }))
+                                .transpose()
                             {
-                                Ok((runtime, result)) => (Some(runtime), result),
-                                Err(error) => (None, Err(error)),
+                                Err(error) => Err((runtime, RuntimeError::new(error))),
+                                Ok(claim) => {
+                                    let fence = fence.with_claim_fence_epoch(ingress.claim_revision);
+                                    runtime.set_original_session_claim(claim);
+                                    if let Some(lease) = execution_bus_lease.as_ref() {
+                                        let owner = Arc::new(runtime.shared_policy_owner());
+                                        if let Err(error) = lease.install_session_policy_owner(owner) {
+                                            let _ = completion_sender.send((Some(runtime), Err(RuntimeError::new(error))));
+                                            return;
+                                        }
+                                    }
+                                    runtime.set_session_execution_fence(fence);
+                                    Ok((runtime, Some(ingress)))
+                                }
                             },
-                            Err(error) => (Some(runtime), Err(RuntimeError::new(error))),
+                            Err(error) => Err((runtime, RuntimeError::new(error))),
                         };
-                        drop(execution_scope);
-                        drop(execution_bus_lease);
-                        (runtime, result)
+                        (prepared, execution_scope, execution_bus_lease)
                     }
-                    None => match submit_owned_conversation_turn_with_ingress(
-                        runtime,
-                        services,
-                        &content,
-                        &prompter,
-                        None,
-                        execution_parent,
-                        execution_lineage,
-                        execution_role,
-                        recovered_tool_receipt_count,
+                    None => (Ok((runtime, None)), None, None),
+                };
+                let (runtime, result) = match prepared {
+                    Ok((runtime, ingress)) => match submit_owned_conversation_turn_with_ingress(
+                        runtime, services, &content, &prompter, ingress, execution_parent,
+                        execution_lineage, execution_role, recovered_tool_receipt_count,
                         recovered_tool_receipts_require_text_only,
-                    )
-                    .await
-                    {
+                    ).await {
                         Ok((runtime, result)) => (Some(runtime), result),
                         Err(error) => (None, Err(error)),
-                    }
+                    },
+                    Err((runtime, error)) => (Some(runtime), Err(error)),
                 };
+                drop(execution_scope);
+                drop(execution_bus_lease);
                 let _ = completion_sender.send((runtime, result));
             }))
             .await

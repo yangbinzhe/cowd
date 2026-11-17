@@ -24,7 +24,41 @@ pub struct PostgresRuntimeEventStore {
     recent_interleave: Arc<std::sync::Mutex<Option<RuntimeEventInput>>>,
 }
 
+#[derive(Default)]
+struct SessionOwnerReadCharge {
+    events: usize,
+    bytes: usize,
+    pages: usize,
+}
+
+struct PgOwnedCommitGuard<'a>(&'a dyn runtime::RuntimeTransactionCommitControl, bool);
+impl Drop for PgOwnedCommitGuard<'_> {
+    fn drop(&mut self) {
+        if !self.1 { self.0.finish(runtime::RuntimeTransactionOutcome::Unknown); }
+    }
+}
+
 impl PostgresRuntimeEventStore {
+    fn append_owned_cancellable_inner(
+        &self, request: AppendTransactionRequest, control: &dyn runtime::RuntimeTransactionCommitControl,
+    ) -> RuntimeEventStoreResult<Option<AppendTransactionReceipt>> {
+        if !control.begin().map_err(RuntimeEventStoreError::InvalidTransaction)? { return Ok(None); }
+        let mut guard = PgOwnedCommitGuard(control, false);
+        let mut connection = self.checkout_event_write()?;
+        let mut tx = pg(connection.transaction())?;
+        let receipt = append_transaction_in_tx(&mut tx, &request, None)?;
+        control.before_commit();
+        if !control.commit_wins().map_err(RuntimeEventStoreError::InvalidTransaction)? {
+            pg(tx.rollback())?;
+            control.finish(runtime::RuntimeTransactionOutcome::RolledBack);
+            guard.1 = true;
+            return Ok(None);
+        }
+        pg(tx.commit())?;
+        control.finish(runtime::RuntimeTransactionOutcome::Committed);
+        guard.1 = true;
+        Ok(Some(receipt))
+    }
     fn put_source_checkpoint(
         &self,
         projection_id: &str,
@@ -151,10 +185,15 @@ impl PostgresRuntimeEventStore {
         max_bytes: usize,
         descending: bool,
     ) -> Result<Vec<DurableRuntimeEvent>, String> {
+        // An unbounded head-only cursor is a legitimate request: clamp it to
+        // the representable range instead of failing, so the read is not blind
+        // exactly when a diagnostic needs it.
         let after_sequence =
-            to_i64(after_sequence, "after_sequence").map_err(|error| error.to_string())?;
+            to_i64(after_sequence.min(i64::MAX as u64), "after_sequence")
+                .map_err(|error| error.to_string())?;
         let through_sequence =
-            to_i64(through_sequence, "through_sequence").map_err(|error| error.to_string())?;
+            to_i64(through_sequence.min(i64::MAX as u64), "through_sequence")
+                .map_err(|error| error.to_string())?;
         if max_events == 0 || max_bytes == 0 || through_sequence <= after_sequence {
             return Ok(Vec::new());
         }
@@ -259,6 +298,317 @@ impl PostgresRuntimeEventStore {
     }
 }
 
+impl PostgresRuntimeEventStore {
+    /// A new Program opening or dispatch must not follow the original terminal.
+    /// This runs under the same original Session row lock as terminal append.
+    fn check_no_original_terminal(
+        tx: &mut PostgresTransaction<'_>,
+        claim: &runtime::RuntimeOriginalSessionClaim<'_>,
+        budget: &runtime::SourceCheckBudget,
+    ) -> RuntimeEventStoreResult<SessionOwnerReadCharge> {
+        let terminal_id = format!("turn-terminal:{}", claim.fence.request_id);
+        // Bound and return only immutable terminal identity fields in one SQL
+        // snapshot; delivery status and last_error can change concurrently.
+        let identity_bytes = "256::BIGINT + 6::BIGINT * (octet_length(terminal_id)::BIGINT + octet_length(message_id)::BIGINT + octet_length(session_id)::BIGINT + octet_length(payload_ref)::BIGINT + COALESCE(octet_length(execution_id),0)::BIGINT + COALESCE(octet_length(turn_id),0)::BIGINT + COALESCE(octet_length(request_id),0)::BIGINT + COALESCE(octet_length(input_claim_owner),0)::BIGINT + COALESCE(octet_length(input_claim_token),0)::BIGINT)";
+        let sql = format!("SELECT CASE WHEN ({identity_bytes}) <= $2 THEN jsonb_build_object('terminal_id',terminal_id,'message_id',message_id,'session_id',session_id,'payload_ref',payload_ref,'execution_id',execution_id,'turn_id',turn_id,'request_id',request_id,'session_generation',session_generation,'input_sequence',input_sequence,'input_claim_owner',input_claim_owner,'input_claim_token',input_claim_token,'input_claim_revision',input_claim_revision) END, ({identity_bytes}), commit_cursor FROM runtime_session_outbox WHERE terminal_id=$1");
+        let meta = pg(tx.query_opt(&sql, &[&terminal_id, &to_i64(budget.max_bytes as u64, "source bytes")?]))?;
+        let mut charge = SessionOwnerReadCharge { events: 0, bytes: terminal_id.len().saturating_add(16), pages: 1 };
+        let Some(meta) = meta else { return Ok(charge); };
+        let row_bytes = from_i64(pg(meta.try_get(1))?, "terminal source bytes")?;
+        charge.bytes = charge.bytes.saturating_add(usize::try_from(row_bytes).unwrap_or(usize::MAX));
+        if charge.bytes > budget.max_bytes || charge.pages > budget.max_pages {
+            return Err(RuntimeEventStoreError::HistoryBudgetExceeded("original Session terminal source budget".into()));
+        }
+        let value: Option<Value> = pg(meta.try_get(0))?;
+        let terminal: SessionTerminalInput = serde_json::from_value(value.ok_or_else(||
+            RuntimeEventStoreError::HistoryBudgetExceeded("original Session terminal identity bytes".into()))?)?;
+        let terminal_cursor = from_i64(pg(meta.try_get(2))?, "terminal cursor")?;
+        let root = runtime::session_ingress_graph_id(claim.session_id, &claim.fence.request_id, claim.turn_id);
+        if terminal.session_id != claim.session_id || terminal.turn_id.as_deref() != Some(claim.turn_id)
+            || terminal.request_id.as_deref() != Some(claim.fence.request_id.as_str())
+            || terminal.execution_id.as_deref() != Some(root.as_str())
+            || terminal.session_generation != Some(claim.fence.session_generation)
+            || terminal.input_sequence != u64::try_from(claim.fence.input_sequence).ok()
+            || terminal.input_claim_owner.as_deref() != Some(claim.fence.claim_owner.as_str())
+            || terminal.input_claim_token.as_deref() != Some(claim.fence.claim_token.as_str())
+            || terminal.input_claim_revision != Some(claim.fence.claim_fence_epoch)
+        {
+            return Err(RuntimeEventStoreError::InvalidTransaction("original Session terminal claim identity is unavailable or changed".into()));
+        }
+        let stream = format!("session-terminal:{}", claim.fence.request_id);
+        let metadata = pg(tx.query(
+            "SELECT encoded_bytes FROM runtime_events WHERE stream_id=$1 AND kind='runtime.session.terminal_requested' AND scope='session_input' AND schema_version=1 AND commit_cursor=$2 LIMIT 2",
+            &[&stream, &to_i64(terminal_cursor, "terminal cursor")?],
+        ))?;
+        if metadata.len() != 1 {
+            return Err(RuntimeEventStoreError::Corrupt("original Session terminal event unavailable".into()));
+        }
+        charge.events = 1;
+        charge.pages = charge.pages.saturating_add(1);
+        let event_bytes = from_i64(pg(metadata[0].try_get(0))?, "terminal event bytes")?;
+        charge.bytes = charge.bytes.saturating_add(16).saturating_add(usize::try_from(event_bytes).unwrap_or(usize::MAX));
+        if charge.events > budget.max_events || charge.bytes > budget.max_bytes || charge.pages > budget.max_pages {
+            return Err(RuntimeEventStoreError::HistoryBudgetExceeded("original Session terminal event budget".into()));
+        }
+        let rows = pg(tx.query(
+            "SELECT payload FROM runtime_events WHERE stream_id=$1 AND kind='runtime.session.terminal_requested' AND scope='session_input' AND schema_version=1 AND commit_cursor=$2 LIMIT 2",
+            &[&stream, &to_i64(terminal_cursor, "terminal cursor")?],
+        ))?;
+        if rows.len() != 1 {
+            return Err(RuntimeEventStoreError::Corrupt("original Session terminal event changed".into()));
+        }
+        let payload: Value = pg(rows[0].try_get(0))?;
+        let requested: SessionTerminalInput = serde_json::from_value(payload)?;
+        if requested.terminal_id != terminal.terminal_id || requested.session_id != terminal.session_id
+            || requested.message_id != terminal.message_id || requested.execution_id != terminal.execution_id
+            || requested.turn_id != terminal.turn_id || requested.request_id != terminal.request_id
+            || requested.session_generation != terminal.session_generation
+            || requested.input_sequence != terminal.input_sequence
+            || requested.payload_ref != terminal.payload_ref
+        {
+            return Err(RuntimeEventStoreError::InvalidTransaction("original Session terminal event identity is unavailable or changed".into()));
+        }
+        if requested.input_claim_owner != terminal.input_claim_owner
+            || requested.input_claim_token != terminal.input_claim_token
+            || requested.input_claim_revision != terminal.input_claim_revision
+        {
+            // Terminal adoption can change the outbox claim without changing
+            // the original event. Do not treat that difference as corruption
+            // or as authorization for a new dispatch.
+            return Err(RuntimeEventStoreError::InvalidTransaction("original Session terminal claim adoption is not authenticated".into()));
+        }
+        Err(RuntimeEventStoreError::SessionTerminalCommitted)
+    }
+
+    /// Fold the complete Program at the exact head pinned by this terminal.
+    /// Called with the original claim locked; no external work runs under it.
+    fn check_terminal_attempts(
+        tx: &mut PostgresTransaction<'_>,
+        request: &CheckedAppendRequest,
+        claim: &runtime::RuntimeOriginalSessionClaim<'_>,
+        charge: &mut SessionOwnerReadCharge,
+        held_since: std::time::Instant,
+    ) -> RuntimeEventStoreResult<()> {
+        let objective = runtime::root_objective_id(claim.session_id, claim.turn_id);
+        let program = runtime::program_id_for_objective(&objective);
+        let stream = format!("agentic-program:{program}");
+        let root = runtime::session_ingress_graph_id(claim.session_id, &claim.fence.request_id, claim.turn_id);
+        if request.transaction.events.iter().any(|event| event.event.stream_id == stream) {
+            return Err(RuntimeEventStoreError::InvalidTransaction("terminal transaction modifies original Program".into()));
+        }
+        let source = request.transaction.expected_streams.iter().find(|source| source.stream_id == stream)
+            .ok_or_else(|| RuntimeEventStoreError::InvalidTransaction("terminal original Program source unavailable".into()))?;
+        let head = stream_head(tx, &stream)?;
+        if head != source.expected_revision {
+            return Err(RuntimeEventStoreError::StaleRevision { stream_id: stream, expected: source.expected_revision, actual: head });
+        }
+        if head == 0 { return Ok(()); }
+        let count = usize::try_from(head).map_err(|_| RuntimeEventStoreError::HistoryBudgetExceeded("terminal Program count overflow".into()))?;
+        charge.events = charge.events.saturating_add(count);
+        charge.pages = charge.pages.saturating_add(count.div_ceil(64));
+        if charge.events > request.budget.max_events || charge.pages > request.budget.max_pages {
+            return Err(RuntimeEventStoreError::HistoryBudgetExceeded("terminal Program event budget".into()));
+        }
+        let metadata = pg(tx.query(
+            "SELECT sequence,encoded_bytes FROM runtime_events WHERE stream_id=$1 AND sequence<=$2 ORDER BY sequence LIMIT $3",
+            &[&stream, &to_i64(head, "Program head")?, &to_i64(head, "Program count")?],
+        ))?;
+        if metadata.len() != count {
+            return Err(RuntimeEventStoreError::InvalidTransaction("terminal Program source is incomplete".into()));
+        }
+        for (index, row) in metadata.iter().enumerate() {
+            let sequence = from_i64(pg(row.try_get(0))?, "Program sequence")?;
+            if sequence != u64::try_from(index).unwrap_or(u64::MAX).saturating_add(1) {
+                return Err(RuntimeEventStoreError::InvalidTransaction("terminal Program sequence gap".into()));
+            }
+            let bytes = from_i64(pg(row.try_get(1))?, "Program encoded bytes")?;
+            charge.bytes = charge.bytes.saturating_add(16).saturating_add(usize::try_from(bytes).unwrap_or(usize::MAX));
+            if charge.bytes > request.budget.max_bytes || held_since.elapsed().as_millis() > u128::from(request.budget.max_lock_millis) {
+                return Err(RuntimeEventStoreError::HistoryBudgetExceeded("terminal Program bytes or time".into()));
+            }
+        }
+        let rows = pg(tx.query(&format!("SELECT {EVENT_COLUMNS} FROM runtime_events WHERE stream_id=$1 AND sequence<=$2 ORDER BY sequence LIMIT $3"),
+            &[&stream, &to_i64(head, "Program head")?, &to_i64(head, "Program count")?]))?;
+        let events = rows.iter().map(row_to_event).collect::<RuntimeEventStoreResult<Vec<_>>>()?;
+        if events.len() != count {
+            return Err(RuntimeEventStoreError::InvalidTransaction("terminal Program source changed".into()));
+        }
+        let mut openings = events.iter().filter(|event| event.kind == "agentic.program_opened");
+        let opened = openings.next().ok_or_else(|| RuntimeEventStoreError::InvalidTransaction("terminal Program opening unavailable".into()))?;
+        if openings.next().is_some() || opened.stream_id != stream || opened.scope != RuntimeEventScope::Program
+            || opened.schema_version != 1
+            || opened.payload.get("program_id").and_then(Value::as_str) != Some(program.as_str())
+            || opened.payload.get("objective_id").and_then(Value::as_str) != Some(objective.as_str())
+            || opened.payload.get("session_id").and_then(Value::as_str) != Some(claim.session_id)
+            || opened.payload.get("turn_id").and_then(Value::as_str) != Some(claim.turn_id)
+            || opened.payload.get("root_execution_id").and_then(Value::as_str) != Some(root.as_str())
+        {
+            return Err(RuntimeEventStoreError::InvalidTransaction("terminal Program binding unavailable".into()));
+        }
+        let mut fold = runtime::MemberAttemptFold::default();
+        for (index, event) in events.iter().enumerate() {
+            if event.stream_id != stream || event.sequence != u64::try_from(index).unwrap_or(u64::MAX).saturating_add(1) {
+                return Err(RuntimeEventStoreError::InvalidTransaction("terminal Program order changed".into()));
+            }
+            if event.kind != "agentic.action_applied" { continue; }
+            if event.scope != RuntimeEventScope::Program || event.status.as_deref() != Some("applied")
+                || event.schema_version != 1
+                || event.actor.as_deref() != event.payload.pointer("/envelope/actor/actor_id").and_then(Value::as_str)
+            {
+                return Err(RuntimeEventStoreError::InvalidTransaction("terminal Program action source unavailable".into()));
+            }
+            fold.observe_action_applied(&event.payload, claim.session_id, claim.turn_id, &program, Some(&root))
+                .map_err(|error| RuntimeEventStoreError::InvalidTransaction(format!("terminal Program attempt fact unavailable: {error:?}")))?;
+        }
+        if fold.any_unsettled() { return Err(RuntimeEventStoreError::SessionAttemptsUnsettled); }
+        Ok(())
+    }
+
+    fn append_checked_owned_tx(
+        &self, request: CheckedAppendRequest, terminal: Option<&SessionTerminalInput>,
+        validator: &dyn CheckedSourceValidator,
+        control: &dyn runtime::RuntimeTransactionCommitControl,
+        claim: &runtime::RuntimeOriginalSessionClaim<'_>,
+    ) -> RuntimeEventStoreResult<Option<CheckedAppendReceipt>> {
+        request.identity_hash()?;
+        if validator.frame_digest() != request.frame_digest {
+            return Err(RuntimeEventStoreError::InvalidTransaction("source frame mismatch".into()));
+        }
+        // Identify an already committed transaction under the original
+        // transaction advisory lock before considering a new cancellation.
+        let mut connection = self.checkout_event_write()?;
+        let mut tx = pg(connection.transaction())?;
+        pg(tx.query_one(
+            "SELECT set_config('statement_timeout', $1, true)",
+            &[&format!("{}ms", request.budget.max_lock_millis)],
+        ))?;
+        // Do not allow search_path fallback to resolve Session and Runtime
+        // tables from different schemas. The selected production topology
+        // constructs both adapters from the same scoped executor.
+        let same_schema: bool = pg(tx.query_one(
+            "SELECT COALESCE(to_regclass('session_records') = to_regclass(format('%I.session_records', current_schema())), false) AND COALESCE(to_regclass('session_runtime_outbox') = to_regclass(format('%I.session_runtime_outbox', current_schema())), false) AND COALESCE(to_regclass('runtime_commits') = to_regclass(format('%I.runtime_commits', current_schema())), false) AND COALESCE(to_regclass('runtime_events') = to_regclass(format('%I.runtime_events', current_schema())), false) AND COALESCE(to_regclass('runtime_session_outbox') = to_regclass(format('%I.runtime_session_outbox', current_schema())), false)",
+            &[],
+        ))?.try_get(0).map_err(|error| RuntimeEventStoreError::Corrupt(error.to_string()))?;
+        if !same_schema {
+            return Err(RuntimeEventStoreError::InvalidTransaction("Session and Runtime transaction schemas differ".into()));
+        }
+        let held_since = std::time::Instant::now();
+        let mut pre_read = SessionOwnerReadCharge::default();
+        // Match the existing checked owner's transaction identity lock. This
+        // makes the duplicate probe and subsequent append one decision.
+        lock_original_member_decisions(&mut tx, &request.transaction)?;
+        let transaction_lock = format!("cowd-runtime-event-transaction:{}", request.transaction.transaction_id);
+        pg(tx.query_one("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", &[&transaction_lock]))?;
+        let already_committed = pg(tx.query_opt(
+            "SELECT 1 FROM runtime_commits WHERE transaction_id=$1",
+            &[&request.transaction.transaction_id],
+        ))?.is_some();
+        if !already_committed {
+            if terminal.is_some() {
+                let isolation: String = pg(tx.query_one("SHOW transaction_isolation", &[]))?
+                    .try_get(0).map_err(|error| RuntimeEventStoreError::Corrupt(error.to_string()))?;
+                if isolation != "read committed" {
+                    return Err(RuntimeEventStoreError::InvalidTransaction("terminal Program source requires read committed isolation".into()));
+                }
+            }
+            session_postgres::lock_runtime_input_claim_with_consumed_tx(
+                &mut tx, claim.session_id, claim.ingress_message_id, claim.turn_id, claim.fence,
+                claim.consumed_input_sequence,
+            ).map_err(|error| RuntimeEventStoreError::InvalidTransaction(error.to_string()))?;
+            if let Some(terminal) = terminal {
+                let root = runtime::session_ingress_graph_id(claim.session_id, &claim.fence.request_id, claim.turn_id);
+                if terminal.session_id != claim.session_id || terminal.turn_id.as_deref() != Some(claim.turn_id)
+                    || terminal.request_id.as_deref() != Some(claim.fence.request_id.as_str())
+                    || terminal.execution_id.as_deref() != Some(root.as_str())
+                    || terminal.session_generation != Some(claim.fence.session_generation)
+                    || terminal.input_sequence != u64::try_from(claim.fence.input_sequence).ok()
+                    || terminal.input_claim_owner.as_deref() != Some(claim.fence.claim_owner.as_str())
+                    || terminal.input_claim_token.as_deref() != Some(claim.fence.claim_token.as_str())
+                    || terminal.input_claim_revision != Some(claim.fence.claim_fence_epoch)
+                {
+                    pg(tx.rollback())?;
+                    control.finish(runtime::RuntimeTransactionOutcome::RolledBack);
+                    return Err(RuntimeEventStoreError::CheckedAttemptRolledBack(Box::new(
+                        RuntimeEventStoreError::InvalidTransaction("terminal differs from original Session claim".into()),
+                    )));
+                }
+                if let Err(error) = Self::check_terminal_attempts(&mut tx, &request, claim, &mut pre_read, held_since) {
+                    pg(tx.rollback())?;
+                    control.finish(runtime::RuntimeTransactionOutcome::RolledBack);
+                    return Err(RuntimeEventStoreError::CheckedAttemptRolledBack(Box::new(error)));
+                }
+            } else if request.transaction.events.iter().any(|event| {
+                event.event.kind == "agentic.program_opened"
+                    || (event.event.kind == "agentic.action_applied"
+                        && event.event.payload.pointer("/envelope/action/kind").and_then(Value::as_str)
+                            == Some("task_attempt_dispatch"))
+            }) {
+                if request.transaction.expected_streams.len().saturating_add(1) > request.budget.max_sources {
+                    return Err(RuntimeEventStoreError::HistoryBudgetExceeded("original Session terminal source count".into()));
+                }
+                pre_read = match Self::check_no_original_terminal(&mut tx, claim, &request.budget) {
+                    Ok(charge) => charge,
+                    Err(error) => {
+                        pg(tx.rollback())?;
+                        control.finish(runtime::RuntimeTransactionOutcome::RolledBack);
+                        return Err(RuntimeEventStoreError::CheckedAttemptRolledBack(Box::new(error)));
+                    }
+                };
+            }
+        }
+        let commit = match append_transaction_in_tx_checked_charged(
+            &mut tx, &request.transaction, terminal, Some((&request, validator)), pre_read, held_since,
+        ) {
+            Ok(commit) => commit,
+            Err(error @ (RuntimeEventStoreError::StaleRevision { .. }
+                | RuntimeEventStoreError::TransactionConflict { .. }
+                | RuntimeEventStoreError::CurrentMemberAuthorityExpired)) => {
+                // The backend, not a missing receipt, proves this attempt did
+                // not commit. If rollback itself fails, preserve Unknown.
+                pg(tx.rollback())?;
+                control.finish(runtime::RuntimeTransactionOutcome::RolledBack);
+                return Err(RuntimeEventStoreError::CheckedAttemptRolledBack(Box::new(error)));
+            }
+            Err(error) => return Err(error),
+        };
+        let row = pg(tx.query_one(
+            "SELECT checked_source_evidence FROM runtime_commits WHERE transaction_id=$1",
+            &[&request.transaction.transaction_id],
+        ))?;
+        let evidence: Option<Value> = pg(row.try_get(0))?;
+        let validation = serde_json::from_value(evidence.ok_or_else(|| {
+            RuntimeEventStoreError::Corrupt("checked commit missing source evidence".into())
+        })?)?;
+        if commit.duplicate {
+            pg(tx.commit())?;
+            return Ok(Some(CheckedAppendReceipt { commit, validation }));
+        }
+        if !control.begin().map_err(RuntimeEventStoreError::InvalidTransaction)? {
+            pg(tx.rollback())?;
+            return Ok(None);
+        }
+        let mut guard = PgOwnedCommitGuard(control, false);
+        control.before_commit();
+        if held_since.elapsed().as_millis() > u128::from(request.budget.max_lock_millis) {
+            pg(tx.rollback())?;
+            control.finish(runtime::RuntimeTransactionOutcome::RolledBack);
+            guard.1 = true;
+            return Err(RuntimeEventStoreError::HistoryBudgetExceeded("cumulative owner transaction time".into()));
+        }
+        if !control.commit_wins().map_err(RuntimeEventStoreError::InvalidTransaction)? {
+            pg(tx.rollback())?;
+            control.finish(runtime::RuntimeTransactionOutcome::RolledBack);
+            guard.1 = true;
+            return Ok(None);
+        }
+        pg(tx.commit())?;
+        control.finish(runtime::RuntimeTransactionOutcome::Committed);
+        guard.1 = true;
+        Ok(Some(CheckedAppendReceipt { commit, validation }))
+    }
+
+}
+
 impl RuntimeEventStoreBackend for PostgresRuntimeEventStore {
     /// Deadline-bounded reader for the fixture evidence oracle.  Without it a
     /// PostgreSQL-backed run can never reach a business verdict: the oracle
@@ -273,7 +623,9 @@ impl RuntimeEventStoreBackend for PostgresRuntimeEventStore {
         if Instant::now() >= request.deadline {
             return Err("Unavailable: deadline exhausted before read");
         }
-        let after_sequence = to_i64(request.after_sequence, "after_sequence")
+        // PostgreSQL sequence values are signed BIGINT. An unbounded
+        // head-only cursor lies beyond every representable stored sequence.
+        let after_sequence = to_i64(request.after_sequence.min(i64::MAX as u64), "after_sequence")
             .map_err(|_| "Unavailable: sequence bound overflow")?;
         // The oracle asks for an open-ended range; clamp instead of failing so
         // an unbounded request still reads every event that exists.
@@ -546,6 +898,36 @@ impl RuntimeEventStoreBackend for PostgresRuntimeEventStore {
         }
         Ok(lines)
     }
+    fn original_transaction_receipt(&self, transaction_id: &str)
+        -> RuntimeEventStoreResult<Option<AppendTransactionReceipt>> {
+        if transaction_id.trim().is_empty() {
+            return Err(RuntimeEventStoreError::InvalidTransaction("original transaction identity missing".into()));
+        }
+        let mut connection = self.executor.checkout_online_read()?;
+        if pg(connection.query_opt("SELECT 1 FROM runtime_commits WHERE transaction_id=$1", &[&transaction_id]))?.is_none() {
+            return Ok(None);
+        }
+        load_receipt(&mut connection, transaction_id, true).map(Some)
+    }
+
+    fn original_checked_transaction_receipt(&self, transaction_id: &str)
+        -> RuntimeEventStoreResult<Option<CheckedAppendReceipt>> {
+        if transaction_id.trim().is_empty() {
+            return Err(RuntimeEventStoreError::InvalidTransaction("original transaction identity missing".into()));
+        }
+        let mut connection = self.executor.checkout_online_read()?;
+        let mut tx = pg(connection.transaction())?;
+        let Some(row) = pg(tx.query_opt("SELECT checked_source_evidence FROM runtime_commits WHERE transaction_id=$1", &[&transaction_id]))? else {
+            return Ok(None);
+        };
+        let value: Option<Value> = pg(row.try_get(0))?;
+        let validation = serde_json::from_value(value.ok_or_else(||
+            RuntimeEventStoreError::InvalidTransaction("original transaction is not checked".into()))?)?;
+        let commit = load_receipt(&mut tx, transaction_id, true)?;
+        pg(tx.commit())?;
+        Ok(Some(CheckedAppendReceipt { commit, validation }))
+    }
+
     fn transaction_stream_revision_exact(
         &self,
         transaction_id: &str,
@@ -610,6 +992,39 @@ impl RuntimeEventStoreBackend for PostgresRuntimeEventStore {
                         graph.as_ref(),
                         artifact,
                     ));
+                }
+                if kind == "execution.read.receipt" || kind == "execution.effect.receipt" {
+                    let primary = Self::process_closure_root_event(&mut connection, stream_id, idempotency_key)?;
+                    let identity = primary.as_ref().and_then(|primary|
+                        RuntimeEventStore::process_closure_index_identity(&primary.payload, &primary.refs).ok());
+                    let index = match identity {
+                        Some((stream, key)) => Self::process_closure_root_event(&mut connection, &stream, &key)?,
+                        None => None,
+                    };
+                    return Ok(RuntimeEventStore::delegated_outcome_root(primary.as_ref(), index.as_ref(), artifact));
+                }
+                if kind == "execution_node.transitioned" {
+                    let row = connection.query_opt(
+                        "SELECT kind,scope,schema_version,CASE WHEN octet_length(payload#>>'{_runtime_activity_binding,session_id}')<=1024 THEN payload#>>'{_runtime_activity_binding,session_id}' END,CASE WHEN octet_length(payload#>>'{result,result_ref}')<=16384 THEN payload#>>'{result,result_ref}' END FROM runtime_events WHERE stream_id=$1 AND idempotency_key=$2",
+                        &[&stream_id, &idempotency_key],
+                    ).map_err(|error| RuntimeEventStoreError::Corrupt(error.to_string()))?;
+                    return Ok(match row {
+                        None => PreparedContentRoot::Absent,
+                        Some(row) => {
+                            let actual_kind: String = row.get(0);
+                            let scope: String = row.get(1);
+                            let schema: i64 = row.get(2);
+                            let session: Option<String> = row.get(3);
+                            let value: Option<String> = row.get(4);
+                            if actual_kind != *kind || scope != "execution_node" || schema != 1
+                                || session.is_none_or(|session| artifact.visibility_scope != format!("session:{session}")) {
+                                PreparedContentRoot::Blocked
+                            } else if let Some(value) = value {
+                                RuntimeEventStore::prepared_agent_tool_outcome_root(
+                                    &value, stream_id, idempotency_key, artifact)
+                            } else { PreparedContentRoot::Blocked }
+                        }
+                    });
                 }
                 let row = connection.query_opt(
                     "SELECT CASE WHEN octet_length(kind)<=1024 THEN kind ELSE '' END,schema_version,CASE WHEN octet_length(scope)<=64 THEN scope ELSE '' END,
@@ -957,6 +1372,13 @@ impl RuntimeEventStoreBackend for PostgresRuntimeEventStore {
         Ok(receipt)
     }
 
+    fn append_transaction_cancellable(
+        &self, request: AppendTransactionRequest,
+        control: &dyn runtime::RuntimeTransactionCommitControl,
+    ) -> RuntimeEventStoreResult<Option<AppendTransactionReceipt>> {
+        self.append_owned_cancellable_inner(request, control)
+    }
+
     fn append_checked_transaction(
         &self,
         request: CheckedAppendRequest,
@@ -990,6 +1412,399 @@ impl RuntimeEventStoreBackend for PostgresRuntimeEventStore {
         })?)?;
         pg(tx.commit())?;
         Ok(CheckedAppendReceipt { commit, validation })
+    }
+
+    fn append_checked_transaction_cancellable(
+        &self, request: CheckedAppendRequest, validator: &dyn CheckedSourceValidator,
+        control: &dyn runtime::RuntimeTransactionCommitControl,
+        claim: &runtime::RuntimeOriginalSessionClaim<'_>,
+    ) -> RuntimeEventStoreResult<Option<CheckedAppendReceipt>> {
+        self.append_checked_owned_tx(request, None, validator, control, claim)
+    }
+
+    fn append_original_member_decision(
+        &self, request: CheckedAppendRequest, member: runtime::OriginalMemberDecisionInput,
+        validator: &dyn CheckedSourceValidator, control: &dyn runtime::RuntimeTransactionCommitControl,
+        claim: &runtime::RuntimeOriginalSessionClaim<'_>,
+    ) -> RuntimeEventStoreResult<runtime::OriginalMemberDecision> {
+        let invalid = || RuntimeEventStoreError::InvalidTransaction("original member decision identity unavailable".into());
+        let checked_hash = request.identity_hash()?;
+        if validator.frame_digest() != request.frame_digest || member.terminal_transaction_id != format!("member-noncommit:{checked_hash}")
+            || request.transaction.transaction_id == member.terminal_transaction_id || member.preparation.events.len() != 1 {
+            return Err(invalid());
+        }
+        let preparation = &member.preparation.events[0];
+        let pp = &preparation.event.payload;
+        let outer = pp["outer_key"].as_str().filter(|v| !v.is_empty()).ok_or_else(invalid)?;
+        let index = pp["member_index"].as_u64().ok_or_else(invalid)?;
+        let ticket = pp.get("ticket").filter(|v| !v.is_null()).ok_or_else(invalid)?;
+        let stream = format!("execution-effect:{outer}");
+        let member_key = format!("agentic-member:{index}");
+        let prep_key = format!("agentic-member-preparation:{index}");
+        let prep_hash = request_hash_with_terminal(&member.preparation, None)?;
+        let expected_payload = serde_json::json!({"ticket":ticket,"outer_key":outer,"member_index":index,
+            "preparation_transaction_id":member.preparation.transaction_id,
+            "preparation_request_hash":prep_hash,"checked_transaction_id":request.transaction.transaction_id,
+            "checked_request_hash":checked_hash});
+        let terminal = &member.terminal_event;
+        if preparation.event.stream_id != stream || preparation.event.scope != RuntimeEventScope::ExecutionNode
+            || preparation.event.kind != "execution.effect.member_preparation" || preparation.event.status.as_deref() != Some("inflight")
+            || preparation.event.actor.as_deref() != Some("execution_commit_service") || preparation.schema_version != 1
+            || preparation.idempotency_key.as_deref() != Some(prep_key.as_str())
+            || member.preparation_receipt.transaction_id != member.preparation.transaction_id
+            || member.preparation_receipt.request_hash != prep_hash || member.preparation_receipt.commit_cursor == 0
+            || member.preparation_receipt.event_ids.len() != 1
+            || terminal.event.stream_id != stream || terminal.event.scope != RuntimeEventScope::ExecutionNode
+            || terminal.event.kind != "execution.effect.member_noncommit" || terminal.event.status.as_deref() != Some("not_committed")
+            || terminal.event.actor.as_deref() != Some("execution_commit_service") || terminal.event.refs != preparation.event.refs
+            || terminal.schema_version != 1 || terminal.idempotency_key.as_deref() != Some(member_key.as_str())
+            || terminal.event.payload != expected_payload
+            || !request.transaction.expected_streams.iter().any(|source| source.stream_id == stream) {
+            return Err(invalid());
+        }
+        let mut markers = request.transaction.events.iter().filter(|event| event.event.kind == "agentic.batch_member.index");
+        let marker = markers.next().ok_or_else(invalid)?;
+        if markers.next().is_some() || marker.event.stream_id != stream || marker.event.scope != RuntimeEventScope::ExecutionNode
+            || marker.event.status.as_deref() != Some("committed") || marker.event.actor.as_deref() != Some("runtime.agentic_action")
+            || marker.schema_version != 1 || marker.idempotency_key.as_deref() != Some(member_key.as_str())
+            || marker.event.payload["outer_key"] != outer || marker.event.payload["member_index"] != index
+            || marker.event.payload.get("ticket") != Some(ticket) {
+            return Err(invalid());
+        }
+        let position = marker.event.payload["program_event_index"].as_u64().and_then(|v| usize::try_from(v).ok()).ok_or_else(invalid)?;
+        let action = request.transaction.events.get(position).ok_or_else(invalid)?;
+        if action.event.payload.pointer("/envelope/actor/session_id").and_then(Value::as_str) != Some(claim.session_id)
+            || action.event.payload.pointer("/envelope/actor/turn_id").and_then(Value::as_str) != Some(claim.turn_id)
+            || marker.event.payload["program_stream"] != action.event.stream_id
+            || marker.event.payload["program_event_kind"] != action.event.kind
+            || marker.event.payload["program_event_key"].as_str() != action.idempotency_key.as_deref()
+            || !matches!(action.event.kind.as_str(), "agentic.action_applied" | "agentic.completion_rejected") {
+            return Err(invalid());
+        }
+        let mut connection = self.checkout_event_write()?;
+        let mut tx = pg(connection.transaction())?;
+        pg(tx.query_one("SELECT set_config('statement_timeout', $1, true)", &[&format!("{}ms", request.budget.max_lock_millis)]))?;
+        let same_schema: bool = pg(tx.query_one("SELECT COALESCE(to_regclass('session_records') = to_regclass(format('%I.session_records', current_schema())), false) AND COALESCE(to_regclass('session_runtime_outbox') = to_regclass(format('%I.session_runtime_outbox', current_schema())), false) AND COALESCE(to_regclass('runtime_commits') = to_regclass(format('%I.runtime_commits', current_schema())), false) AND COALESCE(to_regclass('runtime_events') = to_regclass(format('%I.runtime_events', current_schema())), false)", &[]))?.try_get(0).map_err(|error| RuntimeEventStoreError::Corrupt(error.to_string()))?;
+        if !same_schema { return Err(invalid()); }
+        lock_original_member_decisions(&mut tx, &request.transaction)?;
+        let action_lock = format!("cowd-runtime-event-transaction:{}", request.transaction.transaction_id);
+        let terminal_lock = format!("cowd-runtime-event-transaction:{}", member.terminal_transaction_id);
+        let row = pg(tx.query_one("SELECT hashtextextended($1, 0), hashtextextended($2, 0)", &[&action_lock, &terminal_lock]))?;
+        let mut transaction_locks = vec![pg(row.try_get::<_, i64>(0))?, pg(row.try_get::<_, i64>(1))?];
+        transaction_locks.sort_unstable(); transaction_locks.dedup();
+        for lock in transaction_locks { pg(tx.query_one("SELECT pg_advisory_xact_lock($1)", &[&lock]))?; }
+        let winner_exists = pg(tx.query_opt("SELECT 1 FROM runtime_commits WHERE transaction_id=$1", &[&request.transaction.transaction_id]))?.is_some();
+        let terminal_exists = pg(tx.query_opt("SELECT 1 FROM runtime_commits WHERE transaction_id=$1", &[&member.terminal_transaction_id]))?.is_some();
+        if !winner_exists && !terminal_exists {
+            session_postgres::lock_runtime_input_claim_with_consumed_tx(&mut tx, claim.session_id, claim.ingress_message_id,
+                claim.turn_id, claim.fence, claim.consumed_input_sequence).map_err(|e| RuntimeEventStoreError::InvalidTransaction(e.to_string()))?;
+        }
+        let mut sources = request.transaction.expected_streams.iter().map(|source| source.stream_id.as_str()).collect::<Vec<_>>();
+        sources.sort_unstable(); sources.dedup();
+        for source in sources { let lock = format!("cowd-runtime-event-stream:{source}"); pg(tx.query_one("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", &[&lock]))?; }
+        let stored_preparation = pg(tx.query_opt(&format!("SELECT {EVENT_COLUMNS} FROM runtime_events WHERE stream_id=$1 AND idempotency_key=$2"), &[&stream, &prep_key]))?
+            .map(|row| row_to_event(&row)).transpose()?.ok_or_else(invalid)?;
+        let stored_receipt = load_receipt(&mut tx, &member.preparation.transaction_id, true)?;
+        let mut stored_revisions = stored_receipt.stream_revisions.clone();
+        let mut provided_revisions = member.preparation_receipt.stream_revisions.clone();
+        stored_revisions.sort_by(|a, b| a.stream_id.cmp(&b.stream_id));
+        provided_revisions.sort_by(|a, b| a.stream_id.cmp(&b.stream_id));
+        if stored_preparation.event_id != member.preparation_receipt.event_ids[0]
+            || stored_preparation.transaction_id != member.preparation.transaction_id || stored_preparation.commit_cursor != member.preparation_receipt.commit_cursor
+            || stored_preparation.transaction_index != 0 || stored_preparation.schema_version != preparation.schema_version
+            || stored_preparation.kind != preparation.event.kind || stored_preparation.scope != preparation.event.scope
+            || stored_preparation.actor != preparation.event.actor || stored_preparation.status != preparation.event.status
+            || stored_preparation.refs != preparation.event.refs || stored_preparation.payload != preparation.event.payload
+            || stored_receipt.request_hash != prep_hash || stored_receipt.commit_cursor != member.preparation_receipt.commit_cursor
+            || stored_receipt.event_ids != member.preparation_receipt.event_ids || stored_revisions != provided_revisions {
+            return Err(invalid());
+        }
+        if winner_exists {
+            let commit = append_transaction_in_tx_checked(&mut tx, &request.transaction, None, Some((&request, validator)))?;
+            if !commit.duplicate || commit.request_hash != checked_hash { return Err(invalid()); }
+            let rows = pg(tx.query(&format!("SELECT {EVENT_COLUMNS} FROM runtime_events WHERE transaction_id=$1 ORDER BY transaction_index ASC"), &[&request.transaction.transaction_id]))?;
+            if rows.len() != request.transaction.events.len() || commit.event_ids.len() != rows.len() { return Err(invalid()); }
+            for (position, (row, expected)) in rows.iter().zip(&request.transaction.events).enumerate() {
+                let actual = row_to_event(row)?;
+                if actual.event_id != commit.event_ids[position] || actual.transaction_id != request.transaction.transaction_id
+                    || actual.transaction_index as usize != position || actual.commit_cursor != commit.commit_cursor
+                    || actual.stream_id != expected.event.stream_id || actual.scope != expected.event.scope
+                    || actual.kind != expected.event.kind || actual.status != expected.event.status || actual.actor != expected.event.actor
+                    || actual.refs != expected.event.refs || actual.payload != expected.event.payload
+                    || actual.schema_version != expected.schema_version || actual.idempotency_key != expected.idempotency_key { return Err(invalid()); }
+            }
+            let row = pg(tx.query_one("SELECT checked_source_evidence FROM runtime_commits WHERE transaction_id=$1", &[&request.transaction.transaction_id]))?;
+            let evidence: Option<Value> = pg(row.try_get(0))?;
+            let validation = serde_json::from_value(evidence.ok_or_else(invalid)?)?;
+            pg(tx.commit())?;
+            return Ok(runtime::OriginalMemberDecision::Committed(CheckedAppendReceipt { commit, validation }));
+        }
+        let existing = pg(tx.query_opt(&format!("SELECT {EVENT_COLUMNS} FROM runtime_events WHERE stream_id=$1 AND idempotency_key=$2"), &[&stream, &member_key]))?
+            .map(|row| row_to_event(&row)).transpose()?;
+        if terminal_exists {
+            let event = existing.ok_or_else(invalid)?;
+            let reason = event.payload["noncommit_reason"].as_str().filter(|reason| matches!(*reason, "cancelled" | "rolled_back" | "abandoned")).ok_or_else(invalid)?;
+            let error_kind = event.payload["noncommit_error_kind"].as_str().ok_or_else(invalid)?;
+            if !matches!((reason, error_kind), ("cancelled", "cancelled") | ("rolled_back", "stale_revision" | "current_member_authority_expired") | ("abandoned", "original_owner_stopped")) { return Err(invalid()); }
+            let mut expected_event = member.terminal_event.clone();
+            expected_event.event.payload.as_object_mut().ok_or_else(invalid)?.insert("noncommit_reason".into(), Value::String(reason.into()));
+            expected_event.event.payload.as_object_mut().ok_or_else(invalid)?.insert("noncommit_error_kind".into(), Value::String(error_kind.into()));
+            let receipt = load_receipt(&mut tx, &member.terminal_transaction_id, true)?;
+            let source = receipt.stream_revisions.first().filter(|_| receipt.stream_revisions.len() == 1).ok_or_else(invalid)?;
+            let terminal_request = AppendTransactionRequest { transaction_id: member.terminal_transaction_id,
+                expected_streams: vec![ExpectedStreamRevision { stream_id: stream.clone(), expected_revision: source.expected_revision }],
+                events: vec![expected_event.clone()] };
+            if event.transaction_id != terminal_request.transaction_id || event.event_id != *receipt.event_ids.first().filter(|_| receipt.event_ids.len() == 1).ok_or_else(invalid)?
+                || event.commit_cursor == 0 || event.commit_cursor != receipt.commit_cursor || event.transaction_index != 0
+                || event.stream_id != stream || event.sequence != source.committed_revision || source.stream_id != stream
+                || source.expected_revision.checked_add(1) != Some(source.committed_revision)
+                || event.scope != expected_event.event.scope || event.kind != expected_event.event.kind || event.status != expected_event.event.status
+                || event.actor != expected_event.event.actor || event.refs != expected_event.event.refs || event.payload != expected_event.event.payload
+                || event.schema_version != expected_event.schema_version || event.idempotency_key != expected_event.idempotency_key
+                || receipt.request_hash != request_hash_with_terminal(&terminal_request, None)? { return Err(invalid()); }
+            pg(tx.commit())?;
+            return Ok(runtime::OriginalMemberDecision::ConfirmedNoncommit { receipt, transaction: terminal_request });
+        }
+        if existing.is_some() { return Err(invalid()); }
+        pg(tx.batch_execute("SAVEPOINT original_member_action"))?;
+        let attempted = append_transaction_in_tx_checked(&mut tx, &request.transaction, None, Some((&request, validator)));
+        let (reason, error_kind, mut guard, finish_rollback) = match attempted {
+            Ok(commit) => {
+                if commit.duplicate { return Err(invalid()); }
+                let row = pg(tx.query_one("SELECT checked_source_evidence FROM runtime_commits WHERE transaction_id=$1", &[&request.transaction.transaction_id]))?;
+                let evidence: Option<Value> = pg(row.try_get(0))?;
+                let validation = serde_json::from_value(evidence.ok_or_else(invalid)?)?;
+                if !control.begin().map_err(RuntimeEventStoreError::InvalidTransaction)? {
+                    let guard = PgOwnedCommitGuard(control, false);
+                    pg(tx.batch_execute("ROLLBACK TO SAVEPOINT original_member_action; RELEASE SAVEPOINT original_member_action"))?;
+                    ("cancelled", "cancelled", Some(guard), false)
+                } else {
+                    let mut guard = PgOwnedCommitGuard(control, false);
+                    control.before_commit();
+                    if control.commit_wins().map_err(RuntimeEventStoreError::InvalidTransaction)? {
+                        pg(tx.batch_execute("RELEASE SAVEPOINT original_member_action"))?;
+                        pg(tx.commit())?;
+                        control.finish(runtime::RuntimeTransactionOutcome::Committed);
+                        guard.1 = true;
+                        return Ok(runtime::OriginalMemberDecision::Committed(CheckedAppendReceipt { commit, validation }));
+                    }
+                    pg(tx.batch_execute("ROLLBACK TO SAVEPOINT original_member_action; RELEASE SAVEPOINT original_member_action"))?;
+                    ("cancelled", "cancelled", Some(guard), true)
+                }
+            }
+            Err(error @ (RuntimeEventStoreError::StaleRevision { .. } | RuntimeEventStoreError::CurrentMemberAuthorityExpired)) => {
+                let kind = match error { RuntimeEventStoreError::StaleRevision { .. } => "stale_revision", RuntimeEventStoreError::CurrentMemberAuthorityExpired => "current_member_authority_expired", _ => unreachable!() };
+                let guard = PgOwnedCommitGuard(control, false);
+                pg(tx.batch_execute("ROLLBACK TO SAVEPOINT original_member_action; RELEASE SAVEPOINT original_member_action"))?;
+                ("rolled_back", kind, Some(guard), true)
+            }
+            Err(error) => { pg(tx.batch_execute("ROLLBACK TO SAVEPOINT original_member_action; RELEASE SAVEPOINT original_member_action"))?; return Err(error); }
+        };
+        let mut event = member.terminal_event.clone();
+        event.event.payload.as_object_mut().ok_or_else(invalid)?.insert("noncommit_reason".into(), Value::String(reason.into()));
+        event.event.payload.as_object_mut().ok_or_else(invalid)?.insert("noncommit_error_kind".into(), Value::String(error_kind.into()));
+        let terminal_request = AppendTransactionRequest { transaction_id: member.terminal_transaction_id,
+            expected_streams: vec![ExpectedStreamRevision { stream_id: stream.clone(), expected_revision: stream_head(&mut tx, &stream)? }],
+            events: vec![event] };
+        let receipt = append_transaction_in_tx(&mut tx, &terminal_request, None)?;
+        if receipt.duplicate || receipt.request_hash != request_hash_with_terminal(&terminal_request, None)? { return Err(invalid()); }
+        pg(tx.commit())?;
+        if finish_rollback { control.finish(runtime::RuntimeTransactionOutcome::RolledBack); }
+        if let Some(guard) = &mut guard { guard.1 = true; }
+        Ok(runtime::OriginalMemberDecision::ConfirmedNoncommit { receipt, transaction: terminal_request })
+    }
+
+    fn settle_original_member(
+        &self, checked: Option<&CheckedAppendRequest>, member: runtime::OriginalMemberDecisionInput,
+        claim: &runtime::RuntimeOriginalSessionClaim<'_>,
+    ) -> RuntimeEventStoreResult<runtime::OriginalMemberDecision> {
+        let invalid = || RuntimeEventStoreError::InvalidTransaction("original member settlement identity unavailable".into());
+        let [preparation] = member.preparation.events.as_slice() else { return Err(invalid()); };
+        let pp = &preparation.event.payload;
+        let outer = pp["outer_key"].as_str().filter(|v| !v.is_empty()).ok_or_else(invalid)?;
+        let index = pp["member_index"].as_u64().ok_or_else(invalid)?;
+        let ticket = pp.get("ticket").filter(|v| !v.is_null()).ok_or_else(invalid)?;
+        let graph = ticket["graph_id"].as_str().filter(|v| !v.is_empty()).ok_or_else(invalid)?;
+        let stream = format!("execution-effect:{outer}");
+        let member_key = format!("agentic-member:{index}");
+        let prep_key = format!("agentic-member-preparation:{index}");
+        let prep_hash = request_hash_with_terminal(&member.preparation, None)?;
+        let mut expected_payload = serde_json::json!({"ticket":ticket,"outer_key":outer,"member_index":index,
+            "preparation_transaction_id":member.preparation.transaction_id,"preparation_request_hash":prep_hash});
+        let terminal_id = if let Some(request) = checked {
+            let hash = request.identity_hash()?;
+            expected_payload["checked_transaction_id"] = serde_json::json!(request.transaction.transaction_id);
+            expected_payload["checked_request_hash"] = serde_json::json!(hash);
+            let mut markers = request.transaction.events.iter().filter(|e| e.event.kind == "agentic.batch_member.index");
+            let marker = markers.next().ok_or_else(invalid)?;
+            if markers.next().is_some() || marker.event.stream_id != stream || marker.idempotency_key.as_deref() != Some(member_key.as_str())
+                || marker.event.payload["outer_key"] != outer || marker.event.payload["member_index"] != index
+                || marker.event.payload.get("ticket") != Some(ticket)
+                || !request.transaction.expected_streams.iter().any(|s| s.stream_id == stream) { return Err(invalid()); }
+            let position = marker.event.payload["program_event_index"].as_u64().and_then(|n| usize::try_from(n).ok()).ok_or_else(invalid)?;
+            let action = request.transaction.events.get(position).ok_or_else(invalid)?;
+            if action.event.payload.pointer("/envelope/actor/session_id").and_then(Value::as_str) != Some(claim.session_id)
+                || action.event.payload.pointer("/envelope/actor/turn_id").and_then(Value::as_str) != Some(claim.turn_id) { return Err(invalid()); }
+            format!("member-noncommit:{hash}")
+        } else {
+            expected_payload["decision_identity"] = serde_json::json!("preparation");
+            format!("member-preparation-noncommit:{prep_hash}")
+        };
+        let terminal = &member.terminal_event;
+        if member.terminal_transaction_id != terminal_id
+            || preparation.event.stream_id != stream || preparation.event.scope != RuntimeEventScope::ExecutionNode
+            || preparation.event.kind != "execution.effect.member_preparation" || preparation.event.status.as_deref() != Some("inflight")
+            || preparation.event.actor.as_deref() != Some("execution_commit_service") || preparation.schema_version != 1
+            || preparation.idempotency_key.as_deref() != Some(prep_key.as_str())
+            || member.preparation_receipt.transaction_id != member.preparation.transaction_id
+            || member.preparation_receipt.request_hash != prep_hash || member.preparation_receipt.commit_cursor == 0
+            || member.preparation_receipt.event_ids.len() != 1
+            || terminal.event.stream_id != stream || terminal.event.scope != RuntimeEventScope::ExecutionNode
+            || terminal.event.kind != "execution.effect.member_noncommit" || terminal.event.status.as_deref() != Some("not_committed")
+            || terminal.event.actor.as_deref() != Some("execution_commit_service") || terminal.event.refs != preparation.event.refs
+            || terminal.schema_version != 1 || terminal.idempotency_key.as_deref() != Some(member_key.as_str())
+            || pp["session_id"].as_str() != Some(claim.session_id) || pp["turn_id"].as_str() != Some(claim.turn_id)
+            || terminal.event.payload != expected_payload { return Err(invalid()); }
+        let mut connection = self.checkout_event_write()?;
+        let mut tx = pg(connection.transaction())?;
+        let timeout = checked.map_or(runtime::SourceCheckBudget::default().max_lock_millis, |r| r.budget.max_lock_millis);
+        pg(tx.query_one("SELECT set_config('statement_timeout', $1, true)", &[&format!("{timeout}ms")]))?;
+        let same_schema: bool = pg(tx.query_one("SELECT COALESCE(to_regclass('session_records') = to_regclass(format('%I.session_records', current_schema())), false) AND COALESCE(to_regclass('session_runtime_outbox') = to_regclass(format('%I.session_runtime_outbox', current_schema())), false) AND COALESCE(to_regclass('runtime_commits') = to_regclass(format('%I.runtime_commits', current_schema())), false) AND COALESCE(to_regclass('runtime_events') = to_regclass(format('%I.runtime_events', current_schema())), false)", &[]))?.try_get(0).map_err(|e| RuntimeEventStoreError::Corrupt(e.to_string()))?;
+        if !same_schema { return Err(invalid()); }
+        lock_original_member_decisions(&mut tx, &member.preparation)?;
+        // Same lock order as checked append: transaction identities, original claim, sources.
+        let mut ids = vec![member.terminal_transaction_id.as_str()];
+        if let Some(request) = checked { ids.push(&request.transaction.transaction_id); }
+        let mut locks = Vec::new();
+        for id in ids {
+            let name = format!("cowd-runtime-event-transaction:{id}");
+            locks.push(pg(tx.query_one("SELECT hashtextextended($1, 0)", &[&name]))?.get::<_, i64>(0));
+        }
+        locks.sort_unstable(); locks.dedup();
+        for lock in locks { pg(tx.query_one("SELECT pg_advisory_xact_lock($1)", &[&lock]))?; }
+        // An immutable existing result is read without renewing current admission.
+        let prior = pg(tx.query_opt(&format!("SELECT {EVENT_COLUMNS} FROM runtime_events WHERE stream_id=$1 AND idempotency_key=$2"), &[&stream, &member_key]))?
+            .map(|row| row_to_event(&row)).transpose()?;
+        if prior.is_none() {
+            session_postgres::lock_runtime_input_claim_with_consumed_tx(&mut tx, claim.session_id, claim.ingress_message_id,
+                claim.turn_id, claim.fence, claim.consumed_input_sequence).map_err(|e| RuntimeEventStoreError::InvalidTransaction(e.to_string()))?;
+        }
+        let mut sources = member.preparation.expected_streams.iter().map(|s| s.stream_id.as_str()).collect::<Vec<_>>();
+        sources.push(&stream); sources.push(graph);
+        if let Some(request) = checked { sources.extend(request.transaction.expected_streams.iter().map(|s| s.stream_id.as_str())); }
+        sources.sort_unstable(); sources.dedup();
+        for source in sources {
+            let name = format!("cowd-runtime-event-stream:{source}");
+            pg(tx.query_one("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", &[&name]))?;
+        }
+        let stored = pg(tx.query_opt(&format!("SELECT {EVENT_COLUMNS} FROM runtime_events WHERE stream_id=$1 AND idempotency_key=$2"), &[&stream, &prep_key]))?
+            .map(|row| row_to_event(&row)).transpose()?.ok_or_else(invalid)?;
+        let receipt = load_receipt(&mut tx, &member.preparation.transaction_id, true)?;
+        let mut actual_sources = receipt.stream_revisions.clone();
+        let mut expected_sources = member.preparation_receipt.stream_revisions.clone();
+        actual_sources.sort_by(|a,b| a.stream_id.cmp(&b.stream_id)); expected_sources.sort_by(|a,b| a.stream_id.cmp(&b.stream_id));
+        if stored.transaction_id != member.preparation.transaction_id || stored.transaction_index != 0
+            || stored.commit_cursor != receipt.commit_cursor || receipt.commit_cursor != member.preparation_receipt.commit_cursor
+            || receipt.request_hash != prep_hash || receipt.event_ids != member.preparation_receipt.event_ids
+            || actual_sources != expected_sources || receipt.event_ids.as_slice() != [stored.event_id.clone()]
+            || stored.scope != preparation.event.scope || stored.kind != preparation.event.kind || stored.status != preparation.event.status
+            || stored.actor != preparation.event.actor || stored.refs != preparation.event.refs || stored.payload != preparation.event.payload
+            || stored.schema_version != preparation.schema_version || stored.idempotency_key != preparation.idempotency_key { return Err(invalid()); }
+        let existing = pg(tx.query_opt(&format!("SELECT {EVENT_COLUMNS} FROM runtime_events WHERE stream_id=$1 AND idempotency_key=$2"), &[&stream, &member_key]))?
+            .map(|row| row_to_event(&row)).transpose()?;
+        if let Some(event) = existing {
+            if event.kind == "agentic.batch_member.index" {
+                // A locator alone cannot authenticate another action. Without the actual
+                // retained checked command leave the winner unresolved for its original reader.
+                let request = checked.ok_or_else(invalid)?;
+                let commit = load_receipt(&mut tx, &event.transaction_id, true)?;
+                if event.transaction_id != request.transaction.transaction_id || commit.request_hash != request.identity_hash()?
+                    || commit.commit_cursor == 0 || commit.event_ids.len() != request.transaction.events.len() { return Err(invalid()); }
+                let rows = pg(tx.query(&format!("SELECT {EVENT_COLUMNS} FROM runtime_events WHERE transaction_id=$1 ORDER BY transaction_index ASC"), &[&event.transaction_id]))?;
+                if rows.len() != request.transaction.events.len() { return Err(invalid()); }
+                for (i, (row, expected)) in rows.iter().zip(&request.transaction.events).enumerate() {
+                    let actual = row_to_event(row)?;
+                    if actual.event_id != commit.event_ids[i] || actual.transaction_index as usize != i
+                        || actual.transaction_id != commit.transaction_id || actual.commit_cursor != commit.commit_cursor
+                        || actual.stream_id != expected.event.stream_id || actual.scope != expected.event.scope
+                        || actual.kind != expected.event.kind || actual.status != expected.event.status || actual.actor != expected.event.actor
+                        || actual.refs != expected.event.refs || actual.payload != expected.event.payload
+                        || actual.schema_version != expected.schema_version || actual.idempotency_key != expected.idempotency_key { return Err(invalid()); }
+                }
+                let row = pg(tx.query_one("SELECT checked_source_evidence FROM runtime_commits WHERE transaction_id=$1", &[&event.transaction_id]))?;
+                let evidence: Option<Value> = pg(row.try_get(0))?;
+                let validation: CheckedSourceEvidence = serde_json::from_value(evidence.ok_or_else(invalid)?)?;
+                if validation.frame_digest != request.frame_digest { return Err(invalid()); }
+                pg(tx.commit())?;
+                return Ok(runtime::OriginalMemberDecision::Committed(CheckedAppendReceipt { commit, validation }));
+            }
+            let reason = event.payload["noncommit_reason"].as_str().ok_or_else(invalid)?;
+            let kind = event.payload["noncommit_error_kind"].as_str().ok_or_else(invalid)?;
+            if !matches!((reason, kind), ("cancelled", "cancelled") | ("rolled_back", "stale_revision" | "current_member_authority_expired")
+                | ("abandoned", "original_owner_stopped")) { return Err(invalid()); }
+            let mut expected = terminal.clone();
+            expected.event.payload["noncommit_reason"] = serde_json::json!(reason);
+            expected.event.payload["noncommit_error_kind"] = serde_json::json!(kind);
+            let receipt = load_receipt(&mut tx, &member.terminal_transaction_id, true)?;
+            let [source] = receipt.stream_revisions.as_slice() else { return Err(invalid()); };
+            let transaction = AppendTransactionRequest { transaction_id: member.terminal_transaction_id,
+                expected_streams: vec![ExpectedStreamRevision { stream_id: stream.clone(), expected_revision: source.expected_revision }], events: vec![expected.clone()] };
+            if event.transaction_id != transaction.transaction_id || receipt.transaction_id != transaction.transaction_id
+                || receipt.request_hash != request_hash_with_terminal(&transaction, None)? || receipt.commit_cursor == 0
+                || event.commit_cursor != receipt.commit_cursor || event.transaction_index != 0
+                || receipt.event_ids.as_slice() != [event.event_id.clone()] || source.stream_id != stream
+                || event.sequence != source.committed_revision || source.expected_revision.checked_add(1) != Some(source.committed_revision)
+                || event.scope != expected.event.scope || event.kind != expected.event.kind || event.status != expected.event.status
+                || event.actor != expected.event.actor || event.refs != expected.event.refs || event.payload != expected.event.payload
+                || event.schema_version != expected.schema_version || event.idempotency_key != expected.idempotency_key { return Err(invalid()); }
+            pg(tx.commit())?;
+            return Ok(runtime::OriginalMemberDecision::ConfirmedNoncommit { receipt, transaction });
+        }
+        // The real source locks plus the unique member key arbitrate with every
+        // action/rejection writer. This is a terminal decision, not inferred rollback.
+        let mut event = member.terminal_event;
+        event.event.payload["noncommit_reason"] = serde_json::json!("abandoned");
+        event.event.payload["noncommit_error_kind"] = serde_json::json!("original_owner_stopped");
+        let transaction = AppendTransactionRequest { transaction_id: member.terminal_transaction_id,
+            expected_streams: vec![ExpectedStreamRevision { stream_id: stream.clone(), expected_revision: stream_head(&mut tx, &stream)? }], events: vec![event] };
+        let receipt = append_transaction_in_tx(&mut tx, &transaction, None)?;
+        if receipt.duplicate { return Err(invalid()); }
+        pg(tx.commit())?;
+        Ok(runtime::OriginalMemberDecision::ConfirmedNoncommit { receipt, transaction })
+    }
+
+    fn original_checked_terminal_winner(
+        &self, request: &CheckedAppendRequest, terminal: &SessionTerminalInput,
+        validator: &dyn CheckedSourceValidator,
+    ) -> RuntimeEventStoreResult<Option<CheckedAppendReceipt>> {
+        if validator.frame_digest() != request.frame_digest { return Err(RuntimeEventStoreError::InvalidTransaction("source frame mismatch".into())); }
+        let mut connection = self.checkout_event_write()?;
+        let mut tx = pg(connection.transaction())?;
+        // Keep the common writer order even if a terminal transaction carries a member.
+        lock_original_member_decisions(&mut tx, &request.transaction)?;
+        let lock = format!("cowd-runtime-event-transaction:{}", request.transaction.transaction_id);
+        pg(tx.query_one("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", &[&lock]))?;
+        if pg(tx.query_opt("SELECT 1 FROM runtime_commits WHERE transaction_id=$1", &[&request.transaction.transaction_id]))?.is_none() {
+            pg(tx.rollback())?;
+            return Ok(None);
+        }
+        // The original helper checks checked identity AND the terminal outbox
+        // content on duplicate; the terminal is not in checked identity_hash.
+        let commit = append_transaction_in_tx_checked(&mut tx, &request.transaction, Some(terminal), Some((request, validator)))?;
+        if !commit.duplicate { return Err(RuntimeEventStoreError::Corrupt("terminal winner was not duplicate".into())); }
+        let row = pg(tx.query_one("SELECT checked_source_evidence FROM runtime_commits WHERE transaction_id=$1", &[&request.transaction.transaction_id]))?;
+        let evidence: Option<Value> = pg(row.try_get(0))?;
+        let validation = serde_json::from_value(evidence.ok_or_else(|| RuntimeEventStoreError::Corrupt("checked terminal evidence missing".into()))?)?;
+        pg(tx.commit())?;
+        Ok(Some(CheckedAppendReceipt { commit, validation }))
+    }
+
+    fn append_checked_terminal_cancellable(
+        &self, request: CheckedAppendRequest, terminal: SessionTerminalInput,
+        validator: &dyn CheckedSourceValidator, control: &dyn runtime::RuntimeTransactionCommitControl,
+        claim: &runtime::RuntimeOriginalSessionClaim<'_>,
+    ) -> RuntimeEventStoreResult<Option<CheckedAppendReceipt>> {
+        self.append_checked_owned_tx(request, Some(&terminal), validator, control, claim)
     }
 
     fn append_transaction_with_terminal(
@@ -2628,11 +3443,75 @@ fn append_transaction_in_tx(
     append_transaction_in_tx_checked(tx, request, terminal, None)
 }
 
+// A member's action, rejection and terminal share one ordering point before
+// transaction/claim/source locks, including the ordinary append/replay path.
+fn original_member_decision_locks(request: &AppendTransactionRequest) -> RuntimeEventStoreResult<Vec<String>> {
+    let invalid = || RuntimeEventStoreError::InvalidTransaction("member writer lacks its original index/source".into());
+    let mut keys = Vec::new();
+    for (position, input) in request.events.iter().enumerate() {
+        let event = &input.event;
+        if matches!(event.kind.as_str(), "agentic.action_applied" | "agentic.completion_rejected") && event.payload.get("member_admission").is_some() {
+            let facts = &event.payload["member_admission"];
+            let outer = facts["prepared"]["outer_key"].as_str().ok_or_else(invalid)?;
+            let index = facts["prepared"]["index"].as_u64().ok_or_else(invalid)?;
+            let markers = request.events.iter().filter(|marker| marker.event.kind == "agentic.batch_member.index"
+                && marker.event.payload["outer_key"] == outer && marker.event.payload["member_index"] == index
+                && marker.event.payload["program_event_index"].as_u64() == Some(position as u64)
+                && marker.event.payload["program_stream"] == event.stream_id
+                && marker.event.payload["program_event_kind"] == event.kind
+                && marker.event.payload["program_event_key"].as_str() == input.idempotency_key.as_deref()
+                && marker.event.payload["ticket"] == facts["ticket"]).count();
+            if markers != 1 { return Err(invalid()); }
+        }
+        if !matches!(event.kind.as_str(), "agentic.batch_member.index" | "execution.effect.member_noncommit" | "execution.effect.member_preparation") { continue; }
+        let outer = event.payload["outer_key"].as_str().filter(|s| !s.is_empty()).ok_or_else(invalid)?;
+        let index = event.payload["member_index"].as_u64().ok_or_else(invalid)?;
+        let stream = format!("execution-effect:{outer}");
+        let key = if event.kind == "execution.effect.member_preparation" { format!("agentic-member-preparation:{index}") }
+            else { format!("agentic-member:{index}") };
+        if event.stream_id != stream || input.idempotency_key.as_deref() != Some(key.as_str())
+            || !request.expected_streams.iter().any(|s| s.stream_id == stream) { return Err(invalid()); }
+        if event.kind == "agentic.batch_member.index" {
+            let position = event.payload["program_event_index"].as_u64().and_then(|n| usize::try_from(n).ok()).ok_or_else(invalid)?;
+            let action = request.events.get(position).ok_or_else(invalid)?;
+            if !matches!(action.event.kind.as_str(), "agentic.action_applied" | "agentic.completion_rejected")
+                || action.event.payload.pointer("/member_admission/prepared/outer_key").and_then(Value::as_str) != Some(outer)
+                || action.event.payload.pointer("/member_admission/prepared/index").and_then(Value::as_u64) != Some(index)
+                || action.event.payload.pointer("/member_admission/ticket") != event.payload.get("ticket")
+                || event.payload["program_stream"] != action.event.stream_id
+                || event.payload["program_event_kind"] != action.event.kind
+                || event.payload["program_event_key"].as_str() != action.idempotency_key.as_deref() { return Err(invalid()); }
+        }
+        keys.push(format!("cowd-runtime-member-decision:{}:{outer}:{index}", outer.len()));
+    }
+    keys.sort(); keys.dedup();
+    Ok(keys)
+}
+fn lock_original_member_decisions(tx: &mut PostgresTransaction<'_>, request: &AppendTransactionRequest) -> RuntimeEventStoreResult<()> {
+    for key in original_member_decision_locks(request)? {
+        pg(tx.query_one("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", &[&key]))?;
+    }
+    Ok(())
+}
+
 fn append_transaction_in_tx_checked(
     tx: &mut PostgresTransaction<'_>,
     request: &AppendTransactionRequest,
     terminal: Option<&SessionTerminalInput>,
     checked: Option<(&CheckedAppendRequest, &dyn CheckedSourceValidator)>,
+) -> RuntimeEventStoreResult<AppendTransactionReceipt> {
+    append_transaction_in_tx_checked_charged(
+        tx, request, terminal, checked, SessionOwnerReadCharge::default(), std::time::Instant::now(),
+    )
+}
+
+fn append_transaction_in_tx_checked_charged(
+    tx: &mut PostgresTransaction<'_>,
+    request: &AppendTransactionRequest,
+    terminal: Option<&SessionTerminalInput>,
+    checked: Option<(&CheckedAppendRequest, &dyn CheckedSourceValidator)>,
+    pre_read: SessionOwnerReadCharge,
+    held_since: std::time::Instant,
 ) -> RuntimeEventStoreResult<AppendTransactionReceipt> {
     validate_transaction(request)?;
     RuntimeEventStore::validate_current_content_inputs(request)?;
@@ -2648,7 +3527,7 @@ fn append_transaction_in_tx_checked(
         Some((request, _)) => request.identity_hash()?,
         None => request_hash_with_terminal(request, terminal)?,
     };
-    let held_since = std::time::Instant::now();
+    lock_original_member_decisions(tx, request)?;
     let transaction_lock = format!("cowd-runtime-event-transaction:{}", request.transaction_id);
     pg(tx.query_one(
         "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
@@ -2688,10 +3567,18 @@ fn append_transaction_in_tx_checked(
     let mut evidence = checked.map(|(request, _)| CheckedSourceEvidence {
         frame_digest: request.frame_digest.clone(),
         sources: Vec::new(),
-        events_read: 0,
-        bytes_read: 0,
-        pages_read: 0,
+        events_read: pre_read.events,
+        bytes_read: pre_read.bytes,
+        pages_read: pre_read.pages,
     });
+    if let (Some((checked, _)), Some(evidence)) = (checked, evidence.as_ref()) {
+        if evidence.events_read > checked.budget.max_events || evidence.bytes_read > checked.budget.max_bytes
+            || evidence.pages_read > checked.budget.max_pages
+            || held_since.elapsed().as_millis() > u128::from(checked.budget.max_lock_millis)
+        {
+            return Err(RuntimeEventStoreError::HistoryBudgetExceeded("cumulative owner source budget".into()));
+        }
+    }
     for stream in &request.expected_streams {
         let actual = stream_head(tx, &stream.stream_id)?;
         if let Some((checked, validator)) = checked {

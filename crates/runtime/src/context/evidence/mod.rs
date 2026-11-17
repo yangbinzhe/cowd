@@ -1,5 +1,7 @@
 pub mod projection;
 pub mod raw;
+mod grep;
+pub(crate) use grep::{grep_original_input_matches, grep_read_target, grep_read_target_for_parent, grep_read_target_for_composite, original_read_file_domain};
 
 use harness_contract::context::EvidenceContentKind;
 use harness_contract::reality::EvidenceRef;
@@ -13,8 +15,16 @@ pub use projection::audit_projection;
 
 pub(crate) const READ_ACQUISITION_FIELD: &str = "read_acquisition_v1";
 pub(crate) const CHILD_READ_ACQUISITIONS_FIELD: &str = "child_read_acquisitions_v1";
+
+/// 033 S3: how many returned chunks one acquisition seal can carry.
+///
+/// The seal proves the returned body chunk by chunk (digest, byte count and
+/// byte range), so the capacity is a receipt-size budget. 256 chunks of
+/// 1500 bytes is about 384 KB of artifact body, and the seal metadata it
+/// costs stays inside the receipt budget the effect receipt already uses.
+pub(crate) const READ_CHUNK_SEAL_CAPACITY: usize = 256;
 pub(crate) fn native_read_candidate_tool(name: &str) -> bool {
-    matches!(name, "read_file" | "read_ref" | "evidence_retrieve" | "tool_orchestrate")
+    matches!(name, "read_file" | "read_ref" | "evidence_retrieve" | "tool_orchestrate" | "grep_search")
 }
 pub(crate) const NATIVE_DELIVERY_KIND: &str = "context.model_input_observed";
 pub(crate) const PROCESS_DELIVERY_KIND: &str = "context.agent_channel_sent";
@@ -409,9 +419,36 @@ pub(crate) fn read_body_seal(tool_name: &str, output: &str) -> Option<ReadBodySe
         if value["kind"] != "evidence_retrieve" || value["available"] != true {
             return None;
         }
-        let total_chunks = value["total_chunks"].as_u64()?;
         let values = value["chunks"].as_array()?;
-        if values.len() > 16 {
+        // 033 S8: the seal builder must judge the envelope the read tool
+        // actually produces. The tool carries the artifact's total size and
+        // the chunk width, not a chunk count; demanding a field it never
+        // writes left every artifact read unsealed, and an unsealed read has
+        // no original physical extent - the review could then never judge it.
+        // The count is derived from the two numbers the tool does write; every
+        // proof check below is unchanged.
+        let total_chunks = match value["total_chunks"].as_u64() {
+            Some(total) => total,
+            None => {
+                let bytes = value["bytes"].as_u64()?;
+                let width = value["chunk_bytes"].as_u64()?;
+                if width == 0 {
+                    return None;
+                }
+                bytes.div_ceil(width)
+            }
+        };
+        // 033 S3 (seal capacity is a budget, not a proof): the per-chunk
+        // acquisition seal carries one digest per returned chunk, so the
+        // number of chunks it can carry is a receipt-size budget. Refusing to
+        // seal a read that returned more chunks than the budget left the
+        // receipt unsealed, and an unsealed read has no original physical
+        // extent: every later review of that read was refused with
+        // "proof_actual_input_extent_unsupported: actual read lacks an
+        // original physical extent" and the review turn could never reach a
+        // terminal answer. The budget is raised to the size the seal
+        // metadata can carry; every proof check below is unchanged.
+        if values.len() > READ_CHUNK_SEAL_CAPACITY {
             return None;
         }
         if total_chunks == 0 {
@@ -492,8 +529,8 @@ pub(crate) fn child_read_acquisitions(
 ) -> Option<Vec<serde_json::Value>> {
     let auth = request.authorization.as_ref()?;
     let parent = request.compiled_invocation.as_ref()?;
-    if request.tool_name != "tool_orchestrate" || !scope.complete
-        || parent.effect.tool_id != "tool_orchestrate"
+    if !matches!(request.tool_name.as_str(), "tool_orchestrate" | "grep_search")
+        || parent.effect.tool_id != request.tool_name
         || parent.effect.descriptor_hash != auth.descriptor_hash || auth.request_id.is_empty()
         || parent.invocation_id != request.tool_use_id
         || request.step_binding.as_ref().is_none_or(|binding| binding.origin.call_id != request.tool_use_id
@@ -505,18 +542,39 @@ pub(crate) fn child_read_acquisitions(
     let mut prefix_count = 0usize;
     for child in children {
         let effect = child.effect();
-        if child.parent_request_id() != auth.request_id
+        let direct_batch = if request.tool_name == "grep_search" {
+            serde_json::from_str::<serde_json::Value>(&request.input).ok().is_some_and(|input| {
+                let child_value = serde_json::json!({"parent_tool_name":"grep_search", "step_index":child.step_index(),
+                    "step_id":child.step_id(), "position":child.position(), "batch_index":child.grep_batch_index(),
+                    "input":child.input(), "input_sha256":read_sha256(&serde_json::to_vec(child.input()).unwrap_or_default()),
+                    "effect":effect});
+                grep::direct_grep_file_domain(&input, &parent.effect, scope, &child_value)
+                    && parent.effect.scopes.iter().all(|s| auth.authorization_lease.scopes.contains(s))
+            })
+        } else { false };
+        let composite_file_domain = request.tool_name == "tool_orchestrate"
+            && original_read_file_domain(&parent.effect, scope)
+            && parent.effect.scopes.iter().all(|item| auth.authorization_lease.scopes.contains(item));
+        if (!scope.complete && !direct_batch && !composite_file_domain) || child.parent_request_id() != auth.request_id
             || child.parent_descriptor_hash() != auth.descriptor_hash
             || child.parent_authorization() != auth
-            || !positions.insert((child.step_index(), child.position()))
-            || effect.tool_id != "read_file"
+            || !positions.insert((child.step_index(), child.position(), child.grep_batch_index()))
+            || !matches!(effect.tool_id.as_str(), "read_file" | "grep_search")
             || effect.effect_kind != harness_contract::tool::ToolEffectKind::Read
             || effect.uses_network || effect.spawns_process || effect.mutates_packages || effect.mutates_system
             || effect.scopes.is_empty()
-            || !effect.scopes.iter().all(|s| auth.authorization_lease.scopes.contains(s)
+            || (!direct_batch && !effect.scopes.iter().all(|s| auth.authorization_lease.scopes.contains(s)
                 && parent.effect.scopes.contains(s)
-                && scope.targets.iter().filter(|t| &t.declared_scope == s).count() == 1)
+                && (scope.targets.iter().filter(|t| &t.declared_scope == s).count() == 1
+                    || composite_file_domain
+                        && s.resource == harness_contract::policy::PermissionResource::Tool
+                        && s.operation == harness_contract::policy::PermissionOperation::Read)))
         { return None; }
+        if effect.tool_id == "grep_search" {
+            records.extend(grep::acquisitions(request, scope, child)?);
+            if records.len() > 400 { return None; }
+            continue;
+        }
         let body = read_body_seal("read_file", child.output())?;
         let output: serde_json::Value = serde_json::from_str(child.output()).ok()?;
         let content = output["file"]["content"].as_str()?;
@@ -550,6 +608,55 @@ pub(crate) fn child_read_acquisitions(
     Some(records)
 }
 
+/// Compare the committed records with every position/window in the original
+/// child trace. Equal counts alone cannot prove a one-to-one correspondence.
+pub(crate) fn original_child_coverage_complete(
+    children: &[tools::OrchestratedRead], records: &[serde_json::Value],
+) -> bool {
+    let mut expected = std::collections::BTreeSet::new();
+    for child in children {
+        match child.effect().tool_id.as_str() {
+            "read_file" => {
+                if !expected.insert((child.step_index() as u64, child.position() as u64,
+                    None, None)) { return false; }
+            }
+            "grep_search" => {
+                let Some(windows) = child.grep_windows() else { return false; };
+                if windows.is_empty() { return false; }
+                for index in 0..windows.len() {
+                    if !expected.insert((child.step_index() as u64, child.position() as u64,
+                        child.grep_batch_index().map(|value| value as u64), Some(index as u64))) {
+                        return false;
+                    }
+                }
+            }
+            _ => return false,
+        }
+    }
+    child_record_coverage_matches(&expected, records)
+}
+
+fn child_record_coverage_matches(
+    expected: &std::collections::BTreeSet<(u64, u64, Option<u64>, Option<u64>)>,
+    records: &[serde_json::Value],
+) -> bool {
+    let mut actual = std::collections::BTreeSet::new();
+    for record in records {
+        let Some(step) = record["step_index"].as_u64() else { return false; };
+        let Some(position) = record["position"].as_u64() else { return false; };
+        let (batch, window) = match record["tool_name"].as_str() {
+            Some("read_file") if record["batch_index"].is_null() && record["window_index"].is_null() => (None, None),
+            Some("grep_search") => {
+                let Some(window) = record["window_index"].as_u64() else { return false; };
+                (record["batch_index"].as_u64(), Some(window))
+            }
+            _ => return false,
+        };
+        if !actual.insert((step, position, batch, window)) { return false; }
+    }
+    &actual == expected
+}
+
 /// Match only a literal batch member at its original program location. This
 /// function proves bytes in the supplied presentation, not its wire delivery;
 /// the caller must first bind the whole presentation to the accepted wire.
@@ -558,23 +665,32 @@ pub(crate) fn child_read_presented_extent(
     presentation: &str,
     child: &serde_json::Value,
 ) -> Option<serde_json::Value> {
+    if child["tool_name"] == "grep_search" {
+        return grep::presented_extent(parent_input, presentation, child);
+    }
     let input: serde_json::Value = serde_json::from_str(parent_input).ok()?;
     let steps = input["steps"].as_array()?;
     let index = usize::try_from(child["step_index"].as_u64()?).ok()?;
     let position = usize::try_from(child["position"].as_u64()?).ok()?;
     let step = steps.get(index)?;
     let id = step["id"].as_str()?;
-    if child["step_id"] != id || step["op"] != "batch"
-        || steps.iter().filter(|step| step["id"] == id).count() != 1 { return None; }
-    let calls = step["calls"].as_array()?;
-    let call = calls.get(position)?;
+    if child["step_id"] != id || steps.iter().filter(|step| step["id"] == id).count() != 1 { return None; }
+    let (call, alias) = match step["op"].as_str()? {
+        "call" if position == 0 => (step, None),
+        "batch" => {
+            let calls = step["calls"].as_array()?;
+            let call = calls.get(position)?;
+            let alias = call["as"].as_str().map(str::to_string)
+                .unwrap_or_else(|| format!("read_file[{position}]"));
+            if calls.iter().enumerate().filter(|(i, call)| {
+                call["as"].as_str().map(str::to_string)
+                    .unwrap_or_else(|| format!("{}[{i}]", call["tool"].as_str().unwrap_or(""))) == alias
+            }).count() != 1 { return None; }
+            (call, Some(alias))
+        }
+        _ => return None,
+    };
     if call["tool"] != "read_file" { return None; }
-    let alias = call["as"].as_str().map(str::to_string)
-        .unwrap_or_else(|| format!("read_file[{position}]"));
-    if calls.iter().enumerate().filter(|(i, call)| {
-        call["as"].as_str().map(str::to_string)
-            .unwrap_or_else(|| format!("{}[{i}]", call["tool"].as_str().unwrap_or(""))) == alias
-    }).count() != 1 { return None; }
     let prefix = format!("Tool `tool_orchestrate` completed. Evidence: tool://");
     let tail = presentation.strip_prefix(&prefix)?;
     let (_, mut body) = tail.split_once(". ")?;
@@ -585,7 +701,7 @@ pub(crate) fn child_read_presented_extent(
     if selected.is_some_and(|selected| selected != format!("${id}")) { return None; }
     let result = &value["result"];
     let batch = if selected.is_some() || (partial && steps.len() == 1) { result } else { &result[id] };
-    let member = &batch[&alias];
+    let member = alias.as_ref().map_or(batch, |alias| &batch[alias]);
     let output = if partial {
         if member["source_tool"] != "read_file" || member["ok"] != true { return None; }
         &member["output"]
@@ -1039,10 +1155,27 @@ pub(crate) fn build_tool_receipt_for_delivery(
     let prefix_tokens = estimate_text_tokens(&fixed_prefix);
     let body_budget = token_budget.saturating_sub(prefix_tokens).max(1);
     let raw_lines = output.lines().count();
-    let (body, body_omitted) = if preserve_complete_read && tool_name == "read_file" && !is_error {
+    if tool_name == "grep_search" && !is_error
+        && estimate_text_tokens(&format!("{fixed_prefix}{}", summarize_json(tool_name, output))) > token_budget
+    {
+        if let Some((summary, truncated)) = compact_grep_batch(output, original_input, &fixed_prefix, token_budget) {
+            return ModelReceipt {
+                evidence_ref, content_kind, receipt_tokens: estimate_text_tokens(&summary),
+                raw_tokens, omitted_tokens: if truncated { raw_tokens.saturating_sub(estimate_text_tokens(&summary)).max(1) } else { 0 },
+                summary, truncated,
+            };
+        }
+    }
+    let (body, body_omitted) = if preserve_complete_read
+        && tool_name == "read_file"
+        && !is_error
+        && raw_tokens <= body_budget
+    {
         // A complete acquisition must not lose its middle to a second generic
         // receipt summary. The original request packing/capacity and wire proof
-        // still decide whether these actual bytes reach the model.
+        // still decide whether these actual bytes reach the model. A body that
+        // exceeds the granted receipt budget cannot be delivered whole, so it
+        // must stay explicitly incomplete instead of claiming false EOF.
         (output.to_string(), false)
     } else {
         let recover_ref = (durable_recovery && tool_name == "tool_orchestrate")
@@ -1083,6 +1216,50 @@ pub(crate) fn build_tool_receipt_for_delivery(
         },
         truncated: body_omitted,
     }
+}
+
+// Preserve only complete original batch members. A missing member is never a
+// successful read, and the proof consumer still authenticates each member.
+fn compact_grep_batch(output: &str, original_input: Option<&str>, prefix: &str, budget: u64) -> Option<(String, bool)> {
+    let source: serde_json::Value = serde_json::from_str(output).ok()?;
+    if source.get("type")?.as_str()? != "grep_search" || !source.get("results")?.is_array() { return None; }
+    let minimal = || {
+        let body = serde_json::json!({"complete":false}).to_string();
+        let with_prefix = format!("{prefix}{body}");
+        if estimate_text_tokens(&with_prefix) <= budget { Some((with_prefix, true)) }
+        else { Some((String::new(), true)) }
+    };
+    let Some(input) = original_input.and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok()) else { return minimal(); };
+    let members = source.get("results")?.as_array()?;
+    let Some(searches) = input.get("searches").and_then(serde_json::Value::as_array) else { return minimal(); };
+    if members.len() != searches.len() || source.get("count").and_then(serde_json::Value::as_u64) != Some(members.len() as u64)
+        || members.iter().enumerate().any(|(i, member)| member.get("index").and_then(serde_json::Value::as_u64) != Some(i as u64)) {
+        return minimal();
+    }
+    let compact_original = format!("{prefix}{source}");
+    if estimate_text_tokens(&compact_original) <= budget { return Some((compact_original, false)); }
+    let omitted = |i: usize| serde_json::json!({"index":i,"status":"omitted"});
+    let mut result = serde_json::json!({
+        "type":"grep_search", "complete":false,
+        "continuation":"Repeat omitted searches with a narrower request; omitted members were not delivered.",
+        "results":(0..members.len()).map(omitted).collect::<Vec<_>>()
+    });
+    let render = |value: &serde_json::Value| format!("{prefix}{value}");
+    if estimate_text_tokens(&render(&result)) > budget {
+        result = serde_json::json!({"type":"grep_search","complete":false,"results":[],
+            "omitted_count":members.len(),"continuation":"Repeat omitted searches with a narrower request."});
+        if estimate_text_tokens(&render(&result)) > budget {
+            return minimal();
+        }
+        return Some((render(&result), true));
+    }
+    for (i, member) in members.iter().enumerate() {
+        result["results"][i] = member.clone();
+        if estimate_text_tokens(&render(&result)) > budget {
+            result["results"][i] = omitted(i);
+        }
+    }
+    Some((render(&result), true))
 }
 
 fn classify_content(output: &str, is_error: bool) -> EvidenceContentKind {
@@ -1472,6 +1649,269 @@ fn truncate_head_tail(
 
 #[cfg(test)]
 mod tests {
+
+    /// 033 S3: the acquisition seal is a receipt-size budget, not a proof
+    /// requirement. A delegated child that read an artifact in more chunks
+    /// than the old budget (the live runs read 28 and 34 chunk artifacts)
+    /// used to settle without a seal, and an unsealed read has no original
+    /// physical extent - every later review of it was refused.
+    #[test]
+    fn s3_b_a_read_beyond_the_old_chunk_budget_still_settles_with_a_seal() {
+        let chunks: Vec<serde_json::Value> = (0..34)
+            .map(|index| serde_json::json!({
+                "index": index,
+                "content": "x",
+                "byte_start": index * 1500,
+                "byte_end": index * 1500 + 1,
+            }))
+            .collect();
+        let output = serde_json::json!({
+            "kind": "evidence_retrieve",
+            "available": true,
+            "evidence_ref": "artifact://art-s3",
+            "sha256": format!("sha256:{}", "a".repeat(64)),
+            "bytes": 34 * 1500,
+            "total_chunks": 34,
+            "chunks": chunks,
+        });
+        let sealed = super::read_body_seal("read_ref", &output.to_string())
+            .expect("a read beyond the old chunk budget still proves its extent");
+        match sealed.extent {
+            super::ReadExtent::ArtifactChunks { total_chunks, chunks } => {
+                assert_eq!(total_chunks, 34);
+                assert_eq!(chunks.len(), 34, "every returned chunk is proven");
+            }
+            other => panic!("a chunked artifact read seals as chunk coverage: {other:?}"),
+        }
+    }
+
+
+    /// 033 S8 (F2 repro control): the acquisition seal must recognise the
+    /// envelope the read tool actually produces.
+    ///
+    /// The live S8 runs read small artifacts through `read_ref`, and the
+    /// envelope the tool returns carries `available`, `bytes`, `chunk_bytes`,
+    /// `chunks` (with `index`/`byte_start`/`byte_end`/`content`/`encoding`)
+    /// and `coverage` - it does NOT carry `total_chunks`. The seal builder
+    /// demanded `total_chunks`, so every artifact read settled without a
+    /// seal, and the review's actual-input judgment had to refuse it.
+    ///
+    /// Green form: after the fix the same live envelope carries a seal, so
+    /// the read has a home - the sealed path, where its extent is proven.
+    #[test]
+    fn s8_a_the_live_read_envelope_shape_has_no_acquisition_seal() {
+        let live = serde_json::json!({
+            "kind": "evidence_retrieve",
+            "available": true,
+            "bytes": 65,
+            "chunk_bytes": 1500,
+            "encoding": "utf8",
+            "evidence_ref": "artifact://art_676785eb2ac14fc8bc5204a94cd00fa1",
+            "sha256": format!("sha256:{}", "a".repeat(64)),
+            "coverage": {
+                "byte_start": 0, "byte_end": 65, "complete": true,
+                "selection": "sequential_content", "total_bytes": 65
+            },
+            "chunks": [{
+                "index": 0, "byte_start": 0, "byte_end": 65,
+                "content": "I have sufficient evidence. Writing the report and submitting it.",
+                "encoding": "utf8"
+            }]
+        });
+        let sealed = super::read_body_seal("read_ref", &live.to_string())
+            .expect("GREEN: the live envelope shape yields an acquisition seal, so the read has a home");
+        match sealed.extent {
+            super::ReadExtent::ArtifactChunks { total_chunks, chunks } => {
+                assert_eq!(total_chunks, 1, "the artifact's chunk count is derived");
+                assert_eq!(chunks.len(), 1, "the returned chunk is proven");
+            }
+            other => panic!("a chunked artifact read seals as chunk coverage: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn original_child_coverage_rejects_duplicate_in_place_of_missing_window() {
+        let expected = [(0, 0, Some(0), Some(0)), (0, 0, Some(0), Some(1))]
+            .into_iter().collect();
+        let first = serde_json::json!({"tool_name":"grep_search", "step_index":0,
+            "position":0, "batch_index":0, "window_index":0});
+        let second = serde_json::json!({"tool_name":"grep_search", "step_index":0,
+            "position":0, "batch_index":0, "window_index":1});
+        assert!(super::child_record_coverage_matches(&expected, &[first.clone(), second]));
+        assert!(!super::child_record_coverage_matches(&expected, &[first.clone(), first]));
+    }
+
+    #[test]
+    fn grep_batch_receipt_keeps_whole_members_within_original_budget() {
+        let input = serde_json::json!({"searches":[{"pattern":"a"},{"pattern":"b"},{"pattern":"c"}]});
+        let member = |index, text: String| serde_json::json!({"index":index,"status":"success",
+            "output":{"mode":"content","content":text,"scanComplete":true,"truncated":false,"omissions":[]}});
+        let first = member(0, "small first".into());
+        let middle = member(1, "x".repeat(20000));
+        let last = member(2, "small last".into());
+        let output = serde_json::json!({"type":"grep_search","count":3,"results":[first.clone(),middle.clone(),last.clone()]}).to_string();
+        let reference = super::EvidenceRef::observed("tool", "batch-test");
+        let prefix = format!("Tool `grep_search` completed. Evidence: tool://{}. ", reference.id());
+        let receipt = super::build_tool_receipt_for_delivery("grep_search", &output, false,
+            reference, 400, false, false, Some(&input.to_string()));
+        assert!(receipt.truncated);
+        assert!(receipt.receipt_tokens <= 400);
+        let body = receipt.summary.strip_prefix(&prefix).expect("original tool receipt prefix");
+        let actual: serde_json::Value = serde_json::from_str(body).unwrap();
+        assert_eq!(actual["results"][0], first);
+        assert_eq!(actual["results"][1]["status"], "omitted");
+        assert_eq!(actual["results"][2], last);
+        assert_eq!(actual["complete"], false);
+        let child = |index: usize, presentation: &str| serde_json::json!({
+            "parent_tool_name":"grep_search", "tool_name":"grep_search", "step_index":0, "step_id":"", "position":0,
+            "batch_index":index, "input":input["searches"][index],
+            "input_sha256":super::read_sha256(&serde_json::to_vec(&input["searches"][index]).unwrap()),
+            "output_row":0, "presentation":presentation,
+            "body":{"extent":{"kind":"file_lines","start_line":1,"line_count":1}}
+        });
+        assert!(super::child_read_presented_extent(&input.to_string(), &receipt.summary, &child(0, "small first")).is_some());
+        assert!(super::child_read_presented_extent(&input.to_string(), &receipt.summary, &child(1, &"x".repeat(20000))).is_none());
+        assert!(super::child_read_presented_extent(&input.to_string(), &receipt.summary, &child(2, "small last")).is_some());
+        let mut foreign = child(0, "small first");
+        foreign["input"]["pattern"] = serde_json::json!("foreign");
+        assert!(super::child_read_presented_extent(&input.to_string(), &receipt.summary, &foreign).is_none());
+        let zero = super::build_tool_receipt_for_delivery("grep_search", &output, false,
+            super::EvidenceRef::observed("tool", "batch-test"), 0, false, false, Some(&input.to_string()));
+        assert!(zero.truncated && zero.summary.is_empty());
+        assert!(super::child_read_presented_extent(&input.to_string(), &zero.summary, &child(0, "small first")).is_none());
+        let reference = super::EvidenceRef::observed("tool", "batch-test");
+        let minimal = format!("Tool `grep_search` completed. Evidence: tool://{}. {{\"complete\":false}}", reference.id());
+        let minimum_budget = super::estimate_text_tokens(&minimal);
+        let too_small = super::build_tool_receipt_for_delivery("grep_search", &output, false,
+            reference, minimum_budget, false, false, Some(&input.to_string()));
+        assert!(too_small.truncated);
+        assert_eq!(too_small.summary, minimal);
+        assert!(too_small.receipt_tokens <= minimum_budget);
+        assert!(super::child_read_presented_extent(&input.to_string(), &too_small.summary, &child(0, "small first")).is_none());
+        let count_input = serde_json::json!({"searches":[{"pattern":"a"}]}).to_string();
+        let count_receipt = format!("Tool `grep_search` completed. Evidence: tool://batch-test. {}",
+            serde_json::json!({"results":[{"index":0,"status":"success","output":{"mode":"count","content":null}}]}));
+        let mut count_child = child(0, "small first");
+        count_child["input"] = serde_json::json!({"pattern":"a"});
+        assert!(super::child_read_presented_extent(&count_input, &count_receipt, &count_child).is_none());
+        let full = super::build_tool_receipt_for_delivery("grep_search", &output, false,
+            super::EvidenceRef::observed("tool", "batch-test"), 30000, false, false, Some(&input.to_string()));
+        assert!(!full.truncated);
+        assert!(full.summary.contains(&middle.to_string()));
+    }
+
+    #[test]
+    fn grep_batch_receipt_rejects_unbound_members_and_honours_tiny_budget() {
+        let input = serde_json::json!({"searches":[{"pattern":"x"},{"pattern":"y"}]}).to_string();
+        let duplicate = serde_json::json!({"type":"grep_search","count":2,"results":[
+            {"index":0,"status":"success"},{"index":0,"status":"success"}]}).to_string();
+        for source in [None, Some(input.as_str())] {
+            let (shown, incomplete) = super::compact_grep_batch(&duplicate, source, "", 100).unwrap();
+            assert!(incomplete);
+            let body: serde_json::Value = serde_json::from_str(&shown).unwrap();
+            assert_eq!(body["complete"], false);
+            assert!(body["results"].is_null());
+        }
+        let unknown = serde_json::json!({"type":"grep_search","count":2,"results":[
+            {"index":0,"status":"success"},{"index":9,"status":"success"}]}).to_string();
+        let (shown, _) = super::compact_grep_batch(&unknown, Some(&input), "", 100).unwrap();
+        assert!(serde_json::from_str::<serde_json::Value>(&shown).unwrap()["results"].is_null());
+        let single = serde_json::json!({"mode":"content","content":"x"}).to_string();
+        assert!(super::compact_grep_batch(&single, Some(&input), "", 100).is_none());
+        let (tiny, incomplete) = super::compact_grep_batch(&duplicate, Some(&input), "prefix", 0).unwrap();
+        assert!(incomplete);
+        assert!(tiny.is_empty());
+        assert_eq!(super::estimate_text_tokens(&tiny), 0);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn grep_samecall_target_requires_original_file_identity() {
+        use harness_contract::context::{EvidenceCoverageKind, WorkspaceAccessMode};
+        use harness_contract::goal::{ProofEffectScope, ProofEffectTarget};
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("a.txt"), "original\n").unwrap();
+        let resolver = crate::path_identity::WorkspacePathIdentityResolver::discover(root.path()).unwrap();
+        let path = resolver.resolve_existing("a.txt").unwrap();
+        let admitted = resolver.physical_file_identity_at_admission(&path).unwrap().unwrap();
+        let lease = tools::ToolHost::builtin("grep-identity", root.path()).pin_snapshot();
+        let resolution = lease.describe_effect_resolution("grep_search", &serde_json::json!({"path":"a.txt","pattern":".*"}));
+        let scope = ProofEffectScope {
+            version:2, descriptor_hash:resolution.descriptor.descriptor_hash.clone(), complete:true,
+            scope_purposes:resolution.scope_purposes,
+            targets:vec![ProofEffectTarget { path:path.clone(), declared_scope:resolution.descriptor.scopes[0].clone(),
+                access_mode:WorkspaceAccessMode::Read, coverage:EvidenceCoverageKind::ScopedContent,
+                exact:true, alias_checked:true, physical_identity:Some(admitted.clone()) }],
+        };
+        // Candidate validation only; these values are not appended as a receipt.
+        let mut child = serde_json::json!({"relative_path":"a.txt","physical_identity":admitted,
+            "effect":resolution.descriptor,"body":{"source_sha256":super::read_sha256(b"original\n")}});
+        assert!(super::grep_read_target(&scope, &child).is_some());
+        let mut missing = scope.clone(); missing.targets[0].physical_identity = None;
+        assert!(super::grep_read_target(&missing, &child).is_none());
+        std::fs::rename(root.path().join("a.txt"), root.path().join("old.txt")).unwrap();
+        std::fs::write(root.path().join("a.txt"), "replacement\n").unwrap();
+        child["physical_identity"] = serde_json::json!(resolver.physical_file_identity_at_admission(&path).unwrap().unwrap());
+        assert!(super::grep_read_target(&scope, &child).is_none());
+        let directory = resolver.resolve_existing(".").unwrap();
+        assert!(resolver.physical_file_identity_at_admission(&directory).unwrap().is_none());
+        let mut directory_scope = scope; directory_scope.targets[0].path = directory;
+        directory_scope.targets[0].physical_identity = None;
+        assert!(super::grep_read_target(&directory_scope, &child).is_none(), "lexical prefix is not ancestry");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn direct_grep_file_domain_keeps_parent_and_physical_scope_bound() {
+        use harness_contract::context::{EvidenceCoverageKind, WorkspaceAccessMode};
+        use harness_contract::goal::{ProofEffectScope, ProofEffectTarget};
+        use harness_contract::policy::PermissionResource;
+        let root = tempfile::tempdir().unwrap();
+        let resolver = crate::path_identity::WorkspacePathIdentityResolver::discover(root.path()).unwrap();
+        let path = resolver.resolve_existing(".").unwrap();
+        let lease = tools::ToolHost::builtin("grep-parent-scope", root.path()).pin_snapshot();
+        let member = serde_json::json!({"pattern":"hit"});
+        let input = serde_json::json!({"path":root.path().to_str().unwrap(),"searches":[member]});
+        let resolution = lease.describe_effect_resolution("grep_search", &input);
+        let file = resolution.descriptor.scopes.iter().find(|s| s.resource == PermissionResource::File).unwrap().clone();
+        let scope = ProofEffectScope { version:2, descriptor_hash:resolution.descriptor.descriptor_hash.clone(),
+            scope_purposes:resolution.scope_purposes, complete:false, targets:vec![ProofEffectTarget {
+                path, declared_scope:file, access_mode:WorkspaceAccessMode::Read,
+                coverage:EvidenceCoverageKind::ScopedContent, exact:false, alias_checked:false, physical_identity:None,
+            }] };
+        let effect = lease.describe_effect("grep_search", &input["searches"][0]);
+        let mut child = serde_json::json!({"parent_tool_name":"grep_search","step_index":0,"step_id":"","position":0,
+            "batch_index":0,"input":input["searches"][0],"input_sha256":super::read_sha256(&serde_json::to_vec(&input["searches"][0]).unwrap()),"effect":effect});
+        assert!(super::grep::direct_grep_file_domain(&input, &resolution.descriptor, &scope, &child));
+        child["batch_index"] = serde_json::json!(1);
+        assert!(!super::grep::direct_grep_file_domain(&input, &resolution.descriptor, &scope, &child));
+        child["batch_index"] = serde_json::json!(0);
+        child["input"]["pattern"] = serde_json::json!("foreign");
+        assert!(!super::grep::direct_grep_file_domain(&input, &resolution.descriptor, &scope, &child));
+        child["input"] = input["searches"][0].clone();
+        assert!(super::grep::direct_grep_file_domain(&input, &resolution.descriptor, &scope, &child));
+        let mut missing = scope.clone(); missing.targets.clear();
+        assert!(!super::grep::direct_grep_file_domain(&input, &resolution.descriptor, &missing, &child));
+    }
+
+    #[test]
+    fn grep_samecall_delivery_rejects_summary_wrong_window_and_child_input() {
+        let input = serde_json::json!({"pattern":"hit","path":"a.txt"});
+        let mut child = serde_json::json!({"parent_tool_name":"grep_search","step_index":0,"step_id":"","position":0,
+            "input":input,"input_sha256":super::read_sha256(&serde_json::to_vec(&input).unwrap()),
+            "tool_name":"grep_search","output_row":0,"presentation":"a.txt:1:hit",
+            "body":{"extent":{"kind":"file_lines","start_line":1,"line_count":1}}});
+        let presented = "Tool `grep_search` completed. Evidence: tool://original. {\"mode\":\"content\",\"content\":\"a.txt:1:hit\"}";
+        assert!(super::child_read_presented_extent(&input.to_string(), presented, &child).is_some());
+        assert!(super::child_read_presented_extent(&input.to_string(), "summary only", &child).is_none());
+        assert!(super::child_read_presented_extent(&input.to_string(), &presented[..presented.len()-1], &child).is_none());
+        child["output_row"] = serde_json::json!(1);
+        assert!(super::child_read_presented_extent(&input.to_string(), presented, &child).is_none());
+        child["output_row"] = serde_json::json!(0);
+        child["input"]["path"] = serde_json::json!("foreign.txt");
+        assert!(super::child_read_presented_extent(&input.to_string(), presented, &child).is_none());
+    }
+
     #[test]
     fn child_preview_requires_original_position_and_exact_content() {
         let input = serde_json::json!({"steps":[{"id":"r","op":"batch","calls":[{"tool":"read_file","input":{"path":"a"}}]}]}).to_string();
@@ -1505,6 +1945,24 @@ mod tests {
         value["result"]["read_file[0]"]["output"]["file"]["sha256"] = serde_json::json!("abc");
         let duplicate = serde_json::json!({"steps":[{"id":"r","op":"batch","calls":[{"tool":"read_file"}]},{"id":"r","op":"batch","calls":[]}]}).to_string();
         assert!(super::child_read_presented_extent(&duplicate, &show(&value), &child).is_none());
+    }
+
+    #[test]
+    fn original_single_child_delivery_keeps_original_position_and_body() {
+        let input = serde_json::json!({"steps":[{"id":"r","op":"call","tool":"read_file","input":{"path":"a"}}]}).to_string();
+        let child = serde_json::json!({"step_index":0,"step_id":"r","position":0,"body":{"source_ref":"a",
+            "extent":{"kind":"file_lines","start_line":1,"line_count":1,"total_lines":1,
+                "body_bytes":1,"body_sha256":super::read_sha256(b"x"),
+                "ends_with_newline":false,"source_omitted":false}},"prefixes":[]});
+        let result = serde_json::json!({"result":{"r":{"file":{"filePath":"a","content":"x",
+            "startLine":1,"numLines":1,"totalLines":1}}}});
+        let shown = format!("Tool `tool_orchestrate` completed. Evidence: tool://original. {result}");
+        assert!(super::child_read_presented_extent(&input, &shown, &child).is_some());
+        let mut foreign = child.clone(); foreign["position"] = serde_json::json!(1);
+        assert!(super::child_read_presented_extent(&input, &shown, &foreign).is_none());
+        let mut changed = result.clone(); changed["result"]["r"]["file"]["content"] = serde_json::json!("y");
+        let shown = format!("Tool `tool_orchestrate` completed. Evidence: tool://original. {changed}");
+        assert!(super::child_read_presented_extent(&input, &shown, &child).is_none());
     }
 
     #[test]
@@ -1947,6 +2405,39 @@ mod tests {
             assert!(!receipt.truncated);
             assert_eq!(receipt.omitted_tokens, 0);
         }
+    }
+
+    #[test]
+    fn complete_read_above_the_granted_budget_cannot_claim_a_complete_receipt() {
+        let reference = EvidenceRef::observed("tool", "oversized-complete");
+        let small = build_tool_receipt_for_delivery(
+            "read_file",
+            "alpha\nbeta\n",
+            false,
+            reference.clone(),
+            4_096,
+            true,
+            false,
+            Some(r#"{"path":"target.txt","complete":true}"#),
+        );
+        assert!(!small.truncated, "a body inside the grant stays complete");
+        assert_eq!(small.omitted_tokens, 0);
+        let oversized = "source row: exact retained native body\n".repeat(8_000);
+        let receipt = build_tool_receipt_for_delivery(
+            "read_file",
+            &oversized,
+            false,
+            reference,
+            256,
+            true,
+            false,
+            Some(r#"{"path":"target.txt","complete":true}"#),
+        );
+        assert!(
+            receipt.truncated,
+            "complete=true is an acquisition request, not proof that the granted receipt delivered EOF"
+        );
+        assert!(receipt.omitted_tokens > 0);
     }
 
     #[test]

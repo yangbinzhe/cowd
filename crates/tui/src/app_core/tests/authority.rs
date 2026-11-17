@@ -61,8 +61,8 @@ fn unchanged_session_catalog_skips_materialization_and_redraw() {
     });
 
     assert!(state.apply_gateway_session_catalog(&catalog));
-    assert_eq!(state.app.shell.picker_sessions.len(), 1);
-    assert_eq!(state.session.session_sidebar.len(), 1);
+    assert_eq!(state.app.shell.picker_sessions.iter().map(|session| session.id.as_str()).collect::<Vec<_>>(), vec!["session-a"]);
+    assert_eq!(state.session.session_sidebar.sessions().iter().map(|session| session.id.as_str()).collect::<Vec<_>>(), vec!["session-a"]);
     let render_version = state.app.timeline.render_version;
 
     assert!(!state.apply_gateway_session_catalog(&catalog));

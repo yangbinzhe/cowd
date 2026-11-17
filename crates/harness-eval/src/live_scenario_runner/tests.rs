@@ -6,7 +6,6 @@ fn u5_fixture_owner() -> U5Owner {
     U5Owner {
         pid: 42,
         starttime: 17,
-        image_sha256: format!("sha256:{}", "a".repeat(64)),
         candidate: "b".repeat(40),
         namespace: "fixture-run".into(),
         base_url: "http://127.0.0.1:12345".into(),
@@ -351,7 +350,13 @@ fn r202_session_reader_retains_actual_payload_and_rejects_foreign_or_truncated_p
         } else {
             assert!(result.is_err(), "{fault}");
         }
-        assert_eq!(fixture.finish().len(), 1);
+        let requests = fixture.finish();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            requests[0].0,
+            "GET /api/sessions/session-a/events?from_seq=0&limit=100&include_payload=true",
+            "the reader must issue exactly one session-events read: {fault}"
+        );
     }
 }
 
@@ -369,14 +374,25 @@ fn k05_session_reader_retries_concurrent_append_without_accepting_bad_page() {
     ]);
     let runner = u5_fixture_runner(&fixture.url);
     assert_eq!(runner.read_u5_session_events("session-a", Instant::now() + Duration::from_secs(2)).unwrap(), original);
-    assert_eq!(fixture.finish().len(), 2);
+    let requests = fixture.finish();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(
+        requests.iter().map(|request| request.0.as_str()).collect::<Vec<_>>(),
+        vec![path, path],
+        "the raced page must be re-read once at the very same cursor: {requests:?}"
+    );
 
     // Persistent mismatch still fails closed within the same three-page cap.
     raced["total"] = json!(1);
     let mut fixture = U5SingleCaseHttpFixture::start_wire((0..3).map(|_| (path.into(), raced.clone(), false, Duration::ZERO)).collect());
     let runner = u5_fixture_runner(&fixture.url);
     assert!(runner.read_u5_session_events("session-a", Instant::now() + Duration::from_secs(2)).is_err());
-    assert_eq!(fixture.finish().len(), 3);
+    let requests = fixture.finish();
+    assert_eq!(requests.len(), 3);
+    assert!(
+        requests.iter().all(|request| request.0 == path),
+        "the reader must stop at the three-page cap of the same cursor: {requests:?}"
+    );
 }
 
 #[test]
@@ -1000,7 +1016,16 @@ fn u5_resource_reader_real_manager_writer_store_selected_witnesses_and_symmetric
         let evidence = runner
             .read_u5_resource_witnesses(&owner, &sessions, Instant::now() + Duration::from_secs(2))
             .unwrap();
-        assert_eq!(fixture.finish().len(), 2);
+        let requests = fixture.finish();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(
+            requests.iter().map(|request| request.0.as_str()).collect::<Vec<_>>(),
+            sessions
+                .iter()
+                .map(|session| u5_resource_path(session, None, 100))
+                .collect::<Vec<_>>(),
+            "every session timeline must be read exactly once: {requests:?}"
+        );
         assert!(evidence.selected_witnesses_complete);
         for (observation, source) in evidence.observations.iter().zip(&evidence.source_refs) {
             assert!(
@@ -1167,11 +1192,39 @@ fn u5_resource_reader_loopback_binding_cursor_and_page_counterexamples() {
                 let evidence = result.unwrap();
                 assert!(u5_capacity_witness(&evidence, &sessions).is_some());
                 assert_eq!(requests.len(), 2);
+                let mut request_lines = requests
+                    .iter()
+                    .map(|request| request.0.clone())
+                    .collect::<Vec<_>>();
+                request_lines.sort();
+                let mut expected_lines = sessions
+                    .iter()
+                    .map(|session| u5_resource_path(session, None, 100))
+                    .collect::<Vec<_>>();
+                expected_lines.sort();
+                assert_eq!(
+                    request_lines, expected_lines,
+                    "each session timeline must be read exactly once"
+                );
             }
             "missing-grant" => assert!(u5_capacity_witness(&result.unwrap(), &sessions).is_none()),
             "replay-conflict" | "same-position-kind" | "replay-position" => {
                 let error = result.err().expect("immutable source conflict must reject");
                 assert_eq!(requests.len(), 2, "must reach the replay page: {fault}");
+                let mut request_lines = requests
+                    .iter()
+                    .map(|request| request.0.clone())
+                    .collect::<Vec<_>>();
+                request_lines.sort();
+                let mut expected_lines = vec![
+                    u5_resource_path(&sessions[0], None, 100),
+                    u5_resource_path(&sessions[0], Some("v2:0:1:0"), 100),
+                ];
+                expected_lines.sort();
+                assert_eq!(
+                    request_lines, expected_lines,
+                    "the replay page of the first session must be the second read: {fault}"
+                );
                 assert!(
                     error.contains("immutable source")
                         || error
@@ -1205,6 +1258,7 @@ fn u5_resource_reader_shared_budgets_streaming_and_deadlines() {
         "expired",
         "shared-expired",
         "body-timeout",
+        "transport-abort",
     ] {
         let [a, _] = u5_fixture_resource_events();
         let mut script = Vec::new();
@@ -1292,7 +1346,15 @@ fn u5_resource_reader_shared_budgets_streaming_and_deadlines() {
                 Duration::ZERO,
             ));
         }
-        let mut fixture = U5SingleCaseHttpFixture::start_wire(script);
+        // H1-N3: a deliberate connection abort must reach the consumer as the
+        // transport error it is, never as a laundered budget verdict or a success.
+        let mut fixture = if fault == "transport-abort" {
+            U5SingleCaseHttpFixture::start_status(
+                script.into_iter().map(|(p, v, u, d)| (p, v, u, d, 1)).collect(),
+            )
+        } else {
+            U5SingleCaseHttpFixture::start_wire(script)
+        };
         let mut owner = u5_fixture_owner();
         owner.base_url = fixture.url.clone();
         let mut runner = u5_fixture_runner(&fixture.url);
@@ -1319,6 +1381,14 @@ fn u5_resource_reader_shared_budgets_streaming_and_deadlines() {
             }
             "events" => {
                 assert_eq!(requests.len(), 6);
+                assert!(
+                    requests.iter().all(|request| sessions.iter().any(|session| request
+                        .0
+                        .starts_with(&format!(
+                            "GET /api/runtime/timeline?session_id={session}&"
+                        )))),
+                    "every request must read one of the two session timelines: {requests:?}"
+                );
                 assert!(error.contains("event budget"), "{error}");
             }
             "exact512-before-IO-more" | "exact512-before-IO-second-session" => {
@@ -1327,10 +1397,36 @@ fn u5_resource_reader_shared_budgets_streaming_and_deadlines() {
                     6,
                     "no seventh HTTP after 512 events: {fault}"
                 );
+                assert!(
+                    requests.iter().all(|request| sessions.iter().any(|session| request
+                        .0
+                        .starts_with(&format!(
+                            "GET /api/runtime/timeline?session_id={session}&"
+                        )))),
+                    "every request must read one of the two session timelines: {requests:?}"
+                );
                 assert!(error.contains("before IO"), "{error}");
             }
             "pages" => {
                 assert_eq!(requests.len(), 32);
+                let request_lines = requests
+                    .iter()
+                    .map(|request| request.0.as_str())
+                    .collect::<Vec<_>>();
+                assert!(
+                    request_lines.iter().all(|request| sessions.iter().any(|session| request
+                        .starts_with(&format!(
+                            "GET /api/runtime/timeline?session_id={session}&"
+                        )))),
+                    "every request must read one of the two session timelines: {request_lines:?}"
+                );
+                let mut distinct = request_lines.clone();
+                distinct.sort_unstable();
+                distinct.dedup();
+                assert!(
+                    distinct.len() > 1,
+                    "the page budget must stop a paginated read, not a single request"
+                );
                 assert!(error.contains("before IO"), "{error}");
             }
             "known-bytes" | "cumulative-bytes" => assert!(error.contains("byte budget"), "{error}"),
@@ -1338,6 +1434,17 @@ fn u5_resource_reader_shared_budgets_streaming_and_deadlines() {
             "body-timeout" => {
                 assert_eq!(requests.len(), 1);
                 assert!(started.elapsed() < Duration::from_secs(1));
+            }
+            "transport-abort" => {
+                assert!(
+                    requests.is_empty(),
+                    "the abort answers nothing, so no request is recorded: {requests:?}"
+                );
+                assert!(error.contains("error sending request"), "{error}");
+                assert!(
+                    !error.contains("byte budget") && !error.contains("before IO"),
+                    "a refused connection must not be relabelled as a budget verdict: {error}"
+                );
             }
             _ => unreachable!(),
         }
@@ -1381,7 +1488,14 @@ impl U5SingleCaseHttpFixture {
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let stopping = stop.clone();
         let server = thread::spawn(move || {
-            let deadline = Instant::now() + Duration::from_secs(5);
+            // Supply is event-driven, not wall-clock-driven. The former
+            // five-second absolute lifetime starved the consumer under load
+            // and rewrote product budget refusals into transport errors, so
+            // the thread now lives until the script is fully served or its
+            // owner stops it. The long cap below is a liveness watchdog for a
+            // pathological hang, not a service deadline: no consumer-facing
+            // window moves, every test deadline stays on the consumer side.
+            let liveness = Instant::now() + Duration::from_secs(120);
             let mut requests = Vec::new();
             let mut served = vec![false; script.len()];
             loop {
@@ -1390,7 +1504,7 @@ impl U5SingleCaseHttpFixture {
                 }
                 let mut stream = loop {
                     if stopping.load(std::sync::atomic::Ordering::SeqCst)
-                        || Instant::now() >= deadline
+                        || Instant::now() >= liveness
                     {
                         return requests;
                     }
@@ -1402,19 +1516,46 @@ impl U5SingleCaseHttpFixture {
                         Err(error) => panic!("NoRealU5 accept: {error}"),
                     }
                 };
+                // A scripted abort closes the accepted connection before the
+                // request is read and before anything is answered. Whether
+                // the peer's kernel then sees a reset or a clean shutdown is
+                // platform behaviour; the consumer contract the negative
+                // control guards is identical for both shapes: a refused
+                // connection must stay a transport error, must record no
+                // answered request, and must never reach a budget verdict or
+                // an Ok.
+                let abort_now = script
+                    .iter()
+                    .zip(served.iter())
+                    .find(|(_, done)| !**done)
+                    .is_some_and(|((_, _, _, _, status), _)| *status == 1);
+                if abort_now {
+                    return requests;
+                }
                 stream
-                    .set_read_timeout(Some(Duration::from_millis(200)))
+                    .set_read_timeout(Some(Duration::from_millis(250)))
                     .unwrap();
                 stream
-                    .set_write_timeout(Some(Duration::from_millis(200)))
+                    .set_write_timeout(Some(Duration::from_secs(5)))
                     .unwrap();
                 let mut bytes = Vec::new();
                 let (headers, body) = loop {
-                    assert!(bytes.len() < 16_384 && Instant::now() < deadline);
+                    assert!(bytes.len() < 16_384);
+                    if stopping.load(std::sync::atomic::Ordering::SeqCst) {
+                        return requests;
+                    }
                     let mut chunk = [0; 1024];
-                    let count = stream.read(&mut chunk).unwrap();
-                    assert!(count > 0, "NoRealU5 incomplete HTTP request");
-                    bytes.extend_from_slice(&chunk[..count]);
+                    match stream.read(&mut chunk) {
+                        // An early client close is a consumer-side event:
+                        // keep the recordings and end this connection, never
+                        // panic and never re-label it.
+                        Ok(0) => return requests,
+                        Ok(count) => bytes.extend_from_slice(&chunk[..count]),
+                        Err(error)
+                            if error.kind() == std::io::ErrorKind::WouldBlock
+                                || error.kind() == std::io::ErrorKind::TimedOut => {}
+                        Err(error) => panic!("NoRealU5 read: {error}"),
+                    }
                     if let Some(end) = bytes.windows(4).position(|part| part == b"\r\n\r\n") {
                         let headers = String::from_utf8(bytes[..end].to_vec()).unwrap();
                         let length = headers
@@ -1475,9 +1616,11 @@ impl U5SingleCaseHttpFixture {
                     )
                 };
                 // A bounded consumer may close early on size/deadline errors.
-                // Request parsing/order and all consumer assertions still fail normally.
+                // A failed write ends only this connection: the recordings
+                // stay and the rest of the script keeps being served, so one
+                // early close can no longer starve the later pages.
                 if stream.write_all(header.as_bytes()).is_err() {
-                    return requests;
+                    continue;
                 }
                 let wake = Instant::now() + *delay;
                 while Instant::now() < wake {
@@ -1486,9 +1629,7 @@ impl U5SingleCaseHttpFixture {
                     }
                     thread::sleep(Duration::from_millis(1));
                 }
-                if stream.write_all(&body).is_err() {
-                    return requests;
-                }
+                let _ = stream.write_all(&body);
             }
         });
         Self {
@@ -1575,6 +1716,17 @@ fn u5_event_first_observation_case(case: &str) -> Result<(Value, U5CancelContext
         }
         if case == "event-budget" {
             response["total"] = json!(513);
+            // A 513-row total on a one-row page promises more pages; the
+            // reader's pagination contract rejects an inconsistent page
+            // before the budget check, so this fixture must keep has_more
+            // truthful to exercise the intended budget refusal.
+            response["has_more"] = json!(true);
+        }
+        if case == "count-lies" {
+            // Negative control for the pagination contract itself: the
+            // count exceeds the returned rows while has_more claims the
+            // page is complete.
+            response["total"] = json!(5);
         }
         script.push(wire(
             EVENTS,
@@ -1583,7 +1735,7 @@ fn u5_event_first_observation_case(case: &str) -> Result<(Value, U5CancelContext
         ));
     }
     let before_graph_failure =
-        ["deadline", "permission", "wrong-page", "event-budget"].contains(&case);
+        ["deadline", "permission", "wrong-page", "event-budget", "count-lies"].contains(&case);
     let selected_failure = [
         "selected-404",
         "selected-invariant",
@@ -1737,6 +1889,7 @@ fn u5_event_first_original_observer_rejects_foreign_closed_and_failed_boundaries
         ("permission", "evidence response rejected"),
         ("wrong-page", "page identity mismatch"),
         ("event-budget", "exceeds event budget"),
+        ("count-lies", "pagination contract mismatch"),
         ("deadline", "coverage missing"),
     ] {
         let error = u5_event_first_observation_case(case).err().expect(case);
@@ -2094,10 +2247,43 @@ fn agentic_progress_counts_unique_structured_action_events() {
             "tasks_published": 3,
             "tasks_submitted": 3,
             "tasks_reviewed": 3,
+            // 033 S8 (B1): the new review measure reads the applied verdicts
+            // that were an acceptance. This fixture's review events carry no
+            // decision, so the same method counts zero of them - the old
+            // measure (every applied verdict) keeps its own value.
+            "tasks_reviewed_accepted": 0,
             "objective_complete_requested": true,
             "remaining": []
         })
     );
+}
+
+#[test]
+fn agentic_progress_counts_accepted_reviews_via_adjacent_input_tag() {
+    // 034 R1 red-first control: AgentAction is adjacently tagged (kind +
+    // input) and TaskReviewDecision serializes snake_case. The decision must
+    // be read from /envelope/action/input/decision and matched as "accept";
+    // the pre-fix path (missing /input) and case ("Accept") read 0 forever,
+    // structurally blocking the S8/S9 review-landing criterion.
+    let review = |cursor, decision| {
+        json!({
+            "kind": "agentic.action_applied",
+            "commit_cursor": cursor,
+            "payload": {"envelope": {"action": {
+                "kind": "task_review",
+                "input": {"decision": decision}
+            }}}
+        })
+    };
+    let timeline = json!({"events": [
+        review(1, "accept"),
+        review(2, "accept"),
+        review(3, "rework"),
+        review(4, "challenge")
+    ]});
+    let progress = LiveScenarioRunner::agentic_progress_from_timeline(&timeline);
+    assert_eq!(progress["tasks_reviewed"], 4);
+    assert_eq!(progress["tasks_reviewed_accepted"], 2);
 }
 
 fn successful_root_outcome_timeline(mut timeline: Value) -> Value {
@@ -2106,7 +2292,8 @@ fn successful_root_outcome_timeline(mut timeline: Value) -> Value {
         "status": "succeeded",
         "payload": {
             "identity": {"execution_graph_ref": "root", "execution_scope":"session"},
-            "terminal": {"class": "succeeded"}
+            "terminal": {"class": "succeeded"},
+            "verified": {"verdict": "satisfied", "reason": "satisfied"}
         }
     });
     let object = timeline
@@ -2134,6 +2321,32 @@ fn completed_tool_event() -> Value {
             "is_error": false
         }
     })
+}
+
+#[test]
+fn s6_root_business_success_requires_a_verified_conclusion() {
+    // An Outcome event without a verified business conclusion is Unknown, not
+    // a success: the consumer may not re-interpret the terminal wording.
+    let timeline = json!({"events": [{
+        "kind": "runtime.outcome.recorded.v1",
+        "status": "succeeded",
+        "payload": {
+            "identity": {"execution_graph_ref": "root", "execution_scope":"session"},
+            "terminal": {"class": "succeeded"}
+        }
+    }]});
+    let outcome = root_business_outcome(&timeline, "root");
+    assert!(!outcome.passed);
+    assert_eq!(outcome.verified_verdict, None);
+    let observation = root_business_observation(&timeline, "root");
+    assert!(observation["verified_verdict"].is_null());
+    // With the durable verified conclusion the same event is a success.
+    let verified_timeline = successful_root_outcome_timeline(json!({}));
+    let outcome = root_business_outcome(&verified_timeline, "root");
+    assert!(outcome.passed);
+    assert_eq!(outcome.verified_verdict.as_deref(), Some("satisfied"));
+    let observation = root_business_observation(&verified_timeline, "root");
+    assert_eq!(observation["verified_verdict"], json!("satisfied"));
 }
 
 #[test]
@@ -2242,7 +2455,14 @@ fn autonomous_deepseek_template_is_frozen_and_complete() {
         .prompt_template
         .contains("objective_complete_request"));
     assert!(!template.prompt_template.contains("Team A"));
-    assert!(!template.prompt_template.contains("恰好"));
+    assert!(
+        !template.prompt_template.contains("恰好"),
+        "the frozen template must not contain the scaled-down wording"
+    );
+    let spec = autonomous_deepseek_spec().expect("autonomous collaboration spec");
+    assert!(matches!(spec.acceptance, LiveAcceptance::AutonomousCollaboration {
+        minimum_teams: 1.., minimum_agents: 1.., minimum_tasks: 1.., ..
+    }));
 }
 
 fn agentic_program_projection(
@@ -2360,6 +2580,14 @@ fn unknown_or_unscheduled_explicit_scenarios_fail_before_dispatch() {
     let unregistered = BTreeSet::new();
     let errors = live_scenario_selection_errors(Some(&selected), &unregistered);
     assert_eq!(errors.len(), 1);
+    assert_eq!(
+        errors
+            .iter()
+            .map(|error| error["scenario_id"].as_str().unwrap_or_default())
+            .collect::<Vec<_>>(),
+        vec![GROUP_THEORY_SCENARIO_ID],
+        "exactly the unregistered scenario must be named"
+    );
     assert_eq!(errors[0]["scenario_id"], GROUP_THEORY_SCENARIO_ID);
     assert!(!live_scenario_selection_passed(Some(&selected), &errors, 0));
 
@@ -2503,6 +2731,19 @@ fn http_success_with_non_ready_control_plane_fails_closed() {
     assert_eq!(observation["status"], "failed");
     assert_eq!(observation["failed_checks"].as_array().unwrap().len(), 2);
     assert_eq!(
+        observation["failed_checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|check| check["name"].as_str().unwrap_or_default())
+            .collect::<Vec<_>>(),
+        vec![
+            "runtime_control_plane.production_ready",
+            "runtime_control_plane.required_blocked",
+        ],
+        "the not-ready control plane must fail exactly the readiness checks"
+    );
+    assert_eq!(
         observation["reason"],
         "HTTP transport succeeded but the endpoint semantic health contract failed"
     );
@@ -2547,6 +2788,43 @@ fn root_terminal_requires_completed_synthesis_not_child_progress() {
         root_execution_terminal_state(&completed),
         RootExecutionTerminal::Completed
     );
+}
+
+#[test]
+fn finalized_failure_requires_same_turn_fence_and_terminal_decision() {
+    let projection = json!({
+        "execution_id":"root", "session_id":"session", "turn_id":"turn",
+        "revision": 3, "cursor": 91,
+        "graph":{"terminal_result_ref":"result", "nodes":[
+            {"kind":"synthesize", "status":"completed"}
+        ]},
+        "terminal_axes":{"source_race":false,"source_cursor":91,
+            "outcome":{"outcome":"partially_satisfied","goal_id":"goal","goal_revision":2,"terminal_fence":"fence"},
+            "execution":{"phase":"draining","settlement":"unknown","coverage_complete":false},
+            "delivery":{"runtime_terminal_ref":"result"}},
+        "live":{"status":"error","turn_id":"turn","terminal_ref":"turn-terminal:request"},
+        "terminal_presentation":{"state":"committed","source_execution_id":"root"},
+        "strategy":{"decision_id":"decision","revision":2,"execution_id":"root","session_id":"session"},
+        "outcomes":[{"kind":"outcome","status":"failed","payload":{"value":{
+            "execution_id":"turn:decision","execution_graph_ref":"root", "session_id":"session",
+            "turn_id":"turn","terminal_class":"failed"
+        }}}]
+    });
+    assert_eq!(finalized_non_success_terminal_ref(&projection, "root", "session", "turn").as_deref(), Some("turn-terminal:request"));
+    for (pointer, replacement) in [
+        ("/live/status", json!("finalizing")),
+        ("/live/turn_id", json!("other-turn")),
+        ("/terminal_axes/source_race", json!(true)),
+        ("/terminal_axes/outcome/terminal_fence", json!("")),
+        ("/terminal_axes/outcome/outcome", json!("satisfied")),
+        ("/terminal_presentation/state", json!("pending")),
+        ("/outcomes/0/payload/value/execution_id", json!("turn:other")),
+        ("/graph/nodes/0/status", json!("running")),
+    ] {
+        let mut changed = projection.clone();
+        *changed.pointer_mut(pointer).unwrap() = replacement;
+        assert!(finalized_non_success_terminal_ref(&changed, "root", "session", "turn").is_none(), "{pointer}");
+    }
 }
 
 #[test]
@@ -2877,7 +3155,15 @@ fn large_scale_presentation_gate_accepts_complete_synthesized_terminal() {
 #[test]
 fn scale_recommendation_requires_subject_and_decision_in_the_same_semantic_block() {
     assert!(!has_scale_recommendation("## 扩大规模结论\n结论完整。"));
+    assert!(
+        has_scale_recommendation("## 扩大规模结论\n建议扩容。"),
+        "the same heading with a decision must be accepted"
+    );
     assert!(!has_scale_recommendation("- 扩容建议"));
+    assert!(
+        has_scale_recommendation("- 扩容建议\n必须先完成持久层分片。"),
+        "the same subject with a decision must be accepted"
+    );
     assert!(!has_scale_recommendation(
         "当前系统需要扩容。\n\n建议先完成持久层分片。"
     ));
@@ -2950,30 +3236,32 @@ fn complete_source_receipt_gate_requires_attested_exact_content_for_every_target
         .enumerate()
         .map(|(index, path)| receipt(path, index as u64 + 1))
         .collect::<Vec<_>>();
+    let expected: BTreeSet<String> = LARGE_SCALE_SOURCE_PATHS.iter().map(|path| (*path).to_string()).collect();
     assert_eq!(
-        complete_exact_source_receipt_paths(
-            &json!({"observed_acceptance": {"observed_evidence": complete}}),
-            &[],
-        )
-        .len(),
-        LARGE_SCALE_SOURCE_PATHS.len()
+        expected.len(),
+        LARGE_SCALE_SOURCE_PATHS.len(),
+        "the frozen source path list must not repeat a path"
     );
+    assert!(!expected.is_empty());
+    assert_eq!(complete_exact_source_receipt_paths(
+        &json!({"observed_acceptance": {"observed_evidence": complete}}), &[],
+    ), expected);
 
-    let mut incomplete = LARGE_SCALE_SOURCE_PATHS
+    let (last, earlier) = LARGE_SCALE_SOURCE_PATHS.split_last().expect("source paths");
+    let mut incomplete = earlier
         .iter()
-        .take(11)
         .enumerate()
         .map(|(index, path)| receipt(path, index as u64 + 1))
         .collect::<Vec<_>>();
-    let mut bounded = receipt(LARGE_SCALE_SOURCE_PATHS[11], 12);
+    let mut bounded = receipt(last, earlier.len() as u64 + 1);
     bounded["target"]["scope"]["coverage"] = json!("scoped_content");
     incomplete.push(bounded);
     let observed = complete_exact_source_receipt_paths(
         &json!({"observed_acceptance": {"observed_evidence": incomplete}}),
         &[],
     );
-    assert_eq!(observed.len(), 11);
-    assert!(!observed.contains(LARGE_SCALE_SOURCE_PATHS[11]));
+    assert_eq!(observed, earlier.iter().map(|path| (*path).to_string()).collect());
+    assert!(!observed.contains(*last));
 }
 
 #[test]
@@ -3952,6 +4240,14 @@ fn an_unresolved_agent_activity_is_named_in_the_evidence() {
     assert!(no_active_agent_waits(std::slice::from_ref(&projection)) == false);
     let unresolved = unresolved_agent_activities(std::slice::from_ref(&projection));
     assert_eq!(unresolved.len(), 1);
+    assert_eq!(
+        unresolved
+            .iter()
+            .map(|activity| activity["activity_id"].as_str().unwrap_or_default())
+            .collect::<Vec<_>>(),
+        vec!["a2"],
+        "only the still-running activity must be named"
+    );
     assert_eq!(unresolved[0]["activity_id"], "a2");
     assert_eq!(unresolved[0]["execution_id"], "exec-2");
     assert_eq!(unresolved[0]["status"], "running");
@@ -4228,7 +4524,22 @@ fn per_task_reports_without_a_synthesis_fail() {
     let program = program_with_tasks(3, None);
     let (present, unsynthesized) = synthesized_final_artifact_findings(Some(&program));
     assert!(!present, "per-Task reports are not a synthesis");
-    assert_eq!(unsynthesized.len(), 3, "{unsynthesized:?}");
+    assert!(!program.tasks.is_empty());
+    let mut unsynthesized_ids = unsynthesized.iter().cloned().collect::<Vec<_>>();
+    unsynthesized_ids.sort();
+    let mut distinct_unsynthesized = unsynthesized_ids.clone();
+    distinct_unsynthesized.dedup();
+    assert_eq!(
+        distinct_unsynthesized.len(),
+        unsynthesized_ids.len(),
+        "a task without a synthesis must be named exactly once: {unsynthesized_ids:?}"
+    );
+    let mut task_ids = program.tasks.keys().cloned().collect::<Vec<_>>();
+    task_ids.sort();
+    assert_eq!(
+        unsynthesized_ids, task_ids,
+        "every task without a synthesis must be named: {unsynthesized_ids:?}"
+    );
 }
 
 /// A "synthesis" written by the author of a Task it covers is a fourth report,
@@ -4349,6 +4660,82 @@ fn u7_literal_case(fixture: &U7MemoryFixture) -> Value {
         "input_preview":json!({"source":"memory","query":"independent-project"}).to_string(),"output_preview":preview,
         "_runtime_activity_binding":{"session_id":"s-original","turn_id":"turn-original","root_execution_id":"graph-original","tool_call_id":"call-original","tool_contract_id":"context_retrieve"}
     }}]}}]})
+}
+
+#[test]
+fn failed_u7_observation_keeps_the_admitted_turn_without_passing_the_phase() {
+    let source = u7_literal_case(&u7_literal_fixture());
+    let mut trace = source["trace"].as_array().unwrap().clone();
+    trace[1]["response"]["events"][0]["payload"]["output_preview"] = json!(
+        "{\n  \"selected\": [],\n  \"kind\": \"authorized_lexical_catalog\",\n  \"complete\": true\n}"
+    );
+    let spec = LiveScenarioSpec {
+        id: "u7-absence",
+        prompt: "observe absence",
+        acceptance: LiveAcceptance::Contains("absent"),
+        timeout: LiveScenarioTimeout::tool(),
+    };
+    let leaf = failed_scenario_with_session_execution_and_program(
+        spec,
+        started_now(),
+        trace,
+        "s-original".into(),
+        Some("graph-original".into()),
+        Some("turn-original".into()),
+        "receipt_observation_deadline_elapsed".into(),
+        json!({"timeline":{"events":[]}}),
+        None,
+    );
+    assert_eq!(leaf["turn_id"], "turn-original");
+    assert_eq!(
+        u7_empty_retrieval_observation(&leaf, "s-original", "independent-project"),
+        Some(true)
+    );
+    assert_eq!(leaf["status"], "failed");
+    assert!(!u7_phase_delivery_passed(&leaf));
+
+    let mut wrong_turn = leaf.clone();
+    wrong_turn["turn_id"] = json!("foreign-turn");
+    assert_eq!(
+        u7_empty_retrieval_observation(&wrong_turn, "s-original", "independent-project"),
+        Some(false)
+    );
+    wrong_turn["turn_id"] = Value::Null;
+    assert_eq!(
+        u7_empty_retrieval_observation(&wrong_turn, "s-original", "independent-project"),
+        None
+    );
+    let mut no_timeline = leaf;
+    no_timeline["trace"] = json!([]);
+    assert_eq!(
+        u7_empty_retrieval_observation(&no_timeline, "s-original", "independent-project"),
+        None
+    );
+}
+
+// The report must be able to tell "no matching retrieval was observed" from
+// "the receipts could not be read". A null `absence_retrieval_proven` plus an
+// explicit label keeps the two apart; neither may be read as false or true.
+#[test]
+fn u7_absence_report_labels_an_unreadable_receipt_set_as_unevaluable() {
+    let observed = u7_empty_retrieval_observation(
+        &json!({"session_id":"s","execution_id":"g","turn_id":"t","trace":[
+            {"channel":"timeline","response":{"events":[]}}]}),
+        "s",
+        "lookup",
+    );
+    assert_eq!(observed, Some(false), "an empty but readable event set is a real absence");
+    let unreadable = u7_empty_retrieval_observation(
+        &json!({"session_id":"s","execution_id":"g","trace":[]}),
+        "s",
+        "lookup",
+    );
+    assert_eq!(unreadable, None, "a missing turn id is not an observed absence");
+    let report = json!({"absence_retrieval_proven": unreadable,
+        "absence_retrieval_evaluation": match unreadable {
+            None => "unevaluable", Some(true) => "proven", Some(false) => "absent" }});
+    assert_eq!(report["absence_retrieval_proven"], Value::Null);
+    assert_eq!(report["absence_retrieval_evaluation"], "unevaluable");
 }
 
 #[test]
@@ -4618,9 +5005,22 @@ fn u7_lifecycle_oracles_keep_correction_absence_and_original_terminal_hard() {
     };
     assert!(u7_contains_any_secret("仓库代号WH-literal-527", &old, &new));
     assert!(u7_contains_any_secret("out-new-337", &old, &new));
+    assert!(
+        u7_contains_any_secret("原口令OUT-literal-893仍在。", &old, &new),
+        "the original passphrase must be detected as well"
+    );
     assert!(!u7_contains_any_secret("该项目记忆不存在。", &old, &new));
+    assert!(
+        u7_contains_any_secret("该项目记忆不存在，但旧仓库代号WH-literal-527 仍在。", &old, &new),
+        "an absence statement that still carries the original value must be detected"
+    );
     assert!(u7_explicit_absence("未找到相关项目记忆，两个值均缺失。"));
+    assert!(u7_explicit_absence("两个值均缺失。"));
     assert!(!u7_explicit_absence("已有项目记录，稍后提供口令。"));
+    assert!(
+        !u7_explicit_absence("请稍后提供口令。"),
+        "a pending request is not an explicit absence"
+    );
     let absent = json!({"enabled":true,"layer":"L3","include_archived":false,"entries":[]});
     assert!(u7_active_memory_absent(&absent, "original-id"));
     for defect in [
@@ -4797,8 +5197,13 @@ fn u7_correction_producer_patches_the_original_id_before_any_model_request() {
         &old.content
     ));
     assert_eq!(
-        task.join().unwrap().len(),
-        4,
+        task.join().unwrap(),
+        vec![
+            "POST /api/memory/L3 HTTP/1.1".to_string(),
+            "GET /api/memory/L3 HTTP/1.1".to_string(),
+            "PATCH /api/memory/entry/00000000-0000-0000-0000-000000000007 HTTP/1.1".to_string(),
+            "GET /api/memory/L3 HTTP/1.1".to_string(),
+        ],
         "no Provider request or baseline recall is permitted"
     );
 }
@@ -4808,6 +5213,23 @@ fn u7_correction_producer_patches_the_original_id_before_any_model_request() {
 fn u8_fixed_order_preserves_revision_order_and_independent_integer_oracle() {
     let input = U8OrderInput::fixed();
     assert_eq!(input.rows.len(), 64);
+    assert_eq!(
+        input
+            .rows
+            .iter()
+            .map(|(id, quantity, price)| (id.clone(), *quantity, *price))
+            .collect::<Vec<_>>(),
+        (1..=64u64)
+            .map(|index| {
+                (
+                    format!("PO447-{index:03}"),
+                    (index * 7 + 447) % 9 + 1,
+                    ((index * 11 + 447) % 23 + 1) * 100,
+                )
+            })
+            .collect::<Vec<_>>(),
+        "every frozen row must keep its original id, quantity and price exactly once"
+    );
     assert_eq!(input.total(false), 389_400);
     assert_eq!(input.total(true), 387_900);
     assert_eq!(input.revisions[0], ("PO447-003".into(), Some(12)));
@@ -4917,6 +5339,30 @@ fn u8_body_and_label_are_separate_without_relaxing_body_or_amount() {
 fn u8_long_input_uses_original_history_compiler_with_fixed_bounded_scale() {
     let input = U8OrderInput::long_history();
     assert_eq!(input.rows.len(), 4096);
+    assert_eq!(
+        input
+            .rows
+            .first()
+            .map(|(id, quantity, price)| (id.clone(), *quantity, *price)),
+        Some((
+            "PO447-001".to_string(),
+            (1 * 7 + 447) % 9 + 1,
+            ((1 * 11 + 447) % 23 + 1) * 100
+        )),
+        "the long history must start at the original first row"
+    );
+    assert_eq!(
+        input
+            .rows
+            .last()
+            .map(|(id, quantity, price)| (id.clone(), *quantity, *price)),
+        Some((
+            "PO447-4096".to_string(),
+            (4096 * 7 + 447) % 9 + 1,
+            ((4096 * 11 + 447) % 23 + 1) * 100
+        )),
+        "the long history must end at the original last row"
+    );
     assert_eq!(input.total(false), 24_581_400);
     assert_eq!(input.total(true), 24_579_900);
     let offset = input.prompts[0].find(U8_CLAUSE_BODY).unwrap();
@@ -4992,6 +5438,18 @@ fn u8_original447_case_is_body_correct_under_separate_label_observation() {
     assert_eq!(case["status"], "failed", "oldfrozenreportnotrewritten");
     let phases = case["u8_history"]["phase_results"].as_array().unwrap();
     assert_eq!(phases.len(), 3);
+    let phase_sessions = phases
+        .iter()
+        .map(|phase| phase["session_id"].as_str().unwrap_or_default().to_string())
+        .collect::<Vec<_>>();
+    let mut distinct_phase_sessions = phase_sessions.clone();
+    distinct_phase_sessions.sort();
+    distinct_phase_sessions.dedup();
+    assert_eq!(
+        distinct_phase_sessions.len(),
+        phase_sessions.len(),
+        "every phase must be a distinct session: {phase_sessions:?}"
+    );
     for p in phases {
         assert!(u8_turn_passed(p, p["session_id"].as_str().unwrap()));
         assert_eq!(p["u8_original_user_sources_present"], true);
@@ -5198,11 +5656,13 @@ fn deadline_expired_leaf_retains_its_collected_evidence() {
         Vec::new(),
         "session-b".to_string(),
         Some("execution-b".to_string()),
+        Some("turn-b".to_string()),
         "receipt_observation_deadline_elapsed".to_string(),
         diagnostics,
         None,
     );
     assert_eq!(leaf["status"], "failed", "the leaf still fails");
+    assert_eq!(leaf["turn_id"], "turn-b");
     assert_eq!(
         leaf["error"], "receipt_observation_deadline_elapsed",
         "the reason is preserved"
@@ -5250,4 +5710,781 @@ fn unreadable_execution_projection_marks_progress_unobservable() {
     observer.mark_stalled();
     observer.mark_unobservable();
     assert_eq!(observer.phase(), "unobservable");
+}
+
+// The wait loop's second terminal source: the root's own durable outcome
+// receipt on the cursor-complete timeline. Terminal receipt present with no
+// usable projection plane stops the wait by name; every other shape keeps
+// the existing behaviour, including a readable projection with authority
+// and a succeeded class (the message plane still owns that exit).
+#[test]
+fn root_terminal_receipt_stops_the_wait_by_name_before_watchdogs() {
+    let receipt = |class: Option<&str>, status: Option<&str>, cursor: u64, graph: &str, scope: &str| {
+        json!({"kind":"runtime.outcome.recorded.v1","commit_cursor":cursor,
+               "status":status,
+               "payload":{"identity":{"execution_graph_ref":graph,"execution_scope":scope},
+                          "terminal":{"class":class}}})
+    };
+    let timeline_of = |events: Vec<Value>| json!({"events":events});
+    let failed_root = receipt(Some("failed"), Some("failed"), 6244, "root-a", "session");
+    // Negative control A: terminal receipt present, projection plane has
+    // nothing to say - stop waiting, named, with the receipt's identity.
+    assert_eq!(
+        root_terminal_awaiting_review_reconstruction(
+            &timeline_of(vec![failed_root.clone()]),
+            "root-a",
+            None,
+            &RootExecutionTerminal::Pending,
+        ),
+        Some(("failed".to_string(), Some(6244))),
+        "a root-recorded terminal outcome must end the wait before any watchdog window"
+    );
+    // The receipt must name the root's own session-scoped execution.
+    assert_eq!(
+        root_terminal_awaiting_review_reconstruction(
+            &timeline_of(vec![receipt(Some("failed"), Some("failed"), 3, "other-graph", "session")]),
+            "root-a",
+            None,
+            &RootExecutionTerminal::Pending,
+        ),
+        None,
+        "another execution's terminal receipt cannot end this wait"
+    );
+    assert_eq!(
+        root_terminal_awaiting_review_reconstruction(
+            &timeline_of(vec![receipt(Some("failed"), Some("failed"), 3, "root-a", "child")]),
+            "root-a",
+            None,
+            &RootExecutionTerminal::Pending,
+        ),
+        None,
+        "a child-scoped receipt is not the root's terminal decision"
+    );
+    // No receipt: the existing watchdog contract keeps its role.
+    assert_eq!(
+        root_terminal_awaiting_review_reconstruction(
+            &timeline_of(vec![]),
+            "root-a",
+            None,
+            &RootExecutionTerminal::Pending,
+        ),
+        None
+    );
+    // A readable projection with a finalized reference keeps authority: the
+    // existing named finalization exit (and its message selection) runs.
+    assert_eq!(
+        root_terminal_awaiting_review_reconstruction(
+            &timeline_of(vec![failed_root.clone()]),
+            "root-a",
+            Some("terminal-ref-from-projection"),
+            &RootExecutionTerminal::Pending,
+        ),
+        None
+    );
+    // A Completed projection stays on the message-plane path.
+    assert_eq!(
+        root_terminal_awaiting_review_reconstruction(
+            &timeline_of(vec![failed_root.clone()]),
+            "root-a",
+            None,
+            &RootExecutionTerminal::Completed,
+        ),
+        None
+    );
+    // Succeeded receipts do not trigger the awaiting-review stop.
+    assert_eq!(
+        root_terminal_awaiting_review_reconstruction(
+            &timeline_of(vec![receipt(Some("succeeded"), Some("succeeded"), 9, "root-a", "session")]),
+            "root-a",
+            None,
+            &RootExecutionTerminal::Pending,
+        ),
+        None,
+        "a succeeded root keeps the durable-message exit, never the reconstruction stop"
+    );
+    // Missing class falls back to the event status, then to a named unknown.
+    assert_eq!(
+        root_terminal_awaiting_review_reconstruction(
+            &timeline_of(vec![receipt(None, Some("cancelled"), 11, "root-a", "session")]),
+            "root-a",
+            None,
+            &RootExecutionTerminal::Pending,
+        ),
+        Some(("cancelled".to_string(), Some(11)))
+    );
+    assert_eq!(
+        root_terminal_awaiting_review_reconstruction(
+            &timeline_of(vec![receipt(None, None, 12, "root-a", "session")]),
+            "root-a",
+            None,
+            &RootExecutionTerminal::Pending,
+        ),
+        Some(("unknown".to_string(), Some(12))),
+        "a recorded terminal without a parseable class is still terminal, and named honestly"
+    );
+    // The latest root receipt wins across generations.
+    assert_eq!(
+        root_terminal_awaiting_review_reconstruction(
+            &timeline_of(vec![
+                receipt(Some("failed"), Some("failed"), 10, "root-a", "session"),
+                receipt(Some("cancelled"), Some("cancelled"), 20, "root-a", "session"),
+            ]),
+            "root-a",
+            None,
+            &RootExecutionTerminal::Pending,
+        ),
+        Some(("cancelled".to_string(), Some(20)))
+    );
+}
+
+
+#[test]
+fn v2_direct_numeric_answer_distinguishes_correct_wrong_and_unknown() {
+    for answer in ["56", "7 × 8 = 56", "答案是56。"] {
+        assert_eq!(v2_direct_decision(answer), Some(true), "{answer}");
+    }
+    for answer in ["156", "56 或 57", "7 × 8 = 56，但是答案是57", "56 不正确"] {
+        assert_eq!(v2_direct_decision(answer), Some(false), "{answer}");
+    }
+    assert_eq!(v2_direct_decision("也许是56"), None);
+    assert_eq!(v2_direct_decision("56 大概吧"), None);
+    assert_eq!(
+        v2_direct_decision("56 不正确"),
+        Some(false),
+        "a decided wrong answer must stay decided, not unknown"
+    );
+}
+
+#[test]
+fn v2_workspace_version_answer_does_not_accept_a_different_version() {
+    let expected = "0.0.37";
+    assert_eq!(v2_version_decision("Cargo.toml workspace.package.version: 0.0.37", expected), Some(true));
+    assert_eq!(v2_version_decision("Cargo.toml version: 0.0.99", expected), Some(false));
+    assert_eq!(v2_version_decision("Cargo.toml version 0.0.37 或 0.0.99", expected), Some(false));
+    assert_eq!(
+        v2_version_decision("Cargo.toml version 0.0.37 或 0.0.99", "0.0.99"),
+        Some(false),
+        "an ambiguous version list must be rejected whichever version is expected"
+    );
+    assert_eq!(
+        v2_version_decision("Cargo.toml 没有 0.0.37", expected),
+        Some(false),
+        "a missing version must be decided as a mismatch, never accepted"
+    );
+    assert_eq!(
+        v2_version_decision("版本无法确认", expected),
+        None,
+        "an undecidable version must stay unknown, never accepted"
+    );
+}
+
+#[test]
+fn v2_version_delivery_requires_original_source_and_body() {
+    // Existing typed read-evidence fixture represents the consumer contract;
+    // it does not claim a live producer or a full scenario run.
+    let expected = V2WorkspaceVersion {
+        value: "0.0.37".into(), source_sha256: "source-digest".into(),
+        first_line: 2, last_line: 2,
+    };
+    let timeline = typed_read_timeline_fixture();
+    let evidence = &timeline["read_evidence"];
+    assert!(v2_version_delivered(evidence, &expected));
+    let mut absent = evidence.clone();
+    absent["pages"][0]["reads"] = json!([]);
+    assert!(!v2_version_delivered(&absent, &expected));
+    let mut wrong_source = evidence.clone();
+    wrong_source["pages"][0]["reads"][0]["source_sha256"] = json!("different-source");
+    assert!(!v2_version_delivered(&wrong_source, &expected));
+    let mut not_delivered = evidence.clone();
+    not_delivered["pages"][0]["reads"][0]["body_delivered"] = json!(false);
+    assert!(!v2_version_delivered(&not_delivered, &expected));
+    let mut wrong_extent = evidence.clone();
+    wrong_extent["pages"][0]["reads"][0]["delivered_extent"]["start_line"] = json!(3);
+    assert!(!v2_version_delivered(&wrong_extent, &expected));
+}
+
+#[test]
+fn v2_workspace_snapshot_reads_workspace_package_version_not_package_version() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("Cargo.toml"),
+        "[package]\nversion = \"9.9.9\"\n[workspace.package]\nversion = \"0.0.37\"\n").unwrap();
+    let snapshot = v2_workspace_version_snapshot_for_root(root.path()).unwrap();
+    assert_eq!(snapshot.value, "0.0.37");
+    assert_eq!((snapshot.first_line, snapshot.last_line), (4, 4));
+    assert_eq!(v2_version_decision("Cargo.toml version 9.9.9", &snapshot.value), Some(false));
+    std::fs::write(root.path().join("Cargo.toml"), "[package]\nversion = \"9.9.9\"\n").unwrap();
+    assert!(v2_workspace_version_snapshot_for_root(root.path()).is_err());
+}
+
+#[test]
+fn v2_scenario_selection_keeps_v1_and_unimplemented_scenarios_unchanged() {
+    fn original(id: &'static str) -> LiveScenarioSpec {
+        LiveScenarioSpec { id, prompt: "v1 original prompt", acceptance: LiveAcceptance::Contains("original"), timeout: LiveScenarioTimeout::direct() }
+    }
+    for id in ["live_direct_terminal", "live_tool_evidence", "live_minimal_batch_read", "live_small_two_team_collaboration", "live_single_architecture_baseline"] {
+        for requested in [None, Some("n8-eval-v1")] {
+            let (selected, revision) = v2_select_scenario(original(id), requested);
+            assert_eq!(revision, "n8-eval-v1", "{id}");
+            assert_eq!(selected.prompt, "v1 original prompt", "{id}");
+            assert!(matches!(selected.acceptance, LiveAcceptance::Contains("original")), "{id}");
+        }
+    }
+    for id in ["live_minimal_batch_read", "live_small_two_team_collaboration", "live_single_architecture_baseline"] {
+        let (selected, revision) = v2_select_scenario(original(id), Some("n8-eval-v2"));
+        assert_eq!(revision, "n8-eval-v1", "{id}");
+        assert_eq!(selected.prompt, "v1 original prompt", "{id}");
+        assert!(matches!(selected.acceptance, LiveAcceptance::Contains("original")), "{id}");
+    }
+    let (direct, revision) = v2_select_scenario(original("live_direct_terminal"), Some("n8-eval-v2"));
+    assert_eq!(revision, "n8-eval-v2");
+    assert!(matches!(direct.acceptance, LiveAcceptance::V2DirectNumber));
+    assert_eq!(Some(direct.prompt), v2_group_one_prompt("live_direct_terminal"));
+    let (tool, revision) = v2_select_scenario(original("live_tool_evidence"), Some("n8-eval-v2"));
+    assert_eq!(revision, "n8-eval-v2");
+    assert!(matches!(tool.acceptance, LiveAcceptance::V2WorkspaceVersion));
+    assert_eq!(Some(tool.prompt), v2_group_one_prompt("live_tool_evidence"));
+}
+
+#[test]
+fn numeric_acceptance_does_not_regate_terminal_observation() {
+    let mut checks = vec![
+        json!({"name":"independent_numeric_oracle", "passed":true}),
+        json!({"name":"frozen_content_read_receipts", "passed":true}),
+        json!({"name":"read_receipt:Cargo.toml", "passed":true}),
+        json!({"name":"durable_response", "passed":true}),
+        json!({"name":"run_reached_terminal_state", "passed":true}),
+        json!({"name":"root_business_outcome_succeeded", "passed":true}),
+        json!({"name":"terminal_three_piece_complete", "passed":false,
+            "missing":["goal_verified"], "pieces":{"goal_verified":false,
+                "business_outcome":true, "user_visible_delivery":true}}),
+    ];
+    assert!(numeric_acceptance_checks_pass(&checks));
+    for index in 0..6 {
+        checks[index]["passed"] = json!(false);
+        assert!(!numeric_acceptance_checks_pass(&checks), "{} must remain required", checks[index]["name"]);
+        checks[index]["passed"] = json!(true);
+    }
+    checks[6]["pieces"]["business_outcome"] = json!(false);
+    assert!(!numeric_acceptance_checks_pass(&checks));
+    checks[6]["pieces"]["business_outcome"] = json!(true);
+    checks[6]["pieces"]["user_visible_delivery"] = json!(false);
+    assert!(!numeric_acceptance_checks_pass(&checks));
+    checks[6]["pieces"]["user_visible_delivery"] = json!(true);
+    checks[6]["missing"] = json!(["goal_verified", "business_outcome"]);
+    assert!(!numeric_acceptance_checks_pass(&checks));
+    checks[6]["missing"] = json!(["goal_verified"]);
+    checks.push(json!({"name":"agentic_program_verified", "passed":false}));
+    assert!(!numeric_acceptance_checks_pass(&checks), "an explicit Program gate remains required");
+}
+
+// S2 (G4): a failure leaves the harness with its cause attached, and the cause
+// is the root's own durable outcome - not a sentence somebody re-typed.
+#[test]
+fn a_wait_failure_carries_the_root_durable_outcome_verbatim() {
+    let timeline = json!({
+        "events": [{
+            "kind": "runtime.outcome.recorded.v1",
+            "status": "failed",
+            "payload": {
+                "identity": {
+                    "execution_scope": "session",
+                    "execution_graph_ref": "root-1",
+                    "session_id": "session-1",
+                    "turn_id": "turn-1",
+                    "terminal_generation": 7,
+                },
+                "terminal": {"class": "failed"},
+                "verified": {
+                    "verdict": "unsatisfied",
+                    "reason": "the delegated child receipt never settled",
+                },
+            },
+        }],
+    });
+    let stop = WaitStop {
+        kind: ObservationStopKind::RegisteredTerminal,
+        code: "root_terminal_awaiting_review_reconstruction",
+        message: "root_terminal_awaiting_review_reconstruction: class=failed".to_string(),
+        class: Some("failed".to_string()),
+        commit_cursor: Some(42),
+    };
+    let failure = typed_wait_failure(&stop, &timeline, "root-1", "live_one_team");
+    assert_eq!(
+        failure["code"],
+        "root_terminal_awaiting_review_reconstruction"
+    );
+    let outcome = &failure["payload"]["root_durable_outcome"];
+    assert_eq!(outcome["terminal_class"], "failed");
+    assert_eq!(outcome["verified_reason"], "the delegated child receipt never settled");
+    assert_eq!(outcome["verified_verdict"], "unsatisfied");
+    assert_eq!(outcome["execution_id"], "root-1");
+    assert_eq!(outcome["turn_id"], "turn-1");
+    // GB-5: the block says what the observer read, and that it may cancel
+    // because the work was already over.
+    assert_eq!(failure["payload"]["observation_stop"]["kind"], "registered_terminal");
+    assert_eq!(failure["payload"]["observation_stop"]["class"], "failed");
+    assert_eq!(failure["payload"]["observation_stop"]["commit_cursor"], 42);
+    assert_eq!(failure["payload"]["observation_stop"]["observer_may_cancel"], true);
+}
+
+// 033 GB-5: the observer may end its own look; it may not end the work.
+// A stop that read a registered terminal fact leaves nothing running, so the
+// cancel is a receipt for what happened. A stop that only says "I ran out of
+// ways to look" leaves the work running, and an observer that ends the work
+// it observes writes the verdict it was supposed to read.
+#[test]
+fn an_inferred_stop_does_not_kill_the_run_it_stopped_watching() {
+    let inferred = WaitStop {
+        kind: ObservationStopKind::Inferred,
+        code: "observation_limit_reached",
+        message: "observation limit reached (not a verdict on the work)".to_string(),
+        class: None,
+        commit_cursor: None,
+    };
+    assert!(
+        !observer_may_cancel(&inferred),
+        "an inferred stop may not cancel a running execution"
+    );
+    let registered = WaitStop {
+        kind: ObservationStopKind::RegisteredTerminal,
+        code: "root_terminal_awaiting_review_reconstruction",
+        message: "root_terminal_awaiting_review_reconstruction: class=failed".to_string(),
+        class: Some("failed".to_string()),
+        commit_cursor: Some(7),
+    };
+    assert!(
+        observer_may_cancel(&registered),
+        "a registered terminal leaves nothing running: the cancel is a receipt"
+    );
+}
+
+// GB-5: an inferred stop must not imply a verdict about the work. It says
+// what it did not know, and it says the observer did not kill anything.
+#[test]
+fn an_inferred_stop_says_it_knew_nothing_about_the_work() {
+    let stop = WaitStop {
+        kind: ObservationStopKind::Inferred,
+        code: "inactivity_window_elapsed",
+        message: "no durable execution progress for 1000ms after 2000ms".to_string(),
+        class: None,
+        commit_cursor: None,
+    };
+    let failure = typed_wait_failure(&stop, &json!({"events": []}), "root-1", "live_one_team");
+    assert_eq!(failure["code"], "inactivity_window_elapsed");
+    assert_eq!(failure["payload"]["observation_stop"]["kind"], "inferred");
+    assert_eq!(failure["payload"]["observation_stop"]["class"], Value::Null);
+    assert_eq!(failure["payload"]["observation_stop"]["commit_cursor"], Value::Null);
+    assert_eq!(failure["payload"]["observation_stop"]["observer_may_cancel"], false);
+    // The prose still says the work is not judged.
+    assert!(
+        !failure["reason"].as_str().unwrap_or_default().contains("failed"),
+        "an inferred stop carries no verdict about the work: {failure}"
+    );
+}
+
+// S2 (F3-a): "the run never started" and "the run started and failed" are
+// different facts, and one constructor has to say which one happened.
+#[test]
+fn a_component_failure_states_whether_the_run_started() {
+    let not_started = component_failure_diagnostics(
+        "scenario_spec_build_failed",
+        "the scenario list could not be built",
+        "not_started",
+        false,
+        0,
+        0,
+        Vec::new(),
+    );
+    assert_eq!(not_started["code"], "scenario_spec_build_failed");
+    assert_eq!(not_started["payload"]["phase"], "not_started");
+    assert_eq!(not_started["payload"]["started"], false);
+    assert_eq!(not_started["payload"]["scenarios_started"], 0);
+    assert_eq!(not_started["payload"]["scenarios_failed"], 0);
+    assert!(not_started["payload"]["failures"]
+        .as_array()
+        .expect("failures")
+        .is_empty());
+
+    let ran = component_failure_diagnostics(
+        "scenario_run_failed",
+        "2 of 3 live scenarios did not pass",
+        "completed",
+        true,
+        3,
+        2,
+        vec![json!({"scenario_id": "live_one_team"})],
+    );
+    assert_eq!(ran["code"], "scenario_run_failed");
+    assert_eq!(ran["payload"]["started"], true);
+    assert_eq!(ran["payload"]["scenarios_started"], 3);
+    assert_eq!(ran["payload"]["scenarios_failed"], 2);
+    assert_eq!(ran["payload"]["failures"][0]["scenario_id"], "live_one_team");
+}
+
+// S2 (G4): a reference has to name the file the writer actually wrote, or it
+// names nothing at all.
+#[test]
+fn a_scenario_reference_names_the_file_the_writer_writes() {
+    assert_eq!(
+        crate::report_store::live_scenario_artifact_name(0, "live_one_team"),
+        "001-live_one_team.json"
+    );
+    assert_eq!(
+        crate::report_store::live_scenario_artifact_name(11, "live_explicit_team/requirement"),
+        "012-live_explicit_team_requirement.json"
+    );
+}
+
+// 034-5(a): the wedge read durably off cert-d's retained volume - a first
+// refusal at the lease stage, an expired original lease closure, then the same
+// "original call custody remains unknown" block every reconciliation round.
+// Three rounds in a row judge the scenario and release it; waiting for the
+// state machine to produce a terminal that never comes burned 33 more minutes.
+const REAL_BLOCKED_NODE: &str =
+    "session-ingress-graph:f1dbb20dde6fc8d809274207b58f99b5:32:tools-1";
+
+fn unknown_custody_round(commit_cursor: u64) -> Value {
+    json!({
+        "kind": "execution_graph.recovered",
+        "commit_cursor": commit_cursor,
+        "payload": {
+            "cause": "execution_graph.recovered",
+            "reason": format!(
+                "binding lease reconciliation blocked: original call custody for node `{}` remains unknown: original lease closure deadline expired",
+                REAL_BLOCKED_NODE
+            ),
+        },
+    })
+}
+
+#[test]
+fn three_consecutive_unknown_custody_rounds_end_the_watch() {
+    let timeline = json!({"events": [
+        unknown_custody_round(7),
+        unknown_custody_round(8),
+        unknown_custody_round(9),
+    ]});
+    assert_eq!(
+        lease_custody_unknown_streak(&timeline),
+        LEASE_CUSTODY_UNKNOWN_STREAK,
+        "three identical blocked rounds reach the threshold"
+    );
+}
+
+#[test]
+fn two_unknown_custody_rounds_keep_watching() {
+    let timeline = json!({"events": [unknown_custody_round(8), unknown_custody_round(9)]});
+    let streak = lease_custody_unknown_streak(&timeline);
+    assert_eq!(streak, 2);
+    assert!(
+        streak < LEASE_CUSTODY_UNKNOWN_STREAK,
+        "a block that has not repeated three times is not yet a verdict"
+    );
+}
+
+#[test]
+fn any_other_receipt_breaks_the_unknown_custody_streak() {
+    let events = vec![
+        unknown_custody_round(8),
+        unknown_custody_round(9),
+        json!({"kind": "runtime.outcome.recorded.v1", "status": "succeeded", "commit_cursor": 10}),
+        unknown_custody_round(11),
+    ];
+    assert_eq!(
+        lease_custody_unknown_streak(&json!({"events": events})),
+        1,
+        "a settled receipt in between is progress, so the streak restarts"
+    );
+}
+
+#[test]
+fn a_tool_result_quoting_the_marker_is_not_a_blocked_lease() {
+    let timeline = json!({"events": [
+        {"kind": "node.result.updated", "payload": {"delta": {"node_result_updates": {
+            "agent-tool:1": {"result_ref": format!("agent-tool-outcome:{{\"output\":\"binding lease reconciliation blocked: original call custody for node `{}` remains unknown: original lease closure deadline expired\"}}", REAL_BLOCKED_NODE)},
+        }}}},
+        {"kind": "assistant.message.observed", "payload": {"report": {"observations": [
+            {"model_summary": "original call custody for node `x` remains unknown"},
+        ]}}},
+    ]});
+    assert_eq!(
+        lease_custody_unknown_streak(&timeline),
+        0,
+        "quoted work text is data about a file, not the runtime reporting a block"
+    );
+}
+
+#[test]
+fn the_unwrapped_custody_unknown_error_counts_without_the_recovery_wrapper() {
+    let events = (1..=LEASE_CUSTODY_UNKNOWN_STREAK as u64)
+        .map(|round| {
+            json!({
+                "kind": "node.execution.failed",
+                "commit_cursor": round,
+                "payload": {
+                    "reason": format!(
+                        "original call custody for node `{}` remains unknown: executor failed to start node",
+                        REAL_BLOCKED_NODE
+                    ),
+                },
+            })
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        lease_custody_unknown_streak(&json!({"events": events})),
+        LEASE_CUSTODY_UNKNOWN_STREAK,
+        "OriginalCustodyUnknown reaches the timeline without the recovery wrapper too"
+    );
+}
+
+#[test]
+fn the_unknown_custody_streak_still_releases_the_lineage() {
+    let stop = WaitStop {
+        kind: ObservationStopKind::RegisteredTerminal,
+        code: "lease_custody_unknown_streak",
+        message: "lease custody unknown for 3 consecutive reconciliation rounds".to_string(),
+        class: Some("lease_custody_unknown".to_string()),
+        commit_cursor: None,
+    };
+    assert!(
+        observer_may_cancel(&stop),
+        "a registered blocked-lease receipt leaves nothing to wait for: the lineage is released"
+    );
+    let failure = typed_wait_failure(&stop, &json!({"events": []}), "root-1", "live_one_team");
+    assert_eq!(failure["code"], "lease_custody_unknown_streak");
+    assert_eq!(failure["payload"]["observation_stop"]["kind"], "registered_terminal");
+    assert_eq!(failure["payload"]["observation_stop"]["class"], "lease_custody_unknown");
+}
+
+// 034-5(a) supplement (D22): the root that halts without ever naming a custody
+// problem. The fixture clock is the sealed certv3-20261116-q monitor state, and
+// the halt gap is the 1 888 s that run recorded.
+const SILENT_STALL_NOW_MS: u64 = 1_794_786_017_965;
+const SILENT_STALL_HALT_MS: u64 = SILENT_STALL_NOW_MS - 1_888_000;
+
+fn silent_stall_event(kind: &str, created_at_ms: u64, commit_cursor: u64) -> Value {
+    json!({
+        "kind": kind,
+        "created_at_ms": created_at_ms,
+        "commit_cursor": commit_cursor,
+        "payload": {},
+    })
+}
+
+/// The certv3-20261116-q shape: committed model work, then a root graph that
+/// halted at commit_cursor 848 with nothing durable after it.
+fn silent_stall_timeline(extra: Vec<Value>) -> Value {
+    let mut events = vec![
+        silent_stall_event(MODEL_STEP_EVENT_KIND, SILENT_STALL_HALT_MS - 40_000, 840),
+        silent_stall_event("execution_graph.recovered", SILENT_STALL_HALT_MS, 848),
+    ];
+    events.extend(extra);
+    json!({"events": events})
+}
+
+#[test]
+fn a_halted_root_with_nothing_outstanding_releases_the_lineage() {
+    let halt = silent_custody_free_halt(&silent_stall_timeline(Vec::new()), SILENT_STALL_NOW_MS)
+        .expect("1 888 s of durable silence after committed steps with nothing in flight is a halt");
+    assert_eq!(halt.silence_ms, 1_888_000);
+    assert_eq!(halt.model_steps, 1);
+    assert_eq!(halt.completion_requests, 0);
+    assert_eq!(halt.agentic_events, 0, "a single-stream root carries no closure vocabulary at all");
+    assert_eq!(halt.provider_requests_in_flight, 0);
+    assert_eq!(halt.provider_errors, 0);
+    assert_eq!(halt.halt_kind, "execution_graph.recovered");
+    assert_eq!(halt.halt_commit_cursor, Some(848), "the halt names the cursor the stream stopped at");
+}
+
+#[test]
+fn nine_hundred_seconds_is_the_threshold_and_not_a_moment_earlier() {
+    let just_short = json!({"events": [
+        silent_stall_event(MODEL_STEP_EVENT_KIND, SILENT_STALL_NOW_MS - 899_999, 840),
+    ]});
+    assert!(
+        silent_custody_free_halt(&just_short, SILENT_STALL_NOW_MS).is_none(),
+        "one second short of the window is still inside it"
+    );
+    let exactly = json!({"events": [silent_stall_event(
+        MODEL_STEP_EVENT_KIND,
+        SILENT_STALL_NOW_MS - SILENT_CUSTODY_FREE_STALL_MS,
+        840,
+    )]});
+    assert!(
+        silent_custody_free_halt(&exactly, SILENT_STALL_NOW_MS).is_some(),
+        "the window is inclusive at its own boundary"
+    );
+}
+
+#[test]
+fn a_root_that_never_took_a_step_is_left_to_the_no_progress_guard() {
+    let no_steps = json!({"events": [
+        silent_stall_event("execution_graph.planned", SILENT_STALL_HALT_MS, 12),
+    ]});
+    assert!(
+        silent_custody_free_halt(&no_steps, SILENT_STALL_NOW_MS).is_none(),
+        "silence before any committed work is the existing no-progress fact, not a stall after work"
+    );
+}
+
+#[test]
+fn a_stream_with_no_durable_activity_event_has_nothing_to_measure() {
+    assert!(
+        silent_custody_free_halt(&json!({"events": []}), SILENT_STALL_NOW_MS).is_none(),
+        "without a committed event there is no halt point, so the supplement stays inert"
+    );
+}
+
+#[test]
+fn a_clock_behind_the_events_keeps_the_supplement_inert() {
+    assert!(
+        silent_custody_free_halt(&silent_stall_timeline(Vec::new()), SILENT_STALL_HALT_MS - 10_000)
+            .is_none(),
+        "a now that predates the last durable event is not evidence of silence"
+    );
+}
+
+#[test]
+fn one_new_durable_activity_event_moves_the_halt_point() {
+    let moved = silent_stall_timeline(vec![silent_stall_event(
+        "execution_graph.node_transitioned",
+        SILENT_STALL_NOW_MS - 60_000,
+        849,
+    )]);
+    assert!(
+        silent_custody_free_halt(&moved, SILENT_STALL_NOW_MS).is_none(),
+        "a graph event a minute ago is a run that is still writing"
+    );
+}
+
+#[test]
+fn housekeeping_keeping_flowing_does_not_mask_the_silence() {
+    let housekeeping = silent_stall_timeline(vec![
+        silent_stall_event("resource.admission.granted", SILENT_STALL_NOW_MS - 1_000, 900),
+        silent_stall_event("evolution.case_indexed", SILENT_STALL_NOW_MS - 2_000, 901),
+        silent_stall_event("runtime.strategy.outcome", SILENT_STALL_NOW_MS - 3_000, 902),
+    ]);
+    let halt = silent_custody_free_halt(&housekeeping, SILENT_STALL_NOW_MS).expect(
+        "admission renewals arrive forever while a turn is silent; they are not the stream the ruling measures",
+    );
+    assert_eq!(
+        halt.halt_commit_cursor,
+        Some(848),
+        "the halt stays at the last durable graph event, not at the housekeeping"
+    );
+}
+
+#[test]
+fn a_requested_completion_is_a_different_state_than_silence() {
+    let requested = silent_stall_timeline(vec![json!({
+        "kind": AGENTIC_ACTION_EVENT_KIND,
+        "created_at_ms": SILENT_STALL_HALT_MS,
+        "commit_cursor": 849,
+        "payload": {"envelope": {"action": {"kind": OBJECTIVE_COMPLETE_ACTION_KIND}}},
+    })]);
+    assert!(
+        silent_custody_free_halt(&requested, SILENT_STALL_NOW_MS).is_none(),
+        "a run that asked to close is waiting on a verdict, which 5(a) does not judge"
+    );
+}
+
+#[test]
+fn any_other_agentic_action_is_not_a_completion_request() {
+    let reviewed = silent_stall_timeline(vec![json!({
+        "kind": AGENTIC_ACTION_EVENT_KIND,
+        "created_at_ms": SILENT_STALL_HALT_MS,
+        "commit_cursor": 849,
+        "payload": {"envelope": {"action": {"kind": "task_review"}}},
+    })]);
+    let halt = silent_custody_free_halt(&reviewed, SILENT_STALL_NOW_MS)
+        .expect("work committed, silence past the window, nothing outstanding");
+    assert_eq!(halt.agentic_events, 1, "the closure vocabulary exists here, so 0 requests means something");
+    assert_eq!(halt.completion_requests, 0);
+}
+
+#[test]
+fn a_packed_request_without_an_outcome_is_still_the_provider_turn_to_move() {
+    let in_flight = silent_stall_timeline(vec![json!({
+        "kind": "context.provider_request_packed",
+        "created_at_ms": SILENT_STALL_HALT_MS,
+        "commit_cursor": 849,
+        "payload": {"request_id": "req-848"},
+    })]);
+    assert!(
+        silent_custody_free_halt(&in_flight, SILENT_STALL_NOW_MS).is_none(),
+        "a request still on the wire can return, so silence proves nothing yet"
+    );
+}
+
+#[test]
+fn a_returned_provider_round_leaves_nothing_in_flight() {
+    let settled = silent_stall_timeline(vec![
+        json!({
+            "kind": "context.provider_request_packed",
+            "created_at_ms": SILENT_STALL_HALT_MS - 9_000,
+            "commit_cursor": 847,
+            "payload": {"request_id": "req-1"},
+        }),
+        json!({
+            "kind": "context.provider_attempt_outcome",
+            "created_at_ms": SILENT_STALL_HALT_MS,
+            "commit_cursor": 848,
+            "payload": {"request_id": "req-1", "terminal_status": "completed"},
+        }),
+    ]);
+    let halt = silent_custody_free_halt(&settled, SILENT_STALL_NOW_MS)
+        .expect("a settled round is not something left outstanding");
+    assert_eq!(halt.provider_requests_in_flight, 0);
+    assert_eq!(halt.provider_errors, 0);
+}
+
+#[test]
+fn a_failed_provider_round_already_names_why_the_work_stopped() {
+    let failed = silent_stall_timeline(vec![json!({
+        "kind": "context.provider_attempt_outcome",
+        "created_at_ms": SILENT_STALL_HALT_MS,
+        "commit_cursor": 849,
+        "payload": {"request_id": "req-1", "terminal_status": PROVIDER_FAILED_TERMINAL_STATUS},
+    })]);
+    assert!(
+        silent_custody_free_halt(&failed, SILENT_STALL_NOW_MS).is_none(),
+        "the provider said why it stopped; this supplement does not speak over that"
+    );
+}
+
+#[test]
+fn a_cancelled_round_is_not_a_provider_error() {
+    let cancelled = silent_stall_timeline(vec![json!({
+        "kind": "context.provider_attempt_outcome",
+        "created_at_ms": SILENT_STALL_HALT_MS,
+        "commit_cursor": 849,
+        "payload": {"request_id": "req-1", "terminal_status": "cancelled"},
+    })]);
+    let halt = silent_custody_free_halt(&cancelled, SILENT_STALL_NOW_MS)
+        .expect("a cancelled round ended, it did not fail");
+    assert_eq!(halt.provider_errors, 0);
+}
+
+#[test]
+fn the_silent_stall_releases_the_lineage() {
+    let stop = WaitStop {
+        kind: ObservationStopKind::RegisteredTerminal,
+        code: "silent_custody_free_stall",
+        message: "silent custody-free stall: the stream halted at commit_cursor 848".to_string(),
+        class: Some("silent_custody_free_stall".to_string()),
+        commit_cursor: Some(848),
+    };
+    assert!(
+        observer_may_cancel(&stop),
+        "the stream's own halt point is a registered receipt, so the lineage is released"
+    );
+    let failure = typed_wait_failure(
+        &stop,
+        &silent_stall_timeline(Vec::new()),
+        "root-1",
+        "live_certv3_q",
+    );
+    assert_eq!(failure["code"], "silent_custody_free_stall");
+    assert_eq!(failure["payload"]["observation_stop"]["kind"], "registered_terminal");
+    assert_eq!(failure["payload"]["observation_stop"]["class"], "silent_custody_free_stall");
 }

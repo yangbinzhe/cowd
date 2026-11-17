@@ -156,7 +156,7 @@ fn production_postgres_fixed_workload_matrix_and_failure_recovery() {
                             status:Some("committed".into()),actor:Some("pg-matrix".into()),refs:vec![],payload:body.clone(),
                         }).unwrap();
                         let read=store.list_stream(&stream).unwrap();
-                        assert_eq!(read.len(),1);assert_eq!(read[0].payload,body);assert_eq!(read[0].event_id,committed.event_id);
+                        assert_eq!(read.iter().map(|event| &event.event_id).collect::<Vec<_>>(), vec![&committed.event_id]);assert_eq!(read[0].payload,body);
                         active.fetch_sub(1,Ordering::SeqCst);durations.push(started.elapsed().as_micros());
                     }
                     durations
@@ -257,7 +257,9 @@ fn production_postgres_fixed_workload_matrix_and_failure_recovery() {
     let reopened = PostgresRuntimeEventStore::new(scoped.clone())
         .unwrap()
         .into_runtime_event_store();
-    assert_eq!(reopened.list_stream("matrix:64:4:127").unwrap().len(), 1);
+    let persisted = reopened.list_stream("matrix:64:4:127").unwrap();
+    assert_eq!(persisted.iter().map(|event| event.event_id.clone()).collect::<std::collections::BTreeSet<_>>().len(), 1);
+    assert_eq!(persisted.len(), 1);
     let final_health = scoped.health();
     assert!(final_health
         .lanes

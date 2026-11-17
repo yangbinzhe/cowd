@@ -179,7 +179,11 @@ async fn own818_old_root_child_active_unknown_then_required_closure_resumes() {
     }
     let graph = services.graph_state_store().projection(&root.id).unwrap();
     let (scope, facts, through, mut budget) = warm(&services, &root.id);
-    assert_eq!(facts.len(), 2);
+    let mut actual_graphs = facts.keys().cloned().collect::<Vec<_>>();
+    let mut expected_graphs = vec![root.id.clone(), child.id.clone()];
+    actual_graphs.sort_unstable();
+    expected_graphs.sort_unstable();
+    assert_eq!(actual_graphs, expected_graphs);
     assert_eq!(
         facts
             .values()
@@ -491,6 +495,7 @@ async fn own818_quiescent_real_runner_closure_still_proven_settled_without_goal_
             action_id: "818-team".into(),
             expected_revision: None,
             actor: AgentActorBinding {
+                original_execution: None,
                 objective_id: "818-objective".into(),
                 program_id: "818-program".into(),
                 session_id: "818-session".into(),
@@ -561,7 +566,11 @@ async fn own818_retained_run_start_count_scale_preserves_old_history_and_zero_ac
     }
     let graph = services.graph_state_store().projection(&root.id).unwrap();
     let (scope, facts, through, mut budget) = warm(&services, &root.id);
-    assert_eq!(facts[&root.id].bindings.len(), 26);
+    let mut actual_nodes = facts[&root.id].bindings.values().map(|(node, _)| node.as_str()).collect::<Vec<_>>();
+    let mut expected_nodes = root.nodes.iter().map(|node| node.id.as_str()).collect::<Vec<_>>();
+    actual_nodes.sort_unstable();
+    expected_nodes.sort_unstable();
+    assert_eq!(actual_nodes, expected_nodes);
     assert!(graph.revision > 140);
     let before = budget.consumed_work();
     assert!(before.0 >= 78 && before.0 < 256);

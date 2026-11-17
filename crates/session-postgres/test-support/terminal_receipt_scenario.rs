@@ -1277,7 +1277,7 @@ pub(super) fn safety_selftest() -> StepResult<()> {
         .checked_add(1)
         .ok_or("cursor overflow")?;
     assert!(fixture.store.record_terminal_message_ack(&wrong).is_err());
-    assert_eq!(fixture.history(), vec![received]);
+    assert_eq!(fixture.history(), vec![received.clone()]);
     let suite = unique_id("receipt-safety");
     let nonce = sha(&serde_json::to_vec(&original)?);
     let comment = format!("{suite}:{nonce}");
@@ -1370,6 +1370,6 @@ pub(super) fn safety_selftest() -> StepResult<()> {
     assert_eq!(verified_capture(&output, &capture_hash)?, original);
     fs::write(&output, serde_json::to_vec(&json!({"tampered":original}))?)?;
     assert!(verified_capture(&output, &capture_hash).is_err());
-    assert_eq!(fixture.history().len(), 1);
+    assert_eq!(fixture.history(), vec![received]);
     Ok(())
 }

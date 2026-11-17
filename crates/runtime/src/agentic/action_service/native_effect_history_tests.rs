@@ -325,12 +325,10 @@ async fn r1_475_native_history_wait_then_real_cancel_preserves_original_receipts
         .values()
         .all(|status| *status == ExecutionNodeStatus::Cancelled));
     let cursor = service.store.durable_commit_cursor().unwrap();
-    assert_eq!(
-        validate(&service, &commits, &cancelled, BTreeSet::new())
-            .unwrap()
-            .len(),
-        2
-    );
+    let expected_streams: BTreeSet<_> = receipts.iter().map(|receipt| receipt.stream_id.clone()).collect();
+    assert!(!expected_streams.is_empty());
+    assert_eq!(validate(&service, &commits, &cancelled, BTreeSet::new()).unwrap()
+        .keys().cloned().collect::<BTreeSet<_>>(), expected_streams);
     for receipt in receipts {
         let current = service
             .store
@@ -373,9 +371,12 @@ async fn r1_475_native_history_missing_closure_rejects_even_without_os_handles()
 }
 
 struct HeldHistoryExecutor {
-    entered: tokio::sync::mpsc::UnboundedSender<()>,
+    entered: tokio::sync::mpsc::UnboundedSender<String>,
     cancelled: tokio::sync::watch::Sender<bool>,
     aborts: std::sync::Mutex<BTreeSet<String>>,
+    commits: std::sync::Mutex<Vec<String>>,
+    polls: std::sync::Mutex<Vec<String>>,
+    return_poll_error: bool,
 }
 
 #[async_trait::async_trait]
@@ -404,7 +405,8 @@ impl NodeExecutor for HeldHistoryExecutor {
         ticket: &NodeExecutionTicket,
     ) -> Result<NodeExecutionOutcome, NodeExecutorError> {
         let mut cancelled = self.cancelled.subscribe();
-        self.entered.send(()).unwrap();
+        self.polls.lock().unwrap().push(ticket.node_id.clone());
+        self.entered.send(ticket.node_id.clone()).unwrap();
         loop {
             let is_cancelled = *cancelled.borrow_and_update();
             if is_cancelled {
@@ -412,10 +414,22 @@ impl NodeExecutor for HeldHistoryExecutor {
             }
             cancelled.changed().await.unwrap();
         }
-        Err(NodeExecutorError::Poll {
-            node_id: ticket.node_id.clone(),
-            reason: "cancelled by original control owner".into(),
-        })
+        if self.return_poll_error {
+            return Err(NodeExecutorError::Poll {
+                node_id: ticket.node_id.clone(),
+                reason: "cancelled by original control owner".into(),
+            });
+        }
+        Ok(NodeExecutionOutcome::new(ExecutionNodeResult {
+            status: ExecutionNodeStatus::Cancelled,
+            result_ref: None,
+            wait_class: None,
+            summary: Some("original controlled execution stopped".into()),
+            evidence_refs: Vec::new(),
+            failure: None,
+            usage: Default::default(),
+            finished_at_ms: 1,
+        }))
     }
 
     async fn cancel(&self, _ticket: &NodeExecutionTicket) -> Result<(), NodeExecutorError> {
@@ -431,10 +445,15 @@ impl NodeExecutor for HeldHistoryExecutor {
         self.aborts.lock().unwrap().insert(ticket.node_id.clone());
         Ok(())
     }
+
+    async fn after_commit(&self, ticket: &NodeExecutionTicket) -> Result<(), NodeExecutorError> {
+        self.commits.lock().unwrap().push(ticket.node_id.clone());
+        Ok(())
+    }
 }
 
 #[tokio::test]
-async fn r1_475_native_history_real_cancel_closes_intent_only_without_inventing_receipt() {
+async fn r1_475_native_history_real_cancel_commits_same_ticket_receipt() {
     let (service, commits, graph) = registered();
     let directory = tempfile::tempdir().unwrap();
     let registry = Arc::new(NodeExecutorRegistry::new());
@@ -444,6 +463,9 @@ async fn r1_475_native_history_real_cancel_closes_intent_only_without_inventing_
         entered,
         cancelled,
         aborts: std::sync::Mutex::new(BTreeSet::new()),
+        commits: std::sync::Mutex::new(Vec::new()),
+        polls: std::sync::Mutex::new(Vec::new()),
+        return_poll_error: false,
     });
     registry.register(executor.clone()).unwrap();
     let state = ExecutionGraphStateStore::new(Arc::clone(&service.store));
@@ -462,13 +484,16 @@ async fn r1_475_native_history_real_cancel_closes_intent_only_without_inventing_
         let identity = graph.id.clone();
         async move { runner.run_until_quiescent(&identity).await }
     });
-    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+    let entered = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        let mut nodes = BTreeSet::new();
         for _ in 0..2 {
-            observed.recv().await.unwrap();
+            nodes.insert(observed.recv().await.unwrap());
         }
+        nodes
     })
     .await
     .unwrap();
+    assert_eq!(entered, BTreeSet::from(["first".to_string(), "second".to_string()]));
     let running = state.load(&graph.id).unwrap();
     let cancelled = tokio::time::timeout(
         std::time::Duration::from_secs(5),
@@ -487,39 +512,146 @@ async fn r1_475_native_history_real_cancel_closes_intent_only_without_inventing_
         .await
         .unwrap()
         .unwrap();
-    if let Err(error) = report {
-        assert!(
-            error
-                .to_string()
-                .contains("cancelled by original control owner"),
-            "{error}"
-        );
-    }
+    report.expect("the original driver must close");
     assert!(cancelled
         .node_statuses
         .values()
         .all(|status| *status == ExecutionNodeStatus::Cancelled));
-    assert_eq!(
-        *executor.aborts.lock().unwrap(),
-        cancelled.nodes.iter().map(|node| node.id.clone()).collect()
-    );
+    let commit_log = executor.commits.lock().unwrap();
+    let mut committed_nodes = commit_log.clone();
+    committed_nodes.sort_unstable();
+    assert!(!committed_nodes.is_empty());
+    assert_eq!(committed_nodes, entered.iter().cloned().collect::<Vec<_>>(), "each original callback runs exactly once");
+    let mut committed = BTreeSet::new();
+    assert!(commit_log.iter().all(|id| committed.insert(id.clone())), "each original callback runs exactly once");
+    assert!(!committed.is_empty());
+    assert_eq!(committed, entered);
+    drop(commit_log);
+    assert!(executor.aborts.lock().unwrap().is_empty());
+    let polls = executor.polls.lock().unwrap();
+    let mut polled_nodes = polls.clone();
+    polled_nodes.sort_unstable();
+    assert_eq!(polled_nodes, entered.iter().cloned().collect::<Vec<_>>());
+    let mut polled = BTreeSet::new();
+    assert!(polls.iter().all(|id| polled.insert(id.clone())));
+    assert_eq!(polled, entered);
+    drop(polls);
     let cursor = service.store.durable_commit_cursor().unwrap();
     let pinned = validate(&service, &commits, &cancelled, BTreeSet::new()).unwrap();
-    assert_eq!(pinned.len(), 2);
-    assert!(pinned.values().all(|head| *head == 1));
+    let mut expected_streams = cancelled.nodes.iter().map(|node| {
+        let binding = state.current_binding(&cancelled, &node.id, 1).unwrap();
+        let (ticket, _) = state.binding_start_ticket(&cancelled, &node.id, &binding).unwrap();
+        ExecutionNodeBinding::effect_stream_id(&ticket)
+    }).collect::<Vec<_>>();
+    expected_streams.sort_unstable();
+    assert_eq!(pinned.keys().cloned().collect::<Vec<_>>(), expected_streams);
+    assert!(!expected_streams.is_empty());
+    assert!(pinned.values().all(|head| *head == 2));
+    let mut original_transaction = None;
     for node in &cancelled.nodes {
         let binding = state.current_binding(&cancelled, &node.id, 1).unwrap();
         let (ticket, _) = state
             .binding_start_ticket(&cancelled, &node.id, &binding)
             .unwrap();
-        assert!(service
+        let receipt = service
             .store
             .event_by_idempotency_key(
                 &ExecutionNodeBinding::effect_stream_id(&ticket),
                 &format!("{}:receipt", ticket.idempotency_key),
             )
             .unwrap()
-            .is_none());
+            .expect("the original cancelled outcome must have its own receipt");
+        let outcome: NodeExecutionOutcome = serde_json::from_value(receipt.payload.clone()).unwrap();
+        assert_eq!(outcome.result.status, ExecutionNodeStatus::Cancelled);
+        assert_eq!(cancelled.node_results.get(&node.id), Some(&outcome.result));
+        assert!(receipt.commit_cursor > 0);
+        let node_stream = format!("{}:node:{}", cancelled.id, node.id);
+        let events = service.store.list_stream(&node_stream).unwrap();
+        let transitions = events.iter().filter(|event|
+            event.kind == "execution_node.transitioned"
+                && event.transaction_id == receipt.transaction_id
+                && event.commit_cursor == receipt.commit_cursor
+                && event.payload["node_id"].as_str() == Some(node.id.as_str())
+                && event.payload["from"] == "running"
+                && event.payload["to"] == "cancelled"
+                && event.payload["result"] == serde_json::to_value(&outcome.result).unwrap()
+        ).count();
+        assert_eq!(transitions, 1, "the original node must have exactly one same-transaction cancelled transition");
+        if let Some((transaction, cursor)) = &original_transaction {
+            assert_eq!(&receipt.transaction_id, transaction);
+            assert_eq!(&receipt.commit_cursor, cursor);
+        } else {
+            original_transaction = Some((receipt.transaction_id.clone(), receipt.commit_cursor));
+        }
     }
+    let (transaction, commit_cursor) = original_transaction.unwrap();
+    assert!(service.store.list_stream(&cancelled.id).unwrap().iter().any(|event|
+        event.transaction_id == transaction && event.commit_cursor == commit_cursor
+            && (event.kind == "execution_graph.command_applied"
+                || (event.kind == "execution_graph.checkpoint"
+                    && event.payload.pointer("/body/value/cause").and_then(|value| value.as_str())
+                        == Some("execution_graph.command_applied")))),
+        "the graph cancellation and both original receipts must share one transaction");
     assert_eq!(service.store.durable_commit_cursor().unwrap(), cursor);
+}
+
+#[tokio::test]
+async fn r1_475_native_history_poll_error_does_not_prove_cancelled_outcome() {
+    let (service, commits, graph) = registered();
+    let directory = tempfile::tempdir().unwrap();
+    let registry = Arc::new(NodeExecutorRegistry::new());
+    let (entered, mut observed) = tokio::sync::mpsc::unbounded_channel();
+    let (cancelled, _) = tokio::sync::watch::channel(false);
+    let executor = Arc::new(HeldHistoryExecutor {
+        entered, cancelled, aborts: std::sync::Mutex::new(BTreeSet::new()),
+        commits: std::sync::Mutex::new(Vec::new()),
+        polls: std::sync::Mutex::new(Vec::new()), return_poll_error: true,
+    });
+    registry.register(executor.clone()).unwrap();
+    let state = ExecutionGraphStateStore::new(Arc::clone(&service.store));
+    let runner = ExecutionGraphRunner::new(
+        registry, state.clone(), commits,
+        Arc::new(ExecutionResourceManager::new([])),
+        Arc::new(ScopeLockManager::persistent(directory.path().join("scopes")).unwrap()),
+        Arc::new(WorktreeLeaseManager::open(directory.path().join("worktrees.json")).unwrap()),
+        "history-workspace", directory.path(),
+    );
+    let driver = tokio::spawn({
+        let runner = runner.clone(); let graph_id = graph.id.clone();
+        async move { runner.run_until_quiescent(&graph_id).await }
+    });
+    let entered = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        BTreeSet::from([observed.recv().await.unwrap(), observed.recv().await.unwrap()])
+    }).await.unwrap();
+    assert_eq!(entered, BTreeSet::from(["first".to_string(), "second".to_string()]));
+    let running = state.load(&graph.id).unwrap();
+    let error = tokio::time::timeout(std::time::Duration::from_secs(5), runner.command(
+        &graph.id, harness_contract::execution_graph::ExecutionGraphCommand::Cancel {
+            expected_revision: running.revision, reason: "withdraw running original attempt".into(),
+        })).await.unwrap().expect_err("a Poll error is not a cancellation outcome");
+    assert!(matches!(&error, crate::execution_core::graph::ExecutionRunnerError::Executor(
+        NodeExecutorError::Poll { reason, .. }
+    ) if reason == "cancelled by original control owner"), "{error:?}");
+    let _original_result = tokio::time::timeout(std::time::Duration::from_secs(5), driver)
+        .await.expect("original driver remains unresolved").expect("original driver panicked");
+    let current = state.load(&graph.id).unwrap();
+    assert!(current.node_statuses.values().all(|status| *status != ExecutionNodeStatus::Cancelled));
+    for node in &current.nodes {
+        let binding = state.current_binding(&current, &node.id, 1).unwrap();
+        let (ticket, _) = state.binding_start_ticket(&current, &node.id, &binding).unwrap();
+        if let Some(receipt) = service.store.event_by_idempotency_key(
+            &ExecutionNodeBinding::effect_stream_id(&ticket), &format!("{}:receipt", ticket.idempotency_key),
+        ).unwrap() {
+            let outcome: NodeExecutionOutcome = serde_json::from_value(receipt.payload.clone()).unwrap();
+            assert_eq!(outcome.result.status, ExecutionNodeStatus::Failed,
+                "a Poll error cannot be rewritten into a cancelled receipt");
+        }
+    }
+    let polls = executor.polls.lock().unwrap();
+    let mut polled_nodes = polls.clone();
+    polled_nodes.sort_unstable();
+    assert_eq!(polled_nodes, entered.iter().cloned().collect::<Vec<_>>());
+    let mut polled = BTreeSet::new();
+    assert!(polls.iter().all(|id| polled.insert(id.clone())));
+    assert_eq!(polled, entered);
 }

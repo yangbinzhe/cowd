@@ -12,7 +12,6 @@ environment:
     - tests/performance-v0.9.711/
     - tests/test-governance/capability-baseline-v0.9.710.json
     - tests/test-governance/duplicate-capability-allowlist.yaml
-    - tests/test-governance/source-size-policy.yaml
     - tests/test-governance/state-authority-registry.yaml
     - tests/test-governance/test-inventory.yaml
   cargo_incremental: "0"

@@ -182,6 +182,23 @@ impl ApprovalCoordinator {
     pub async fn resolve_tool(
         &self,
         source: ApprovalSource,
+        context: ApprovalContext,
+        autonomy_profile: Option<harness_contract::policy::AutonomyProfileId>,
+        descriptor: &ToolEffectDescriptor,
+        input: &str,
+        cancellation: CancellationToken,
+        control_notify: Option<Arc<Notify>>,
+        pending_hook: Option<ApprovalPendingHook>,
+        timeout: Duration,
+    ) -> Result<ApprovalResolution, String> {
+        self.resolve_tool_with_risk(source, context, autonomy_profile, descriptor, input,
+            cancellation, control_notify, pending_hook, timeout, task_risk_for_effect(descriptor)).await
+    }
+
+    /// Original member policy supplies its own already-assessed risk.
+    pub(crate) async fn resolve_tool_with_risk(
+        &self,
+        source: ApprovalSource,
         mut context: ApprovalContext,
         autonomy_profile: Option<harness_contract::policy::AutonomyProfileId>,
         descriptor: &ToolEffectDescriptor,
@@ -190,6 +207,7 @@ impl ApprovalCoordinator {
         control_notify: Option<Arc<Notify>>,
         pending_hook: Option<ApprovalPendingHook>,
         timeout: Duration,
+        risk: TaskRisk,
     ) -> Result<ApprovalResolution, String> {
         let config = self.config().await;
         let approval_profile = context.approval_profile.unwrap_or(config.profile);
@@ -209,7 +227,6 @@ impl ApprovalCoordinator {
                 .filter_map(|scope| scope.target.clone())
                 .collect();
         }
-        let risk = task_risk_for_effect(descriptor);
         if let Some(grant) = self.queue.matching_grant(&context, risk) {
             return Ok(ApprovalResolution::Approved {
                 approval_id: grant.approval_id.clone(),

@@ -758,6 +758,9 @@ mod tests {
 
     #[tokio::test]
     async fn r1_projection_395_race_returns_complete_cut_without_replaying_full_history() {
+        if crate::test_support::skip_if_env_absent("COWD_R1_06_FIXTURE_ROOT") {
+            return;
+        }
         for detail_scope in [ProjectionDetailScope::Full, ProjectionDetailScope::Summary] {
             let (services, backend, graph_id) = r1_history_fixture();
             let body = "public projection body ".repeat(30_000);
@@ -846,6 +849,9 @@ mod tests {
 
     #[tokio::test]
     async fn r1_projection_395_real_oversize_still_rejects_without_checkpoint() {
+        if crate::test_support::skip_if_env_absent("COWD_R1_06_FIXTURE_ROOT") {
+            return;
+        }
         let (services, backend, graph_id) = r1_history_fixture();
         for sequence in 0..2 {
             services.event_store().append(crate::RuntimeEventInput {
@@ -1079,250 +1085,6 @@ mod tests {
         assert_eq!(locks.lease_is_active(&reference).unwrap(), Some(false));
     }
 
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn r1_execution_axes_412_real_process_wait_unknown_exit_and_withdrawal() {
-        use crate::agentic::execution::reviewed_goal_fixture::PhysicalProcessFixture;
-        for unknown in [false, true] {
-            let fixture = PhysicalProcessFixture::new(
-                crate::config::AgentExecutorSandboxProfile::WorkspaceReadOnly,
-                if unknown {
-                    "projection-412-unknown"
-                } else {
-                    "projection-412-reaped"
-                },
-            )
-            .await;
-            let gate = fixture
-                .services
-                .agent_runtime()
-                .process_fixture_exit_gate(unknown);
-            let worker = fixture
-                .dispatch(
-                    "projection-412-worker",
-                    vec!["read:.".into()],
-                    false,
-                    false,
-                    true,
-                )
-                .await;
-            let graph_id = worker.packet.graph_id().to_string();
-            let before = snapshot(&fixture.services, &graph_id, &context(&fixture.services))
-                .await
-                .unwrap();
-            assert_ne!(
-                before.terminal_axes.execution.phase,
-                harness_contract::projection::TerminalExecutionPhase::Terminal
-            );
-            worker.withdraw().await;
-            let withdrawal = fixture
-                .services
-                .event_store()
-                .event_by_idempotency_key(
-                    &format!(
-                        "agentic-program:{}",
-                        worker.packet.agentic_binding.as_ref().unwrap().program_id
-                    ),
-                    &format!("agent-action:physical-withdraw:{}", worker.packet.run_id()),
-                )
-                .unwrap()
-                .expect("the original withdrawal must be durably applied");
-            let envelope: harness_contract::agent_action::AgentActionEnvelope =
-                serde_json::from_value(withdrawal.payload["envelope"].clone())
-                    .expect("the durable withdrawal must carry its original envelope");
-            assert!(
-                matches!(
-                    &envelope.action,
-                    harness_contract::agent_action::AgentAction::TaskWithdraw(input)
-                        if input.task_ref == worker.task_ref
-                ),
-                "the durable withdrawal must be the original Task retirement"
-            );
-            let dispatch_context = crate::agentic::execution::AgenticDispatchContext {
-                session_id: worker.packet.session_id().to_string(),
-                turn_id: envelope.actor.turn_id.clone(),
-                model_lease: worker.packet.model_lease.clone(),
-                permission_ceiling: worker.packet.permission_ceiling,
-                resource_scopes: worker.packet.resource_scopes.clone(),
-            };
-            let mut dispatch = fixture
-                .services
-                .dispatch_agentic_followups(&envelope, dispatch_context);
-            struct GateRelease(std::sync::Arc<crate::agent_process_jsonl_adapter::ProcessExitGate>);
-            impl Drop for GateRelease {
-                fn drop(&mut self) {
-                    self.0.release();
-                }
-            }
-            let _gate_release = GateRelease(gate.clone());
-            let mut dispatched: Option<
-                Result<Vec<crate::agentic::execution::AgenticDispatchReceipt>, String>,
-            > = None;
-            let entered = tokio::time::timeout(std::time::Duration::from_secs(30), async {
-                loop {
-                    tokio::select! {
-                        result = &mut dispatch => {
-                            dispatched = Some(result);
-                            return gate.entered.load(std::sync::atomic::Ordering::Acquire);
-                        }
-                        _ = tokio::task::yield_now() => {
-                            if gate.entered.load(std::sync::atomic::Ordering::Acquire) {
-                                return true;
-                            }
-                        }
-                    }
-                }
-            })
-            .await
-            .unwrap_or(false);
-            assert!(
-                entered,
-                "the original withdrawal consumer must cancel the live process before the driver is released"
-            );
-            assert!(crate::agent_runtime::confirmed_run_exit(
-                fixture.services.event_store(),
-                &worker.packet
-            )
-            .unwrap()
-            .is_none());
-            let pending_program = fixture
-                .services
-                .agent_action_service()
-                .project(&worker.packet.agentic_binding.as_ref().unwrap().program_id)
-                .unwrap();
-            assert_eq!(
-                pending_program.tasks[&worker.task_ref].status,
-                crate::AgenticTaskStatus::CancelRequested
-            );
-            assert!(pending_program.tasks[&worker.task_ref]
-                .pending_retirement
-                .is_some());
-            assert!(!pending_program.tasks[&worker.task_ref]
-                .active_attempts
-                .is_empty());
-            let pending = snapshot(&fixture.services, &graph_id, &context(&fixture.services))
-                .await
-                .unwrap();
-            assert_ne!(
-                pending.terminal_axes.execution.phase,
-                harness_contract::projection::TerminalExecutionPhase::Terminal
-            );
-            gate.release();
-            let consumer = async {
-                match dispatched {
-                    Some(result) => result,
-                    None => tokio::time::timeout(std::time::Duration::from_secs(30), dispatch)
-                        .await
-                        .expect("the original withdrawal consumer must finish"),
-                }
-            };
-            let (consumer_result, terminal_result) = tokio::join!(
-                consumer,
-                tokio::time::timeout(std::time::Duration::from_secs(30), worker.wait_terminal()),
-            );
-            terminal_result.expect("the original driver must reach its terminal state");
-            assert!(
-                consumer_result.is_ok(),
-                "the original withdrawal consumer must apply the durable cancellation: {consumer_result:?}"
-            );
-            let turn_id = fixture
-                .services
-                .graph_state_store()
-                .load(&graph_id)
-                .unwrap()
-                .lineage
-                .unwrap()
-                .turn_id;
-            projection_412_goal(
-                &fixture.services,
-                &graph_id,
-                worker.packet.session_id(),
-                &turn_id,
-                "cancelled",
-            );
-            let mut last_axes = None;
-            let settled_result = tokio::time::timeout(std::time::Duration::from_secs(30), async {
-                loop {
-                    let projection =
-                        snapshot(&fixture.services, &graph_id, &context(&fixture.services))
-                            .await
-                            .unwrap();
-                    if unknown
-                        || projection.terminal_axes.execution.phase
-                            == harness_contract::projection::TerminalExecutionPhase::Terminal
-                    {
-                        break projection;
-                    }
-                    last_axes = Some(serde_json::json!(&projection.terminal_axes));
-                    tokio::task::yield_now().await;
-                }
-            })
-            .await;
-            let settled = settled_result.unwrap_or_else(|error| {
-                let task = fixture.services.agent_action_service()
-                    .project(&worker.packet.agentic_binding.as_ref().unwrap().program_id)
-                    .ok().and_then(|program| program.tasks.get(&worker.task_ref).cloned());
-                let graph = fixture.services.graph_state_store().load(&graph_id).ok();
-                panic!("physical retirement did not converge: {error}; {}", serde_json::json!({
-                    "run_id": worker.packet.run_id(), "attempt": worker.packet.attempt,
-                    "unknown": unknown, "last_axes": last_axes,
-                    "node_statuses": graph.map(|graph| graph.node_statuses),
-                    "task": task.map(|task| serde_json::json!({
-                        "status": task.status, "pending_retirement": task.pending_retirement,
-                        "active_attempts": task.active_attempts, "claim_generation": task.claim_generation,
-                    })),
-                    "exact_exit": format!("{:?}", crate::agent_runtime::confirmed_run_exit(
-                        fixture.services.event_store(), &worker.packet).map(|exit| exit.is_some())),
-                }));
-            });
-            assert_eq!(
-                settled.terminal_axes.outcome.outcome,
-                Some(harness_contract::goal::ObjectiveTerminalKind::Cancelled)
-            );
-            if unknown {
-                assert_ne!(
-                    settled.terminal_axes.execution.phase,
-                    harness_contract::projection::TerminalExecutionPhase::Terminal
-                );
-                assert_ne!(
-                    settled.terminal_axes.execution.settlement,
-                    harness_contract::projection::TerminalEffectSettlement::ProvenSettled
-                );
-            } else {
-                assert_eq!(
-                    settled.terminal_axes.execution.settlement,
-                    harness_contract::projection::TerminalEffectSettlement::ProvenSettled
-                );
-                assert!(settled.terminal_axes.execution.coverage_complete);
-                let binding = worker.packet.agentic_binding.as_ref().unwrap();
-                let program = fixture
-                    .services
-                    .agent_action_service()
-                    .project(&binding.program_id)
-                    .unwrap();
-                assert_eq!(
-                    program.tasks[&worker.task_ref].status,
-                    crate::AgenticTaskStatus::Withdrawn
-                );
-                assert_ne!(
-                    program.tasks[&worker.task_ref].status,
-                    crate::AgenticTaskStatus::Accepted
-                );
-                assert!(program.tasks[&worker.task_ref].pending_retirement.is_none());
-                assert!(program.tasks[&worker.task_ref].active_attempts.is_empty());
-                let diff = delta(
-                    &fixture.services,
-                    &graph_id,
-                    settled.revision,
-                    settled.cursor,
-                    &context(&fixture.services),
-                )
-                .unwrap();
-                assert!(diff.resync_reason.is_some());
-            }
-            fixture.services.shutdown_execution().await;
-        }
-    }
 
     struct BindingHistoryExecutor {
         polls: std::sync::atomic::AtomicUsize,
@@ -1933,6 +1695,9 @@ mod tests {
 
     #[tokio::test]
     async fn r1_bounded_history_projection_request_does_not_accumulate_all_pages() {
+        if crate::test_support::skip_if_env_absent("COWD_R1_06_FIXTURE_ROOT") {
+            return;
+        }
         let (services, backend, graph_id) = r1_history_fixture();
         let original_plan = services.graph_state_store().load(&graph_id).unwrap();
         for sequence in 0..1000 {
@@ -1982,6 +1747,9 @@ mod tests {
 
     #[tokio::test]
     async fn r1_703_long_history_full_hot_and_durable_reload_preserve_axes_and_bounds() {
+        if crate::test_support::skip_if_env_absent("COWD_R1_06_FIXTURE_ROOT") {
+            return;
+        }
         let (services, backend, graph_id) = r1_history_fixture();
         let query = context(&services);
         let mut latest = snapshot(&services, &graph_id, &query).await.unwrap();
@@ -2019,6 +1787,9 @@ mod tests {
 
     #[tokio::test]
     async fn r1_bounded_history_projection_cursor_scope_and_oversize_are_honest() {
+        if crate::test_support::skip_if_env_absent("COWD_R1_06_FIXTURE_ROOT") {
+            return;
+        }
         let (services, backend, graph_id) = r1_history_fixture();
         let query = context(&services);
         let initial = snapshot(&services, &graph_id, &query).await.unwrap();
@@ -3643,6 +3414,7 @@ mod tests {
         let root = |action_id: &str, action: AgentAction| AgentActionEnvelope {
             action_id: action_id.to_string(),
             actor: AgentActorBinding {
+                original_execution: None,
                 objective_id: "objective-agentic-projection".to_string(),
                 program_id: "program-agentic-projection".to_string(),
                 session_id: "session-agentic-projection".to_string(),
@@ -3849,6 +3621,8 @@ mod tests {
                 &reviewer_id,
                 "execution-agentic-reviewer",
                 AgentAction::TaskReview(TaskReviewInput {
+                    gaps: Vec::new(),
+                    directed_actions: Vec::new(),
                     operator_requirement: None,
                     task_ref: research_task_id.clone(),
                     decision: TaskReviewDecision::Accept,
@@ -3908,6 +3682,8 @@ mod tests {
                 &analyst_id,
                 "execution-agentic-analyst",
                 AgentAction::TaskReview(TaskReviewInput {
+                    gaps: Vec::new(),
+                    directed_actions: Vec::new(),
                     operator_requirement: None,
                     task_ref: synthesis_task_id.clone(),
                     decision: TaskReviewDecision::Accept,

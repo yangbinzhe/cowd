@@ -146,7 +146,9 @@ async fn lifecycle_keeps_each_authenticated_surface_attachment_distinct() {
     let attachments = lifecycle["snapshot"]["attachments"]
         .as_array()
         .expect("attachments array");
-    assert_eq!(attachments.len(), 2);
+    let mut actor_ids = attachments.iter().map(|attachment| attachment.pointer("/actor/id").and_then(serde_json::Value::as_str).unwrap()).collect::<Vec<_>>();
+    actor_ids.sort_unstable();
+    assert_eq!(actor_ids, ["principal:local-human:surface:tui:auth-gate", "principal:local-human:surface:webui:auth-gate"]);
     assert!(attachments.iter().any(|attachment| {
         attachment.pointer("/actor/surface") == Some(&serde_json::json!("tui"))
             && attachment.pointer("/actor/id")
@@ -186,8 +188,7 @@ async fn lifecycle_keeps_each_authenticated_surface_attachment_distinct() {
     let attachments = detached["snapshot"]["attachments"]
         .as_array()
         .expect("attachments array");
-    assert_eq!(attachments.len(), 1);
-    assert_eq!(attachments[0]["actor"]["surface"], "webui");
+    assert!(matches!(attachments.as_slice(), [attachment] if attachment["actor"]["surface"] == "webui" && attachment["actor"]["id"] == "principal:local-human:surface:webui:auth-gate"));
 }
 
 #[tokio::test]

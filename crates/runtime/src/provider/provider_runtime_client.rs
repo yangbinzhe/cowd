@@ -303,17 +303,20 @@ struct ProviderEntryTemplate {
     client: ProviderClient,
     profile: ResolvedProviderProfile,
     transport_fingerprint: crate::TransportProfileFingerprint,
+    diagnostic_send_reason: Option<String>,
 }
 
 impl ProviderEntryTemplate {
     fn request_entry(&self) -> ProviderEntry {
+        let request_id = uuid::Uuid::new_v4().to_string();
         ProviderEntry {
             model: self.model.clone(),
             client: self.client.clone(),
             request_context: ProviderRequestContext {
-                request_id: uuid::Uuid::new_v4().to_string(),
+                request_id,
                 profile: self.profile.clone(),
                 transport_fingerprint: self.transport_fingerprint,
+                diagnostic_send_reason: self.diagnostic_send_reason.clone(),
                 attempt: 1,
             },
         }
@@ -399,7 +402,12 @@ impl ProviderClientTemplateCache {
             }
         }
 
-        let template = build_provider_template(snapshot, transport_fingerprint, http, &resolved)?;
+        let template = build_provider_template(
+            snapshot,
+            transport_fingerprint,
+            http,
+            &resolved,
+        )?;
         let entry = template.request_entry();
         let mut state = self
             .state
@@ -473,6 +481,9 @@ pub struct ProviderRequestContext {
     pub request_id: String,
     pub profile: ResolvedProviderProfile,
     pub transport_fingerprint: crate::TransportProfileFingerprint,
+    /// Explicitly unauthenticated operator diagnostic; never acceptance evidence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diagnostic_send_reason: Option<String>,
     pub attempt: u32,
 }
 
@@ -1220,9 +1231,11 @@ impl ProviderRuntimeClient {
         max_tokens: u32,
     ) -> Result<PreparedControlAnalysis, String> {
         let snapshot = self.registry.pin();
-        let entry = self
-            .template_cache
-            .resolve(&snapshot, &self.transport_pool, model)?;
+        let entry = self.template_cache.resolve(
+            &snapshot,
+            &self.transport_pool,
+            model,
+        )?;
         self.validate_control_account(&entry)?;
         let capacity = snapshot.context_window_resolution(model);
         if capacity.source == provider::ModelContextWindowSource::Assumed {
@@ -1267,9 +1280,27 @@ impl ProviderRuntimeClient {
             .with_parent_class_ceiling(class)
             .with_fairness_key(key)
             .with_deadline_at_ms(now.saturating_add(5000));
-            match manager.admit(admission).await.map_err(|e| e.to_string())? {
+            let decision =
+                match admit_preparation_resources(manager, admission, self.turn_cancellation.as_ref())
+                    .await
+                    .map_err(|error| error.to_string())?
+                {
+                    Some(decision) => decision,
+                    None => {
+                        return Err(
+                            "control preparation cancelled while waiting for context capacity"
+                                .into(),
+                        );
+                    }
+                };
+            match decision {
                 ResourceAdmissionDecision::Granted { lease, .. } => Some(lease),
-                _ => return Err("control prepared content capacity unavailable".into()),
+                decision => {
+                    return Err(preparation_capacity_failure(
+                        "control prepared content capacity unavailable",
+                        &decision,
+                    ))
+                }
             }
         } else {
             if self.execution_supervisor.is_some() {
@@ -1286,7 +1317,7 @@ impl ProviderRuntimeClient {
                 &entry.model,
                 &entry.request_context.profile.model_capabilities,
                 None,
-                self.reasoning_effort.clone(),
+                self.reasoning_effort.clone().or_else(|| snapshot.resolve(&entry.model).and_then(|provider| provider.reasoning_effort.clone())),
             ),
             protocol_capabilities: entry.request_context.profile.model_capabilities.clone(),
             context_window_limit: Some(capacity.tokens),
@@ -1597,8 +1628,13 @@ fn build_provider_entry(
     let (transport_fingerprint, http) = transport_pool
         .checkout_default()
         .map_err(|error| error.to_string())?;
-    build_provider_template(snapshot, transport_fingerprint, http, &resolved)
-        .map(|template| template.request_entry())
+    build_provider_template(
+        snapshot,
+        transport_fingerprint,
+        http,
+        &resolved,
+    )
+    .map(|template| template.request_entry())
 }
 
 fn build_provider_template(
@@ -1666,6 +1702,7 @@ fn build_provider_template(
             capabilities,
         },
         transport_fingerprint,
+        diagnostic_send_reason: None,
     })
 }
 
@@ -1748,6 +1785,68 @@ impl ApiClient for ProviderRuntimeClient {
             .lock()
             .map(|mut recorded| std::mem::take(&mut *recorded))
             .unwrap_or_default()
+    }
+}
+
+/// The message one preparation's admission failure carries.
+///
+/// The admission decision has three states and the wait reason has eight; a
+/// preparation that was not granted says WHICH of them held it back, so the
+/// failure names its cause instead of collapsing every wait into one
+/// sentence that reads like a capacity wall.
+fn preparation_capacity_failure(
+    prefix: &str,
+    decision: &crate::execution_core::graph::ResourceAdmissionDecision,
+) -> String {
+    match decision {
+        crate::execution_core::graph::ResourceAdmissionDecision::Granted { .. } => {
+            format!("{prefix}: wait_reason=granted")
+        }
+        crate::execution_core::graph::ResourceAdmissionDecision::Deferred { wait_reason, .. }
+        | crate::execution_core::graph::ResourceAdmissionDecision::Overloaded {
+            wait_reason, ..
+        } => format!("{prefix}: wait_reason={wait_reason:?}"),
+    }
+}
+
+/// The fairness key one preparation's admission queues on.
+///
+/// The sibling provider path admits on `session:{id}`, so this path queues on
+/// the same session's admission instead of on a second queue of its own.
+fn preparation_fairness_key(session: Option<&str>) -> String {
+    match session {
+        Some(session) if !session.is_empty() => format!("session:{session}"),
+        _ => "provider-prepare".to_string(),
+    }
+}
+
+/// Admit one preparation's resources, and stop waiting when the turn ends.
+///
+/// The sibling provider path binds the turn's cancellation to its admission
+/// wait; a preparation waits the same way, so a cancelled turn does not sit
+/// out the whole admission window and then fail for a capacity that no
+/// longer matters.
+///
+/// `Ok(None)` means the turn was cancelled while the admission was pending.
+async fn admit_preparation_resources(
+    manager: &crate::execution_core::graph::ExecutionResourceManager,
+    admission: crate::execution_core::graph::ResourceAdmissionRequest,
+    cancellation: Option<&Arc<crate::execution_core::services::TurnCancellationControl>>,
+) -> Result<Option<crate::execution_core::graph::ResourceAdmissionDecision>, String> {
+    let admit = manager.admit(admission);
+    tokio::select! {
+        () = wait_for_turn_cancellation(cancellation) => Ok(None),
+        decision = admit => decision.map(Some).map_err(|error| error.to_string()),
+    }
+}
+
+/// Await the turn's cancellation, when this client has one.
+async fn wait_for_turn_cancellation(
+    cancellation: Option<&Arc<crate::execution_core::services::TurnCancellationControl>>,
+) {
+    match cancellation {
+        Some(control) => control.token().cancelled().await,
+        None => std::future::pending::<()>().await,
     }
 }
 
@@ -2075,37 +2174,59 @@ impl ProviderRuntimeClient {
                 .duration_since(std::time::UNIX_EPOCH)
                 .map_err(|e| RuntimeError::new(e.to_string()))?
                 .as_millis() as u64;
-            let (class, key) = request
+            let (class, session) = request
                 .preparation
                 .preparation_scope
                 .as_ref()
-                .map(|(class, key)| (*class, key.as_str()))
+                .map(|(class, key)| (*class, Some(key.as_str())))
                 .unwrap_or_else(|| {
                     (
                         ExecutionServiceClass::Foreground,
                         request
                             .provider_evidence_context
                             .as_ref()
-                            .map_or("provider-prepare", |c| c.session_id.as_str()),
+                            .map(|context| context.session_id.as_str()),
                     )
                 });
+            // The sibling provider path admits on `session:{id}`; this path
+            // queues on the same session's admission instead of on a second
+            // queue of its own.
+            let fairness_key = preparation_fairness_key(session);
             let admission = ResourceAdmissionRequest::new(
                 class,
                 [(ExecutionResourceKind::ContextBytes, resident)],
             )
-            .with_fairness_key(key)
+            .with_parent_class_ceiling(class)
+            .with_fairness_key(fairness_key.as_str())
             .with_deadline_at_ms(now.saturating_add(5000));
-            match manager.admit(admission).await.map_err(|e| {
+            let decision = match admit_preparation_resources(
+                manager,
+                admission,
+                self.turn_cancellation.as_ref(),
+            )
+            .await
+            .map_err(|error| {
                 RuntimeError::context_capacity(
                     crate::context_ledger::ContextCapacityFailure::RenderOverflow,
-                    e.to_string(),
+                    error,
                 )
             })? {
+                Some(decision) => decision,
+                None => {
+                    return Err(RuntimeError::new(
+                        "provider preparation cancelled while waiting for context capacity",
+                    ));
+                }
+            };
+            match decision {
                 ResourceAdmissionDecision::Granted { lease, .. } => Some(lease),
-                _ => {
+                decision => {
                     return Err(RuntimeError::context_capacity(
                         crate::context_ledger::ContextCapacityFailure::RenderOverflow,
-                        "prepared content capacity unavailable",
+                        preparation_capacity_failure(
+                            "prepared content capacity unavailable",
+                            &decision,
+                        ),
                     ))
                 }
             }
@@ -2178,7 +2299,11 @@ impl ProviderRuntimeClient {
         if required_tool_name.is_some_and(|name| !active_tools.iter().any(|tool| tool.name == name)) {
             return Err(RuntimeError::new("required governed tool is not exposed"));
         }
-        let mut entry = self.template_cache.resolve(snapshot, &self.transport_pool, &request.model)
+        let mut entry = self.template_cache.resolve(
+            snapshot,
+            &self.transport_pool,
+            &request.model,
+        )
             .map_err(|error| RuntimeError::new(format!("provider candidate unavailable: {error}")))?;
         if self.transport_pool.provider_account_is_fenced(
             entry.request_context.profile.registry_revision,
@@ -2190,7 +2315,7 @@ impl ProviderRuntimeClient {
             &entry.model,
             &entry.request_context.profile.model_capabilities,
             request.reasoning_effort_override.clone(),
-            self.reasoning_effort.clone(),
+            self.reasoning_effort.clone().or_else(|| snapshot.resolve(&entry.model).and_then(|provider| provider.reasoning_effort.clone())),
         );
         if let Some(protocol) = entry.request_context.profile.protocol.as_deref()
             .and_then(ProviderProtocol::parse)
@@ -2424,7 +2549,7 @@ async fn forward_provider_attempt(
     let request_guard = transport_pool.begin_request();
     let mut attempt_usage = None;
     let mut attempt_cache_dimensions_observed = false;
-    let stream_result = forward_provider_stream(
+    let stream_result = Box::pin(forward_provider_stream(
         &entry.client,
         &message_request,
         &prepared.wire,
@@ -2439,7 +2564,7 @@ async fn forward_provider_attempt(
         control,
         &entry.request_context.request_id,
         evidence_writer.as_deref(),
-    )
+    ))
     .await;
     // Provider transport capacity is unrelated to disk-cache persistence.
     // Release it before the bounded cohort barrier so different cache keys
@@ -3006,233 +3131,14 @@ async fn forward_provider_stream(
             diag.record("runtime_queue_send_accepted", &transport_activity);
             provider_model_emitted = true;
         }
-        match event {
-            ApiStreamEvent::MessageStart(start) => {
-                if !flush_pending_text(
-                    sender,
-                    &mut pending_text,
-                    emit_output,
-                    &stream_callback,
-                    &mut emitted,
-                )
-                .await
-                {
-                    return Ok(ForwardedProviderStream::ConsumerDropped);
-                }
-                let mut events = Vec::new();
-                for (index, block) in start.message.content.into_iter().enumerate() {
-                    let Ok(index) = u32::try_from(index) else {
-                        break;
-                    };
-                    push_provider_output_block(block, index, &mut events, &mut pending_tools, true);
-                }
-                if !forward_events(sender, events, emit_output, &stream_callback, &mut emitted)
-                    .await
-                {
-                    return Ok(ForwardedProviderStream::ConsumerDropped);
-                }
-                if start.message.usage_observed {
-                    let usage = merge_provider_usage_max(
-                        cumulative_usage,
-                        start.message.usage.token_usage(),
-                    );
-                    cumulative_usage = Some(usage);
-                    *attempt_usage = Some(usage);
-                    *attempt_cache_dimensions_observed |= start.message.cache_dimensions_observed;
-                }
-            }
-            ApiStreamEvent::ContentBlockStart(start) => {
-                if !flush_pending_text(
-                    sender,
-                    &mut pending_text,
-                    emit_output,
-                    &stream_callback,
-                    &mut emitted,
-                )
-                .await
-                {
-                    return Ok(ForwardedProviderStream::ConsumerDropped);
-                }
-                let mut events = Vec::new();
-                push_provider_output_block(
-                    start.content_block,
-                    start.index,
-                    &mut events,
-                    &mut pending_tools,
-                    true,
-                );
-                if !forward_events(sender, events, emit_output, &stream_callback, &mut emitted)
-                    .await
-                {
-                    return Ok(ForwardedProviderStream::ConsumerDropped);
-                }
-            }
-            ApiStreamEvent::ContentBlockDelta(delta) => match delta.delta {
-                ContentBlockDelta::TextDelta { text } => {
-                    if !text.is_empty()
-                        && !forward_text_delta(
-                            sender,
-                            text,
-                            &mut pending_text,
-                            emit_output,
-                            &stream_callback,
-                            &mut emitted,
-                        )
-                        .await
-                    {
-                        return Ok(ForwardedProviderStream::ConsumerDropped);
-                    }
-                }
-                ContentBlockDelta::InputJsonDelta { partial_json } => {
-                    if let Some((_, _, input)) = pending_tools.get_mut(&delta.index) {
-                        input.push_str(&partial_json);
-                    }
-                }
-                ContentBlockDelta::ReasoningSummaryDelta { text } => {
-                    if !forward_event(
-                        sender,
-                        AssistantEvent::ReasoningSummaryDelta(text),
-                        emit_output,
-                        &stream_callback,
-                        &mut emitted,
-                    )
-                    .await
-                    {
-                        return Ok(ForwardedProviderStream::ConsumerDropped);
-                    }
-                }
-                ContentBlockDelta::ThinkingDelta { thinking } => {
-                    if !forward_event(
-                        sender,
-                        AssistantEvent::PrivateReasoningDelta(thinking),
-                        emit_output,
-                        &stream_callback,
-                        &mut emitted,
-                    )
-                    .await
-                    {
-                        return Ok(ForwardedProviderStream::ConsumerDropped);
-                    }
-                }
-                ContentBlockDelta::SignatureDelta { signature } => {
-                    if !forward_event(
-                        sender,
-                        AssistantEvent::SignatureDelta(signature),
-                        emit_output,
-                        &stream_callback,
-                        &mut emitted,
-                    )
-                    .await
-                    {
-                        return Ok(ForwardedProviderStream::ConsumerDropped);
-                    }
-                }
-            },
-            ApiStreamEvent::ContentBlockStop(stop) => {
-                if !flush_pending_text(
-                    sender,
-                    &mut pending_text,
-                    emit_output,
-                    &stream_callback,
-                    &mut emitted,
-                )
-                .await
-                {
-                    return Ok(ForwardedProviderStream::ConsumerDropped);
-                }
-                if let Some((id, name, input)) = pending_tools.remove(&stop.index) {
-                    if !forward_event(
-                        sender,
-                        AssistantEvent::ToolUse { id, name, input },
-                        emit_output,
-                        &stream_callback,
-                        &mut emitted,
-                    )
-                    .await
-                    {
-                        return Ok(ForwardedProviderStream::ConsumerDropped);
-                    }
-                }
-                if !forward_event(
-                    sender,
-                    AssistantEvent::ItemCompleted { index: stop.index },
-                    emit_output,
-                    &stream_callback,
-                    &mut emitted,
-                )
-                .await
-                {
-                    return Ok(ForwardedProviderStream::ConsumerDropped);
-                }
-            }
-            ApiStreamEvent::MessageDelta(delta) => {
-                if !flush_pending_text(
-                    sender,
-                    &mut pending_text,
-                    emit_output,
-                    &stream_callback,
-                    &mut emitted,
-                )
-                .await
-                {
-                    return Ok(ForwardedProviderStream::ConsumerDropped);
-                }
-                if delta.usage_observed {
-                    let usage =
-                        merge_provider_usage_max(cumulative_usage, delta.usage.token_usage());
-                    cumulative_usage = Some(usage);
-                    *attempt_usage = Some(usage);
-                    *attempt_cache_dimensions_observed |= delta.cache_dimensions_observed;
-                }
-                // Forward the provider's terminal reason when present so the
-                // runtime can distinguish a normal finish from a max-token
-                // truncation (PLAN W2 Step1). Emitted only on `stop_reason`.
-                if let Some(stop_reason) = delta.delta.stop_reason.clone() {
-                    if !forward_event(
-                        sender,
-                        AssistantEvent::MessageBoundary {
-                            stop_reason: Some(stop_reason),
-                        },
-                        emit_output,
-                        &stream_callback,
-                        &mut emitted,
-                    )
-                    .await
-                    {
-                        return Ok(ForwardedProviderStream::ConsumerDropped);
-                    }
-                }
-            }
-            ApiStreamEvent::MessageStop(_) => {
-                if !flush_pending_text(
-                    sender,
-                    &mut pending_text,
-                    emit_output,
-                    &stream_callback,
-                    &mut emitted,
-                )
-                .await
-                {
-                    return Ok(ForwardedProviderStream::ConsumerDropped);
-                }
-                if let Some(usage) = cumulative_usage {
-                    if !forward_event(
-                        sender,
-                        AssistantEvent::Usage(usage),
-                        emit_output,
-                        &stream_callback,
-                        &mut emitted,
-                    )
-                    .await
-                    {
-                        return Ok(ForwardedProviderStream::ConsumerDropped);
-                    }
-                }
-                saw_stop = true;
-                // Runtime terminal publication is deliberately delayed until
-                // the caller commits attempt evidence and Provider cache
-                // persistence. See `forward_provider_attempt`.
-            }
+        // A single event advances one action at a time. The shared action
+        // executor keeps the original send/flush order and backpressure.
+        if !Box::pin(forward_provider_event(
+            event, &mut pending_tools, &mut cumulative_usage, attempt_usage,
+            attempt_cache_dimensions_observed, &mut saw_stop, sender, emit_output,
+            &stream_callback, &mut pending_text, &mut emitted,
+        )).await {
+            return Ok(ForwardedProviderStream::ConsumerDropped);
         }
         if first_semantic { diag.record("first_content_handler_complete", &transport_activity); semantic_recorded = true; }
     }
@@ -3267,6 +3173,155 @@ async fn forward_provider_stream(
     // This is a distinct nonstream SDK send. The preceding response-open is
     // deliberately out of scope: it cannot certify active cancellation here.
     drop(stream);
+    forward_provider_nonstream_fallback(
+        client, message_request, effective_model, resolved_profile, emit_output,
+        &stream_callback, sender, attempt_usage, attempt_cache_dimensions_observed,
+        control, &mut emitted,
+    ).await
+}
+
+// Process one decoded event on the original producer task, preserving its
+// send order, backpressure, and owned stream.
+async fn forward_provider_event(
+    event: ApiStreamEvent,
+    pending_tools: &mut BTreeMap<u32, (String, String, String)>,
+    cumulative_usage: &mut Option<TokenUsage>,
+    attempt_usage: &mut Option<TokenUsage>,
+    attempt_cache_dimensions_observed: &mut bool,
+    saw_stop: &mut bool,
+    sender: &tokio::sync::mpsc::Sender<Result<AssistantEvent, RuntimeError>>,
+    emit_output: bool,
+    stream_callback: &Option<tokio::sync::mpsc::Sender<crate::CowdEvent>>,
+    pending_text: &mut String,
+    emitted: &mut bool,
+) -> bool {
+    enum EventAction {
+        Flush,
+        Send(AssistantEvent),
+        SendMany(Vec<AssistantEvent>),
+        Text(String),
+        Continue,
+        Done,
+    }
+    let mut event = Some(event);
+    let mut phase = 0_u8;
+    loop {
+        let action = if phase == 0 {
+            phase = 1;
+            if matches!(event.as_ref(), Some(
+                ApiStreamEvent::MessageStart(_)
+                | ApiStreamEvent::ContentBlockStart(_)
+                | ApiStreamEvent::ContentBlockStop(_)
+                | ApiStreamEvent::MessageDelta(_)
+                | ApiStreamEvent::MessageStop(_)
+            )) { EventAction::Flush } else { EventAction::Continue }
+        } else if phase == 1 {
+            match event.as_mut().expect("event remains until its action is prepared") {
+                ApiStreamEvent::MessageStart(start) => {
+                    let mut events = Vec::new();
+                    for (index, block) in std::mem::take(&mut start.message.content).into_iter().enumerate() {
+                        let Ok(index) = u32::try_from(index) else { break; };
+                        push_provider_output_block(block, index, &mut events, pending_tools, true);
+                    }
+                    phase = 2;
+                    EventAction::SendMany(events)
+                }
+                ApiStreamEvent::ContentBlockStart(_) => {
+                    let Some(ApiStreamEvent::ContentBlockStart(start)) = event.take() else { unreachable!() };
+                    let mut events = Vec::new();
+                    push_provider_output_block(start.content_block, start.index, &mut events, pending_tools, true);
+                    phase = 3;
+                    EventAction::SendMany(events)
+                }
+                ApiStreamEvent::ContentBlockDelta(_) => {
+                    let Some(ApiStreamEvent::ContentBlockDelta(delta)) = event.take() else { unreachable!() };
+                    phase = 3;
+                    match delta.delta {
+                        ContentBlockDelta::TextDelta { text } if !text.is_empty() => EventAction::Text(text),
+                        ContentBlockDelta::TextDelta { .. } => EventAction::Continue,
+                        ContentBlockDelta::InputJsonDelta { partial_json } => {
+                            if let Some((_, _, input)) = pending_tools.get_mut(&delta.index) { input.push_str(&partial_json); }
+                            EventAction::Continue
+                        }
+                        ContentBlockDelta::ReasoningSummaryDelta { text } => EventAction::Send(AssistantEvent::ReasoningSummaryDelta(text)),
+                        ContentBlockDelta::ThinkingDelta { thinking } => EventAction::Send(AssistantEvent::PrivateReasoningDelta(thinking)),
+                        ContentBlockDelta::SignatureDelta { signature } => EventAction::Send(AssistantEvent::SignatureDelta(signature)),
+                    }
+                }
+                ApiStreamEvent::ContentBlockStop(stop) => {
+                    phase = 2;
+                    match pending_tools.remove(&stop.index) {
+                        Some((id, name, input)) => EventAction::Send(AssistantEvent::ToolUse { id, name, input }),
+                        None => EventAction::Continue,
+                    }
+                }
+                ApiStreamEvent::MessageDelta(delta) => {
+                    if delta.usage_observed {
+                        let usage = merge_provider_usage_max(*cumulative_usage, delta.usage.token_usage());
+                        *cumulative_usage = Some(usage);
+                        *attempt_usage = Some(usage);
+                        *attempt_cache_dimensions_observed |= delta.cache_dimensions_observed;
+                    }
+                    phase = 3;
+                    match delta.delta.stop_reason.clone() {
+                        Some(stop_reason) => EventAction::Send(AssistantEvent::MessageBoundary { stop_reason: Some(stop_reason) }),
+                        None => EventAction::Continue,
+                    }
+                }
+                ApiStreamEvent::MessageStop(_) => {
+                    phase = 2;
+                    match *cumulative_usage {
+                        Some(usage) => EventAction::Send(AssistantEvent::Usage(usage)),
+                        None => EventAction::Continue,
+                    }
+                }
+            }
+        } else if phase == 2 {
+            phase = 3;
+            match event.take().expect("event retained for its post-action") {
+                ApiStreamEvent::MessageStart(start) => {
+                    if start.message.usage_observed {
+                        let usage = merge_provider_usage_max(*cumulative_usage, start.message.usage.token_usage());
+                        *cumulative_usage = Some(usage);
+                        *attempt_usage = Some(usage);
+                        *attempt_cache_dimensions_observed |= start.message.cache_dimensions_observed;
+                    }
+                    EventAction::Continue
+                }
+                ApiStreamEvent::ContentBlockStop(stop) => EventAction::Send(AssistantEvent::ItemCompleted { index: stop.index }),
+                ApiStreamEvent::MessageStop(_) => { *saw_stop = true; EventAction::Continue }
+                _ => unreachable!("only events with a post-action reach this phase"),
+            }
+        } else {
+            EventAction::Done
+        };
+        let accepted = match action {
+            EventAction::Flush => flush_pending_text(sender, pending_text, emit_output, stream_callback, emitted).await,
+            EventAction::Send(event) => forward_event(sender, event, emit_output, stream_callback, emitted).await,
+            EventAction::SendMany(events) => forward_events(sender, events, emit_output, stream_callback, emitted).await,
+            EventAction::Text(text) => forward_text_delta(sender, text, pending_text, emit_output, stream_callback, emitted).await,
+            EventAction::Continue => true,
+            EventAction::Done => break,
+        };
+        if !accepted { return false; }
+    }
+    true
+}
+
+// Entered only after the original stream has been dropped at empty EOF.
+async fn forward_provider_nonstream_fallback(
+    client: &ProviderClient,
+    message_request: &MessageRequest,
+    effective_model: &str,
+    resolved_profile: &ResolvedProviderProfile,
+    emit_output: bool,
+    stream_callback: &Option<tokio::sync::mpsc::Sender<crate::CowdEvent>>,
+    sender: &tokio::sync::mpsc::Sender<Result<AssistantEvent, RuntimeError>>,
+    attempt_usage: &mut Option<TokenUsage>,
+    attempt_cache_dimensions_observed: &mut bool,
+    control: &ProviderAttemptControl,
+    emitted: &mut bool,
+) -> Result<ForwardedProviderStream, ProviderStreamError> {
     let fallback_request = MessageRequest {
         stream: false,
         ..message_request.clone()
@@ -3288,7 +3343,7 @@ async fn forward_provider_stream(
             identity: outcome_provider_identity(resolved_profile, effective_model),
         },
     );
-    if forward_events(sender, events, emit_output, &stream_callback, &mut emitted).await {
+    if forward_events(sender, events, emit_output, stream_callback, emitted).await {
         Ok(ForwardedProviderStream::Completed)
     } else {
         Ok(ForwardedProviderStream::ConsumerDropped)
@@ -3632,6 +3687,134 @@ mod tests {
     };
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+    #[tokio::test]
+    async fn provider_event_phase_preserves_text_before_original_tool_completion() {
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(8);
+        let mut pending = BTreeMap::from([(7, ("original-call".to_string(),
+            "read_ref".to_string(), r#"{"reference":"artifact://x"}"#.to_string()))]);
+        let mut cumulative = None;
+        let mut usage = None;
+        let mut cache_observed = false;
+        let mut saw_stop = false;
+        let mut text = "earlier text".to_string();
+        let mut emitted = false;
+        let event = provider::StreamEvent::ContentBlockStop(provider::ContentBlockStopEvent { index: 7 });
+        assert!(super::forward_provider_event(event, &mut pending, &mut cumulative,
+            &mut usage, &mut cache_observed, &mut saw_stop, &sender, false,
+            &None, &mut text, &mut emitted).await);
+        assert!(matches!(receiver.recv().await.unwrap().unwrap(), AssistantEvent::TextDelta(value)
+            if value == "earlier text"));
+        assert!(matches!(receiver.recv().await.unwrap().unwrap(), AssistantEvent::ToolUse { id, name, input }
+            if id == "original-call" && name == "read_ref" && input == r#"{"reference":"artifact://x"}"#));
+        assert!(matches!(receiver.recv().await.unwrap().unwrap(), AssistantEvent::ItemCompleted { index: 7 }));
+        assert!(pending.is_empty());
+        assert!(!saw_stop);
+        drop(receiver);
+        text.push_str("unobserved");
+        let event = provider::StreamEvent::MessageStop(provider::MessageStopEvent {});
+        assert!(!super::forward_provider_event(event, &mut pending, &mut cumulative,
+            &mut usage, &mut cache_observed, &mut saw_stop, &sender, false,
+            &None, &mut text, &mut emitted).await);
+        assert!(!saw_stop, "a dropped consumer cannot be recorded as completed");
+    }
+
+    /// P-2: a preparation that was not granted says WHICH wait held it
+    /// back, so the failure names its cause instead of reading like a
+    /// capacity wall.
+    #[test]
+    fn p2_a_preparation_that_is_not_granted_names_its_wait_reason() {
+        use crate::execution_core::graph::{ResourceAdmissionDecision, ResourceWaitReason};
+        let deferred = ResourceAdmissionDecision::Deferred {
+            request_id: uuid::Uuid::new_v4(),
+            wait_reason: ResourceWaitReason::DeadlineExpired,
+            policy_revision: 1,
+        };
+        assert_eq!(
+            super::preparation_capacity_failure(
+                "prepared content capacity unavailable",
+                &deferred,
+            ),
+            "prepared content capacity unavailable: wait_reason=DeadlineExpired",
+        );
+        let overloaded = ResourceAdmissionDecision::Overloaded {
+            request_id: uuid::Uuid::new_v4(),
+            wait_reason: ResourceWaitReason::KeyPendingLimit,
+            policy_revision: 1,
+            pending: 3,
+        };
+        assert_eq!(
+            super::preparation_capacity_failure(
+                "prepared content capacity unavailable",
+                &overloaded,
+            ),
+            "prepared content capacity unavailable: wait_reason=KeyPendingLimit",
+        );
+    }
+
+    /// P-2: the preparation queues on the session's admission, the queue the
+    /// sibling provider path already uses.
+    #[test]
+    fn p2_the_frozen_preparation_queues_on_the_session_fairness_key() {
+        assert_eq!(
+            super::preparation_fairness_key(Some("session-1")),
+            "session:session-1",
+        );
+        assert_eq!(
+            super::preparation_fairness_key(None),
+            "provider-prepare",
+        );
+    }
+
+    /// P-2: a cancelled turn stops waiting for the admission instead of
+    /// sitting out the whole window and then failing for a capacity that no
+    /// longer matters.
+    #[tokio::test]
+    async fn p2_a_cancelled_turn_stops_waiting_for_the_admission() {
+        use crate::execution_core::graph::{
+            ExecutionResourceKind, ExecutionResourceManager, ResourceAdmissionRequest,
+            ResourceQuota,
+        };
+        let manager = ExecutionResourceManager::new([(
+            ExecutionResourceKind::ContextBytes,
+            ResourceQuota::new(1, 1, 1).unwrap(),
+        )]);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_millis() as u64)
+            .unwrap_or_default();
+        let request = |bytes: usize, deadline_at_ms: u64| {
+            ResourceAdmissionRequest::new(
+                crate::execution_core::graph::ExecutionServiceClass::Foreground,
+                [(ExecutionResourceKind::ContextBytes, bytes)],
+            )
+            .with_deadline_at_ms(deadline_at_ms)
+        };
+        // Hold the only byte the quota has, so the next request has to wait
+        // for it instead of being refused on the spot.
+        let held = manager
+            .admit(request(1, now.saturating_add(30_000)))
+            .await
+            .expect("the held admission");
+        let control = crate::execution_core::services::TurnCancellationControl::operational(
+            "session-1",
+            "turn-1",
+            "execution-1",
+        );
+        control.token().cancel();
+        let decision = super::admit_preparation_resources(
+            &manager,
+            request(1, now.saturating_add(300)),
+            Some(&control),
+        )
+        .await
+        .expect("the admission decision");
+        assert!(
+            decision.is_none(),
+            "a cancelled turn stops waiting for the admission"
+        );
+        drop(held);
+    }
+
     #[test]
     fn control_completion_keeps_absent_usage_unknown_and_reported_zero_known() {
         for observed in [false, true] {
@@ -3736,6 +3919,7 @@ mod tests {
                 capabilities: ProviderCapabilityProfile::unknown(),
             },
             transport_fingerprint: crate::TransportProfileFingerprint(1),
+            diagnostic_send_reason: None,
             attempt: 1,
         };
         let wire = |stable: &str, tail: &str| provider::ProviderWireRequest {
@@ -3809,6 +3993,7 @@ mod tests {
                 capabilities: ProviderCapabilityProfile::unknown(),
             },
             transport_fingerprint: crate::TransportProfileFingerprint(1),
+            diagnostic_send_reason: None,
             attempt: 1,
         };
         let wire = |system: &str| provider::ProviderWireRequest {
@@ -3875,6 +4060,7 @@ mod tests {
                 capabilities: ProviderCapabilityProfile::unknown(),
             },
             transport_fingerprint: crate::TransportProfileFingerprint(1),
+            diagnostic_send_reason: None,
             attempt: 1,
         };
         let wire = |tool: &str| provider::ProviderWireRequest {
@@ -4450,6 +4636,9 @@ mod tests {
 
     #[tokio::test]
     async fn r194_original_writer_replays_frozen_observation_and_rejects_stale_claim() {
+        if crate::test_support::skip_if_env_absent("COWD_TEST_POSTGRES_URL") {
+            return;
+        }
         // This is the writer/CAS boundary with a synthetic response identity,
         // not evidence that a real SDK response was opened or cancelled.
         let root = tempfile::tempdir().unwrap();
@@ -4577,6 +4766,9 @@ mod tests {
 
     #[tokio::test]
     async fn r189_actual_sdk_cancel_uses_original_requested_and_session_writer() {
+        if crate::test_support::skip_if_env_absent("COWD_TEST_POSTGRES_URL") {
+            return;
+        }
         use crate::execution_core::graph::*;
         struct WriterBarrier {
             original: Arc<dyn super::ProviderWireEvidenceWriter>,
@@ -5178,6 +5370,7 @@ mod tests {
                     providers: HashMap::from([(
                         "fixture".into(),
                         ProviderConfig {
+                            reasoning_effort: None,
                             name: "fixture".into(),
                             base_url: endpoint,
                             api_key: "fixture-secret".into(),
@@ -5695,6 +5888,44 @@ mod tests {
             .is_err());
         assert_eq!(client.wire_preparation_count(), 0);
         assert_eq!(client.transport_pool.stats().in_flight, 0);
+    }
+
+    #[tokio::test]
+    async fn provider_config_effort_reaches_actual_wire_and_follows_selected_model() {
+        let workspace = tempfile::tempdir().unwrap();
+        let (mut root, mut request) = step_wire_fixture("http://127.0.0.1:1/v1".into(), workspace.path());
+        let prior_snapshot = root.registry.pin();
+        let (prior_entry, prior_message) = root.prepare_message_request(&request, &prior_snapshot).unwrap();
+        assert!(prior_entry.client.wire_request(&prior_message).unwrap().body.get("reasoning_effort").is_none());
+        std::fs::write(workspace.path().join("config.yaml"),
+            "model: fixture-model\nproviders:\n  fixture:\n    base_url: http://127.0.0.1:1/v1\n    api_key: fixture-secret\n    protocol: completions\n    models: [fixture-model]\n    reasoning_effort: high\n").unwrap();
+        let config = crate::ConfigLoader::new(workspace.path(), workspace.path()).load().unwrap();
+        let mut providers = config.providers().clone();
+        assert_eq!(providers.providers["fixture"].reasoning_effort.as_deref(), Some("high"));
+        let mut other = providers.providers["fixture"].clone();
+        other.name = "other".into();
+        other.models = vec!["other-model".into()];
+        other.reasoning_effort = None;
+        providers.providers.insert("other".into(), other);
+        root.registry.replace(providers).unwrap();
+        let snapshot = root.registry.pin();
+        let (old_entry, old_message) = root.prepare_message_request(&request, &prior_snapshot).unwrap();
+        assert!(old_entry.client.wire_request(&old_message).unwrap().body.get("reasoning_effort").is_none());
+        let (entry, message) = root.prepare_message_request(&request, &snapshot).unwrap();
+        assert_eq!(entry.client.wire_request(&message).unwrap().body["reasoning_effort"], "high");
+        let control = root.prepare_control_analysis("fixture-model", "system", "input", 64).await.unwrap();
+        assert_eq!(control.wire.wire_request().body["reasoning_effort"], "high");
+        let member = ProviderRuntimeClient::new(Arc::clone(&root.registry), "fixture-model".into(), Vec::new()).unwrap();
+        let (entry, message) = member.prepare_message_request(&request, &snapshot).unwrap();
+        assert_eq!(entry.client.wire_request(&message).unwrap().body["reasoning_effort"], "high");
+        request.model = "other-model".into();
+        let (entry, message) = root.prepare_message_request(&request, &snapshot).unwrap();
+        assert!(entry.client.wire_request(&message).unwrap().body.get("reasoning_effort").is_none());
+        assert_eq!(request_reasoning_effort("fixture-model", &["openai_compat_enable_thinking".into()], Some("none".into()), Some("high".into())).as_deref(), Some("none"));
+        root.set_reasoning_effort(Some("medium".into()));
+        request.model = "fixture-model".into();
+        let (entry, message) = root.prepare_message_request(&request, &snapshot).unwrap();
+        assert_eq!(entry.client.wire_request(&message).unwrap().body["reasoning_effort"], "medium");
     }
 
     #[tokio::test]
@@ -6519,6 +6750,7 @@ mod tests {
                 providers: HashMap::from([(
                     "test".to_string(),
                     ProviderConfig {
+                        reasoning_effort: None,
                         name: "test".to_string(),
                         base_url: "https://example.test/v1".to_string(),
                         api_key: "test".to_string(),
@@ -6542,6 +6774,7 @@ mod tests {
                 providers: HashMap::from([(
                     "token-plan".to_string(),
                     ProviderConfig {
+                        reasoning_effort: None,
                         name: "token-plan".to_string(),
                         base_url: "http://127.0.0.1:9/v1".to_string(),
                         api_key: "test".to_string(),
@@ -6636,6 +6869,7 @@ mod tests {
                 providers: HashMap::from([(
                     "token-plan".to_string(),
                     ProviderConfig {
+                        reasoning_effort: None,
                         name: "token-plan".to_string(),
                         base_url: format!("http://{address}/v1"),
                         api_key: "test".to_string(),
@@ -6719,6 +6953,7 @@ mod tests {
             providers: HashMap::from([(
                 "test".to_string(),
                 ProviderConfig {
+                    reasoning_effort: None,
                     name: "test".to_string(),
                     base_url: base_url.to_string(),
                     api_key: "test".to_string(),
@@ -6839,6 +7074,7 @@ mod tests {
             providers: HashMap::from([(
                 "test".to_string(),
                 ProviderConfig {
+                    reasoning_effort: None,
                     name: "test".to_string(),
                     base_url: "https://example.test/v1".to_string(),
                     api_key: "test".to_string(),
@@ -6874,6 +7110,7 @@ mod tests {
             providers: HashMap::from([(
                 "test".to_string(),
                 ProviderConfig {
+                    reasoning_effort: None,
                     name: "test".to_string(),
                     base_url: "https://example.test/v1".to_string(),
                     api_key: "test".to_string(),

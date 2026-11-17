@@ -22,6 +22,73 @@ fn cold_start_failure_replan_covers_the_root_turn() {
 }
 
 include!("attestation.rs");
+
+pub(crate) async fn run_original_tool_wave<C, T>(
+    services: Arc<crate::RuntimeServices>,
+    mut runtime: crate::ConversationRuntime<C, T>,
+    calls: Vec<ModelToolCall>,
+    turn: &str,
+    objective: &str,
+) -> Vec<ConversationMessage>
+where
+    C: ApiClient + Clone + Send + Sync + 'static,
+    T: ToolExecutor + 'static,
+{
+    use harness_contract::execution_graph::{ExecutionGraph, ExecutionGraphLineage, ExecutionNodeKind, ExecutionNodeSpec, ExecutionNodeStatus};
+    let session_id = runtime.session_id().to_owned();
+    let mut graph = ExecutionGraph::new(objective);
+    graph.lineage = Some(ExecutionGraphLineage {
+        session_id: session_id.clone(), turn_id: turn.into(), root_task_id: format!("{turn}:task"),
+        task_id: format!("{turn}:task"), generation: 1,
+    });
+    let goal_id = format!("{turn}:goal");
+    let goal: harness_contract::goal::GoalContract = serde_json::from_value(serde_json::json!({
+        "id":goal_id, "session_id":session_id, "objective":objective,
+        "criteria":[{"id":"checked","statement":objective,"status":"open"}],
+        "phase":"execution", "spec_revision":1, "spec_digest":"original-host-test",
+        "scope":"internal", "completion":"open", "revision":1, "user_sequence":1
+    })).unwrap();
+    services.goal_store().create(goal).unwrap();
+    let strategy = runtime.bind_turn_strategy_execution(turn, &graph.id).unwrap();
+    let mut node = ExecutionNodeSpec::new(ExecutionNodeKind::ToolBatch, "tool_batch",
+        encode_tool_calls_with_continuation(&session_id, &calls, false).unwrap());
+    node.id = format!("{}:original-tools", graph.id);
+    node.idempotency_key = format!("{}:original", node.id);
+    graph.nodes.push(node.clone());
+    let mut state = r1_branch_state(&session_id, &goal_id);
+    state.turn_id = turn.into();
+    state.content = objective.into();
+    state.task_understanding = Some(strategy.decision.strategy.understanding.clone());
+    state.collaboration_obligation = strategy.decision.collaboration_obligation.clone();
+    let bus = runtime.cowd_bus().unwrap().clone();
+    let runtime = Arc::new(tokio::sync::Mutex::new(Box::new(runtime)));
+    let state = Arc::new(tokio::sync::Mutex::new(state));
+    services.tool_batch_executor().install_resolver(Arc::new(TurnToolResolver {
+        session_id: session_id.clone(), graph_id: graph.id.clone(), runtime: Arc::downgrade(&runtime),
+        state: Arc::downgrade(&state), services: Arc::downgrade(&services),
+    }));
+    let runner = crate::execution_core::graph::ExecutionGraphRunner::new(
+        services.executor_registry().clone(), services.graph_state_store().clone(), services.commit_service().clone(),
+        services.resource_manager().clone(), services.scope_locks().clone(), services.worktree_leases().clone(),
+        services.workspace_key(), services.workspace_root());
+    let registered = runner.register(graph).await.unwrap();
+    let snapshot = runner.pump_snapshot(&registered.id, &BTreeSet::new()).await.unwrap();
+    let mut wave = runner.prepare_ready_wave(&registered.id, snapshot.ready).await.unwrap();
+    assert_eq!(wave.len(), 1);
+    let activity = services.event_store().latest_for_stream(&format!("{}:node:{}", registered.id, node.id))
+        .unwrap().unwrap().activity_binding().unwrap();
+    let _scope = bus.enter_execution_with_activity(crate::CowdExecutionContext {
+        execution_id: registered.id.clone(), session_id, turn_id: turn.into(),
+    }, Some(activity));
+    runner.execute_prepared_pump_node(&registered.id, wave.remove(0), Arc::new(tokio::sync::Notify::new()))
+        .await.unwrap();
+    let result = services.graph_state_store().load(&registered.id).unwrap();
+    assert_eq!(result.node_statuses[&node.id], ExecutionNodeStatus::Completed,
+        "{:?}", result.node_results.get(&node.id));
+    let messages = runtime.lock().await.session_snapshot().await.materialize_messages();
+    messages
+}
+
 include!("agentic_content_bridge.rs");
 include!("agentic_protocol_state.rs");
 include!("agency_economy.rs");
@@ -69,6 +136,10 @@ fn the_closure_view_never_calls_a_gap_both_open_and_closed() {
         program.tasks.insert(
             format!("task:{index}"),
             AgenticTaskProjection {
+                obligations: Vec::new(),
+                rework_directives: Vec::new(),
+                unsettled_released_attempts: Vec::new(),
+                terminal_note: None,
                 task_id: format!("task:{index}"),
                 team_id: "team:1".to_string(),
                 title: (*title).to_string(),
@@ -98,6 +169,11 @@ fn the_closure_view_never_calls_a_gap_both_open_and_closed() {
                 failed_attempts: 0,
                 review_generation: 0,
                 failed_review_attempts: 0,
+                structural_execution_stalls: 0,
+                structural_review_stalls: 0,
+                reviews_applied: 0,
+                review_obligation: None,
+                reviews_accepted: 0,
                 last_failure: None,
                 replacement_task_refs: Vec::new(),
                 supersede_evidence_refs: Vec::new(),
@@ -229,6 +305,10 @@ fn the_control_plane_requirement_is_derived_from_the_program_not_written_as_lite
     program.tasks.insert(
         "task:0".to_string(),
         crate::AgenticTaskProjection {
+            obligations: Vec::new(),
+            rework_directives: Vec::new(),
+            unsettled_released_attempts: Vec::new(),
+            terminal_note: None,
             task_id: "task:0".into(),
             team_id: "team:1".into(),
             title: "t".into(),
@@ -258,6 +338,11 @@ fn the_control_plane_requirement_is_derived_from_the_program_not_written_as_lite
             failed_attempts: 0,
             review_generation: 0,
             failed_review_attempts: 0,
+            structural_execution_stalls: 0,
+            structural_review_stalls: 0,
+            reviews_applied: 0,
+            review_obligation: None,
+            reviews_accepted: 0,
             last_failure: None,
             replacement_task_refs: Vec::new(),
             supersede_evidence_refs: Vec::new(),
@@ -547,6 +632,10 @@ fn multiple_results_do_not_create_synthesis_debt_or_discharge_goal_review() {
         program.tasks.insert(
             format!("task:{index}"),
             AgenticTaskProjection {
+                obligations: Vec::new(),
+                rework_directives: Vec::new(),
+                unsettled_released_attempts: Vec::new(),
+                terminal_note: None,
                 task_id: format!("task:{index}"),
                 team_id: "team:1".into(),
                 title: format!("task {index}"),
@@ -576,6 +665,11 @@ fn multiple_results_do_not_create_synthesis_debt_or_discharge_goal_review() {
                 failed_attempts: 0,
                 review_generation: 0,
                 failed_review_attempts: 0,
+                structural_execution_stalls: 0,
+                structural_review_stalls: 0,
+                reviews_applied: 0,
+                review_obligation: None,
+                reviews_accepted: 0,
                 last_failure: None,
                 replacement_task_refs: Vec::new(),
                 supersede_evidence_refs: Vec::new(),

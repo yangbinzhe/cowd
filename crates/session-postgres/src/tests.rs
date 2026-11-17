@@ -257,8 +257,7 @@ impl TerminalReceiptFixture {
 
 #[test]
 fn r1_message_ack_clean_baseline_has_only_current_schema() {
-    assert_eq!(SESSION_MIGRATIONS.len(), 1);
-    assert_eq!(SESSION_MIGRATIONS[0].id, "session.current-baseline");
+    assert_eq!(SESSION_MIGRATIONS.iter().map(|migration| migration.id).collect::<Vec<_>>(), vec!["session.current-baseline"]);
     let ddl = SESSION_MIGRATIONS[0].statements.join("\n");
     for required in [
         "session_terminal_binding_pair",
@@ -1004,7 +1003,9 @@ fn postgres_current_schema_preserves_records_and_indexes_casefolded_listing() {
         })
         .unwrap();
     assert_eq!(page.total, 1668);
-    assert_eq!(page.records.len(), 7);
+    assert_eq!(page.records.iter().map(|record| record.session_id.clone()).collect::<Vec<_>>(),
+        std::iter::once("preserved-v22".to_string())
+            .chain((0..6).map(|index| format!("casefold-{}", 9996 - index * 6))).collect::<Vec<_>>());
     assert!(page
         .records
         .windows(2)
@@ -1142,8 +1143,7 @@ fn postgres_usage_summary_decodes_bigint_aggregates() {
     assert_eq!(usage.output_tokens, 678);
     assert_eq!(usage.by_platform["webui"].input_tokens, 12_345);
     assert_eq!(usage.by_model["deepseek-v4-flash"].output_tokens, 678);
-    assert_eq!(usage.recent_sessions.len(), 1);
-    assert_eq!(usage.recent_sessions[0].session_id, session_id);
+    assert_eq!(usage.recent_sessions.iter().map(|session| session.session_id.as_str()).collect::<Vec<_>>(), vec![session_id.as_str()]);
 }
 
 #[test]
@@ -1833,8 +1833,7 @@ fn postgres_branch_command_commits_every_artifact_or_nothing() {
     let copied = store
         .get_all_messages(&target)
         .expect("read branch messages");
-    assert_eq!(copied.len(), 1);
-    assert_eq!(copied[0].sequence, 0);
+    assert_eq!(copied.iter().map(|message| message.sequence).collect::<Vec<_>>(), vec![0]);
     assert!(copied[0]
         .stable_message_id
         .starts_with(&format!("branch:{target}:")));
@@ -2422,7 +2421,11 @@ fn postgres_durable_input_contract_is_fenced_ordered_and_auditable() {
     let claimed = store
         .claim_session_runtime_outbox("worker-a", 200, 1_000, 10, &[])
         .expect("claim session heads");
-    assert_eq!(claimed.len(), 2, "one head per Session may be claimed");
+    let mut claim_ids = claimed.iter().map(|item| item.input_id.as_str()).collect::<Vec<_>>();
+    claim_ids.sort_unstable();
+    let mut expected_ids = vec![first.input_id.as_str(), peer_record.input_id.as_str()];
+    expected_ids.sort_unstable();
+    assert_eq!(claim_ids, expected_ids, "one head per Session may be claimed");
     assert!(
         claimed.iter().all(|item| item.session_id != rejected),
         "terminal policy decisions must never enter the runnable claim set"
@@ -2496,8 +2499,7 @@ fn postgres_durable_input_contract_is_fenced_ordered_and_auditable() {
     let next = store
         .claim_session_runtime_outbox("worker-b", 204, 1_000, 10, &[])
         .expect("claim released Session head");
-    assert_eq!(next.len(), 1);
-    assert_eq!(next[0].input_id, second.input_id);
+    assert_eq!(next.iter().map(|item| &item.input_id).collect::<Vec<_>>(), vec![&second.input_id]);
     let requeued = store
         .requeue_claimed_session_runtime_outbox(
             &next[0].request_id,
@@ -2517,8 +2519,7 @@ fn postgres_durable_input_contract_is_fenced_ordered_and_auditable() {
     let reclaimed = store
         .claim_session_runtime_outbox("worker-c", 206, 1_000, 10, &[])
         .expect("reclaim reclassified input");
-    assert_eq!(reclaimed.len(), 1);
-    assert_eq!(reclaimed[0].input_id, second.input_id);
+    assert_eq!(reclaimed.iter().map(|item| &item.input_id).collect::<Vec<_>>(), vec![&second.input_id]);
 
     let peer_claim = claimed
         .iter()
@@ -2570,8 +2571,7 @@ fn postgres_durable_input_contract_is_fenced_ordered_and_auditable() {
         1
     );
     let branch_messages = store.get_all_messages(&branch).expect("branch messages");
-    assert_eq!(branch_messages.len(), 1);
-    assert_eq!(branch_messages[0].sequence, 0);
+    assert_eq!(branch_messages.iter().map(|message| message.sequence).collect::<Vec<_>>(), vec![0]);
     assert!(branch_messages[0]
         .stable_message_id
         .starts_with(&format!("branch:{branch}:")));

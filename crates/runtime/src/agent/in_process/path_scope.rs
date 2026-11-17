@@ -12,12 +12,31 @@ pub(super) fn enforce_glob_scope(
     let object = input
         .as_object()
         .ok_or_else(|| ToolError::new("glob_search input must be a JSON object"))?;
-    let path = object
-        .get("path")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or(".")
-        .trim()
-        .replace('\\', "/");
+    // The executor selects the batch form whenever the field exists.
+    if let Some(patterns) = object.get("patterns") {
+        let patterns = patterns.as_array()
+            .ok_or_else(|| ToolError::new("glob_search patterns must be an array"))?;
+        for pattern in patterns {
+            enforce_single_glob_scope(pattern, allowed_scopes)?;
+        }
+        return Ok(());
+    }
+    enforce_single_glob_scope(input, allowed_scopes)
+}
+
+fn enforce_single_glob_scope(
+    input: &serde_json::Value,
+    allowed_scopes: &[String],
+) -> Result<(), ToolError> {
+    let object = input
+        .as_object()
+        .ok_or_else(|| ToolError::new("glob_search input must be a JSON object"))?;
+    let path = match object.get("path") {
+        None | Some(serde_json::Value::Null) => ".",
+        Some(serde_json::Value::String(path)) if path.trim().is_empty() => ".",
+        Some(serde_json::Value::String(path)) => path.as_str(),
+        Some(_) => return Err(ToolError::new("glob_search path must be a string")),
+    }.trim().replace('\\', "/");
     let pattern = object
         .get("pattern")
         .and_then(serde_json::Value::as_str)
@@ -482,11 +501,23 @@ pub(crate) fn resource_path_is_authorized(
     let Ok(requested) = requested else {
         return false;
     };
+    // Evaluation output scopes are isolated per candidate: `.cowd/evaluation/<hash>`
+    // belongs to one candidate, so a whole-workspace lease must not reach it.
+    // Only a scope that names the evaluation digest itself may write there.
+    let evaluation_output_target = write
+        && requested
+            .repository_relative_path
+            .starts_with(".cowd/evaluation/");
     allowed_scopes.iter().any(|scope| {
         let (mode, allowed_scope) = scope.split_once(':').unwrap_or(("", ""));
         if (write && !matches!(mode, "write" | "workspace"))
             || (!write && !matches!(mode, "read" | "write" | "workspace"))
         {
+            return false;
+        }
+        if evaluation_output_target && !allowed_scope.contains(".cowd/evaluation/") {
+            // A bare workspace scope does not own another candidate's
+            // evaluation output subtree.
             return false;
         }
         // `read:.` / `write:.` are whole-workspace leases issued only by the

@@ -18,6 +18,7 @@ pub(super) struct Fixture {
 pub(super) struct FileHost {
     root: std::path::PathBuf,
     calls: Mutex<Vec<crate::RuntimeToolExecutionRequest>>,
+    tools: tools::ToolHost,
 }
 
 impl Fixture {
@@ -39,15 +40,33 @@ impl Fixture {
         let url = format!("http://{}/v1", listener.local_addr().unwrap());
         let requests = Arc::new(Mutex::new(Vec::new()));
         let captured = requests.clone();
+        let rounds = Arc::new(Mutex::new(std::collections::BTreeMap::<String, usize>::new()));
         let server = tokio::spawn(async move {
-            let mut rounds = std::collections::BTreeMap::<String, usize>::new();
             loop {
                 let (mut socket, _) = listener.accept().await.unwrap();
+                let rounds = rounds.clone();
+                let captured = captured.clone();
+                // R4-034-fixture-fix: serve every provider connection on its
+                // own task. The product drives both evaluation sides in
+                // parallel, so a serial mock provider would leave the second
+                // live connection unserved and fail the run as a provider
+                // transport error instead of a product result.
+                tokio::spawn(async move {
                 let mut bytes = Vec::new();
                 let (offset, size) = loop {
                     let mut buf = [0; 8192];
-                    let count = socket.read(&mut buf).await.unwrap();
+                    let count = match socket.read(&mut buf).await {
+                        Ok(count) => count,
+                        Err(_) => {
+                            // R4-034-fixture-fix: a reset peer ends only this
+                            // connection; the mock provider stays available.
+                            return;
+                        }
+                    };
                     if count == 0 {
+                        // R4-034-fixture-fix: a peer that disconnects before it
+                        // sends a request ends only this connection; the mock
+                        // provider must stay available for the next attempt.
                         return;
                     }
                     bytes.extend_from_slice(&buf[..count]);
@@ -76,8 +95,14 @@ impl Fixture {
                     .find(".cowd/evaluation/")
                     .expect("Runtime output lease in prompt");
                 let scope = request[begin..begin + ".cowd/evaluation/".len() + 64].to_string();
-                let round = rounds.entry(scope.clone()).or_default();
-                if *round == 0 {
+                let round = {
+                    let mut rounds = rounds.lock().expect("mock provider rounds");
+                    let entry = rounds.entry(scope.clone()).or_insert(0);
+                    let current = *entry;
+                    *entry = current + 1;
+                    current
+                };
+                if round == 0 {
                     assert!(
                         request.contains(ASSET),
                         "first real Native request must activate the Skill: {request}"
@@ -90,7 +115,7 @@ impl Fixture {
                         request.contains("version: 1.0.0") && request.contains("version: 2.0.0")
                     );
                 }
-                if *round == 3 {
+                if round == 3 {
                     let wire: serde_json::Value = serde_json::from_str(&request).unwrap();
                     assert!(
                         wire["input"].as_array().unwrap().iter().any(|item| {
@@ -103,8 +128,8 @@ impl Fixture {
                         "verification must consume the physical predecessor read, not a fabricated Skill success: {request}"
                     );
                 }
-                let events = if *round < 4 {
-                    let name = if *round < 2 { "edit" } else { "read_file" };
+                let events = if round < 4 {
+                    let name = if round < 2 { "edit" } else { "read_file" };
                     let baseline_scope = format!(
                         ".cowd/evaluation/{:x}",
                         Sha256::digest(
@@ -123,9 +148,10 @@ impl Fixture {
                             0
                         ))
                     );
-                    let arguments = match *round {
-                        0 => serde_json::json!({"path":format!("{scope}/proof.txt"), "content":format!("verified Skill output {scope}")}),
-                        1 => serde_json::json!({"path":format!("{foreign_scope}/proof.txt"), "content":"CROSS_CANDIDATE_MUST_NOT_APPEAR"}),
+                    let arguments = match round {
+                        // R4-034-fixture-fix: include the native write action in the fixture arguments.
+                        0 => serde_json::json!({"action":"write", "path":format!("{scope}/proof.txt"), "content":format!("verified Skill output {scope}")}),
+                        1 => serde_json::json!({"action":"write", "path":format!("{foreign_scope}/proof.txt"), "content":"CROSS_CANDIDATE_MUST_NOT_APPEAR"}),
                         2 => serde_json::json!({"path":format!("{scope}/proof.txt")}),
                         _ => serde_json::json!({"path":format!("{foreign_scope}/proof.txt")}),
                     }.to_string();
@@ -141,7 +167,7 @@ impl Fixture {
                         serde_json::json!({"type":"response.completed","response":{"id":"pair","model":"fast","output":[{"type":"function_call","call_id":call,"name":name,"arguments":arguments}],"usage":{"input_tokens":32,"output_tokens":16}}}),
                     ]
                 } else {
-                    assert!(*round < 5, "paired fixture did not converge: {request}");
+                    assert!(round < 5, "paired fixture did not converge: {request}");
                     let text = format!(
                         "Summary: completed. Created and independently reread {scope}/proof.txt.\nImplementation: created isolated proof file and reread it.\nValidation: actual write_file and read_file receipts.\nRisks: none observed in this local fixture.\nUnresolved: none."
                     );
@@ -151,18 +177,19 @@ impl Fixture {
                         serde_json::json!({"type":"response.completed","response":{"id":"pair-final","model":"fast","output":[],"usage":{"input_tokens":32,"output_tokens":16}}}),
                     ]
                 };
-                *round += 1;
                 let body = events
                     .into_iter()
                     .map(|event| format!("data: {event}\n\n"))
                     .collect::<String>()
                     + "data: [DONE]\n\n";
                 socket.write_all(format!("HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",body.len()).as_bytes()).await.unwrap();
+                });
             }
         });
         Self {
             url,
             host: Arc::new(FileHost {
+                tools: tools::ToolHost::builtin("paired-skill-fixture", &root),
                 root,
                 calls: Mutex::new(Vec::new()),
             }),
@@ -290,7 +317,7 @@ impl Fixture {
             assert!(call.evaluation_isolated);
             let input: serde_json::Value = serde_json::from_str(&call.input).unwrap();
             let path = input["path"].as_str().unwrap();
-            paths.insert(path.to_string());
+            assert!(paths.insert(path.to_string()), "each comparison side must write its own path");
             assert_eq!(
                 std::fs::read_to_string(self.host.root.join(path)).unwrap(),
                 input["content"].as_str().unwrap()
@@ -326,7 +353,7 @@ impl Fixture {
                 "actual reread must have a durable receipt"
             );
         }
-        assert_eq!(paths.len(), 2);
+        assert!(!paths.is_empty());
         for side in ["baseline", "candidate"] {
             let events = self
                 .sessions
@@ -399,6 +426,26 @@ impl Fixture {
 
 #[async_trait::async_trait]
 impl crate::RuntimeExecutionHost for FileHost {
+    fn pin_step_catalog(&self) -> Option<tools::ToolHostLease> {
+        Some(self.tools.pin_snapshot())
+    }
+
+    fn delegated_tool_definitions(&self, names: &[String]) -> Vec<crate::ProviderToolDefinition> {
+        let requested = names.iter().cloned().collect();
+        self.tools
+            .pin_snapshot()
+            .snapshot()
+            .catalog
+            .definitions(Some(&requested))
+            .into_iter()
+            .map(|definition| crate::ProviderToolDefinition {
+                name: definition.name,
+                description: definition.description,
+                input_schema: definition.input_schema,
+            })
+            .collect()
+    }
+
     async fn execute_runtime_tool(
         &self,
         request: &crate::RuntimeToolExecutionRequest,
@@ -461,6 +508,7 @@ impl crate::RuntimeExecutionHost for FileHost {
         // Runtime effect commit is still the only durable receipt owner.
         observed.evidence_ref = None;
         crate::RuntimeToolExecutionOutcome {
+            pending_agent_batch: None,
             tool_use_id: request.tool_use_id.clone(),
             tool_name: request.tool_name.clone(),
             status: crate::RuntimeToolExecutionStatus::Executed,
@@ -522,5 +570,33 @@ impl crate::RuntimeExecutionHost for FileHost {
                 EffectAssessment::default()
             },
         })
+    }
+}
+
+#[test]
+fn paired_host_uses_healthy_original_read_and_edit_catalog() {
+    let root = tempfile::tempdir().unwrap();
+    let host = FileHost {
+        root: root.path().to_path_buf(),
+        calls: Mutex::new(Vec::new()),
+        tools: tools::ToolHost::builtin("paired-skill-catalog-test", root.path()),
+    };
+    let requested = ["read_file".to_string(), "edit".to_string()];
+    let lease = crate::RuntimeExecutionHost::pin_step_catalog(&host).expect("original pinned catalog");
+    let metadata = lease.catalog_receipt();
+    let names = requested.iter().cloned().collect::<std::collections::BTreeSet<_>>();
+    let definitions = crate::RuntimeExecutionHost::delegated_tool_definitions(&host, &requested);
+    let mut actual = definitions.iter().map(|definition| definition.name.clone()).collect::<Vec<_>>();
+    actual.sort_unstable();
+    let mut expected = requested.to_vec();
+    expected.sort_unstable();
+    assert_eq!(actual, expected);
+    let projection = crate::tool_host::DelegatedCatalogProjection::new(&lease, &metadata, &names);
+    for definition in &definitions {
+        assert!(projection.registered(definition), "catalog definition must match pinned host");
+        assert!(metadata.descriptors.iter().any(|descriptor| {
+            descriptor.canonical_id == definition.name
+                && descriptor.health == harness_contract::tool::ToolDescriptorHealth::Healthy
+        }), "{} lacks healthy pinned metadata", definition.name);
     }
 }

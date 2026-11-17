@@ -1,3 +1,4 @@
+use crate::api_routes::slash_controller::SlashController;
 use std::{
     collections::{HashMap, VecDeque},
     path::Path,
@@ -34,7 +35,6 @@ mod registry;
 mod runtime_event_service;
 pub(crate) mod session_service;
 mod skill_service;
-mod slash_controller;
 mod surface_service;
 mod system_service;
 mod task_service;
@@ -73,7 +73,6 @@ pub(crate) use skill_service::profile_provider::{
 pub(crate) use skill_service::{
     SkillActionRequest, SkillCatalogQuery, SkillFileQuery, SkillProjectionQuery, SkillServiceError,
 };
-pub(crate) use slash_controller::SlashController;
 pub(crate) use surface_service::SurfaceService;
 pub(crate) use task_service::TaskService;
 

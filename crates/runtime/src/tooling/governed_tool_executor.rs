@@ -17,6 +17,8 @@ pub enum GovernedToolAdmission<A> {
     Granted(A),
     Deferred,
     Refused(String),
+    /// Admission infrastructure failed; this is not a policy refusal.
+    Failed(String),
 }
 
 /// Runtime adapter for hard gates, resource admission, effects, and durable
@@ -71,6 +73,13 @@ pub trait GovernedToolExecutionContext: Send + Sync {
         task: &'a GovernedToolPlanTask,
         terminal: &'a GovernedToolTaskTerminal<Self::Output>,
     ) -> GovernedToolFuture<'a, Result<Self::Receipt, String>>;
+
+    /// A returned outcome is not itself proof that a refusal was committed.
+    /// Owners must authenticate a durable receipt for this exact task before
+    /// conflict-only successors can be released.
+    fn refusal_receipt_is_durable(&self, _task: &GovernedToolPlanTask, _receipt: &Self::Receipt) -> bool {
+        false
+    }
 
     /// Publish the canonical start of one governed invocation. The executor
     /// guarantees this hook runs at most once, including tasks that become
@@ -160,6 +169,8 @@ pub struct GovernedToolTaskOutcome<O, R> {
     pub original_call_index: usize,
     pub task_id: String,
     pub terminal: GovernedToolTaskTerminal<O>,
+    /// The terminal's durability barrier failed; this is not an execution terminal.
+    pub terminal_commit_error: Option<String>,
     pub receipt: Option<R>,
 }
 
@@ -273,12 +284,25 @@ impl GovernedToolExecutor {
                 break;
             }
 
+            let terminals_before = state.terminal.len();
             let admitted = refill(dag, context, ceiling, &mut state, &mut workers).await;
+            // A refusal is progress too: it records a terminal, and releasing a
+            // compiled-conflict edge can make an independent call ready. Without
+            // counting it, a batch whose first call is refused looks like a DAG
+            // with nothing left to run, and the released successor is marked
+            // unreachable instead of executed.
+            let progressed = admitted || state.terminal.len() > terminals_before;
             if state.is_complete() {
                 break;
             }
 
             if workers.is_empty() {
+                // A refusal is progress that can release new ready work, so
+                // re-fill immediately rather than waiting for admission capacity
+                // that nothing will free.
+                if !state.ready.is_empty() && progressed {
+                    continue;
+                }
                 if !state.ready.is_empty() && !admitted {
                     tokio::select! {
                         _ = context.wait_for_admission_change() => {}
@@ -343,6 +367,11 @@ async fn seed_precompleted<C>(
         };
         state.ready.remove(&(task.original_call_index, *task_index));
         state.lifecycle_started.insert(*task_index);
+        // Same distinction as in finish_task: a pre-recorded refusal never ran,
+        // so it must not take independent conflict-only successors with it.
+        let predecessor_refused = matches!(terminal, GovernedToolTaskTerminal::Refused { .. }
+            | GovernedToolTaskTerminal::Failed { .. } | GovernedToolTaskTerminal::FailedOutput { .. })
+            && context.refusal_receipt_is_durable(task, &receipt);
         let succeeded = terminal.succeeded();
         let failure_reason = (!succeeded).then(|| terminal_reason(&terminal));
         state.record(
@@ -352,6 +381,7 @@ async fn seed_precompleted<C>(
                 original_call_index: task.original_call_index,
                 task_id: task.tool_call_id.clone(),
                 terminal,
+                terminal_commit_error: None,
                 receipt: Some(receipt),
             },
         );
@@ -373,6 +403,7 @@ async fn seed_precompleted<C>(
                 state,
                 *task_index,
                 failure_reason.unwrap_or_else(|| "precompleted task did not succeed".to_string()),
+                predecessor_refused,
             )
             .await;
         }
@@ -463,6 +494,11 @@ where
                 )
                 .await;
             }
+            GovernedToolAdmission::Failed(error) => {
+                admitted_any = true;
+                finish_task(dag, context, state, task_index,
+                    GovernedToolTaskTerminal::Failed { error }).await;
+            }
         }
     }
     admitted_any
@@ -537,26 +573,30 @@ async fn finish_task<C>(
     context: &C,
     state: &mut GovernedToolExecutorState<C::Output, C::Receipt>,
     task_index: usize,
-    mut terminal: GovernedToolTaskTerminal<C::Output>,
+    terminal: GovernedToolTaskTerminal<C::Output>,
 ) where
     C: GovernedToolExecutionContext,
 {
     if state.terminal.contains(&task_index) {
         return;
     }
+    // Whether the call itself was refused by authority, captured before the
+    // Only a durably recorded refusal can release ordering-only successors.
+    // A failed terminal commit is a failed predecessor and remains fail-closed.
     let task = &dag.tasks[task_index];
     notify_task_started(context, state, task_index, task);
-    let receipt = match context.commit_terminal(task, &terminal).await {
-        Ok(receipt) => Some(receipt),
-        Err(error) => {
-            terminal = GovernedToolTaskTerminal::Failed {
-                error: format!("durable terminal commit failed: {error}"),
-            };
-            None
-        }
+    let (receipt, terminal_commit_error) = match context.commit_terminal(task, &terminal).await {
+        Ok(receipt) => (Some(receipt), None),
+        Err(error) => (None, Some(error)),
     };
+    let predecessor_refused = matches!(terminal, GovernedToolTaskTerminal::Refused { .. }
+        | GovernedToolTaskTerminal::Failed { .. } | GovernedToolTaskTerminal::FailedOutput { .. })
+        && receipt.as_ref().is_some_and(|proof| context.refusal_receipt_is_durable(task, proof));
     let succeeded = terminal.succeeded() && receipt.is_some();
-    let failure_reason = (!succeeded).then(|| terminal_reason(&terminal));
+    let failure_reason = (!succeeded).then(|| match &terminal_commit_error {
+        Some(error) => format!("durable terminal commit failed: {error}; original terminal: {}", terminal_reason(&terminal)),
+        None => terminal_reason(&terminal),
+    });
     context.on_task_terminal(task, &terminal, receipt.as_ref());
     state.record(
         task_index,
@@ -565,6 +605,7 @@ async fn finish_task<C>(
             original_call_index: task.original_call_index,
             task_id: task.tool_call_id.clone(),
             terminal,
+            terminal_commit_error,
             receipt,
         },
     );
@@ -590,17 +631,42 @@ async fn finish_task<C>(
             state,
             task_index,
             failure_reason.unwrap_or_else(|| "predecessor did not succeed".to_string()),
+            predecessor_refused,
         )
         .await;
     }
 }
 
+/// Only a known compiled conflict without an explicit or unknown edge is safe
+/// to release after an authenticated refusal. Missing edge metadata stays closed.
+fn is_conflict_only_dependency(task: &GovernedToolPlanTask, predecessor_id: &str) -> bool {
+    if task.invocation.explicit_dependencies.iter().any(|dependency| dependency.depends_on == predecessor_id) {
+        return false;
+    }
+    let mut edges = task.invocation.compiled_dependencies.iter()
+        .filter(|dependency| dependency.depends_on == predecessor_id).peekable();
+    edges.peek().is_some() && edges.all(|dependency| dependency.reason.starts_with("compiled_conflict:"))
+}
+
+/// Propagate a predecessor's failure to its descendants.
+///
+/// `predecessor_refused` distinguishes *why* the predecessor did not succeed. A
+/// refused call never ran and produced no output, so ordering alone - a
+/// compiled safety conflict, which exists to serialize effects rather than to
+/// carry data - is not a reason to discard an authorized, independent call that
+/// merely happens to sit behind it. In that case only successors with a real
+/// data dependency are blocked; the rest stay ready and report on their own.
+///
+/// A call that ran and failed, or was cancelled or panicked, keeps the previous
+/// behaviour: every descendant is blocked, because the plan can no longer be
+/// reasoned about.
 async fn block_descendants<C>(
     dag: &ValidatedGovernedToolDag,
     context: &C,
     state: &mut GovernedToolExecutorState<C::Output, C::Receipt>,
     failed_index: usize,
     reason: String,
+    predecessor_refused: bool,
 ) where
     C: GovernedToolExecutionContext,
 {
@@ -608,20 +674,38 @@ async fn block_descendants<C>(
     let mut pending = dag.tasks[failed_index]
         .successors
         .iter()
-        .map(|index| (*index, failed_id.clone(), reason.clone()))
+        .map(|index| (*index, failed_id.clone(), reason.clone(), predecessor_refused))
         .collect::<Vec<_>>();
-    while let Some((task_index, predecessor_id, block_reason)) = pending.pop() {
+    while let Some((task_index, predecessor_id, block_reason, directly_refused)) = pending.pop() {
         if state.terminal.contains(&task_index) {
             continue;
         }
         let task = &dag.tasks[task_index];
+        if directly_refused && is_conflict_only_dependency(task, &predecessor_id) {
+            // Reachable only through a compiled conflict edge: this call is
+            // independent of the refused one, so it must still run. Release the
+            // ordering edge - the refused predecessor will never succeed, so
+            // nothing else will drain it - and let the task become ready once
+            // every other predecessor it really depends on has finished.
+            state.remaining_indegree[task_index] =
+                state.remaining_indegree[task_index].saturating_sub(1);
+            if state.remaining_indegree[task_index] == 0 {
+                state
+                    .ready
+                    .insert((task.original_call_index, task_index));
+            }
+            continue;
+        }
         state.ready.remove(&(task.original_call_index, task_index));
         notify_task_started(context, state, task_index, task);
         let terminal = GovernedToolTaskTerminal::Blocked {
             predecessor_id,
             reason: block_reason,
         };
-        let receipt = context.commit_terminal(task, &terminal).await.ok();
+        let (receipt, terminal_commit_error) = match context.commit_terminal(task, &terminal).await {
+            Ok(receipt) => (Some(receipt), None),
+            Err(error) => (None, Some(error)),
+        };
         context.on_task_terminal(task, &terminal, receipt.as_ref());
         state.record(
             task_index,
@@ -630,6 +714,7 @@ async fn block_descendants<C>(
                 original_call_index: task.original_call_index,
                 task_id: task.tool_call_id.clone(),
                 terminal,
+                terminal_commit_error,
                 receipt,
             },
         );
@@ -638,6 +723,7 @@ async fn block_descendants<C>(
                 *successor,
                 task.tool_call_id.clone(),
                 format!("predecessor `{}` was blocked", task.tool_call_id),
+                false,
             ));
         }
     }
@@ -664,7 +750,10 @@ async fn cancel_remaining<C>(
         let terminal = GovernedToolTaskTerminal::Cancelled {
             reason: "execution context cancelled before task start".to_string(),
         };
-        let receipt = context.commit_terminal(task, &terminal).await.ok();
+        let (receipt, terminal_commit_error) = match context.commit_terminal(task, &terminal).await {
+            Ok(receipt) => (Some(receipt), None),
+            Err(error) => (None, Some(error)),
+        };
         context.on_task_terminal(task, &terminal, receipt.as_ref());
         state.record(
             task_index,
@@ -673,6 +762,7 @@ async fn cancel_remaining<C>(
                 original_call_index: task.original_call_index,
                 task_id: task.tool_call_id.clone(),
                 terminal,
+                terminal_commit_error,
                 receipt,
             },
         );
@@ -704,7 +794,10 @@ async fn mark_unreachable_tasks<C>(
             predecessor_id: "executor".to_string(),
             reason: "validated DAG became unreachable during execution".to_string(),
         };
-        let receipt = context.commit_terminal(task, &terminal).await.ok();
+        let (receipt, terminal_commit_error) = match context.commit_terminal(task, &terminal).await {
+            Ok(receipt) => (Some(receipt), None),
+            Err(error) => (None, Some(error)),
+        };
         context.on_task_terminal(task, &terminal, receipt.as_ref());
         state.record(
             task_index,
@@ -713,6 +806,7 @@ async fn mark_unreachable_tasks<C>(
                 original_call_index: task.original_call_index,
                 task_id: task.tool_call_id.clone(),
                 terminal,
+                terminal_commit_error,
                 receipt,
             },
         );
@@ -732,7 +826,7 @@ fn notify_task_started<C>(
     }
 }
 
-fn terminal_reason<O>(terminal: &GovernedToolTaskTerminal<O>) -> String {
+pub(crate) fn terminal_reason<O>(terminal: &GovernedToolTaskTerminal<O>) -> String {
     match terminal {
         GovernedToolTaskTerminal::Succeeded(_) => "task succeeded".to_string(),
         GovernedToolTaskTerminal::FailedOutput { error, .. } => error.clone(),
@@ -953,12 +1047,14 @@ mod tests {
                 if self.commit_failures.contains(&task.tool_call_id) {
                     return Err(format!("{} commit failed", task.tool_call_id));
                 }
-                self.commits
-                    .lock()
-                    .expect("commits lock")
-                    .push(task.tool_call_id.clone());
+                self.commits.lock().expect("commits lock").push(task.tool_call_id.clone());
                 Ok(format!("receipt:{}", task.tool_call_id))
             })
+        }
+
+        fn refusal_receipt_is_durable(&self, task: &GovernedToolPlanTask, receipt: &Self::Receipt) -> bool {
+            receipt == &format!("receipt:{}", task.tool_call_id)
+                && self.commits.lock().expect("commits lock").contains(&task.tool_call_id)
         }
 
         fn precompleted(
@@ -1238,8 +1334,9 @@ mod tests {
             .await;
         assert!(matches!(
             commit_report.outcomes[0].terminal,
-            GovernedToolTaskTerminal::Failed { .. }
+            GovernedToolTaskTerminal::Succeeded(_)
         ));
+        assert!(commit_report.outcomes[0].terminal_commit_error.as_deref().is_some_and(|error| error.contains("commit-fails commit failed")));
         assert!(commit_report.outcomes[0].receipt.is_none());
         assert!(matches!(
             commit_report.outcomes[1].terminal,

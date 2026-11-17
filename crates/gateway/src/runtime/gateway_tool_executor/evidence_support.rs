@@ -23,9 +23,6 @@ fn gateway_observed_evidence(
         "read_file" => complete_read_evidence(resolver, "read_file", &output, sequence)
             .into_iter()
             .collect(),
-        "tool_orchestrate" => batch_success_outputs(&output)
-            .filter_map(|child| complete_read_evidence(resolver, "read_file", child, sequence))
-            .collect(),
         "artifact_materialize" => materialized_artifact_evidence(resolver, &output, sequence)
             .into_iter().collect(),
         "edit" => {
@@ -80,20 +77,6 @@ fn gateway_observed_evidence(
         )
         .into_iter()
         .collect(),
-        "tool_orchestrate" => batch_success_outputs(&output)
-            .filter_map(|child| {
-                discovery_evidence(
-                    resolver,
-                    "glob_search",
-                    child,
-                    "basePath",
-                    "scanComplete",
-                    true,
-                    harness_contract::context::EvidenceCoverageKind::GlobDiscovery,
-                    sequence,
-                )
-            })
-            .collect(),
         "web_fetch" => output
             .get("url")
             .and_then(serde_json::Value::as_str)
@@ -136,15 +119,6 @@ fn gateway_observed_evidence(
     observed
 }
 
-fn batch_success_outputs(output: &serde_json::Value) -> impl Iterator<Item = &serde_json::Value> {
-    output
-        .get("results")
-        .and_then(serde_json::Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter(|item| item.get("status").and_then(serde_json::Value::as_str) == Some("success"))
-        .filter_map(|item| item.get("output"))
-}
 
 fn complete_read_evidence(
     resolver: &runtime::path_identity::WorkspacePathIdentityResolver,

@@ -504,11 +504,17 @@ impl ApiClient for PromptRecordingApi {
 
 #[tokio::test]
 async fn first_model_step_activates_skill_persists_bridge_and_injects_asset() {
+    if crate::test_support::skip_if_env_absent("COWD_TEST_POSTGRES_URL") {
+        return;
+    }
     verify_first_model_skill_activation(None).await;
 }
 
 #[tokio::test]
 async fn missing_or_wrong_version_second_skill_never_leaks_partial_prompt_or_tool_exposure() {
+    if crate::test_support::skip_if_env_absent("COWD_TEST_POSTGRES_URL") {
+        return;
+    }
     for failure in ["missing", "version"] {
         verify_first_model_skill_activation(Some(failure)).await;
     }
@@ -736,9 +742,9 @@ async fn verify_first_model_skill_activation(failure: Option<&str>) {
             && event.payload["selected"] == "release-evidence"
     }));
     let requests = requests.lock().expect("request recorder");
-    assert_eq!(requests.len(), 1);
+    let [unique_requests_745] = requests.as_slice() else { panic!("expected the original requests exactly once") };
     if failure.is_some() {
-        assert!(rendered_prompt(&requests[0].prompt).contains("SECOND_SKILL_VERIFIED_VERSION"));
+        assert!(rendered_prompt(&unique_requests_745.prompt).contains("SECOND_SKILL_VERIFIED_VERSION"));
         assert_eq!(
             rendered_prompt(&requests[0].prompt)
                 .matches("# Activated skill: release-evidence")
@@ -749,7 +755,7 @@ async fn verify_first_model_skill_activation(failure: Option<&str>) {
     assert!(rendered_prompt(&requests[0].prompt)
         .contains("Require release evidence before accepting completion."));
     let projections = projections.lock().expect("projection recorder");
-    assert_eq!(projections.len(), 1);
+    assert!(matches!(projections.as_slice(), [projection] if projection.active_ids.iter().any(|tool| tool == "lark_cli_read")));
     assert!(
         projections[0]
             .active_ids
@@ -924,10 +930,9 @@ async fn r1_catalog_defaults_never_fabricate_authority_and_keep_exact_pins() {
         admitted.decision_id
     );
     let projections = projections.lock().unwrap();
-    assert_eq!(projections.len(), 1);
-    assert!(projections[0].active_ids.is_empty());
-    assert!(projections[0].bootstrap_ids.is_empty());
-    assert!(projections[0].deferred_ids.is_empty());
+    assert!(matches!(projections.as_slice(), [projection]
+        if projection.active_ids.is_empty() && projection.bootstrap_ids.is_empty()
+            && projection.deferred_ids.is_empty()));
     assert!(required_tool_choices
         .lock()
         .unwrap()
@@ -964,7 +969,7 @@ async fn r1_catalog_defaults_never_fabricate_authority_and_keep_exact_pins() {
     let expected = original.catalog_receipt();
     let read = executor.tool_discovery_receipt_for_step(&original, PermissionMode::ReadOnly);
     assert_eq!(read.catalog_revision, original.revision());
-    assert_eq!(read.descriptors.len(), 1);
+    assert!(matches!(read.descriptors.as_slice(), [descriptor] if descriptor.canonical_id == "read_file"));
     assert_eq!(read.descriptors[0].canonical_id, "read_file");
     assert_eq!(
         Some(&read.descriptors[0]),
@@ -975,7 +980,9 @@ async fn r1_catalog_defaults_never_fabricate_authority_and_keep_exact_pins() {
     );
     assert_eq!(read.activation_candidates, vec!["read_file"]);
     let full = executor.tool_discovery_receipt();
-    assert_eq!(full.descriptors.len(), 2);
+    let mut ids = full.descriptors.iter().map(|descriptor| descriptor.canonical_id.as_str()).collect::<Vec<_>>();
+    ids.sort_unstable();
+    assert_eq!(ids, ["edit", "read_file"]);
     assert_eq!(
         full.descriptors
             .iter()
@@ -1235,14 +1242,16 @@ async fn text_only_checkpoint_hides_tools_for_exactly_one_model_request() {
         .unwrap();
 
     let projections = projections.lock().unwrap();
-    assert_eq!(projections.len(), 2);
-    assert!(projections[0].active_ids.is_empty());
-    assert_eq!(projections[0].deferred_ids.len(), 3);
+    let [first, second] = projections.as_slice() else {
+        panic!("expected the checkpoint and restored projections");
+    };
+    assert!(first.active_ids.is_empty());
+    assert_eq!(first.deferred_ids.len(), 3);
     assert_eq!(
-        projections[1].active_ids,
+        second.active_ids,
         vec!["grep_search", "tool_search"]
     );
-    assert!(projections[1]
+    assert!(second
         .deferred_ids
         .contains(&"custom_reader".to_string()));
 }
@@ -1374,22 +1383,24 @@ async fn mutation_checkpoint_exposes_only_writes_for_one_model_request() {
         .expect("restored model step");
 
     let projections = projections.lock().unwrap();
-    assert_eq!(projections.len(), 2);
-    assert_eq!(projections[0].active_ids, vec!["edit".to_string()]);
-    assert!(!projections[0]
+    let [first, second] = projections.as_slice() else {
+        panic!("expected the mutation checkpoint and restored projections");
+    };
+    assert_eq!(first.active_ids, vec!["edit".to_string()]);
+    assert!(!first
         .active_ids
         .contains(&"unknown_mutator".to_string()));
-    assert!(projections[0]
+    assert!(first
         .deferred_ids
         .contains(&"read_file".to_string()));
-    assert!(projections[1]
+    assert!(second
         .active_ids
         .contains(&"tool_search".to_string()));
-    assert!(projections[1].active_ids.contains(&"read_file".to_string()));
-    assert!(projections[1]
+    assert!(second.active_ids.contains(&"read_file".to_string()));
+    assert!(second
         .active_ids
         .contains(&"grep_search".to_string()));
-    assert!(projections[1].exposure_revision > projections[0].exposure_revision);
+    assert!(second.exposure_revision > first.exposure_revision);
 }
 
 #[derive(Clone)]
@@ -1700,12 +1711,11 @@ async fn mixed_tool_frame_preserves_valid_calls_and_rejects_only_invented_member
         .execute_model_step("inspect available tools", true)
         .await
         .expect("one invented member must not discard an independent valid action");
-    assert_eq!(executed.preflight_tool_results.len(), 1);
+    assert!(matches!(executed.preflight_tool_results.as_slice(), [message] if message.blocks.iter().any(|block| matches!(block, ContentBlock::ToolResult { tool_use_id, tool_name, is_error: true, .. } if tool_use_id == "invented-invalid" && tool_name == "agent_invoke"))));
     let ModelStepIntent::ToolCalls { calls } = executed.intent else {
         panic!("the valid call must remain executable");
     };
-    assert_eq!(calls.len(), 1);
-    assert_eq!(calls[0].name, "tool_search");
+    assert!(matches!(calls.as_slice(), [call] if call.name == "tool_search"));
 
     let transcript = runtime.session_snapshot().await.materialize_messages();
     assert!(transcript.iter().any(|message| {
@@ -1769,6 +1779,9 @@ async fn successful_session_tools_are_rehydrated_on_the_next_user_turn() {
 
 #[tokio::test]
 async fn dynamic_tool_exposure_defers_schema_until_discovery_activation() {
+    if crate::test_support::skip_if_env_absent("COWD_TEST_POSTGRES_URL") {
+        return;
+    }
     let projections = Arc::new(std::sync::Mutex::new(Vec::new()));
     let request_messages = Arc::new(std::sync::Mutex::new(Vec::new()));
     let api = DynamicExposureApi {
@@ -1897,18 +1910,44 @@ async fn dynamic_tool_exposure_defers_schema_until_discovery_activation() {
         panic!("recovery request must invoke the activated tool");
     };
     assert_eq!(calls[0].name, "custom_reader");
-    let batch = runtime
-        .execute_tool_batch_step(&calls, &crate::SharedPrompter::none(), 2)
+    // R4-034-fixture-fix: this exposure unit tests activation, not ToolBatch ownership.
+    let activated_output = runtime
+        .tool_executor
+        .execute_output(&calls[0].name, &calls[0].input)
         .await
         .expect("activated tool execution");
-    assert_eq!(batch.failed, 0);
+    // R4-034-fixture-fix: record the activated invocation through Runtime's result owner.
+    let activated_result = runtime
+        .prepare_governed_tool_result_with_invocation(
+            &calls[0].id,
+            &calls[0].name,
+            &calls[0].input,
+            activated_output.model_text(),
+            false,
+            None,
+        )
+        .await
+        .expect("governed activated result");
+    assert!(activated_result.blocks.iter().any(|block| {
+        matches!(
+            block,
+            ContentBlock::ToolResult {
+                tool_use_id,
+                tool_name,
+                output,
+                is_error: false,
+            } if tool_use_id == "read-1"
+                && tool_name == "custom_reader"
+                && output.contains("README contents")
+        )
+    }), "activated result: {activated_result:?}");
     runtime
         .execute_model_step("inspect files", false)
         .await
         .expect("final model step");
 
     let projections = projections.lock().unwrap();
-    assert_eq!(projections.len(), 4);
+    assert!(matches!(projections.as_slice(), [first, _, _, last] if first.catalog_revision == EXPOSURE_FIXTURE_REVISION && first.active_ids == ["tool_search"] && last.active_ids.iter().any(|id| id == "tool_search")));
     assert_eq!(projections[0].catalog_revision, EXPOSURE_FIXTURE_REVISION);
     assert_eq!(projections[0].active_ids, vec!["tool_search"]);
     assert_eq!(projections[0].deferred_ids, vec!["custom_reader"]);
@@ -1939,7 +1978,9 @@ async fn dynamic_tool_exposure_defers_schema_until_discovery_activation() {
     );
     assert!(projections[3].exposure_revision > projections[2].exposure_revision);
     let request_messages = request_messages.lock().unwrap();
-    assert_eq!(request_messages.len(), 4);
+    assert!(matches!(request_messages.as_slice(), [_, handoff, recovery, _]
+        if handoff.iter().any(|message| message.contains("tool_search already completed successfully"))
+            && recovery.iter().any(|message| message.contains("tool_search already completed successfully"))));
     assert!(
         request_messages[1].iter().any(|message| {
             message.contains("tool_search already completed successfully")
@@ -2140,6 +2181,9 @@ fn stable_prefix_metrics_track_wire_identity_and_provider_native_cache() {
 
 #[tokio::test]
 async fn governed_tool_results_persist_raw_evidence_and_bound_model_receipt() {
+    if crate::test_support::skip_if_env_absent("COWD_TEST_POSTGRES_URL") {
+        return;
+    }
     let artifact_root = tempfile::tempdir().unwrap();
     let store = Arc::new(crate::test_support::session_store());
     let session = Session::new();
@@ -2230,12 +2274,12 @@ async fn governed_tool_results_persist_raw_evidence_and_bound_model_receipt() {
             && event.payload.get("raw").is_none()
     }));
     let audit = runtime.turn_evidence_audits();
-    assert_eq!(audit.len(), 1);
+    assert!(matches!(audit.as_slice(), [item] if item.access.is_some() && item.omitted_tokens > 0));
     assert!(audit[0].access.is_some());
     assert!(audit[0].omitted_tokens > 0);
     let observations = runtime.turn_tool_observations();
-    assert_eq!(observations.len(), 1);
-    let envelope = observations[0]
+    let [observation] = observations.as_slice() else { panic!("expected the original tool observation") };
+    let envelope = observation
         .output_envelope
         .as_ref()
         .expect("tool output envelope must be connected to the turn report");
@@ -2259,9 +2303,9 @@ async fn governed_tool_results_persist_raw_evidence_and_bound_model_receipt() {
         .await
         .unwrap();
     let observations = runtime.turn_tool_observations();
-    assert_eq!(observations.len(), 2);
+    let [_first_observations_2274, _second_observations_2274] = observations.as_slice() else { panic!("expected both original observations exactly once") };
     assert_eq!(
-        observations[0]
+        _first_observations_2274
             .output_envelope
             .as_ref()
             .unwrap()
@@ -2296,15 +2340,15 @@ async fn governed_tool_results_persist_raw_evidence_and_bound_model_receipt() {
     for block in wire.iter().flat_map(|message| &message.content) {
         match block {
             provider::InputContentBlock::ToolUse { id, .. } => {
-                call_ids.insert(id.clone());
+                assert!(call_ids.insert(id.clone()), "duplicate tool call identity");
             }
             provider::InputContentBlock::ToolResult { tool_use_id, .. } => {
-                result_ids.insert(tool_use_id.clone());
+                assert!(result_ids.insert(tool_use_id.clone()), "duplicate tool result identity");
             }
             _ => {}
         }
     }
-    assert_eq!(call_ids.len(), 2);
+    assert_eq!(call_ids.iter().map(String::as_str).collect::<Vec<_>>(), ["governed-read-1", "governed-read-2"]);
     assert_eq!(
         call_ids, result_ids,
         "body reuse must not orphan a provider call or result"
@@ -2313,6 +2357,9 @@ async fn governed_tool_results_persist_raw_evidence_and_bound_model_receipt() {
 
 #[tokio::test]
 async fn governed_tool_result_never_publishes_durable_access_after_raw_store_failure() {
+    if crate::test_support::skip_if_env_absent("COWD_TEST_POSTGRES_URL") {
+        return;
+    }
     let runtime = ConversationRuntime::new(
         Session::new(),
         MockApi,
@@ -2345,6 +2392,9 @@ async fn governed_tool_result_never_publishes_durable_access_after_raw_store_fai
 
 #[tokio::test]
 async fn context_turn_report_is_durable_before_runtime_exposes_it() {
+    if crate::test_support::skip_if_env_absent("COWD_TEST_POSTGRES_URL") {
+        return;
+    }
     let store = Arc::new(crate::test_support::session_store());
     let session = Session::new();
     let session_id = session.session_id.clone();
@@ -2396,6 +2446,9 @@ async fn context_turn_report_is_durable_before_runtime_exposes_it() {
 
 #[tokio::test]
 async fn large_context_envelope_is_canonical_and_artifact_backed() {
+    if crate::test_support::skip_if_env_absent("COWD_TEST_POSTGRES_URL") {
+        return;
+    }
     let store = Arc::new(crate::test_support::session_store());
     let session = Session::new();
     let session_id = session.session_id.clone();
@@ -2462,9 +2515,9 @@ async fn large_context_envelope_is_canonical_and_artifact_backed() {
         .get_events_by_type_limited(&session_id, "ContextEnvelope", 0, 10)
         .await
         .expect("context event");
-    assert_eq!(events.len(), 1);
+    let [event] = events.as_slice() else { panic!("expected one original context event") };
     let payload: serde_json::Value =
-        serde_json::from_str(&events[0].event_json).expect("context payload");
+        serde_json::from_str(&event.event_json).expect("context payload");
     assert_eq!(
         payload["schema_version"],
         PERSISTED_CONTEXT_ENVELOPE_SCHEMA_VERSION
@@ -2492,6 +2545,9 @@ async fn large_context_envelope_is_canonical_and_artifact_backed() {
 
 #[tokio::test]
 async fn context_turn_report_write_failure_does_not_expose_a_successful_report() {
+    if crate::test_support::skip_if_env_absent("COWD_TEST_POSTGRES_URL") {
+        return;
+    }
     let store = Arc::new(crate::test_support::session_store());
     let runtime = ConversationRuntime::new(
         Session::new(),
@@ -2518,6 +2574,9 @@ async fn context_turn_report_write_failure_does_not_expose_a_successful_report()
 
 #[tokio::test]
 async fn compaction_event_failure_is_terminal_and_does_not_claim_durable_recovery() {
+    if crate::test_support::skip_if_env_absent("COWD_TEST_POSTGRES_URL") {
+        return;
+    }
     let store = Arc::new(crate::test_support::session_store());
     let runtime = ConversationRuntime::new(
         Session::new(),
@@ -2633,7 +2692,7 @@ fn context_turn_report_includes_active_knowledge_activation_report() {
         Some("knowledge-plan-test")
     );
     assert_eq!(knowledge.active_pack_ids, vec!["pack-domain-default"]);
-    assert_eq!(knowledge.blocked_namespaces.len(), 1);
+    assert_eq!(knowledge.blocked_namespaces, ["project:irrelevant not relevant to intent"]);
     assert_eq!(knowledge.evidence_refs[0].ref_type, "knowledge_chunk");
 }
 
@@ -2669,9 +2728,8 @@ fn post_turn_memory_window_contains_only_the_current_turn_and_supplements() {
     ];
 
     let current = current_turn_messages(&messages, "current request");
-    assert_eq!(current.len(), 4);
-    assert_eq!(conversation_message_text(&current[0]), "current request");
-    assert_eq!(conversation_message_text(&current[2]), "supplement");
+    assert_eq!(current.iter().map(conversation_message_text).collect::<Vec<_>>(),
+        ["current request", "working", "supplement", "final answer"]);
 }
 
 #[test]
@@ -3042,6 +3100,7 @@ async fn prepare_reality_context_suppresses_memory_conflicting_with_current_turn
             .collect::<Vec<_>>()
     );
 
+    let suppressed_title = prepared.entries.iter().find(|entry| entry.title == "User preference: 不要使用工具或编排").unwrap().title.clone();
     let rt = ConversationRuntime::new(
         session,
         MockApi,
@@ -3063,7 +3122,7 @@ async fn prepare_reality_context_suppresses_memory_conflicting_with_current_turn
         .omitted
         .iter()
         .any(|omission| omission.reason.contains("suppressed_for_current_turn")));
-    assert!(!prompt.contains("<title>User preference: 不要使用工具或编排</title>"));
+    assert!(!prompt.contains(&format!("<title>{suppressed_title}</title>")));
     assert!(!prompt.contains("<knowledge_compliance>"));
 }
 
@@ -3308,7 +3367,7 @@ async fn typed_model_stream_preserves_public_order_without_leaking_private_reaso
     );
     assert_eq!(result.collected.signature, "provider-signature-secret");
     assert_eq!(result.collected.text, "final answer");
-    assert_eq!(result.collected.calls.len(), 1);
+    assert!(matches!(result.collected.calls.as_slice(), [call] if call.id == "tool-0" && call.name == "read_file"));
 
     let mut projected = Vec::new();
     while let Ok(event) = receiver.try_recv() {
@@ -3468,9 +3527,9 @@ async fn tool_step_without_provider_summary_emits_one_safe_public_action_summary
         .filter(|event| event.kind == "model.item_completed")
         .filter(|event| event.payload["kind"] == "public_reasoning")
         .collect::<Vec<_>>();
-    assert_eq!(reasoning.len(), 1);
+    let [unique_reasoning_3498] = reasoning.as_slice() else { panic!("expected the original reasoning exactly once") };
     assert_eq!(
-        reasoning[0].payload["content"],
+        unique_reasoning_3498.payload["content"],
         "先查询两类权威来源，再比较差异。"
     );
     assert_eq!(
@@ -3555,6 +3614,7 @@ impl EarlyToolDispatcher for RecordingEarlyDispatcher {
             let started_at_ms = super::now_ms();
             tokio::time::sleep(Duration::from_millis(5)).await;
             EarlyToolDispatchResult::Executed(EarlyToolExecutionReceipt {
+                original_source: None,
                 lifecycle: crate::conversation::ToolLifecycleReuse::Unknown,
                 outcome: crate::RuntimeToolExecutionOutcome {
                     tool_use_id: candidate.call.id.clone(),
@@ -3565,6 +3625,7 @@ impl EarlyToolDispatcher for RecordingEarlyDispatcher {
                     error: None,
                     evidence_ref: "test:early-result".to_string(),
                     observed_evidence: Vec::new(),
+                    pending_agent_batch: None,
                 },
                 call: candidate.call,
                 ready_at_ms: candidate.ready_at_ms,
@@ -3648,8 +3709,9 @@ async fn completed_tool_item_starts_before_provider_response_completes() {
             .load(std::sync::atomic::Ordering::SeqCst),
         1
     );
-    assert_eq!(result.collected.early_tool_receipts.len(), 1);
-    let receipt = &result.collected.early_tool_receipts[0];
+    let [receipt] = result.collected.early_tool_receipts.as_slice() else {
+        panic!("expected the original early receipt exactly once");
+    };
     assert!(receipt.ready_at_ms <= receipt.started_at_ms);
     assert!(
         receipt.started_at_ms < result.collected.response_completed_at_ms,
@@ -3718,7 +3780,7 @@ async fn provider_interruption_retains_completed_early_read_receipt() {
     .await;
 
     assert!(result.failure.is_some());
-    assert_eq!(result.collected.early_tool_receipts.len(), 1);
+    assert!(matches!(result.collected.early_tool_receipts.as_slice(), [receipt] if receipt.call.id == "read-before-interrupt"));
     assert_eq!(
         dispatch_counter
             .dispatches
@@ -3845,12 +3907,9 @@ async fn unverified_provider_keeps_early_tool_in_the_finalized_batch() {
         0
     );
     assert!(result.collected.early_tool_receipts.is_empty());
-    assert_eq!(result.collected.early_tool_deferrals.len(), 1);
-    assert_eq!(
-        result.collected.early_tool_deferrals[0].tool_call_id,
-        "read-after-model"
-    );
-    assert_eq!(result.collected.calls.len(), 1);
+    assert!(matches!(result.collected.early_tool_deferrals.as_slice(),
+        [deferral] if deferral.tool_call_id == "read-after-model"));
+    assert!(matches!(result.collected.calls.as_slice(), [call] if call.id == "read-after-model" && call.name == "read_file"));
 }
 
 #[test]
@@ -3910,10 +3969,8 @@ fn final_context_binding_rejects_passive_cross_session_history() {
 
     let (selected, omitted) = revalidate_context_binding("session-a", vec![current, unrelated]);
 
-    assert_eq!(selected.len(), 1);
-    assert_eq!(selected[0].id, "current");
-    assert_eq!(omitted.len(), 1);
-    assert!(omitted[0].reason.contains("cross-Session"));
+    assert!(matches!(selected.as_slice(), [item] if item.id == "current"));
+    assert!(matches!(omitted.as_slice(), [item] if item.reason.contains("cross-Session")));
 }
 
 #[tokio::test]
@@ -4289,9 +4346,8 @@ async fn active_runtime_reads_first_approval_and_upgrade_from_original_source_ea
             .await
             .unwrap();
         let items = runtime.take_next_model_context_items();
-        assert_eq!(items.len(), 1);
-        assert_eq!(items[0].source_version.as_deref(), Some(version));
-        assert!(items[0].content.contains(body));
+        assert!(matches!(items.as_slice(), [item]
+            if item.source_version.as_deref() == Some(version) && item.content.contains(body)));
         assert!(
             runtime.skill_profiles.is_empty(),
             "same Runtime remains on its original empty constructor catalog"
@@ -4323,10 +4379,10 @@ async fn active_runtime_reads_first_approval_and_upgrade_from_original_source_ea
         .await
         .unwrap();
     let items = bound.take_next_model_context_items();
-    assert_eq!(items.len(), 1);
-    assert_eq!(items[0].source_version.as_deref(), Some("1.0.0"));
-    assert!(items[0].content.contains("FIRST_HUMAN_APPROVED_BODY"));
-    assert!(!items[0].content.contains("UPGRADED_APPROVED_BODY"));
+    assert!(matches!(items.as_slice(), [item]
+        if item.source_version.as_deref() == Some("1.0.0")
+            && item.content.contains("FIRST_HUMAN_APPROVED_BODY")
+            && !item.content.contains("UPGRADED_APPROVED_BODY")));
     assert_eq!(
         bound
             .skill_instruction_pins
@@ -4338,4 +4394,40 @@ async fn active_runtime_reads_first_approval_and_upgrade_from_original_source_ea
             .1,
         original_pin
     );
+}
+
+#[tokio::test]
+async fn graph_finalization_uses_admitted_strategy_and_preserves_refusals() {
+    macro_rules! finish {
+        ($runtime:expr, $answer:expr) => {
+            $runtime.finalize_graph_turn(
+                "question", $answer.into(), Vec::new(), Vec::new(), 0, None,
+                Vec::new(), None, 0, 0, 0, 1, 0, Vec::new(), 0, 0,
+                harness_contract::goal::GoalCompletion::Satisfied, None, true, None,
+            ).await
+        };
+    }
+    let make_runtime = || ConversationRuntime::new(
+        Session::new(), MockApi, StaticToolExecutor::new(),
+        PermissionPolicy::new(PermissionMode::WorkspaceWrite), Vec::new(),
+    ).without_memory();
+    let mut missing = make_runtime();
+    let empty_error = finish!(missing, "  ").unwrap_err();
+    assert_eq!(empty_error.to_string(), "model produced an empty final answer");
+    let missing_error = finish!(missing, "answer").unwrap_err();
+    assert_eq!(missing_error.to_string(), "turn finalization requires the Host-admitted turn strategy owner");
+
+    let mut admitted = make_runtime();
+    let decision = admitted.begin_turn_strategy("finalization-turn", "question").unwrap().decision;
+    let summary = finish!(admitted, "answer").unwrap();
+    assert_eq!(summary.final_answer, "answer");
+    assert_eq!(summary.ai_kernel_trace.execution_decision, decision);
+
+    let mut poisoned = make_runtime();
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _guard = poisoned.active_turn_strategy.lock().unwrap();
+        panic!("poison the original strategy owner");
+    }));
+    let poisoned_error = finish!(poisoned, "answer").unwrap_err();
+    assert_eq!(poisoned_error.to_string(), "turn finalization requires the Host-admitted turn strategy owner");
 }

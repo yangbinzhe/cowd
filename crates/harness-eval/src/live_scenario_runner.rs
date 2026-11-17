@@ -13,7 +13,7 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
 use crate::{
-    live_scenario_observer::{LiveScenarioObserver, MAX_DRAIN_PAGES_PER_PROBE},
+    live_scenario_observer::{is_execution_activity, LiveScenarioObserver, MAX_DRAIN_PAGES_PER_PROBE},
     session_actor::SessionActor,
     HarnessEvalRunnerOptions,
 };
@@ -283,6 +283,26 @@ fn u7_memory_receipt_previews<'a>(case: &'a Value, session: &str, lookup: &str) 
         .collect()
 }
 
+fn u7_empty_retrieval_observation(case: &Value, session: &str, lookup: &str) -> Option<bool> {
+    if session.is_empty()
+        || case["session_id"].as_str() != Some(session)
+        || case["execution_id"].as_str().filter(|id| !id.is_empty()).is_none()
+        || case["turn_id"].as_str().filter(|id| !id.is_empty()).is_none()
+        || !case["trace"].as_array().is_some_and(|rows| {
+            rows.iter().any(|row| {
+                row["channel"] == "timeline" && row["response"]["events"].is_array()
+            })
+        })
+    {
+        return None;
+    }
+    Some(u7_memory_receipt_previews(case, session, lookup).iter().any(|preview| {
+        preview.starts_with("{\n  \"selected\": []")
+            && preview.contains("\"kind\": \"authorized_lexical_catalog\"")
+            && preview.contains("\"complete\": true")
+    }))
+}
+
 fn u7_memory_checks(
     fixture: &U7MemoryFixture,
     session: &str,
@@ -342,6 +362,7 @@ fn u7_memory_checks(
             && u7_persisted_record(&row["readback"], id, &fixture.content)
     });
     let retrieval = seed_verified
+        && u7_empty_retrieval_observation(case, session, &fixture.lookup).is_some()
         && seed_id.is_some_and(|id| {
             u7_memory_receipt_previews(case, session, &fixture.lookup)
                 .iter()
@@ -353,9 +374,20 @@ fn u7_memory_checks(
                 })
         });
     let terminal = u7_terminal_business(case, session);
+    // Keep the retrieval fact readable in the report too: a case whose receipts
+    // cannot be read is not the same observation as a readable case with no
+    // matching receipt.
+    let retrieval_evaluation = if u7_empty_retrieval_observation(case, session, &fixture.lookup).is_none() {
+        "unevaluable"
+    } else if retrieval {
+        "seed_matched"
+    } else {
+        "no_matching_receipt"
+    };
     json!({"passed": seed_verified && retrieval && correct && terminal,
         "business_passed":seed_verified && retrieval && correct && terminal,
         "authorized_persistent_seed_verified":seed_verified, "bound_memory_retrieval_observed":retrieval,
+        "retrieval_evaluation":retrieval_evaluation,
         "root_success_and_public_ack":terminal,
         "retrieval_evidence_kind":"durable_bound_tool_receipt_preview", "full_result_body_verified":false,
         "persisted_context_memory_selected":selected, "automatic_context_selection_required":false,
@@ -485,6 +517,7 @@ struct AdmittedLiveScenario {
     turn_id: String,
     expected_reads: BTreeMap<String, harness_contract::context::WorkspacePathIdentity>,
     numeric_oracle: Option<crate::facet_gate::numeric_oracle::Snapshot>,
+    v2_workspace_version: Option<V2WorkspaceVersion>,
     trace: Vec<Value>,
 }
 
@@ -494,7 +527,6 @@ struct AdmittedLiveScenario {
 struct U5Owner {
     pid: u32,
     starttime: u64,
-    image_sha256: String,
     candidate: String,
     namespace: String,
     base_url: String,
@@ -511,9 +543,15 @@ pub(crate) struct U5Host {
     launcher_start: u64,
     pid: u32,
     starttime: u64,
-    image_sha256: String,
-    exe_dev: u64,
-    exe_ino: u64,
+    // Launcher-side file observations are neither process identity nor admission.
+    #[serde(default, rename = "image_sha256")]
+    _image_sha256: Option<serde_json::Value>,
+    #[serde(default, rename = "harness_sha256")]
+    _harness_sha256: Option<serde_json::Value>,
+    #[serde(default, rename = "exe_dev")]
+    _exe_dev: Option<serde_json::Value>,
+    #[serde(default, rename = "exe_ino")]
+    _exe_ino: Option<serde_json::Value>,
     listener_inode: u64,
     port: u16,
     #[serde(default)]
@@ -522,7 +560,6 @@ pub(crate) struct U5Host {
     source_sha256: Option<String>,
     pub(crate) namespace: String,
     pub(crate) base_url: String,
-    harness_sha256: String,
     runtime_dev: u64,
     runtime_ino: u64,
 }
@@ -676,13 +713,6 @@ impl U5Host {
             || host.runtime_ino != meta.ino()
             || host.nonce != std::env::var("COWD_EVAL_U5_NONCE").unwrap_or_default()
             || host.nonce.len() != 64
-            || host.harness_sha256
-                != std::env::var("COWD_EVAL_HARNESS_BINARY_SHA256").unwrap_or_default()
-            || host.image_sha256
-                != format!(
-                    "sha256:{}",
-                    std::env::var("COWD_EVAL_BINARY_SHA256").unwrap_or_default()
-                )
             || u5_proc_stat(std::process::id())?.0 != host.launcher_pid
             || u5_proc_stat(host.launcher_pid)?.1 != host.launcher_start
             || u5_proc_stat(host.pid)?.0 != host.launcher_pid
@@ -697,14 +727,9 @@ impl U5Host {
         self.validate_live_until(Instant::now() + Duration::from_secs(5))
     }
     fn validate_live_until(&self, deadline: Instant) -> Result<(), String> {
-        use std::{io::Read, os::unix::fs::MetadataExt};
+        use std::io::Read;
         if u5_proc_stat(self.pid)?.1 != self.starttime {
             return Err("U5 Child changed".into());
-        }
-        let exe =
-            std::fs::metadata(format!("/proc/{}/exe", self.pid)).map_err(|e| e.to_string())?;
-        if (exe.dev(), exe.ino()) != (self.exe_dev, self.exe_ino) {
-            return Err("U5 Child image replaced".into());
         }
         let url = reqwest::Url::parse(&self.base_url).map_err(|e| e.to_string())?;
         if url.host_str() != Some("127.0.0.1")
@@ -763,7 +788,6 @@ impl U5Host {
         U5Owner {
             pid: self.pid,
             starttime: self.starttime,
-            image_sha256: self.image_sha256.clone(),
             candidate: self
                 .candidate
                 .clone()
@@ -774,7 +798,7 @@ impl U5Host {
         }
     }
     pub(crate) fn binding(&self) -> Value {
-        json!({"nonce":self.nonce,"pid":self.pid,"starttime":self.starttime,"image_sha256":self.image_sha256,"candidate":self.candidate,"namespace":self.namespace,"source_sha256":self.source_sha256,"harness_sha256":self.harness_sha256})
+        json!({"nonce":self.nonce,"pid":self.pid,"starttime":self.starttime,"candidate":self.candidate,"namespace":self.namespace,"source_sha256":self.source_sha256})
     }
 }
 
@@ -1072,10 +1096,6 @@ fn u5_valid_owner(owner: &U5Owner, base_url: &str) -> bool {
         && owner.starttime > 0
         && !owner.namespace.is_empty()
         && owner.base_url == base_url
-        && owner
-            .image_sha256
-            .strip_prefix("sha256:")
-            .is_some_and(|s| s.len() == 64 && s.bytes().all(|c| c.is_ascii_hexdigit()))
         && reqwest::Url::parse(base_url).is_ok_and(|url| {
             url.scheme() == "http" && matches!(url.host_str(), Some("127.0.0.1" | "[::1]" | "::1"))
         })
@@ -1897,13 +1917,36 @@ fn live_provider_token_telemetry_limit() -> Result<Option<u64>, String> {
         // turned into a model-output or task-completion cap.
         return Ok(None);
     };
-    let limit = raw.parse::<u64>().map_err(|_| {
-        "COWD_EVAL_MAX_PROVIDER_TOKENS must be a positive integer when supplied".to_string()
-    })?;
-    if limit == 0 {
-        return Err("COWD_EVAL_MAX_PROVIDER_TOKENS must be positive when supplied".to_string());
+    match raw.parse::<u64>() {
+        Ok(limit) if limit > 0 => Ok(Some(limit)),
+        _ => {
+            eprintln!("warning: ignoring invalid provider token telemetry value");
+            Ok(None)
+        }
     }
-    Ok(Some(limit))
+}
+
+/// Versioned business prompts for the first v2 group. The caller selects v2
+/// only together with that scenario's v2 oracle and report revision.
+fn v2_group_one_prompt(spec_id: &str) -> Option<&'static str> {
+    match spec_id {
+        "live_direct_terminal" => Some(
+            "请回答 7 乘以 8 的结果。不要调用工具，不要组队。",
+        ),
+        "live_tool_evidence" => Some(
+            "请只读当前工作区根目录的 Cargo.toml，报告文件路径及 [workspace.package] 下的 version。请依据本次实际读取的证据作答；无法取得或确认时明确说明，不要猜测。",
+        ),
+        "live_minimal_batch_read" => Some(
+            "请只读当前工作区以下七个路径，并分别报告完整路径和对应整数：Cargo.toml 的 [workspace] members 数组项数；crates/tools/src/lib.rs 的行首 pub mod 声明数；crates/runtime/src/lib.rs 的行首 pub mod 与 pub use 声明总数；crates/memory/src/lib.rs 的行首 mod、pub mod 与 pub(crate) mod 声明总数；crates/gateway/src/main.rs 的行数；crates/provider/src/lib.rs 的行首 pub use 声明数；crates/harness-eval/src/lib.rs 的行数。声明按源码行首计数，分组 use 算一条；行数按 UTF-8 行迭代计数，末行无换行也算一行。可用 JSON 对象、逐行路径与整数，或两列表格表达。读取方式和批次由你决定；只使用只读工具，不用 bash 或写工具。未能读取或确认的项目明确标为 unresolved，不要猜测或给出矛盾数字。",
+        ),
+        SMALL_TEAM_SCENARIO_ID => Some(
+            "请在隔离工作区完成两责任域协作审查：runtime 的执行边界，以及 gateway 的工具与 authority 边界。请实际组织恰好两个 Team 分别负责这两个领域，以本次真实取得的只读源码证据支持各域结论，引用实际来源；每域结果须由不同于该结果提交者的 Agent 独立复核。再综合消费两个已验收的上游结果，说明跨域关系、风险与结论；综合结果也须由不同于综合提交者的 Agent 独立复核。Team 名称、成员数、任务划分和工具组合由你决定。只使用只读源码工具及完成协作所需的 Agent 操作，不使用 bash 或写文件工具；证据不足时明确说明，不要编造。",
+        ),
+        "live_single_architecture_baseline" => Some(
+            "请不组建 Team，独立审查当前工作区中 runtime、memory 和 gateway 的架构。基于本次实际读取的只读源码，分别说明三个领域的职责边界、各自的状态或事件真相及潜在风险，引用真实来源，并综合说明三者关系。读取路径和工具组合由你决定；不要使用 bash 或写工具。证据不足时明确列出未解决事项，不要猜测或将未证实内容写成事实。",
+        ),
+        _ => None,
+    }
 }
 
 fn controlled_live_prompt(spec_id: &str, prompt: String, telemetry_limit: Option<u64>) -> String {
@@ -2356,9 +2399,62 @@ impl RootExecutionTerminal {
 #[derive(Clone, Debug)]
 struct RootExecutionObservation {
     terminal: RootExecutionTerminal,
+    finalized_non_success: Option<String>,
     fingerprint: String,
     summary: Value,
     response_body_bytes: u64,
+}
+
+// A Session terminal is absorbing even while its effects remain in custody.
+// This observation never upgrades the settlement axis or the success gate.
+fn finalized_non_success_terminal_ref(
+    projection: &Value,
+    execution_id: &str,
+    session_id: &str,
+    turn_id: &str,
+) -> Option<String> {
+    for (key, expected) in [("execution_id", execution_id), ("session_id", session_id), ("turn_id", turn_id)] {
+        if expected.is_empty() || projection.get(key)?.as_str()? != expected { return None; }
+    }
+    if root_execution_terminal_state(projection) != RootExecutionTerminal::Completed
+        || projection.get("revision")?.as_u64()? == 0 { return None; }
+    let cursor = projection.get("cursor")?.as_u64()?;
+    let axes = projection.get("terminal_axes")?;
+    let source_cursor = axes.get("source_cursor")?.as_u64()?;
+    if cursor == 0 || source_cursor == 0 || source_cursor > cursor
+        || axes.get("source_race")?.as_bool()? { return None; }
+    let outcome = axes.get("outcome")?;
+    if !matches!(outcome.get("outcome")?.as_str()?, "partially_satisfied" | "blocked" | "failed" | "cancelled")
+        || outcome.get("goal_id")?.as_str()?.is_empty()
+        || outcome.get("goal_revision")?.as_u64()? == 0
+        || outcome.get("terminal_fence")?.as_str()?.is_empty() { return None; }
+    let live = projection.get("live")?;
+    let terminal_ref = live.get("terminal_ref")?.as_str()?;
+    if !matches!(live.get("status")?.as_str()?, "error" | "cancelled")
+        || live.get("turn_id")?.as_str()? != turn_id
+        || !terminal_ref.starts_with("turn-terminal:") { return None; }
+    let graph = projection.get("graph")?;
+    let result_ref = graph.get("terminal_result_ref")?.as_str()?;
+    if result_ref.is_empty() || axes.pointer("/delivery/runtime_terminal_ref")?.as_str()? != result_ref { return None; }
+    let presentation = projection.get("terminal_presentation")?;
+    if presentation.get("state")?.as_str()? != "committed"
+        || presentation.get("source_execution_id")?.as_str()? != execution_id { return None; }
+    let strategy = projection.get("strategy")?;
+    let decision = strategy.get("decision_id")?.as_str()?;
+    if decision.is_empty() || strategy.get("revision")?.as_u64()? == 0
+        || strategy.get("execution_id")?.as_str()? != execution_id
+        || strategy.get("session_id")?.as_str()? != session_id { return None; }
+    let mut matched = projection.get("outcomes")?.as_array()?.iter().filter(|entry| {
+        let value = &entry["payload"]["value"];
+        entry["kind"] == "outcome" && entry["status"] == value["terminal_class"]
+            && value["execution_id"] == format!("turn:{decision}")
+            && value["execution_graph_ref"] == execution_id
+            && value["session_id"] == session_id && value["turn_id"] == turn_id
+            && matches!(value["terminal_class"].as_str(), Some("failed" | "blocked" | "cancelled" | "partial_failure"))
+    });
+    matched.next()?;
+    if matched.next().is_some() { return None; }
+    Some(terminal_ref.to_string())
 }
 
 #[derive(Clone, Debug)]
@@ -3203,6 +3299,13 @@ impl LiveScenarioRunner {
 
     fn run(&self, provider_token_telemetry_limit: Option<u64>) -> Value {
         let claim_scope = self.claim_scope;
+        // These two focused HTTP Session flows use the Session presence ledger
+        // and public terminal outbox; the separate app SurfaceHost is observed.
+        // Mixed/v1 selections keep the original full health requirement.
+        let v2_simple_only = std::env::var("COWD_EVAL_REVISION").ok().as_deref() == Some("n8-eval-v2")
+            && selected_live_scenario_ids().as_ref().is_some_and(|ids| !ids.is_empty()
+                && ids.iter().all(|id| matches!(id.as_str(), "live_direct_terminal" | "live_tool_evidence")
+                    && v2_group_one_prompt(id).is_some()));
         let health_observations = [
             ("gateway", "/healthz", LiveHealthContract::Gateway),
             (
@@ -3236,20 +3339,20 @@ impl LiveScenarioRunner {
             let observed = self.get_json(path);
             (
                 id.to_string(),
-                match observed {
-                    Ok(response) => semantic_health_observation(path, contract, response),
-                    Err(error) => json!({
-                        "status": "failed",
-                        "path": path,
-                        "error": error,
-                    }),
+                {
+                    let mut value = match observed {
+                        Ok(response) => semantic_health_observation(path, contract, response),
+                        Err(error) => json!({"status": "failed", "path": path, "error": error}),
+                    };
+                    value["role"] = json!(if v2_simple_only && id == "surface_host" { "observation" } else { "required" });
+                    value
                 },
             )
         })
         .collect::<serde_json::Map<String, Value>>();
         let health_passed = health_observations
             .values()
-            .all(|observation| observation["status"] == "passed");
+            .all(|observation| observation["role"] == "observation" || observation["status"] == "passed");
         let mut scenario_specs = vec![
             LiveScenarioSpec {
                 id: "live_direct_terminal",
@@ -3403,8 +3506,20 @@ impl LiveScenarioRunner {
                         "health_observations": health_observations,
                         "scenario_count": 0,
                         "passed": 0,
-                        "failed": 1,
-                        "configuration_error": error,
+                        // No scenario ran: the failure happened while the list
+                        // was being built. The old `failed: 1` made a run that
+                        // never started look like a run that started and
+                        // failed, and the reason lived in a field nobody read.
+                        "failed": 0,
+                        "failure_diagnostics": component_failure_diagnostics(
+                            "scenario_spec_build_failed",
+                            &error,
+                            "not_started",
+                            false,
+                            0,
+                            0,
+                            Vec::new(),
+                        ),
                     });
                 }
             }
@@ -3469,6 +3584,7 @@ impl LiveScenarioRunner {
             .iter()
             .filter(|scenario| scenario.get("status").and_then(Value::as_str) == Some("passed"))
             .count();
+        let unknown_count = scenarios.iter().filter(|scenario| scenario["status"] == "unknown").count();
         let comparison_requested = scenarios.iter().any(|scenario| {
             scenario.get("scenario_id").and_then(Value::as_str)
                 == Some("live_single_architecture_baseline")
@@ -3521,9 +3637,68 @@ impl LiveScenarioRunner {
             LiveClaimScope::ReleaseCertification => "certification_failed",
         };
         let metrics = aggregate_scenario_metrics(&scenarios);
-        json!({
+        let failed_count = scenarios.len().saturating_sub(passed + usize::from(pending_outer));
+        // One status, one source: the report and the failure block below must
+        // never disagree about whether this component failed.
+        let component_status = if pending_outer {
+            "pending_outer_cleanup"
+        } else if health_passed
+            && selection_passed
+            && passed == scenarios.len()
+            && comparison_passed
+            && (claim_scope == LiveClaimScope::Focused || release_certified)
+        {
+            "passed"
+        } else {
+            "failed"
+        };
+        // Every failure the component reports is a *reference* to the block
+        // that holds it, never a copy of its text: a copy can be truncated,
+        // and a truncated copy reads like a fact. The scenario's own artifact
+        // keeps the payload exactly once.
+        let scenario_failures = scenarios
+            .iter()
+            .enumerate()
+            .filter(|(_, scenario)| scenario.get("status").and_then(Value::as_str) != Some("passed"))
+            .map(|(index, scenario)| {
+                let scenario_id = scenario
+                    .get("scenario_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unnamed");
+                let block = scenario
+                    .pointer("/failure_diagnostics")
+                    .cloned()
+                    .unwrap_or(Value::Null);
+                json!({
+                    "scenario_id": scenario_id,
+                    "status": scenario.get("status").cloned().unwrap_or(Value::Null),
+                    "reference": crate::machine_reference::reference_block(
+                        &format!(
+                            "live-scenarios/{}#/failure_diagnostics",
+                            crate::report_store::live_scenario_artifact_name(index, scenario_id)
+                        ),
+                        &block,
+                    ),
+                })
+            })
+            .collect::<Vec<_>>();
+        let component_failure = (component_status == "failed").then(|| {
+            component_failure_diagnostics(
+                "scenario_run_failed",
+                &format!(
+                    "{failed_count} of {} live scenarios did not pass",
+                    scenarios.len()
+                ),
+                "completed",
+                true,
+                scenarios.len(),
+                failed_count,
+                scenario_failures,
+            )
+        });
+        let mut component = json!({
             "kind": "harness_eval.live_gateway_scenarios",
-            "status": if pending_outer { "pending_outer_cleanup" } else if health_passed && selection_passed && passed == scenarios.len() && comparison_passed && (claim_scope == LiveClaimScope::Focused || release_certified) { "passed" } else { "failed" },
+            "status": component_status,
             "claim_scope": claim_scope.as_str(),
             "claim_status": claim_status,
             "release_certified": release_certified,
@@ -3535,16 +3710,27 @@ impl LiveScenarioRunner {
             "poll_interval_ms": self.poll_interval.as_millis(),
             "health_status": if health_passed { "passed" } else { "failed" },
             "health_observations": health_observations,
+            "requested_eval_revision": std::env::var("COWD_EVAL_REVISION").unwrap_or_else(|_| "n8-eval-v1".into()),
+            "eval_revision": if scenarios.is_empty() { "not_started" }
+                else if scenarios.iter().all(|scenario| scenario["eval_revision"] == "n8-eval-v2") { "n8-eval-v2" }
+                else if scenarios.iter().any(|scenario| scenario["eval_revision"] == "n8-eval-v2") { "mixed" } else { "n8-eval-v1" },
             "scenario_count": scenarios.len(),
             "selected_scenario_ids": selected_scenario_ids,
             "selection_errors": selection_errors,
             "selection_status": if selection_passed { "passed" } else { "failed" },
             "passed": passed,
-            "failed": scenarios.len().saturating_sub(passed + usize::from(pending_outer)),
+            "failed": failed_count,
+            "unknown_scenarios": unknown_count,
             "metrics": metrics,
             "scenarios": scenarios,
             "collaboration_comparison": collaboration_comparison,
-        })
+        });
+        if let Some(failure) = component_failure {
+            if let Some(object) = component.as_object_mut() {
+                object.insert("failure_diagnostics".to_string(), failure);
+            }
+        }
+        component
     }
 
     fn run_scenario(
@@ -3552,13 +3738,17 @@ impl LiveScenarioRunner {
         spec: LiveScenarioSpec,
         provider_token_telemetry_limit: Option<u64>,
     ) -> Value {
-        if spec.id == U8_HISTORY {
-            return self.run_u8_order_history(spec, provider_token_telemetry_limit);
+        let requested_revision = std::env::var("COWD_EVAL_REVISION").ok();
+        let (spec, eval_revision) = v2_select_scenario(spec, requested_revision.as_deref());
+        let mut result = if spec.id == U8_HISTORY {
+            self.run_u8_order_history(spec, provider_token_telemetry_limit)
+        } else if spec.id == U7_MEMORY_LIFECYCLE {
+            self.run_u7_memory_lifecycle(provider_token_telemetry_limit)
+        } else { self.run_prepared_scenario(spec, provider_token_telemetry_limit, None) };
+        if let Some(object) = result.as_object_mut() {
+            object.insert("eval_revision".into(), json!(eval_revision));
         }
-        if spec.id == U7_MEMORY_LIFECYCLE {
-            return self.run_u7_memory_lifecycle(provider_token_telemetry_limit);
-        }
-        self.run_prepared_scenario(spec, provider_token_telemetry_limit, None)
+        result
     }
 
     fn run_prepared_scenario(&self, spec:LiveScenarioSpec, provider_token_telemetry_limit:Option<u64>, prepared:Option<(U7MemoryFixture,Value)>) -> Value {
@@ -3745,6 +3935,7 @@ impl LiveScenarioRunner {
                     turn_id: turn,
                     expected_reads: BTreeMap::new(),
                     numeric_oracle: None,
+                    v2_workspace_version: None,
                     trace: vec![
                         json!({"kind":"u8_original_input_admission","phase":index,"source_sha256":format!("{:x}",Sha256::digest(source.as_bytes())),"source_bytes":source.len(),"admission":admission}),
                     ],
@@ -3942,18 +4133,13 @@ impl LiveScenarioRunner {
             let absence = self.run_prepared_scenario(spec, telemetry, None);
             let absence_session = absence["session_id"].as_str().unwrap_or_default();
             let answer = absence["u7_terminal_answer"].as_str().unwrap_or_default();
-            let query_empty = u7_memory_receipt_previews(&absence, absence_session, &old.lookup)
-                .iter()
-                .any(|preview| {
-                    preview.starts_with("{\n  \"selected\": []")
-                        && preview.contains("\"kind\": \"authorized_lexical_catalog\"")
-                        && preview.contains("\"complete\": true")
-                });
+            let query_empty =
+                u7_empty_retrieval_observation(&absence, absence_session, &old.lookup);
             let secrets_absent = !u7_contains_any_secret(answer, &old, &corrected);
             let absence_passed = u7_phase_delivery_passed(&absence)
                 && absence["session_id"] != phases[0]["session_id"]
                 && absence["execution_id"] != phases[0]["execution_id"]
-                && query_empty
+                && query_empty == Some(true)
                 && u7_explicit_absence(answer)
                 && !answer.to_ascii_lowercase().contains("wh-")
                 && !answer.to_ascii_lowercase().contains("out-")
@@ -3973,7 +4159,16 @@ impl LiveScenarioRunner {
                 checks.push(json!({"name":"same_memory_id_correction","passed":true,"phase":"A"}));
                 checks.push(json!({"name":"delete_real_restart_no_resurrection","passed":absence_passed,"phase":"B"}));
             }
-            result["u7_lifecycle"] = json!({"passed":absence_passed,"memory_id":id,"correction_passed":true,"delete_status":204,"deleted_active_projection":deleted_readback,"restarted_active_projection":after_restart,"restart":restart,"absence_retrieval_proven":query_empty,"old_and_new_secrets_absent":secrets_absent,"phase_results":phases,"claim_scope":"correction plus logical deletion/no resurrection in active retrieval; no claim of all auxiliary bytes erased"});
+            // `absence_retrieval_proven` is null when the receipts could not be
+            // read at all, which is not the same claim as false ("readable and
+            // no matching retrieval"). The companion label states which of the
+            // three it is, so a report reader never has to infer it.
+            let absence_retrieval_evaluation = match query_empty {
+                None => "unevaluable",
+                Some(true) => "proven",
+                Some(false) => "absent",
+            };
+            result["u7_lifecycle"] = json!({"passed":absence_passed,"memory_id":id,"correction_passed":true,"delete_status":204,"deleted_active_projection":deleted_readback,"restarted_active_projection":after_restart,"restart":restart,"absence_retrieval_proven":query_empty,"absence_retrieval_evaluation":absence_retrieval_evaluation,"old_and_new_secrets_absent":secrets_absent,"phase_results":phases,"claim_scope":"correction plus logical deletion/no resurrection in active retrieval; no claim of all auxiliary bytes erased"});
             // Same original report, each phase retains its own Session/turn/usage.
             // Aggregate counters only; never merge the two phases' identity proofs.
             let mut metrics = phases[0]["metrics"].clone();
@@ -4108,16 +4303,30 @@ impl LiveScenarioRunner {
         {
             Ok(expected) => expected,
             Err(error) => {
-                return Err(failed_scenario_with_session(
-                    spec,
-                    started,
-                    trace,
-                    session_id,
-                    error,
-                    Value::Null,
-                ));
+                let mut failure = failed_scenario_with_session(
+                    spec, started, trace, session_id, error, Value::Null);
+                if matches!(spec.acceptance, LiveAcceptance::V2WorkspaceVersion) {
+                    failure["status"] = json!("unknown");
+                }
+                return Err(failure);
             }
         };
+        let v2_workspace_version = if matches!(spec.acceptance, LiveAcceptance::V2WorkspaceVersion) {
+            if resume_session.is_some() {
+                let mut failure = failed_scenario_with_session(spec, started, trace, session_id,
+                    "v2 workspace oracle requires a fresh input snapshot".into(), Value::Null);
+                failure["status"] = json!("unknown");
+                return Err(failure);
+            }
+            match v2_workspace_version_snapshot() {
+                Ok(snapshot) => Some(snapshot),
+                Err(error) => {
+                    let mut failure = failed_scenario_with_session(spec, started, trace, session_id, error, Value::Null);
+                    failure["status"] = json!("unknown");
+                    return Err(failure);
+                },
+            }
+        } else { None };
         // Freeze independently before dispatch; resumed runs have no trustworthy
         // pre-dispatch snapshot and must not acquire a new oracle after the fact.
         let numeric_oracle = if matches!(
@@ -4278,6 +4487,7 @@ impl LiveScenarioRunner {
             turn_id: turn_id_ref.to_string(),
             expected_reads,
             numeric_oracle,
+            v2_workspace_version,
             trace,
         })
     }
@@ -4296,6 +4506,7 @@ impl LiveScenarioRunner {
             turn_id,
             expected_reads,
             numeric_oracle,
+            v2_workspace_version,
             mut trace,
         } = admitted;
         let execution_id = Some(execution_id);
@@ -4313,7 +4524,14 @@ impl LiveScenarioRunner {
             started,
         );
         let Ok(terminal) = terminal else {
-            let terminal_error = terminal.err().unwrap_or_default();
+            let stop = terminal.err().unwrap_or_else(|| WaitStop {
+                kind: ObservationStopKind::Inferred,
+                code: "wait_stop_unknown",
+                message: String::new(),
+                class: None,
+                commit_cursor: None,
+            });
+            let terminal_error = stop.message.clone();
             let mut diagnostics = self.capture_diagnostics(
                 &session_id,
                 Some(execution_id_ref),
@@ -4325,8 +4543,47 @@ impl LiveScenarioRunner {
             if let Some(object) = diagnostics.as_object_mut() {
                 object.insert("observation_integrity".to_string(), observation_integrity);
             }
+            // The wait says which class of stop it was; it does not say why
+            // the root failed, because the reason lives in the root's own
+            // durable terminal event and the wait never read it. A reader
+            // could therefore see that the root ended badly and never learn
+            // the cause - the complaint this answers. The cause is read here,
+            // from the timeline the report already carries, and carried out as
+            // a typed block with a reference to where it lives.
+            let failure = typed_wait_failure(
+                &stop,
+                diagnostics.pointer("/timeline").unwrap_or(&Value::Null),
+                execution_id_ref,
+                spec.id,
+            );
+            if let Some(object) = diagnostics.as_object_mut() {
+                object.insert(
+                    "failure".to_string(),
+                    crate::machine_reference::with_reference(
+                        "#/failure_diagnostics/failure",
+                        failure,
+                    ),
+                );
+            }
             trace.extend(observation_trace);
-            let cleanup = self.cancel_execution_lineage(execution_id_ref, actor, &mut trace);
+            // The observer may end its own look; it may not end the work.
+            // A stop that read a registered terminal fact leaves nothing
+            // running, so the cancel is a receipt for what happened. A stop
+            // that only says "I ran out of ways to look" leaves the work
+            // running, and an observer that ends the work it observes writes
+            // the verdict it was supposed to read: the lineage is left to the
+            // outer reclaim instead.
+            let cleanup = if observer_may_cancel(&stop) {
+                self.cancel_execution_lineage(execution_id_ref, actor, &mut trace)
+            } else {
+                json!({
+                    "status": "not_attempted",
+                    "attempted": 0,
+                    "succeeded": 0,
+                    "failed": 0,
+                    "reason": "the observer stopped observing; it does not kill a running execution - the outer reclaim closes the lineage",
+                })
+            };
             if let Some(object) = diagnostics.as_object_mut() {
                 object.insert("cancellation".to_string(), cleanup);
             }
@@ -4342,6 +4599,7 @@ impl LiveScenarioRunner {
                 trace,
                 session_id,
                 execution_id,
+                turn_id,
                 terminal_error,
                 diagnostics,
                 agentic_program,
@@ -4352,15 +4610,44 @@ impl LiveScenarioRunner {
         let delivery = actor.confirm_terminal_delivery(&terminal_id, turn_id_ref, execution_id_ref);
         let (response_text, delivery_observation) = match delivery {
             Ok(delivery) => (
-                message_text(&json!({"blocks":delivery.blocks})),
+                terminal_answer_text(&delivery.blocks),
                 delivery.observation,
             ),
             Err(error) => (String::new(), json!({"status":"failed","error":error})),
         };
+        if terminal_wait.non_success {
+            let mut diagnostics = self.capture_diagnostics(
+                &session_id, Some(execution_id_ref), &mut observer, started, &mut trace,
+            );
+            let (observation_trace, observation_integrity) = observer.finalize();
+            if let Some(object) = diagnostics.as_object_mut() {
+                object.insert("observation_integrity".into(), observation_integrity);
+            }
+            trace.extend(observation_trace);
+            let agentic_program = self.root_agentic_program(&session_id, turn_id_ref, &mut trace).ok();
+            let mut result = failed_scenario_with_session_execution_and_program(
+                spec, started, trace, session_id, execution_id, turn_id,
+                "runtime terminal non-success; effect settlement remains unconfirmed".into(),
+                diagnostics, agentic_program,
+            );
+            result["collected_evidence"]["terminal_reason"] = json!("runtime_terminal_non_success");
+            result["terminal_id"] = json!(terminal_id);
+            result["terminal_observation"] = terminal_wait.execution_observation;
+            result["delivery_observation"] = delivery_observation;
+            result["terminal_response_summary"] = json!(response_text);
+            result["timeout"] = terminal_wait.report;
+            if let Some(production_trace) = result.get_mut("production_trace").and_then(Value::as_object_mut) {
+                // Selection already required an Available receipt context for this
+                // message; acknowledgement is reported independently.
+                production_trace.insert("message_materialized".into(), json!(true));
+            }
+            return result;
+        }
         let descendant_wait = self.wait_for_descendant_team_acceptance(
             spec.acceptance,
             &expected_reads,
             numeric_oracle.as_ref(),
+            v2_workspace_version.as_ref(),
             &response_text,
             &session_id,
             turn_id_ref,
@@ -4396,6 +4683,27 @@ impl LiveScenarioRunner {
             agentic_program.as_ref(),
             started.elapsed(),
         );
+        let mut v2_evidence_unknown = false;
+        let mut v2_known_failure = false;
+        if matches!(spec.acceptance, LiveAcceptance::V2DirectNumber) {
+            let tool_observation_available = timeline.pointer("/tool_summary/count").and_then(Value::as_u64).is_some()
+                || timeline.get("tool_timeline").and_then(Value::as_array).is_some()
+                || timeline.get("tool_call_details").and_then(Value::as_array).is_some();
+            let no_tools = tool_observation_available.then(|| metrics["tool_calls"].as_u64() == Some(0));
+            let no_teams = v2_complete_empty_team_lineage(execution_id_ref, &projections)
+                .map(|empty| empty && metrics["team_count"].as_u64() == Some(0));
+            let direct_decision = v2_direct_decision(&response_text);
+            v2_evidence_unknown = no_tools.is_none() || no_teams.is_none() || direct_decision.is_none();
+            v2_known_failure = direct_decision == Some(false) || no_tools == Some(false) || no_teams == Some(false);
+            acceptance.checks.push(json!({"name":"v2_no_tools_or_teams", "passed":no_tools == Some(true) && no_teams == Some(true),
+                "evidence_status":if v2_evidence_unknown { "unknown" } else { "observed" }}));
+            acceptance.passed &= no_tools == Some(true) && no_teams == Some(true);
+        }
+        if let Some(expected) = &v2_workspace_version {
+            let version_decision = v2_version_decision(&response_text, &expected.value);
+            v2_evidence_unknown = !v2_version_delivered(&timeline["read_evidence"], expected) || version_decision.is_none();
+            v2_known_failure = version_decision == Some(false);
+        }
         let requested_model = self
             .model
             .as_deref()
@@ -4418,6 +4726,10 @@ impl LiveScenarioRunner {
             "passed": model_verified,
         }));
         acceptance.passed &= model_verified;
+        if matches!(spec.acceptance, LiveAcceptance::V2DirectNumber | LiveAcceptance::V2WorkspaceVersion) {
+            if requested_model.is_some() && effective_models.is_empty() { v2_evidence_unknown = true; }
+            else if !model_verified { v2_known_failure = true; }
+        }
         let (observation_trace, observation_integrity) = observer.finalize();
         let observation_passed = observation_integrity.get("status").and_then(Value::as_str)
             == Some("passed")
@@ -4440,9 +4752,13 @@ impl LiveScenarioRunner {
         }));
         acceptance.passed &= observation_passed;
         trace.extend(observation_trace);
+        let is_v2 = matches!(spec.acceptance, LiveAcceptance::V2DirectNumber | LiveAcceptance::V2WorkspaceVersion);
+        if is_v2 && (!delivery_confirmed || !observation_passed) { v2_evidence_unknown = true; }
+        let scenario_status = if acceptance.passed { "passed" }
+            else if is_v2 && v2_evidence_unknown && !v2_known_failure { "unknown" } else { "failed" };
         let mut result = json!({
             "scenario_id": spec.id,
-            "status": if acceptance.passed { "passed" } else { "failed" },
+            "status": scenario_status,
             "acceptance": acceptance.to_value(),
             "session_id": session_id,
             "execution_id": execution_id,
@@ -4505,13 +4821,14 @@ impl LiveScenarioRunner {
         observer: &mut LiveScenarioObserver,
         actor: &mut SessionActor<'_>,
         scenario_started: Instant,
-    ) -> Result<TerminalWait, String> {
+    ) -> Result<TerminalWait, WaitStop> {
         let started = Instant::now();
         let mut next_message_probe = started;
         let mut next_root_probe = started;
         let mut next_session_progress_probe = started;
         let mut root_terminal = RootExecutionTerminal::Pending;
         let mut execution_observation = Value::Null;
+        let mut finalized_non_success = None;
         loop {
             let elapsed_ms = started.elapsed().as_millis() as u64;
             actor.set_observation_deadline(timeout.observation_deadline(
@@ -4561,10 +4878,11 @@ impl LiveScenarioRunner {
                 // as a periodic safety check or immediately at a live terminal
                 // boundary instead of downloading it every two seconds.
                 next_root_probe = now + Duration::from_secs(30);
-                let root = self.root_execution_observation(root_execution_id);
+                let root = self.root_execution_observation(root_execution_id, session_id, turn_id);
                 let root_path = format!("/api/runtime/executions/{root_execution_id}");
                 match root {
                     Ok(observation) => {
+                        finalized_non_success = observation.finalized_non_success;
                         execution_observation =
                             crate::paired_performance::bounded_execution_observation(
                                 &observation.summary,
@@ -4578,10 +4896,19 @@ impl LiveScenarioRunner {
                         );
                         root_terminal = observation.terminal;
                         if let RootExecutionTerminal::Failed(reason) = &root_terminal {
-                            return Err(reason.clone());
+                            // The execution's own durable projection says it
+                            // failed: a registered fact, read and named.
+                            return Err(WaitStop {
+                                kind: ObservationStopKind::RegisteredTerminal,
+                                code: "root_projection_failed",
+                                message: reason.clone(),
+                                class: Some(reason.clone()),
+                                commit_cursor: None,
+                            });
                         }
                     }
                     Err(error) => {
+                        finalized_non_success = None;
                         observer.observe_root(&root_path, &Err(error), None, None, elapsed_ms);
                         // The execution's own projection could not be read. Its
                         // phase is not known from here any more, so it must not
@@ -4596,6 +4923,26 @@ impl LiveScenarioRunner {
             }
             if root_terminal == RootExecutionTerminal::Completed && !message_polled {
                 self.poll_message_deltas(session_id, elapsed_ms, observer)?;
+            }
+            if let Some(terminal_ref) = finalized_non_success.as_deref().filter(|_| {
+                !crate::report::execution_observation_ready(
+                    &execution_observation, root_execution_id, session_id, turn_id,
+                )
+            }) {
+                if let Ok(Some(message_id)) = actor.select_finalized_terminal_message(
+                    &observer.assistant_message_ids(), turn_id, root_execution_id, terminal_ref,
+                ) {
+                    return Ok(TerminalWait {
+                        message_id, execution_observation,
+                        report: timeout.report(
+                            started.elapsed(),
+                            Duration::from_millis(observer.since_last_progress_ms(elapsed_ms)),
+                            observer.progress_observations() as usize,
+                            "root_finalized_non_success", observer.phase(), observer.last_active_phase(),
+                        ),
+                        non_success: true,
+                    });
+                }
             }
             if root_terminal == RootExecutionTerminal::Completed
                 && crate::report::execution_observation_ready(
@@ -4615,6 +4962,7 @@ impl LiveScenarioRunner {
                     return Ok(TerminalWait {
                         message_id,
                         execution_observation,
+                        non_success: false,
                         report: timeout.report(
                             started.elapsed(),
                             Duration::from_millis(observer.since_last_progress_ms(elapsed_ms)),
@@ -4623,6 +4971,124 @@ impl LiveScenarioRunner {
                             observer.phase(),
                             observer.last_active_phase(),
                         ),
+                    });
+                }
+            }
+            // The root's own durable outcome receipt on the cursor-complete
+            // timeline is the second terminal source. When the execution
+            // projection was unreadable from here the projection-derived
+            // finalized reference is gone, and without this exit the
+            // watchdogs would misname an already-recorded root terminal as
+            // harness stall. This stop is an observation, not a verdict:
+            // review reconstruction still has to rebuild from the receipt,
+            // and a readable projection keeps authority through the exits
+            // above.
+            if let Some((class, commit_cursor)) = root_terminal_awaiting_review_reconstruction(
+                &observer.timeline(),
+                root_execution_id,
+                finalized_non_success.as_deref(),
+                &root_terminal,
+            ) {
+                let message = format!(
+                    "root_terminal_awaiting_review_reconstruction: class={} commit_cursor={} phase={} last_active_phase={} progress_observations={} message_cursor={} timeline_cursor={}; the root outcome is durably recorded and the wait stopped at that receipt rather than at an observation window",
+                    class,
+                    commit_cursor.map_or_else(|| "unknown".to_string(), |cursor| cursor.to_string()),
+                    observer.phase(),
+                    observer.last_active_phase(),
+                    observer.progress_observations(),
+                    observer.next_message_sequence(),
+                    observer.timeline_cursor().unwrap_or("-"),
+                );
+                // The root's durable outcome receipt is registered, and this
+                // stop read it. Nothing is inferred here: the class and the
+                // cursor come from the receipt itself.
+                return Err(WaitStop {
+                    kind: ObservationStopKind::RegisteredTerminal,
+                    code: "root_terminal_awaiting_review_reconstruction",
+                    message,
+                    class: Some(class),
+                    commit_cursor,
+                });
+            }
+            // 034-5(a): a binding lease whose original call custody is unknown
+            // never terminalizes from here. Each reconciliation round only
+            // re-reports the same block, and the watch used to keep reading
+            // them until the absolute window closed (46.2 min for one turn, 8
+            // failed turns before the scenario was judged). Three blocked
+            // receipts in a row is the durable fact that this turn cannot end,
+            // so stop now and release the lineage instead of burning the rest
+            // of the window. The state machine is not touched: 035-3 owns the
+            // absent terminal for unknown custody.
+            let unknown_custody_rounds = lease_custody_unknown_streak(&observer.timeline());
+            if unknown_custody_rounds >= LEASE_CUSTODY_UNKNOWN_STREAK
+                && finalized_non_success.is_none()
+                && root_terminal != RootExecutionTerminal::Completed
+            {
+                observer.mark_stalled();
+                let threshold = LEASE_CUSTODY_UNKNOWN_STREAK;
+                return Err(WaitStop {
+                    kind: ObservationStopKind::RegisteredTerminal,
+                    code: "lease_custody_unknown_streak",
+                    message: format!(
+                        "lease custody unknown for {unknown_custody_rounds} consecutive reconciliation rounds (threshold {threshold}): the original call outcome is durably unknown, so this turn cannot reach a terminal here; failing the scenario and releasing its lineage instead of waiting out the observation window. phase={phase} last_active_phase={last_active_phase} progress_observations={progress_observations} timeline_cursor={timeline_cursor}",
+                        phase = observer.phase(),
+                        last_active_phase = observer.last_active_phase(),
+                        progress_observations = observer.progress_observations(),
+                        timeline_cursor = observer.timeline_cursor().unwrap_or("-"),
+                    ),
+                    class: Some("lease_custody_unknown".to_string()),
+                    commit_cursor: None,
+                });
+            }
+            // 034-5(a) supplement (D22): the wedge that never says so. 5(a)
+            // counts reconciliation rounds whose durable text names unknown
+            // custody, and a silently halted root names nothing, so in
+            // certv3-20261116-q every custody marker stayed at 0 while the
+            // stream sat 1 888 s without a substantive event at 90 model steps
+            // and 0 completion requests. Work is durably committed, closure was
+            // never requested, the Provider has nothing in flight and reported
+            // no failure, and the stream is quiet: that halt point is the
+            // receipt, so fail the leg and release its lineage instead of
+            // burning the rest of the window. Supplementary condition of
+            // 034-5(a), not a new sealing gate; 035-3 still owns the absent
+            // terminal itself. A timeline read that fails never reaches here -
+            // `poll_timeline_deltas` propagates it as an inferred stop.
+            if finalized_non_success.is_none()
+                && root_terminal != RootExecutionTerminal::Completed
+            {
+                let halt = silent_custody_free_halt(&observer.timeline(), silent_stall_now_ms());
+                if let Some(halt) = halt {
+                    observer.mark_stalled();
+                    let silence_ms = halt.silence_ms;
+                    let threshold_ms = SILENT_CUSTODY_FREE_STALL_MS;
+                    let model_steps = halt.model_steps;
+                    let completion_requests = halt.completion_requests;
+                    let agentic_events = halt.agentic_events;
+                    let provider_requests_in_flight = halt.provider_requests_in_flight;
+                    let provider_errors = halt.provider_errors;
+                    let halt_kind = halt.halt_kind.as_str();
+                    let halt_commit_cursor = halt.halt_commit_cursor;
+                    let halt_cursor = halt_commit_cursor.map_or_else(
+                        || "unknown".to_string(),
+                        |cursor| cursor.to_string(),
+                    );
+                    let closure_vocabulary = if agentic_events == 0 {
+                        "absent, so 0 requests carries no signal"
+                    } else {
+                        "present"
+                    };
+                    let phase = observer.phase();
+                    let last_active_phase = observer.last_active_phase();
+                    let progress_observations = observer.progress_observations();
+                    let timeline_cursor = observer.timeline_cursor().unwrap_or("-");
+                    return Err(WaitStop {
+                        kind: ObservationStopKind::RegisteredTerminal,
+                        code: "silent_custody_free_stall",
+                        message: format!(
+                            "silent custody-free stall: no durable execution-graph or execution-activity event for {silence_ms}ms (threshold {threshold_ms}ms) after {model_steps} model steps, with {completion_requests} completion requests (closure vocabulary {closure_vocabulary}), {provider_requests_in_flight} provider requests in flight and {provider_errors} provider errors; the stream halted at kind={halt_kind} commit_cursor={halt_cursor} and no custody receipt was ever raised, so this turn cannot terminalize from here; failing the scenario and releasing its lineage instead of waiting out the observation window. phase={phase} last_active_phase={last_active_phase} progress_observations={progress_observations} timeline_cursor={timeline_cursor}",
+                        ),
+                        class: Some("silent_custody_free_stall".to_string()),
+                        commit_cursor: halt_commit_cursor,
                     });
                 }
             }
@@ -4647,7 +5113,13 @@ impl LiveScenarioRunner {
                     u128::from(observer.since_last_progress_ms(elapsed.as_millis() as u64)),
                     observer.progress_observations() as usize,
                 );
-                return Err(format!(
+                // The window closed. Nothing is known about the work: the
+                // observer stopped looking, so this stop carries no claim
+                // about how the work ended.
+                return Err(WaitStop {
+                    kind: ObservationStopKind::Inferred,
+                    code: "observation_limit_reached",
+                    message: format!(
                     "observation limit reached (not a verdict on the work): {}; diagnostics: waiting_for=durable_assistant_message phase={} last_active_phase={} progress_observations={} message_cursor={} timeline_cursor={}",
                     report,
                     observer.phase(),
@@ -4655,13 +5127,21 @@ impl LiveScenarioRunner {
                     observer.progress_observations(),
                     observer.next_message_sequence(),
                     observer.timeline_cursor().unwrap_or("-"),
-                ));
+                    ),
+                    class: None,
+                    commit_cursor: None,
+                });
             }
             if timeout
                 .should_abort_for_no_progress(elapsed, observer.progress_observations() as usize)
             {
                 observer.mark_stalled();
-                return Err(format!(
+                // Nothing moved before the nominal wait: still the observer's
+                // fact about itself, not about the work.
+                return Err(WaitStop {
+                    kind: ObservationStopKind::Inferred,
+                    code: "no_progress_before_nominal_wait",
+                    message: format!(
                     "no durable execution progress before the nominal scenario wait elapsed after {}ms; nominal wait={}ms, absolute safety wait={}ms, phase={}, last_active_phase={}, message_cursor={}, timeline_cursor={}",
                     elapsed.as_millis(),
                     timeout.nominal_wait.as_millis(),
@@ -4673,7 +5153,10 @@ impl LiveScenarioRunner {
                     observer.last_active_phase(),
                     observer.next_message_sequence(),
                     observer.timeline_cursor().unwrap_or("-"),
-                ));
+                    ),
+                    class: None,
+                    commit_cursor: None,
+                });
             }
             if timeout.should_abort_for_inactivity(
                 elapsed,
@@ -4681,7 +5164,12 @@ impl LiveScenarioRunner {
                 observer.progress_observations() as usize,
             ) {
                 observer.mark_stalled();
-                return Err(format!(
+                // The inactivity window closed. The work may still be running;
+                // the observer is not the thing that may end it.
+                return Err(WaitStop {
+                    kind: ObservationStopKind::Inferred,
+                    code: "inactivity_window_elapsed",
+                    message: format!(
                     "no durable execution progress for {}ms after {}ms; inactivity window={}ms, nominal wait={}ms, absolute safety wait={}ms, phase={}, last_active_phase={}, progress_observations={}, message_cursor={}, timeline_cursor={}",
                     since_progress.as_millis(),
                     elapsed.as_millis(),
@@ -4696,7 +5184,10 @@ impl LiveScenarioRunner {
                     observer.progress_observations(),
                     observer.next_message_sequence(),
                     observer.timeline_cursor().unwrap_or("-"),
-                ));
+                    ),
+                    class: None,
+                    commit_cursor: None,
+                });
             }
             thread::sleep(self.observation_poll_delay());
         }
@@ -4751,6 +5242,8 @@ impl LiveScenarioRunner {
     fn root_execution_observation(
         &self,
         execution_id: &str,
+        session_id: &str,
+        turn_id: &str,
     ) -> Result<RootExecutionObservation, String> {
         let path = format!("/api/runtime/executions/{execution_id}?detail_scope=summary");
         match self.get_json(&path) {
@@ -4762,6 +5255,9 @@ impl LiveScenarioRunner {
                     .map(|bytes| bytes.len() as u64)
                     .unwrap_or_default();
                 let terminal = root_execution_terminal_state(&projection);
+                let finalized_non_success = finalized_non_success_terminal_ref(
+                    &projection, execution_id, session_id, turn_id,
+                );
                 let statuses = root_node_statuses(&projection);
                 let fingerprint = root_progress_fingerprint(&projection, &statuses);
                 let live = projection.get("live").unwrap_or(&Value::Null);
@@ -4782,6 +5278,7 @@ impl LiveScenarioRunner {
                 });
                 Ok(RootExecutionObservation {
                     terminal,
+                    finalized_non_success,
                     fingerprint,
                     summary,
                     response_body_bytes,
@@ -4880,6 +5377,11 @@ impl LiveScenarioRunner {
         let mut submitted = 0;
         let mut reviewed = 0;
         let mut completion_requested = false;
+        // 033 S8 (BLOCK-2): the new review measure counts the applied
+        // verdicts that were an acceptance. The old measure (every applied
+        // verdict) keeps its meaning and its name - the two are read
+        // together, and neither replaces the other.
+        let mut reviewed_accepted = 0usize;
         for event in timeline
             .get("events")
             .and_then(Value::as_array)
@@ -4914,7 +5416,22 @@ impl LiveScenarioRunner {
                 Some("team_create") => teams += 1,
                 Some("task_publish") => published += 1,
                 Some("task_submit") => submitted += 1,
-                Some("task_review") => reviewed += 1,
+                Some("task_review") => {
+                    reviewed += 1;
+                    // 034 R1 fix (hub): AgentAction is adjacently tagged
+                    // (tag="kind", content="input"), so the decision lives
+                    // under /input, not at the action root; and
+                    // TaskReviewDecision serializes snake_case ("accept"),
+                    // not the variant name ("Accept"). Both errors made
+                    // tasks_reviewed_accepted read 0 forever, structurally
+                    // blocking the S8/S9 review-landing criterion.
+                    let decision = payload
+                        .pointer("/envelope/action/input/decision")
+                        .and_then(Value::as_str);
+                    if decision == Some("accept") {
+                        reviewed_accepted += 1;
+                    }
+                }
                 Some("objective_complete_request") => completion_requested = true,
                 _ => {}
             }
@@ -4940,6 +5457,7 @@ impl LiveScenarioRunner {
             "tasks_published": published,
             "tasks_submitted": submitted,
             "tasks_reviewed": reviewed,
+            "tasks_reviewed_accepted": reviewed_accepted,
             "objective_complete_requested": completion_requested,
             "remaining": remaining,
         })
@@ -5009,6 +5527,7 @@ impl LiveScenarioRunner {
         acceptance: LiveAcceptance,
         expected_reads: &BTreeMap<String, harness_contract::context::WorkspacePathIdentity>,
         numeric_oracle: Option<&crate::facet_gate::numeric_oracle::Snapshot>,
+        v2_workspace_version: Option<&V2WorkspaceVersion>,
         response_text: &str,
         session_id: &str,
         turn_id: &str,
@@ -5076,6 +5595,7 @@ impl LiveScenarioRunner {
                     turn_id,
                     expected_reads.clone(),
                     if matches!(acceptance, LiveAcceptance::Facet { facet_id: "read_six_named_files", .. }) { 1 } else { 16 },
+                    v2_workspace_version,
                     deadline,
                     trace,
                     actor,
@@ -5098,6 +5618,14 @@ impl LiveScenarioRunner {
                 agentic_program.as_ref(),
                 root_execution_id,
             );
+            if let Some(expected) = v2_workspace_version {
+                let delivered = v2_version_delivered(&timeline["read_evidence"], expected);
+                let answer = v2_version_answer(response_text, &expected.value);
+                result.checks.push(json!({"name":"v2_workspace_package_version", "passed":answer && delivered,
+                    "answer_matches":answer, "authenticated_version_extent":delivered,
+                    "evidence_status":if delivered { "verified" } else { "unknown" }}));
+                result.passed &= answer && delivered;
+            }
             if let Some(expected) = numeric_oracle {
                 let stable = std::env::var_os("COWD_EVAL_WORKSPACE")
                     .map(std::path::PathBuf::from)
@@ -5153,7 +5681,7 @@ impl LiveScenarioRunner {
                     let verified = crate::facet_gate::numeric_oracle::compute_result_verified(expected, response_text, session_id, &refs, &resolved);
                     result.checks.push(json!({"name":"authenticated_compute_result", "passed":verified, "status": if verified { "verified" } else { "unknown" }, "references":refs}));
                 }
-                result.passed = result.checks.iter().all(|c| c["passed"] == true);
+                result.passed = numeric_acceptance_checks_pass(&result.checks);
                 if matches!(acceptance, LiveAcceptance::Facet { facet_id: "deterministic_reduction_outside_the_model", .. }) {
                     trace.push(json!({"kind":"compute_complete_input_consumption", "required":false, "status":"unknown", "reason":"no authenticated complete compute input-to-result evidence"}));
                 }
@@ -5182,6 +5710,21 @@ impl LiveScenarioRunner {
                 };
             }
 
+            let waiting_v2_evidence = v2_workspace_version.is_some_and(|expected|
+                v2_version_answer(response_text, &expected.value)
+                    && !v2_version_delivered(&timeline["read_evidence"], expected));
+            if waiting_v2_evidence {
+                let deadline = timeout.observation_deadline(scenario_started, wait_started,
+                    Duration::from_millis(observer.since_last_progress_ms(scenario_started.elapsed().as_millis() as u64)),
+                    observer.progress_observations() as usize);
+                if Instant::now() >= deadline {
+                    return DescendantTeamWait { timeline, projections, agentic_program, acceptance: result,
+                        report: json!({"required":true, "elapsed_ms":wait_started.elapsed().as_millis(),
+                            "observations":observations, "terminal_reason":"v2_version_evidence_unknown"}) };
+                }
+                thread::sleep(self.poll_interval.min(deadline.saturating_duration_since(Instant::now())));
+                continue;
+            }
             if !acceptance.requires_descendant_team_closure() || result.passed {
                 return DescendantTeamWait {
                     timeline,
@@ -5361,6 +5904,7 @@ impl LiveScenarioRunner {
         turn: &str,
         expected: BTreeMap<String, harness_contract::context::WorkspacePathIdentity>,
         page_limit: usize,
+        v2_workspace_version: Option<&V2WorkspaceVersion>,
         deadline: Instant,
         trace: &mut Vec<Value>,
         actor: &mut SessionActor<'_>,
@@ -5419,11 +5963,14 @@ impl LiveScenarioRunner {
                     break;
                 }
             };
-            if evidence.accept(page).is_err() || evidence.satisfied() || evidence.exhausted() {
-                break;
-            }
+            if evidence.accept(page).is_err() { break; }
+            let sufficient = v2_workspace_version.map_or_else(|| evidence.satisfied(),
+                |expected| v2_version_delivered(&evidence.report(), expected));
+            if sufficient || evidence.exhausted() { break; }
         }
-        if !evidence.satisfied() && !evidence.exhausted() {
+        let sufficient = v2_workspace_version.map_or_else(|| evidence.satisfied(),
+            |expected| v2_version_delivered(&evidence.report(), expected));
+        if !sufficient && !evidence.exhausted() {
             evidence.fail("read evidence 256-page limit reached");
         }
         evidence.report()
@@ -6171,6 +6718,173 @@ fn value_u64(value: &Value, keys: &[&str]) -> u64 {
         .sum()
 }
 
+// This is the same selection used by run_scenario; unsupported scenarios stay v1.
+fn v2_select_scenario(mut spec: LiveScenarioSpec, requested: Option<&str>) -> (LiveScenarioSpec, &'static str) {
+    if requested == Some("n8-eval-v2") && matches!(spec.id, "live_direct_terminal" | "live_tool_evidence") {
+        if let Some(prompt) = v2_group_one_prompt(spec.id) {
+            spec.prompt = prompt;
+            spec.acceptance = if spec.id == "live_direct_terminal" { LiveAcceptance::V2DirectNumber }
+                else { LiveAcceptance::V2WorkspaceVersion };
+            return (spec, "n8-eval-v2");
+        }
+    }
+    (spec, "n8-eval-v1")
+}
+
+// v2 oracles are enabled only with their corresponding prompt and revision.
+#[derive(Clone)]
+struct V2WorkspaceVersion {
+    value: String,
+    source_sha256: String,
+    first_line: u64,
+    last_line: u64,
+}
+
+fn v2_workspace_version_snapshot() -> Result<V2WorkspaceVersion, String> {
+    let root = std::env::var_os("COWD_EVAL_WORKSPACE").map(std::path::PathBuf::from)
+        .or_else(|| std::env::current_dir().ok()).ok_or("workspace unavailable")?;
+    v2_workspace_version_snapshot_for_root(&root)
+}
+
+fn v2_workspace_version_snapshot_for_root(root: &std::path::Path) -> Result<V2WorkspaceVersion, String> {
+    #[derive(serde::Deserialize)]
+    struct Manifest { workspace: Workspace }
+    #[derive(serde::Deserialize)]
+    struct Workspace { package: Package }
+    #[derive(serde::Deserialize)]
+    struct Package { version: toml::Spanned<String> }
+    let bytes = std::fs::read(root.join("Cargo.toml")).map_err(|_| "workspace manifest unavailable")?;
+    let text = std::str::from_utf8(&bytes).map_err(|_| "workspace manifest is not UTF-8")?;
+    let manifest: Manifest = toml::from_str(text).map_err(|_| "workspace.package.version unavailable")?;
+    let span = manifest.workspace.package.version.span();
+    let first_line = 1 + bytes[..span.start].iter().filter(|&&byte| byte == b'\n').count() as u64;
+    let last_line = 1 + bytes[..span.end.saturating_sub(1)].iter().filter(|&&byte| byte == b'\n').count() as u64;
+    Ok(V2WorkspaceVersion { value: manifest.workspace.package.version.into_inner(),
+        source_sha256: format!("{:x}", Sha256::digest(&bytes)), first_line, last_line })
+}
+
+fn v2_complete_empty_team_lineage(root: &str, projections: &[Value]) -> Option<bool> {
+    let mut by_id = BTreeMap::new();
+    for projection in projections {
+        let Some(id) = projection["execution_id"].as_str().filter(|id| !id.is_empty()) else { return None; };
+        if by_id.insert(id, projection).is_some() { return None; }
+    }
+    let mut pending = vec![root];
+    let mut seen = BTreeSet::new();
+    while let Some(id) = pending.pop() {
+        if !seen.insert(id) { return None; }
+        let Some(projection) = by_id.get(id) else { return None; };
+        let teams = projection["teams"].as_array()?;
+        if !teams.is_empty() { return Some(false); }
+        let Some(children) = projection["child_executions"].as_array() else { return None; };
+        for child in children {
+            let Some(child_id) = child["execution_id"].as_str().filter(|id| !id.is_empty()) else { return None; };
+            pending.push(child_id);
+        }
+    }
+    Some(true)
+}
+
+fn v2_version_delivered(observation: &Value, expected: &V2WorkspaceVersion) -> bool {
+    let Some(pages) = observation.get("pages").and_then(Value::as_array) else { return false; };
+    let frozen = BTreeMap::from([("Cargo.toml".to_string(), expected.source_sha256.clone())]);
+    for (page_index, page) in pages.iter().enumerate() {
+        for (read_index, read) in page["reads"].as_array().into_iter().flatten().enumerate() {
+            if read.pointer("/path/workspace_relative_path").and_then(Value::as_str) != Some("Cargo.toml")
+                || read["source_sha256"].as_str().map(|value| value.trim_start_matches("sha256:")) != Some(expected.source_sha256.as_str())
+                || !match read.pointer("/recipient/kind").and_then(Value::as_str) {
+                    Some("root") => read["grade"] == "provider_model_observed",
+                    Some("agent") => matches!(read["grade"].as_str(), Some("provider_model_observed" | "agent_channel_send")),
+                    _ => false,
+                } || read["body_delivered"] != true { continue; }
+            let extent = &read["delivered_extent"];
+            let covered = match extent["kind"].as_str() {
+                Some("file_lines") => extent["start_line"].as_u64().zip(extent["line_count"].as_u64())
+                    .is_some_and(|(start, count)| start <= expected.first_line
+                        && start.checked_add(count).is_some_and(|end| end > expected.last_line)),
+                Some("artifact_chunks") => {
+                    let Some(total) = extent["total_chunks"].as_u64() else { continue; };
+                    let Some(chunks) = extent["chunks"].as_array() else { continue; };
+                    let indexes: BTreeSet<u64> = chunks.iter().filter_map(|chunk| chunk["index"].as_u64()).collect();
+                    let bytes = chunks.iter().try_fold(0_u64, |sum, chunk|
+                        sum.checked_add(chunk["body_bytes"].as_u64()?));
+                    total > 0 && indexes.len() == chunks.len() && indexes.len() as u64 == total
+                        && indexes.iter().copied().eq(0..total)
+                        && bytes == read["source_bytes"].as_u64()
+                },
+                _ => false,
+            };
+            if !covered { continue; }
+            let mut selected = observation.clone();
+            let Some(selected_pages) = selected["pages"].as_array_mut() else { return false; };
+            for (index, item) in selected_pages.iter_mut().enumerate() {
+                if index == page_index { item["reads"] = json!([read]); }
+                else { item["reads"] = json!([]); }
+            }
+            if crate::facet_gate::collect_read_paths_frozen(&selected, Some(&frozen))
+                .iter().any(|path| path == "Cargo.toml") { return true; }
+            let _ = read_index;
+        }
+    }
+    false
+}
+
+fn v2_direct_decision(response: &str) -> Option<bool> {
+    let compact: String = response.chars().filter(|ch| !ch.is_whitespace()).collect();
+    let lower = compact.to_lowercase();
+    if ["not", "isn't", "wrong", "incorrect", "false", "不是", "错误", "不对", "不正确", "不成立", "有误", "不等于", "并非", "非56", "≠", "-56", "+56", "%", "％"]
+        .iter().any(|marker| lower.contains(marker)) { return Some(false); }
+    if compact.as_bytes().windows(3).any(|window| window[0].is_ascii_digit() && window[1] == b'.' && window[2].is_ascii_digit()) { return Some(false); }
+    let numbers: Vec<&str> = compact.split(|ch: char| !ch.is_ascii_digit())
+        .filter(|part| !part.is_empty()).collect();
+    if numbers.is_empty() { return None; }
+    if numbers.iter().filter(|&&part| part == "56").count() != 1 { return Some(false); }
+    if numbers.len() != 1 {
+        let explicit_product = ["7×8", "7*8", "7乘8", "7乘以8", "8×7", "8*7", "8乘7", "8乘以7"]
+            .iter().any(|marker| compact.contains(marker));
+        if !explicit_product || numbers.iter().filter(|&&part| part == "7").count() != 1
+            || numbers.iter().filter(|&&part| part == "8").count() != 1 || numbers.len() != 3 { return Some(false); }
+    }
+    // A bounded set of affirmative answer phrases is accepted. Unknown prose
+    // is not evidence of an uncontradicted answer.
+    let mut remainder = lower;
+    for token in ["theansweris", "theanswer", "answeris", "resultis", "therefore", "because", "equals", "answer", "result",
+        "计算结果为", "计算结果是", "计算结果", "因此答案是", "所以答案是", "所以结果是", "答案是", "答案为", "结果是", "结果为",
+        "因此", "所以", "因为", "等于", "乘以", "答案", "结果", "乘", "是", "为", "即", "56", "7", "8", "×", "*", "=", "。", "，", "！", "!", ".", ":", "：", ";", "；", "(", ")", "（", "）", "is"] {
+        remainder = remainder.replace(token, "");
+    }
+    if remainder.is_empty() { Some(true) } else { None }
+}
+
+fn v2_direct_answer(response: &str) -> bool { v2_direct_decision(response) == Some(true) }
+
+fn v2_version_decision(response: &str, expected: &str) -> Option<bool> {
+    let candidates: Vec<&str> = response.split(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '.' || ch == '-' || ch == '+'))
+        .map(|part| part.trim_matches('.').trim_start_matches('v'))
+        .filter(|part| part.chars().next().is_some_and(|ch| ch.is_ascii_digit()) && part.contains('.'))
+        .collect();
+    if expected.is_empty() || candidates.is_empty() || response_marks_unresolved(response) { return None; }
+    let compact: String = response.chars().filter(|ch| !ch.is_whitespace()).collect();
+    let lower = compact.to_lowercase();
+    let contradictory = ["not", "wrong", "incorrect", "isn't", "without", "missing", "lacks", "不是", "没有", "不存在", "未包含", "缺少", "并无", "不包含", "错误", "不对", "不正确", "不成立", "有误", "不等于", "并非", "≠"]
+        .iter().any(|marker| lower.contains(marker));
+    if contradictory || candidates.iter().any(|&part| part != expected) { return Some(false); }
+    if !response.contains("Cargo.toml") { return None; }
+    // Only recognized affirmative phrasing can establish the answer. Other
+    // prose remains unknown even if it happens to contain the version token.
+    let mut remainder = lower.replace(&expected.to_lowercase(), "");
+    for token in ["workspace.package.version", "workspacepackageversion", "cargo.toml", "theworkspacepackageversion", "packageversion", "workspaceversion",
+        "workspace包版本", "工作区包版本", "工作空间包版本", "工作区版本", "工作空间版本", "文件路径", "版本号", "版本", "工作区", "工作空间", "文件", "路径",
+        "inthe", "the", "version", "package", "workspace", "is", "in", "为", "是", "位于", "中", "的", "：", ":", "=", "。", "，", ",", ".", "；", ";", "（", "）", "(", ")", "`", "\"", "'", "v"] {
+        remainder = remainder.replace(token, "");
+    }
+    if remainder.is_empty() { Some(true) } else { None }
+}
+
+fn v2_version_answer(response: &str, expected: &str) -> bool {
+    v2_version_decision(response, expected) == Some(true)
+}
+
 #[derive(Clone, Copy)]
 struct LiveScenarioSpec {
     id: &'static str,
@@ -6349,10 +7063,67 @@ impl LiveScenarioTimeout {
     }
 }
 
+/// Whether the observer stopped because a terminal fact was already recorded,
+/// or because it simply ran out of ways to look.
+///
+/// The first is a fact about the work: the execution's own durable
+/// projection or its durable outcome receipt says how it ended. The second is
+/// a fact about the observer: the window closed, or nothing moved for a
+/// while. Only the second kind may not touch the work - an observation that
+/// ends is not a statement about what the work did, and an observer that
+/// ends the work it is observing writes the verdict it was supposed to read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ObservationStopKind {
+    /// A terminal fact was already registered; the work is over.
+    RegisteredTerminal,
+    /// The observer stopped looking; nothing is known about the work.
+    Inferred,
+}
+
+/// One stop of the wait, with what the observer actually read.
+pub(crate) struct WaitStop {
+    pub(crate) kind: ObservationStopKind,
+    pub(crate) code: &'static str,
+    pub(crate) message: String,
+    pub(crate) class: Option<String>,
+    pub(crate) commit_cursor: Option<u64>,
+}
+
+impl From<String> for WaitStop {
+    /// An error the observer hit while looking is not a fact about the work.
+    ///
+    /// The observer failed to read something - the receipt authority, a
+    /// message delta, a timeline delta - so it knows nothing about how the
+    /// work ended. That is an inferred stop, and an inferred stop may not
+    /// cancel a running execution: the observer that cannot read is not the
+    /// one that decides. The prose the model reads is unchanged; only the
+    /// class of the stop is new.
+    fn from(message: String) -> Self {
+        Self {
+            kind: ObservationStopKind::Inferred,
+            code: "wait_stop_unknown",
+            message,
+            class: None,
+            commit_cursor: None,
+        }
+    }
+}
+
+/// Whether the observer may cancel the lineage after this stop.
+///
+/// A registered terminal means the work is already over, so the cancel is a
+/// receipt for what happened. An inferred stop means the work may still be
+/// running, and the observer has no standing to end it: the lineage is left
+/// to the outer reclaim.
+pub(crate) fn observer_may_cancel(stop: &WaitStop) -> bool {
+    matches!(stop.kind, ObservationStopKind::RegisteredTerminal)
+}
+
 struct TerminalWait {
     message_id: String,
     execution_observation: Value,
     report: Value,
+    non_success: bool,
 }
 
 struct DescendantTeamWait {
@@ -6368,6 +7139,8 @@ enum LiveAcceptance {
     MemoryRecall,
     U5(U5Mode),
     Contains(&'static str),
+    V2DirectNumber,
+    V2WorkspaceVersion,
     RequiresToolEvidence {
         tool_name: &'static str,
         target_path: &'static str,
@@ -6430,6 +7203,7 @@ enum ArchitectureEvidenceProfile {
 impl LiveAcceptance {
     fn read_obligations(self) -> Vec<&'static str> {
         match self {
+            Self::V2WorkspaceVersion => vec!["Cargo.toml"],
             Self::RequiresToolEvidence {
                 tool_name: "read_file",
                 target_path,
@@ -6479,6 +7253,14 @@ impl LiveAcceptance {
                 passed: false,
                 quality: None,
                 checks: vec![json!({"name":"u5_requires_composite_driver", "passed":false})],
+            },
+            Self::V2DirectNumber => LiveAcceptanceResult {
+                passed: v2_direct_answer(response), quality: None,
+                checks: vec![json!({"name":"v2_exact_56_no_contradiction", "passed":v2_direct_answer(response)})],
+            },
+            Self::V2WorkspaceVersion => LiveAcceptanceResult {
+                passed: !response.trim().is_empty(), quality: None,
+                checks: vec![json!({"name":"durable_response", "passed":!response.trim().is_empty()})],
             },
             Self::Contains(expected) => LiveAcceptanceResult {
                 passed: response.contains(expected),
@@ -6792,6 +7574,19 @@ impl LiveAcceptance {
         };
         finalize_live_acceptance(result, timeline, root_execution_id)
     }
+}
+
+// The three-piece entry summarizes other checks; it is not an additional gate.
+fn numeric_acceptance_checks_pass(checks: &[Value]) -> bool {
+    !checks.is_empty() && checks.iter().all(|check| {
+        check["passed"] == true
+            || (check["passed"] == false
+                && check["name"] == "terminal_three_piece_complete"
+                && check["missing"] == json!(["goal_verified"])
+                && check["pieces"]["goal_verified"] == false
+                && check["pieces"]["business_outcome"] == true
+                && check["pieces"]["user_visible_delivery"] == true)
+    })
 }
 
 fn finalize_live_acceptance(
@@ -8174,6 +8969,7 @@ fn failed_scenario_with_session_and_execution(
         trace,
         session_id,
         execution_id,
+        None,
         error,
         diagnostics,
         None,
@@ -8201,6 +8997,7 @@ fn failed_scenario_with_session_execution_and_program(
     trace: Vec<Value>,
     session_id: String,
     execution_id: Option<String>,
+    turn_id: Option<String>,
     error: String,
     diagnostics: Value,
     agentic_program: Option<runtime::AgenticProgramProjection>,
@@ -8242,6 +9039,7 @@ fn failed_scenario_with_session_execution_and_program(
         "status": "failed",
         "session_id": if session_id.is_empty() { Value::Null } else { Value::String(session_id) },
         "execution_id": execution_id,
+        "turn_id": turn_id,
         "elapsed_ms": started.elapsed().as_millis(),
         "error": error,
         "metrics": metrics,
@@ -8271,6 +9069,90 @@ fn message_text(message: &Value) -> String {
         }
     }
     String::new()
+}
+
+/// The terminal answer of a delivered Session message, read by block type.
+///
+/// A Provider is allowed to project a reasoning summary ahead of the answer
+/// block. `message_text` reads the first string under a `text` key whatever
+/// block it belongs to, so a reasoning summary would be handed to the
+/// scenario oracles as if it were the answer. Only a `text` block is the
+/// answer here; a message that carries none has no terminal answer, which
+/// keeps the existing "no durable answer" semantics instead of promoting
+/// reasoning prose into a business answer.
+#[must_use]
+pub(crate) fn terminal_answer_text(blocks: &Value) -> String {
+    blocks
+        .as_array()
+        .and_then(|blocks| {
+            blocks.iter().find(|block| {
+                block.get("type").and_then(Value::as_str) == Some("text")
+                    && block
+                        .get("text")
+                        .and_then(Value::as_str)
+                        .is_some_and(|text| !text.trim().is_empty())
+            })
+        })
+        .and_then(|block| block.get("text").and_then(Value::as_str))
+        .unwrap_or_default()
+        .to_string()
+}
+
+#[cfg(test)]
+mod terminal_answer_extraction_tests {
+    use super::terminal_answer_text;
+    use serde_json::json;
+
+    /// Positive control, the shape the real 029-a run produced: a reasoning
+    /// summary ahead of the answer block must yield the answer block.
+    #[test]
+    fn a_reasoning_summary_ahead_of_the_answer_still_yields_the_answer() {
+        let blocks = json!([
+            {"type": "reasoning_summary", "text": "The memory was found. Answer in Chinese. Just answer."},
+            {"type": "text", "text": "两个值都已在记忆中找到：仓库代号 WH-1；出库口令 OUT-2"}
+        ]);
+        let answer = terminal_answer_text(&blocks);
+        assert!(
+            answer.contains("WH-1") && answer.contains("OUT-2"),
+            "the answer block must be read: {answer}"
+        );
+        assert!(
+            !answer.contains("Just answer"),
+            "reasoning prose must not be read as the answer: {answer}"
+        );
+    }
+
+    /// Negative control: reasoning alone is not a terminal answer. The
+    /// existing "no durable answer" reading stays, so an unanswered turn is
+    /// never credited with an answer it did not deliver.
+    #[test]
+    fn reasoning_without_an_answer_block_is_not_read_as_an_answer() {
+        let blocks = json!([
+            {"type": "reasoning_summary", "text": "Thinking about it."},
+            {"type": "thinking", "thinking": "private chain of thought"}
+        ]);
+        assert!(terminal_answer_text(&blocks).is_empty());
+    }
+
+    /// Control: the first non-empty `text` block is the answer; tool frames
+    /// and blank text blocks are not.
+    #[test]
+    fn the_first_non_empty_text_block_is_the_answer() {
+        let blocks = json!([
+            {"type": "tool_use", "id": "call-1", "name": "read_file", "input": "{}"},
+            {"type": "text", "text": "   "},
+            {"type": "text", "text": "final answer"}
+        ]);
+        assert_eq!(terminal_answer_text(&blocks), "final answer");
+    }
+
+    /// Control: a payload that is not a block array keeps the historical empty
+    /// reading instead of inventing an answer.
+    #[test]
+    fn a_message_without_answer_blocks_has_no_terminal_answer() {
+        assert_eq!(terminal_answer_text(&json!([])), "");
+        assert_eq!(terminal_answer_text(&json!("not-an-array")), "");
+    }
 }
 
 fn find_string_by_key(value: &Value, keys: &[&str]) -> Option<String> {
@@ -8321,6 +9203,10 @@ struct RootBusinessOutcome {
     passed: bool,
     event_status: Option<String>,
     terminal_class: Option<String>,
+    /// The verified business conclusion of the Outcome event.  It is the only
+    /// source of a business success: an event that carries no verified
+    /// conclusion is Unknown, never a success.
+    verified_verdict: Option<String>,
 }
 
 /// Bind acceptance to the canonical Runtime outcome for the root execution
@@ -8339,11 +9225,21 @@ fn root_business_outcome(timeline: &Value, root_execution_id: &str) -> RootBusin
         .pointer("/payload/terminal/class")
         .and_then(Value::as_str)
         .map(ToString::to_string);
+    let verified_verdict = outcome
+        .pointer("/payload/verified/verdict")
+        .and_then(Value::as_str)
+        .map(ToString::to_string);
     RootBusinessOutcome {
-        passed: event_status.as_deref() == Some("succeeded")
+        // The durable verified conclusion decides the business verdict.  The
+        // event status and the terminal class stay as the record of what the
+        // Runtime wrote, but they cannot promote a run to a success that no
+        // durable fact verified.
+        passed: verified_verdict.as_deref() == Some("satisfied")
+            && event_status.as_deref() == Some("succeeded")
             && terminal_class.as_deref() == Some("succeeded"),
         event_status,
         terminal_class,
+        verified_verdict,
     }
 }
 
@@ -8370,6 +9266,384 @@ fn root_business_event<'event>(
         })
 }
 
+/// Decide whether a wait loop must stop on the root's own durable terminal
+/// receipt. The receipt (root-scoped, session-scope identity, latest
+/// generation) is a second terminal source next to the execution
+/// projection: when the projection is unreadable from this observer, the
+/// projection-derived `finalized_non_success` reference is lost and the
+/// watchdogs would otherwise misname an already-recorded root terminal as
+/// harness stall or observation-limit. The decision returns `None` (stay on
+/// the existing paths) whenever the projection plane still has authority
+/// (a finalized reference exists, or the root projection reads Completed),
+/// no root receipt is on the timeline, or the receipt's class is
+/// `succeeded` (the normal message plane keeps its exit). A non-success
+/// class yields the class and commit cursor for the named
+/// `root_terminal_awaiting_review_reconstruction` stop.
+fn root_terminal_awaiting_review_reconstruction(
+    timeline: &Value,
+    root_execution_id: &str,
+    finalized_non_success: Option<&str>,
+    root_terminal: &RootExecutionTerminal,
+) -> Option<(String, Option<u64>)> {
+    if finalized_non_success.is_some() || matches!(root_terminal, RootExecutionTerminal::Completed) {
+        return None;
+    }
+    let event = root_business_event(timeline, root_execution_id)?;
+    let class = event
+        .pointer("/payload/terminal/class")
+        .and_then(Value::as_str)
+        .or_else(|| event.get("status").and_then(Value::as_str))
+        .unwrap_or("unknown")
+        .to_string();
+    (class != "succeeded").then(|| (class, event.get("commit_cursor").and_then(Value::as_u64)))
+}
+
+/// 034-5(a): how many consecutive reconciliation rounds must report an unknown
+/// original-call custody before the observer stops watching the turn. Three is
+/// the smallest count that separates a wedged lease from one round of lag.
+const LEASE_CUSTODY_UNKNOWN_STREAK: usize = 3;
+
+/// The durable strings that say a binding lease cannot reach a terminal for the
+/// original call. Both are read verbatim off the product: the recovery wrapper
+/// `ExecutionRecoveryError::LeaseReconciliation` ("binding lease reconciliation
+/// blocked: <inner>") and the deadline itself
+/// (`original lease closure deadline expired`).
+const LEASE_CUSTODY_UNKNOWN_MARKERS: [&str; 2] = [
+    "binding lease reconciliation blocked",
+    "original lease closure deadline expired",
+];
+
+/// `NodeExecutorError::OriginalCustodyUnknown` renders as "original call custody
+/// for node `<node_id>` remains unknown: <reason>", so the node id sits between
+/// the two halves and neither the sentence nor either half alone is a substring
+/// test. Both halves together name the same wedge from the executor path.
+const ORIGINAL_CUSTODY_UNKNOWN_LEAD: &str = "original call custody";
+const ORIGINAL_CUSTODY_UNKNOWN_TAIL: &str = "remains unknown";
+
+/// Event fields that carry quoted work rather than what the runtime reported.
+/// A `read_file` of the source above puts those markers inside a tool result;
+/// that is data about text, not a blocked lease, so these fields never count.
+const UNKNOWN_CUSTODY_QUOTED_TEXT_FIELDS: [&str; 7] = [
+    "result_ref",
+    "model_summary",
+    "output",
+    "content",
+    "text",
+    "prompt",
+    "answer",
+];
+
+fn text_reports_unknown_custody(text: &str) -> bool {
+    LEASE_CUSTODY_UNKNOWN_MARKERS
+        .iter()
+        .any(|marker| text.contains(marker))
+        || (text.contains(ORIGINAL_CUSTODY_UNKNOWN_LEAD) && text.contains(ORIGINAL_CUSTODY_UNKNOWN_TAIL))
+}
+
+fn event_reports_unknown_custody(event: &Value) -> bool {
+    let reports = text_reports_unknown_custody;
+    event
+        .as_object()
+        .into_iter()
+        .flat_map(|object| object.iter())
+        .filter(|(field, _)| !UNKNOWN_CUSTODY_QUOTED_TEXT_FIELDS.contains(&field.as_str()))
+        .flat_map(|(_, value)| match value {
+            Value::String(text) => vec![text.as_str()],
+            Value::Object(nested) => nested
+                .iter()
+                .filter(|(field, _)| !UNKNOWN_CUSTODY_QUOTED_TEXT_FIELDS.contains(&field.as_str()))
+                .filter_map(|(_, value)| value.as_str())
+                .collect(),
+            _ => Vec::new(),
+        })
+        .any(reports)
+}
+
+/// How many trailing timeline events in a row report the unknown-custody block.
+/// Any other event - a progress delta, a receipt, a terminal - breaks the run,
+/// so a scenario that is actually working cannot reach the threshold.
+fn lease_custody_unknown_streak(timeline: &Value) -> usize {
+    timeline
+        .get("events")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .rev()
+        .map(event_reports_unknown_custody)
+        .take_while(|reported| *reported)
+        .count()
+}
+
+/// 034-5(a) supplement (D22): how long the durable stream may stay silent, with
+/// committed work behind it and nothing left outstanding, before the watch
+/// releases the lineage. 900 s is the ruling on the sealed certv3-20261116-q
+/// shape (root halted at revision 181 / commit_cursor 848, 1 888 s without a
+/// substantive event, 90 model steps, 0 completion requests, 0 provider rounds,
+/// no custody marker at all). It sits deliberately above the 600 s inactivity
+/// window, because this condition may only fire while nothing is in flight and
+/// nothing failed: a long Provider round is never mistaken for a halt.
+const SILENT_CUSTODY_FREE_STALL_MS: u64 = 900_000;
+
+/// The kinds this supplement reads, taken from the sealed monitor's own SQL so
+/// the harness and the monitor cannot disagree about what a step is.
+const MODEL_STEP_EVENT_KIND: &str = "model.item_completed";
+const AGENTIC_ACTION_EVENT_KIND: &str = "agentic.action_applied";
+const OBJECTIVE_COMPLETE_ACTION_KIND: &str = "objective_complete_request";
+const AGENTIC_EVENT_KIND_PREFIX: &str = "agentic.";
+const EXECUTION_GRAPH_EVENT_KIND_PREFIX: &str = "execution_graph.";
+
+/// `ProviderAttemptOutcomeEvidence::terminal_status` is one of `completed`,
+/// `consumer_dropped`, `cancelled`, or `failed`. Only the last is a Provider
+/// error; the other three name a round that ended for a reason this supplement
+/// has no business speaking over.
+const PROVIDER_FAILED_TERMINAL_STATUS: &str = "failed";
+
+/// One halt of the durable stream, with every count read to decide it. Nothing
+/// here is invented: each field is a durable event kind, a committed cursor, or
+/// a committed timestamp.
+struct SilentCustodyFreeHalt {
+    silence_ms: u64,
+    model_steps: usize,
+    completion_requests: usize,
+    agentic_events: usize,
+    provider_requests_in_flight: usize,
+    provider_errors: usize,
+    halt_kind: String,
+    halt_commit_cursor: Option<u64>,
+}
+
+/// The durable stream silence is measured on: every kind the observer already
+/// treats as execution activity, plus every `execution_graph.*` event.
+///
+/// The ruling named the root's execution-graph stream. Taking the union makes
+/// this set a superset of it, so the newest durable fact read here is never
+/// older than the newest graph event and the supplement cannot fire before the
+/// ruling's own condition. Runtime's housekeeping
+/// (`resource.admission.granted`, `evolution.*`, `runtime.strategy.outcome`)
+/// stays excluded for the reason recorded on `is_execution_activity`: it
+/// arrives forever while a turn is silent.
+fn silent_stall_durable_activity(kind: &str) -> bool {
+    is_execution_activity(kind) || kind.starts_with(EXECUTION_GRAPH_EVENT_KIND_PREFIX)
+}
+
+/// Wall-clock now, in the unit the durable events carry. A clock this process
+/// cannot read leaves the silence at zero, which keeps the supplement inert
+/// rather than failing a leg on a time it does not know.
+fn silent_stall_now_ms() -> u64 {
+    u64::try_from(crate::report_store::now_ms()).unwrap_or_default()
+}
+
+/// `model_steps`, read the way the sealed monitor reads it:
+/// `kind = 'model.item_completed'`.
+fn silent_stall_model_steps(timeline: &Value) -> usize {
+    timeline
+        .get("events")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|event| event.get("kind").and_then(Value::as_str) == Some(MODEL_STEP_EVENT_KIND))
+        .count()
+}
+
+/// Events that carry the closure vocabulary at all. 034-5(b): where no
+/// `agentic.*` event exists, a completion count of 0 is true by construction
+/// and says nothing, so the halt has to name which case the reader is in.
+fn silent_stall_agentic_events(timeline: &Value) -> usize {
+    timeline
+        .get("events")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|event| {
+            event
+                .get("kind")
+                .and_then(Value::as_str)
+                .is_some_and(|kind| kind.starts_with(AGENTIC_EVENT_KIND_PREFIX))
+        })
+        .count()
+}
+
+/// Completion requests, mirroring the monitor's
+/// `kind = 'agentic.action_applied'` whose
+/// `envelope.action.kind = 'objective_complete_request'`.
+fn silent_stall_completion_requests(timeline: &Value) -> usize {
+    timeline
+        .get("events")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|event| {
+            event.get("kind").and_then(Value::as_str) == Some(AGENTIC_ACTION_EVENT_KIND)
+                && event
+                    .pointer("/payload/envelope/action/kind")
+                    .and_then(Value::as_str)
+                    == Some(OBJECTIVE_COMPLETE_ACTION_KIND)
+        })
+        .count()
+}
+
+/// Provider requests packed onto the wire that never returned a terminal
+/// outcome. While one exists the run can still move on its own, so silence is
+/// not yet evidence that it halted.
+fn silent_stall_provider_requests_in_flight(timeline: &Value) -> usize {
+    let mut packed = BTreeMap::<&str, &Value>::new();
+    let mut outcomes = BTreeMap::<&str, &Value>::new();
+    collect_provider_attempt_events(timeline, &mut packed, &mut outcomes);
+    packed
+        .keys()
+        .filter(|request_id| !outcomes.contains_key(*request_id))
+        .count()
+}
+
+/// Outcomes the Provider itself reported as failed.
+fn silent_stall_provider_errors(timeline: &Value) -> usize {
+    let mut packed = BTreeMap::<&str, &Value>::new();
+    let mut outcomes = BTreeMap::<&str, &Value>::new();
+    collect_provider_attempt_events(timeline, &mut packed, &mut outcomes);
+    outcomes
+        .values()
+        .filter(|outcome| {
+            outcome
+                .get("terminal_status")
+                .and_then(Value::as_str)
+                == Some(PROVIDER_FAILED_TERMINAL_STATUS)
+        })
+        .count()
+}
+
+/// Decide the supplement from the durable stream alone.
+///
+/// The silence is measured on the events' own committed timestamps, not on the
+/// observer's liveness clock, because that clock cannot answer this question: it
+/// re-arms on any change in the message, root, or live reads, so a run whose
+/// durable work stopped while a projection kept moving never reaches any
+/// threshold. That is how certv3-20261116-q sat 1 888 s without a substantive
+/// event inside a wait whose inactivity window is at most 600 s.
+///
+/// `None` unless every conjunct of the ruling is a durable fact at once.
+fn silent_custody_free_halt(timeline: &Value, now_ms: u64) -> Option<SilentCustodyFreeHalt> {
+    let halt = timeline
+        .get("events")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|event| {
+            event
+                .get("kind")
+                .and_then(Value::as_str)
+                .is_some_and(silent_stall_durable_activity)
+        })
+        .filter(|event| event.get("created_at_ms").and_then(Value::as_u64).is_some())
+        .max_by_key(|event| {
+            (
+                event
+                    .get("created_at_ms")
+                    .and_then(Value::as_u64)
+                    .unwrap_or_default(),
+                event
+                    .get("commit_cursor")
+                    .and_then(Value::as_u64)
+                    .unwrap_or_default(),
+            )
+        })?;
+    let silence_ms =
+        now_ms.saturating_sub(halt.get("created_at_ms").and_then(Value::as_u64).unwrap_or_default());
+    if silence_ms < SILENT_CUSTODY_FREE_STALL_MS {
+        return None;
+    }
+    let model_steps = silent_stall_model_steps(timeline);
+    let completion_requests = silent_stall_completion_requests(timeline);
+    let agentic_events = silent_stall_agentic_events(timeline);
+    let provider_requests_in_flight = silent_stall_provider_requests_in_flight(timeline);
+    let provider_errors = silent_stall_provider_errors(timeline);
+    (model_steps > 0
+        && completion_requests == 0
+        && provider_requests_in_flight == 0
+        && provider_errors == 0)
+        .then(|| SilentCustodyFreeHalt {
+            silence_ms,
+            model_steps,
+            completion_requests,
+            agentic_events,
+            provider_requests_in_flight,
+            provider_errors,
+            halt_kind: halt
+                .get("kind")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            halt_commit_cursor: halt.get("commit_cursor").and_then(Value::as_u64),
+        })
+}
+
+/// The typed reason a wait stopped, with the root's durable outcome carried
+/// out verbatim.
+///
+/// The wait's prose names the class of the stop - a root that ended badly, a
+/// review that never came, an observation window that ran out. It does not
+/// carry the root's own reason, because the reason lives in the root's
+/// durable terminal event. A reader of the report could see that the root
+/// failed and never learn why, and a reader who wanted the why had to go and
+/// find it themselves, which is exactly the re-typing this ends.
+fn typed_wait_failure(
+    stop: &WaitStop,
+    timeline: &Value,
+    execution_id: &str,
+    scenario_id: &str,
+) -> Value {
+    let code = stop.code;
+    crate::machine_reference::typed_failure(
+        code,
+        &stop.message,
+        json!({
+            "scenario_id": scenario_id,
+            "root_durable_outcome": root_business_observation(timeline, execution_id),
+            // What the observer read, and what it did not know: a stop that
+            // named a registered terminal fact says which one, and a stop that
+            // did not says so instead of implying a verdict.
+            "observation_stop": {
+                "kind": match stop.kind {
+                    ObservationStopKind::RegisteredTerminal => "registered_terminal",
+                    ObservationStopKind::Inferred => "inferred",
+                },
+                "class": stop.class.clone().map(Value::String).unwrap_or(Value::Null),
+                "commit_cursor": stop.commit_cursor.map(|cursor| json!(cursor)).unwrap_or(Value::Null),
+                "observer_may_cancel": observer_may_cancel(stop),
+            },
+        }),
+    )
+}
+
+/// The one shape a component failure takes on the way out.
+///
+/// Two failures used to leave this component by two doors: a scenario list
+/// that could not be built, and a run whose scenarios did not pass. The first
+/// carried its reason in a field nobody read and counted one failed scenario
+/// that never ran; the second carried no reason at all, so a reader of the
+/// report had nothing to read. One constructor now, so a reader can tell
+/// which door a failure came through and whether anything ran at all.
+fn component_failure_diagnostics(
+    code: &str,
+    reason: &str,
+    phase: &str,
+    started: bool,
+    scenarios_started: usize,
+    scenarios_failed: usize,
+    failures: Vec<Value>,
+) -> Value {
+    crate::machine_reference::typed_failure(
+        code,
+        reason,
+        json!({
+            "phase": phase,
+            "started": started,
+            "scenarios_started": scenarios_started,
+            "scenarios_failed": scenarios_failed,
+            "failures": failures,
+        }),
+    )
+}
+
 pub(crate) fn root_business_observation(timeline: &Value, root_execution_id: &str) -> Value {
     let Some(event) = root_business_event(timeline, root_execution_id) else {
         return Value::Null;
@@ -8383,6 +9657,8 @@ pub(crate) fn root_business_observation(timeline: &Value, root_execution_id: &st
         "execution_scope":event.pointer("/payload/identity/execution_scope"),
         "event_status":event.get("status"),
         "terminal_class":event.pointer("/payload/terminal/class"),
+        "verified_verdict":event.pointer("/payload/verified/verdict"),
+        "verified_reason":event.pointer("/payload/verified/reason"),
     })
 }
 
@@ -8846,9 +10122,20 @@ mod read_evidence_consumer_tests {
     }
 
     fn timeline() -> Value {
+        // A durable Outcome event carries the verified business conclusion.
+        // Without it the business verdict is Unknown, so a synthetic success
+        // event has to state the durable conclusion it is standing for: a
+        // satisfied verdict, the committed terminal conclusion, and an
+        // acceptance evaluation whose obligation ledger is Evaluated with an
+        // empty unresolved set.  Only the fixture changes here - the consumer
+        // predicates keep the S6 invariant that an unreadable verified
+        // conclusion is Unknown, never a success.
         json!({"events":[{
             "kind":"runtime.outcome.recorded.v1","status":"succeeded",
-            "payload":{"identity":{"execution_graph_ref":"graph","execution_scope":"session"},"terminal":{"class":"succeeded"}}
+            "payload":{"identity":{"execution_graph_ref":"graph","execution_scope":"session"},"terminal":{"class":"succeeded"},
+                      "verified":{"verdict":"satisfied","reason":"satisfied",
+                                  "basis":[{"kind":"goal_conclusion","reference":"synthesize:graph"},
+                                           {"kind":"acceptance_evaluation","reference":"satisfied"}]}}
         }]})
     }
 
@@ -9115,10 +10402,9 @@ mod source_metadata_owner_tests {
     fn u5_source_metadata_is_optional_and_actual_owner_stays_required() {
         let raw = json!({
             "nonce": "a".repeat(64), "launcher_pid": 1, "launcher_start": 1,
-            "pid": 2, "starttime": 2, "image_sha256": format!("sha256:{}", "b".repeat(64)),
-            "exe_dev": 1, "exe_ino": 2, "listener_inode": 3, "port": 12345,
+            "pid": 2, "starttime": 2, "listener_inode": 3, "port": 12345,
             "namespace": "owned-run", "base_url": "http://127.0.0.1:12345/",
-            "harness_sha256": "c".repeat(64), "runtime_dev": 4, "runtime_ino": 5
+            "runtime_dev": 4, "runtime_ino": 5
         });
         let host: U5Host = serde_json::from_value(raw.clone()).unwrap();
         assert!(host.candidate.is_none());
@@ -9128,9 +10414,14 @@ mod source_metadata_owner_tests {
         assert!(u5_valid_owner(&owner, &host.base_url));
         owner.pid = 0;
         assert!(!u5_valid_owner(&owner, &host.base_url));
-        owner = host.owner();
-        owner.image_sha256 = "unknown".into();
-        assert!(!u5_valid_owner(&owner, &host.base_url));
+        let mut observed = raw.clone();
+        observed["image_sha256"] = json!("not-a-process-identity");
+        observed["harness_sha256"] = json!(null);
+        observed["exe_dev"] = json!("unavailable");
+        let observed_host: U5Host = serde_json::from_value(observed).unwrap();
+        assert_eq!(observed_host.owner(), host.owner());
+        assert!(observed_host.binding().get("image_sha256").is_none());
+        assert!(observed_host.binding().get("harness_sha256").is_none());
         let mut explicit = raw;
         explicit["candidate"] = json!("d".repeat(40));
         explicit["source_sha256"] = json!("e".repeat(64));

@@ -4022,6 +4022,27 @@ impl RuntimeService {
                 execution_ids = ?cancelled_execution_ids,
                 "cancelled active Runtime execution(s) for session input"
             );
+            // A cancelled turn owns more than its root graph: a bound
+            // Agent ToolBatch and its review-team children are separate
+            // executions with their own lifecycles. Signalling the turn
+            // control alone leaves those children running, so the original
+            // turn keeps waiting for a callback that can no longer be
+            // produced. Walk the lineage once, root first, and retire every
+            // non-terminal graph in the same cancellation pass.
+            for execution_id in &cancelled_execution_ids {
+                if let Err(error) = self
+                    .runtime_services
+                    .cancel_execution_tree(execution_id, reason)
+                    .await
+                {
+                    tracing::warn!(
+                        session_id,
+                        execution_id,
+                        %error,
+                        "execution tree cancellation incomplete"
+                    );
+                }
+            }
         }
         Ok(receipt)
     }
@@ -4711,7 +4732,7 @@ impl RuntimeService {
     pub(crate) async fn install_turn_control(
         &self,
         session_id: &str,
-        cancellation_token: runtime::CancellationToken,
+        cancellation_control: Arc<TurnCancellationControl>,
         hook_abort_signal: runtime::HookAbortSignal,
     ) -> Result<(), RuntimeTurnExecutionError> {
         let runtime_entry = self.sessions.get(session_id).ok_or_else(|| {
@@ -4723,9 +4744,8 @@ impl RuntimeService {
                 "session {session_id} is already executing a turn"
             )));
         }
-        runtime_guard.install_turn_control(cancellation_token, hook_abort_signal);
         runtime_guard
-            .install_provider_cancellation_control(None)
+            .install_turn_control(cancellation_control, hook_abort_signal)
             .map_err(|error| RuntimeTurnExecutionError::Runtime(error.to_string()))?;
         Ok(())
     }

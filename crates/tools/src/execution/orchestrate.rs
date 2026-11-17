@@ -85,6 +85,18 @@ pub(crate) fn original_static_file_scopes(
                 .map(|requests| requests.iter().collect::<Vec<_>>())
                 .unwrap_or_else(|| vec![input]);
             for request in requests {
+                let search_path = if tool_id == "glob_search" {
+                    match request.get("path") {
+                        None | Some(Value::Null) => Some(".".to_string()),
+                        Some(Value::String(value)) if value.trim().is_empty() => Some(".".to_string()),
+                        value => directory_path(value),
+                    }
+                } else {
+                    match request.get("path") {
+                        None | Some(Value::Null) => Some(".".to_string()),
+                        value => directory_path(value),
+                    }
+                };
                 // A glob pattern that escapes the workspace is not a bounded
                 // research read. Refuse it so the effect falls back to the
                 // conservative unknown envelope, which keeps the hard boundary
@@ -108,9 +120,14 @@ pub(crate) fn original_static_file_scopes(
                         .is_none_or(|pattern| {
                             pattern.contains('/') || pattern.contains('\\') || pattern == ".."
                         }) {
-                    None
+                    // A nested search may resolve its base through a symlink,
+                    // so certify the workspace rather than a lexical subtree.
+                    request.get("pattern").and_then(Value::as_str)
+                        .filter(|pattern| !pattern.contains(['{', '}', '\\']))
+                        .and_then(|_| search_path.clone())
+                        .map(|_| ".".to_string())
                 } else {
-                    directory_path(request.get("path"))
+                    search_path
                 };
                 add(read, target, ProofEffectPurpose::InputRead);
             }
@@ -123,33 +140,22 @@ pub(crate) fn original_static_file_scopes(
             // reduction certifiable by a lease that covers the declared inputs
             // instead of demanding a whole-workspace `read:.`.
             //
-            // An explicit empty set means no project files at all: the sandbox
-            // still materializes its read-only snapshot from the workspace root,
-            // so the root directory read is the honest declared scope there.
-            let files = input.get("input_files").and_then(Value::as_array);
-            match files {
-                Some(paths) if !paths.is_empty() => {
-                    if paths.len() > 64 {
-                        return Err("execute_code input_files exceeds the bounded set".into());
-                    }
-                    for path in paths {
-                        let Some(path) = path.as_str() else {
-                            return Err("execute_code input_files entries must be strings".into());
-                        };
-                        let normalized = path.trim().replace('\\', "/");
-                        if normalized.is_empty()
-                            || normalized.starts_with('/')
-                            || normalized.split('/').any(|part| part == "..")
-                        {
-                            return Err(
-                                "execute_code input_files entries must be workspace-relative"
-                                    .into(),
-                            );
-                        }
-                        add(read, Some(normalized), ProofEffectPurpose::InputRead);
-                    }
-                }
-                _ => add(read, Some(".".into()), ProofEffectPurpose::InputRead),
+            // An explicit empty set means no project files at all, and the
+            // sandbox materialises none - so the honest declared scope is
+            // empty, not the workspace root.
+            // Planning and execution must declare the same file set.
+            //
+            // The sandbox refuses a missing list and treats an empty list as
+            // "no project file". Planning used to project the workspace root
+            // for both, so the planned effect was strictly wider than the
+            // executed one - which is why a compute that touches nothing still
+            // demanded a whole-workspace lease and could never be certified
+            // under a read-only ceiling. A missing list now fails closed on
+            // both sides, and an empty list declares no file scope at all.
+            let paths = crate::sandbox_exec::bounded_compute_input_files(input)
+                .map_err(|error| format!("execute_code file contract: {error}"))?;
+            for path in paths {
+                add(read, Some(path), ProofEffectPurpose::InputRead);
             }
         }
         "workspace_snapshot" => {
@@ -162,7 +168,8 @@ pub(crate) fn original_static_file_scopes(
                     );
                 }
             } else {
-                add(read, None, ProofEffectPurpose::InputRead);
+                let default_root = input.get("roots").is_none_or(Value::is_null).then(|| ".".to_string());
+                add(read, default_root, ProofEffectPurpose::InputRead);
             }
         }
         "checkpoint" | "checkpoint_list" | "checkpoint_diff" => {
@@ -748,6 +755,10 @@ fn parse_preflight(input: &Value) -> Result<(OrchestrateInput, Vec<PreflightCall
     Ok((parsed, calls))
 }
 
+fn has_incomplete_search<'a>(items: impl Iterator<Item = (&'a str, bool)>) -> bool {
+    items.into_iter().any(|(tool, incomplete)| tool == "grep_search" && incomplete)
+}
+
 fn evaluate(
     lease: &ToolHostLease,
     step_index: usize,
@@ -788,6 +799,9 @@ fn evaluate(
                 call_tool_uncounted(lease, step_index, step_id, call.3, &call.1, &call.2)
             });
             *total_calls += items.len();
+            if has_incomplete_search(items.iter().zip(&results).map(|(item, result)| (item.1.as_str(), result.output.is_none()))) {
+                lease.discard_orchestrated_searches();
+            }
             let collect = matches!(on_error, Some(OnError::Collect));
             let mut object = Map::new();
             for (index, result) in results.into_iter().enumerate() {
@@ -834,6 +848,7 @@ fn evaluate(
                 ));
             }
             // Bounded parallel fan-out, matching `read_many`/`grep_many`.
+            if tool == "grep_search" && items.is_empty() { lease.discard_orchestrated_searches(); }
             let indexed = items.iter().cloned().enumerate().collect::<Vec<_>>();
             let results =
                 crate::executor::run_ordered_batch(indexed, max_concurrency, |(position, item)| {
@@ -841,6 +856,9 @@ fn evaluate(
                     call_tool_uncounted(lease, step_index, step_id, position, tool, &resolved)
                 });
             *total_calls += items.len();
+            if tool == "grep_search" && results.iter().any(|result| result.output.is_none()) {
+                lease.discard_orchestrated_searches();
+            }
             let collect = matches!(on_error, Some(OnError::Collect));
             let mut outputs = Vec::with_capacity(results.len());
             for result in results {
@@ -906,6 +924,7 @@ fn evaluate(
         } => {
             let resolved = resolve_value(input, state, None)?;
             bump(total_calls)?;
+            lease.discard_orchestrated_searches();
             run_compute(lease, language, code, &resolved)
         }
         StepKind::When {
@@ -917,6 +936,7 @@ fn evaluate(
                 let resolved = resolve_value(input, state, None)?;
                 call_tool(lease, step_index, step_id, 0, tool, &resolved, total_calls)
             } else {
+                if tool == "grep_search" { lease.discard_orchestrated_searches(); }
                 Ok(Value::Null)
             }
         }
@@ -932,6 +952,7 @@ fn evaluate(
                 ));
             }
             let mut last = Value::Null;
+            let before = *total_calls;
             for position in 0..*max {
                 if !eval_condition(condition, state, None)? {
                     break;
@@ -947,6 +968,7 @@ fn evaluate(
                     total_calls,
                 )?;
             }
+            if tool == "grep_search" && *total_calls == before { lease.discard_orchestrated_searches(); }
             Ok(last)
         }
     }
@@ -990,9 +1012,22 @@ fn call_tool_uncounted(
             "tool_orchestrate cannot dispatch `{tool}`: not an allowed orchestration tool"
         ));
     }
-    let output = execute_with_lease(lease, tool, input)?;
+    // Other child tools are not represented by search novelty candidates.
+    if tool != "grep_search" { lease.discard_orchestrated_searches(); }
+    let located = lease.with_read_location(step_index, step_id, position);
+    let output = match execute_with_lease(&located, tool, input) {
+        Ok(output) => output,
+        Err(error) => {
+            if tool == "grep_search" { lease.discard_orchestrated_searches(); }
+            return Err(error);
+        }
+    };
     if tool == "read_file" {
         lease.record_orchestrated_read(step_index, step_id, position, input, &output)?;
+    } else if tool == "grep_search" {
+        if lease.record_orchestrated_search(step_index, step_id, position, tool, input, &output).is_err() {
+            lease.discard_orchestrated_searches();
+        }
     }
     Ok(serde_json::from_str(&output).unwrap_or(Value::String(output)))
 }
@@ -1208,6 +1243,19 @@ fn is_reference(text: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn batch_worker_panic_marks_only_failed_search_incomplete() {
+        let results = crate::executor::run_ordered_batch(vec![0, 1], Some(2), |index| {
+            if index == 1 { panic!("intentional local worker panic"); }
+            Ok(serde_json::json!({"ok":true}))
+        });
+        assert!(has_incomplete_search(["read_file", "grep_search"].into_iter().zip(&results)
+            .map(|(tool, result)| (tool, result.output.is_none()))));
+        assert!(!has_incomplete_search(["grep_search", "read_file"].into_iter().zip(&results)
+            .map(|(tool, result)| (tool, result.output.is_none()))));
+    }
+
 
     #[test]
     fn compute_uses_explicit_empty_project_input_and_cannot_import_live_files() {

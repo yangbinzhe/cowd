@@ -452,7 +452,7 @@ impl RealReceiptScenario {
                                 let attachment = attachments.iter().find(|attachment|attachment["client_id"] == incoming_client).unwrap();
                                 *scenario.selected.lock().await = Some((attachment["actor"]["id"].as_str().unwrap().into(),incoming_client.into()));
                                 let rows = observed["receipts"].as_array().unwrap().iter().filter(|receipt|receipt["client_id"] == incoming_client).collect::<Vec<_>>();
-                                assert_eq!(rows.len(),1);
+                                assert_eq!(rows.len(), 1); assert_eq!(rows[0]["client_id"], incoming_client);
                                 let mut old = scenario.old_receipt.lock().await;
                                 if let Some(old) = old.as_ref() {
                                     if old["client_id"] == incoming_client { assert_eq!(rows[0],old); }
@@ -648,9 +648,14 @@ pub(crate) fn real_receipt_panel(app: &crate::app::App) -> String {
 }
 
 pub(super) fn receipt_private_test_root() -> std::path::PathBuf {
-    let root = std::path::PathBuf::from(
-        std::env::var_os("COWD_R1_TEST_PRIVATE_ROOT").expect("set private plan scratch root"),
-    );
+    // The private scratch root is an environment contract for the isolated
+    // harness. When it is absent the fixture still needs a writable, private
+    // directory, so fall back to a fresh temp directory instead of failing the
+    // whole scenario on a missing variable.
+    let root = match std::env::var_os("COWD_R1_TEST_PRIVATE_ROOT") {
+        Some(value) => std::path::PathBuf::from(value),
+        None => std::env::temp_dir().join("cowd-tui-receipt-private"),
+    };
     assert!(root.is_absolute());
     let root = root.join(format!("tui-receipt-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&root).expect("private fixture directory");
@@ -726,7 +731,14 @@ pub(super) async fn receipt_http_fixture(
                     let body: serde_json::Value =
                         serde_json::from_slice(&request[header_end..header_end + length]).unwrap();
                     assert_eq!(body["runtime_commit_cursor"], "9007199254740993");
-                    assert_eq!(body.as_object().unwrap().len(), 2);
+                    assert_eq!(
+                        body.as_object()
+                            .unwrap()
+                            .keys()
+                            .map(|key| key.as_str())
+                            .collect::<std::collections::BTreeSet<_>>(),
+                        std::collections::BTreeSet::from(["content_digest", "runtime_commit_cursor"])
+                    );
                     let saved = std::fs::read_dir(&save_root)
                         .unwrap()
                         .filter_map(Result::ok)

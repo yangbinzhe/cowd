@@ -177,7 +177,7 @@ impl AssessmentSourceFrame {
         Self::capture(program, projection)
     }
 
-    fn capture(
+    pub(crate) fn capture(
         program: &AgenticProgramProjection,
         projection: &GoalProjection,
     ) -> Result<Self, AssessmentReadError> {
@@ -544,6 +544,226 @@ mod tests {
             }]
         );
     }
+
+    /// A Program with the given team-count contract and team count.
+    fn z_program(
+        required_teams: u8,
+        exact_teams: Option<u8>,
+        teams: usize,
+    ) -> AgenticProgramProjection {
+        let mut program = AgenticProgramProjection::empty("program", "objective");
+        program.session_id = "session".into();
+        program.turn_id = "turn".into();
+        program.root_execution_id = Some("root".into());
+        program.required_team_count = required_teams;
+        program.exact_team_count = exact_teams;
+        for index in 0..teams {
+            let team_id = format!("team-{index}");
+            program.teams.insert(
+                team_id.clone(),
+                crate::AgenticTeamProjection {
+                    team_id: team_id.clone(),
+                    name: team_id.clone(),
+                    mission: "deliver".into(),
+                    objective: None,
+                    topic_ref: format!("topic:{team_id}"),
+                    created_by: "root".into(),
+                    member_ids: vec![],
+                    task_ids: vec![],
+                    lifecycle: crate::AgenticTeamLifecycle::Active,
+                },
+            );
+        }
+        program
+    }
+
+    /// An objective, with or without a participation requirement.
+    ///
+    /// The participation requirement is the objective's own promise. Its
+    /// input contract carries no team-count commitment, exactly as the
+    /// #7 objective's does: the promise lives in the participation
+    /// requirement, not in the input contract.
+    fn z_goal(minimum_team_count: Option<u8>) -> harness_contract::goal::GoalContract {
+        use harness_contract::goal::{
+            GoalCompletion, GoalContract, GoalExecutionBinding, GoalInputContract,
+        };
+        GoalContract {
+            input_contract: Some(GoalInputContract {
+                version: 1,
+                principal_id: "principal".into(),
+                session_id: "session".into(),
+                turn_id: "turn".into(),
+                source_ref: "source".into(),
+                input_revision: 1,
+                content_sha256: "sha".into(),
+                commitments: vec![],
+                proposed_workspace_scopes: vec![],
+            }),
+            id: "goal:root".into(),
+            session_id: "session".into(),
+            objective: "deliver".into(),
+            criteria: vec![],
+            constraints: vec![],
+            phase: "execution".into(),
+            evidence_refs: vec![],
+            review_refs: vec![],
+            reviews: vec![],
+            waiting: None,
+            participation_requirement: minimum_team_count.map(|minimum| {
+                harness_contract::goal::ParticipationRequirement {
+                    minimum_team_count: minimum,
+                    source_ref: "source".into(),
+                }
+            }),
+            obligations: vec![],
+            recovery: None,
+            terminal: None,
+            completion: GoalCompletion::Open,
+            revision: 1,
+            user_sequence: 1,
+            unresolved: vec![],
+            blockers: vec![],
+            scope: Default::default(),
+            user_intent_criterion_id: None,
+            source_intent_ref: None,
+            spec_revision: 1,
+            spec_digest: "spec".into(),
+            execution_binding: Some(GoalExecutionBinding {
+                objective_id: "objective".into(),
+                session_id: "session".into(),
+                turn_id: "turn".into(),
+                root_execution_id: "root".into(),
+                agentic_program_id: "program".into(),
+            }),
+        }
+    }
+
+    fn z_has_rung(assessment: &CompletionAssessment, rung: &str) -> bool {
+        assessment.remaining.iter().any(|step| match (step, rung) {
+            (ClosureStep::Team, "team") => true,
+            (ClosureStep::PublishTask, "publish_task") => true,
+            _ => false,
+        })
+    }
+
+    /// Z-P1 (the #7 shape, and the discriminating assertion): the objective
+    /// promises three teams, and the Program projection still carries its
+    /// own default of zero teams because no action has applied the promise
+    /// yet. The ladder must read the objective's promise.
+    ///
+    /// Under the old code this assertion fails: the ladder read the
+    /// Program projection's default of zero teams, so the publish_task rung
+    /// was absent and the #7 objective published no Task at all.
+    #[test]
+    fn z_p1_the_ladder_reads_the_objectives_participation_requirement() {
+        let program = z_program(0, None, 1);
+        let goal = z_goal(Some(1));
+        let assessment = CompletionAssessment::for_bound(&program, &goal, None);
+        assert_eq!(
+            assessment.facts.required_teams, 1,
+            "the ladder's fact source must be the objective's participation requirement, not the program projection's default 0"
+        );
+        assert!(!z_has_rung(&assessment, "team"));
+        assert!(z_has_rung(&assessment, "publish_task"));
+    }
+
+    /// Z-P2: an objective that promises participation gets the ladder's team
+    /// and Task rungs, whatever the Program projection says.
+    #[test]
+    fn z_p2_an_objective_that_promises_participation_gets_the_ladder() {
+        let program = z_program(0, None, 0);
+        let goal = z_goal(Some(1));
+        let assessment = CompletionAssessment::for_bound(&program, &goal, None);
+        assert!(z_has_rung(&assessment, "team"));
+        assert!(z_has_rung(&assessment, "publish_task"));
+    }
+
+    /// Z-N3: the negative control. An objective that promises no
+    /// participation promises none, and the Program projection's own default
+    /// stays zero - a promise of one team would invent a collaboration
+    /// requirement for every objective.
+    ///
+    /// This control holds with and without the ladder reading the objective's
+    /// promise: it says what an objective without one may never be given, not
+    /// which fact the ladder reads.
+    #[test]
+    fn z_n3_an_objective_without_participation_promises_none() {
+        let program = z_program(0, None, 0);
+        let goal = z_goal(None);
+        let assessment = CompletionAssessment::for_bound(&program, &goal, None);
+        assert_eq!(
+            assessment.facts.required_teams, 0,
+            "an objective without a participation requirement promises no team"
+        );
+        assert!(!z_has_rung(&assessment, "team"));
+        assert!(!z_has_rung(&assessment, "publish_task"));
+        // The Program projection's own default is still zero teams: the
+        // ladder may read the objective's promise, but no default may become
+        // a promise of one team.
+        let program_source = include_str!("../../agentic/program.rs");
+        assert!(
+            program_source.contains("required_team_count: 0,"),
+            "the Program projection's default team count must stay zero"
+        );
+    }
+
+    /// Z-N4: the maximum team count still comes from the Program projection.
+    /// The participation requirement states a minimum only, so the ladder's
+    /// upper bound stays exactly as it was.
+    #[test]
+    fn z_n4_the_maximum_team_count_still_comes_from_the_program_projection() {
+        let program = z_program(1, Some(3), 0);
+        let goal = z_goal(Some(1));
+        let assessment = CompletionAssessment::for_bound(&program, &goal, None);
+        assert_eq!(assessment.facts.maximum_teams, Some(3));
+        assert_eq!(
+            assessment.facts.exact_teams,
+            Some(3),
+            "the exact team count must not be dropped by the participation requirement"
+        );
+    }
+
+    /// Z-N4b: an explicit zero team count is a prohibition. A topology
+    /// without members has no Task to publish.
+    #[test]
+    fn z_n4b_a_teamless_topology_is_never_asked_for_a_published_task() {
+        let program = z_program(0, Some(0), 0);
+        let goal = z_goal(Some(1));
+        let assessment = CompletionAssessment::for_bound(&program, &goal, None);
+        assert!(!z_has_rung(&assessment, "publish_task"));
+    }
+
+    /// Z-N2: without an objective, the program's own team-count contract is
+    /// still what the ladder reads.
+    #[test]
+    fn z_n2_without_an_objective_the_program_contract_still_drives_the_ladder() {
+        let program = z_program(1, None, 0);
+        let assessment = CompletionAssessment::for_program(&program, None);
+        assert!(z_has_rung(&assessment, "team"));
+        assert!(z_has_rung(&assessment, "publish_task"));
+    }
+
+    /// Z-N6: the ladder has one producer. The publish_task rung is pushed in
+    /// exactly one place, and the observation side only echoes it.
+    #[test]
+    fn z_n6_the_ladder_has_one_producer() {
+        // The program contract and the objective promise the same team
+        // count here, so the rung is produced exactly once whichever fact the
+        // ladder reads: this control is about the number of producers, not
+        // about which fact the ladder reads.
+        let program = z_program(1, None, 0);
+        let goal = z_goal(Some(1));
+        let assessment = CompletionAssessment::for_bound(&program, &goal, None);
+        assert_eq!(
+            assessment
+                .remaining
+                .iter()
+                .filter(|step| **step == ClosureStep::PublishTask)
+                .count(),
+            1,
+            "the publish_task rung must be produced exactly once"
+        );
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -620,6 +840,22 @@ pub(crate) fn completion_view(
     completion_gap: Option<&str>,
 ) -> serde_json::Value {
     let assessment = CompletionAssessment::for_program(program, completion_gap);
+    render_completion_view(program, completion_gap, &assessment)
+}
+
+/// The completion view whose ladder is the objective's participation
+/// requirement.
+///
+/// The ladder's fact source is the objective: its `input_contract` carries
+/// the `TeamCount` promise. A program that was never told about that promise
+/// (its projection defaults to zero teams) must not decide that no
+/// participation was required - that is the seam class Z lives in.
+pub(crate) fn completion_view_for_goal(
+    program: &AgenticProgramProjection,
+    completion_gap: Option<&str>,
+    goal: &harness_contract::goal::GoalContract,
+) -> serde_json::Value {
+    let assessment = CompletionAssessment::for_bound(program, goal, completion_gap);
     render_completion_view(program, completion_gap, &assessment)
 }
 
@@ -822,6 +1058,8 @@ struct CompletionFacts {
     required_teams: usize,
     maximum_teams: Option<u8>,
     exact_teams: Option<u8>,
+    /// Whether the program's team count explicitly forbids teams.
+    teams_forbidden: bool,
     quantity_provenance: u8,
     quantity_valid: bool,
     published: usize,
@@ -845,13 +1083,14 @@ pub(crate) struct CompletionAssessment {
 
 impl CompletionAssessment {
     pub(crate) fn for_program(program: &AgenticProgramProjection, gap: Option<&str>) -> Self {
-        Self::for_quantity(program, gap, None)
+        Self::for_quantity(program, gap, None, None)
     }
 
     fn for_quantity(
         program: &AgenticProgramProjection,
         gap: Option<&str>,
         current: Option<(u8, Option<u8>)>,
+        required_teams: Option<u8>,
     ) -> Self {
         use crate::AgenticTaskStatus as Status;
         let active = program
@@ -861,10 +1100,13 @@ impl CompletionAssessment {
             .collect::<Vec<_>>();
         let facts = CompletionFacts {
             teams: program.teams.len(),
-            required_teams: usize::from(
-                current.map_or(program.required_team_count, |(minimum, _)| minimum),
-            ),
+            required_teams: usize::from(required_teams.unwrap_or_else(|| {
+                current.map_or(program.required_team_count, |(minimum, _)| minimum)
+            })),
             maximum_teams: current.map_or(program.exact_team_count, |(_, maximum)| maximum),
+            // An explicit zero team count is a prohibition, not a missing
+            // promise: a topology without members has no Task to publish.
+            teams_forbidden: program.exact_team_count == Some(0),
             exact_teams: current.map_or(program.exact_team_count, |(minimum, maximum)| {
                 maximum.filter(|maximum| *maximum == minimum)
             }),
@@ -908,7 +1150,7 @@ impl CompletionAssessment {
         if facts.teams < facts.required_teams {
             remaining.push(ClosureStep::Team);
         }
-        if facts.published == 0 && facts.required_teams > 0 {
+        if facts.published == 0 && facts.required_teams > 0 && !facts.teams_forbidden {
             remaining.push(ClosureStep::PublishTask);
         }
         if facts.unclaimed > 0 {
@@ -987,8 +1229,27 @@ impl CompletionAssessment {
         goal: &harness_contract::goal::GoalContract,
         gap: Option<&str>,
     ) -> Self {
-        let mut assessment =
-            Self::for_quantity(program, gap, super::current_goal_team_bounds(goal));
+        // The objective's participation requirement is the ladder's fact
+        // source for the team count: the one source of the participation
+        // requirement is the objective's own promise, and it is durable
+        // before any action has applied it to the Program. The Program
+        // projection carries the same count only after such an action, and
+        // its own default is zero - a default, not a promise. An objective
+        // that promises no participation promises none, so it must not
+        // inherit the projection default either.
+        //
+        // Only the team count is replaced. The maximum and the exact count
+        // keep the fact source they always had: a participation requirement
+        // states a minimum only, so no upper bound is taken from it and
+        // none is dropped by it.
+        let mut assessment = Self::for_quantity(
+            program,
+            gap,
+            super::current_goal_team_bounds(goal),
+            goal.participation_requirement
+                .as_ref()
+                .map(|requirement| requirement.minimum_team_count),
+        );
         assessment.required_obligation_refs = goal
             .obligations
             .iter()

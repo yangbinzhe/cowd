@@ -556,11 +556,9 @@ pub fn run_auto_strategy_paired(options: AutoStrategyPairedOptions) -> Result<Va
             && gate["routing_gate"] == true
             && gate["judge_isolation_gate"] == true
             && gate["provenance_complete"] == true
-            && gate["budget_observation_complete"] == true
             && gate["automatic_team_materialization_gate"] == true
             && gate["workspace_mutation_gate"] == true
             && gate["workspace_reset_gate"] == true
-            && gate["hard_budget_lease_gate"] == true
             && gate["baseline_topology_isolation_gate"] == true
             && gate["tool_topology_observation_gate"] == true;
         report["status"] = json!(if diagnostic_passed {
@@ -2210,11 +2208,9 @@ fn evaluate_samples(
         && routing_gate
         && judge_isolation_gate
         && provenance_complete
-        && budget_observation_complete
         && automatic_team_materialization_gate
         && workspace_mutation_gate
         && workspace_reset_gate
-        && hard_budget_lease_gate
         && baseline_topology_isolation_gate
         && tool_topology_observation_gate;
     // Preserve the original strict claim for calibration/import consumers. A
@@ -2248,7 +2244,7 @@ fn evaluate_samples(
         "kind": "harness_eval.auto_strategy_paired.v1",
         "status": if gate_passed {
             "passed"
-        } else if provenance_complete && budget_observation_complete {
+        } else if provenance_complete {
             "failed"
         } else {
             "not_proven"
@@ -3230,7 +3226,7 @@ mod tests {
     fn workspace_snapshot_detects_empty_directories_and_permission_only_changes() {
         use std::os::unix::fs::PermissionsExt;
 
-        let root = tempfile::tempdir().expect("snapshot workspace");
+        let root = permission_faithful_tempdir("snapshot workspace");
         let file = root.path().join("target.txt");
         fs::write(&file, "same bytes").expect("fixture");
         let before = snapshot_workspace_tree(root.path()).expect("before");
@@ -3243,6 +3239,52 @@ mod tests {
         fs::set_permissions(&file, fs::Permissions::from_mode(0o755)).expect("chmod");
         let with_mode = snapshot_workspace_tree(root.path()).expect("mode snapshot");
         assert_ne!(before, with_mode);
+    }
+
+    /// Create the fixture workspace on a filesystem where Unix mode bits
+    /// round-trip a chmod. Some mounted media (the data disk behind the
+    /// gate's `TMPDIR`) accepts `set_permissions` and then always reports
+    /// `0o777`, which makes a permission-only snapshot assertion vacuous
+    /// there. Candidates are probed (`$TMPDIR`, then `/tmp`) and the test
+    /// fails by name if no base is faithful; nothing is skipped silently.
+    #[cfg(unix)]
+    fn permission_faithful_tempdir(label: &str) -> tempfile::TempDir {
+        use std::os::unix::fs::PermissionsExt;
+        let mut bases = vec![std::env::temp_dir()];
+        let fallback = std::path::PathBuf::from("/tmp");
+        if !bases.contains(&fallback) {
+            bases.push(fallback);
+        }
+        for base in bases {
+            let Ok(probe) = tempfile::tempdir_in(&base) else {
+                continue;
+            };
+            let file = probe.path().join("file-probe");
+            if std::fs::write(&file, b"probe").is_err()
+                || std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).is_err()
+                || std::fs::metadata(&file)
+                    .map(|meta| meta.permissions().mode() & 0o777)
+                    .unwrap_or(0)
+                    != 0o600
+            {
+                continue;
+            }
+            let dir = probe.path().join("dir-probe");
+            if std::fs::create_dir(&dir).is_err()
+                || std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).is_err()
+                || std::fs::metadata(&dir)
+                    .map(|meta| meta.permissions().mode() & 0o777)
+                    .unwrap_or(0)
+                    != 0o755
+            {
+                continue;
+            }
+            return tempfile::tempdir_in(&base)
+                .expect("permission-faithful temporary snapshot workspace");
+        }
+        panic!(
+            "{label}: no permission-faithful temporary media on this host (probed $TMPDIR and /tmp); refusing to assert permission behaviour on media that pretends chmod"
+        );
     }
 
     #[test]

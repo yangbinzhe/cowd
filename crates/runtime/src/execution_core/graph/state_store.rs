@@ -238,6 +238,145 @@ impl ExecutionGraphStateStore {
     }
 
     /// Same lookup, with the caller recorded so a miss says where it came from.
+    /// Reconstruct the original graph through exactly `cut`, without using a
+    /// current hot snapshot or importing any subsequently committed event.
+    pub(crate) fn load_graph_at_revision(
+        &self,
+        graph_id: &str,
+        cut: u64,
+    ) -> Result<ExecutionGraph, ExecutionStateStoreError> {
+        let corrupt = |reason: String| ExecutionStateStoreError::Corrupt {
+            graph_id: graph_id.to_string(),
+            reason,
+        };
+        if cut == 0 {
+            return Err(corrupt("graph cut must contain its planned event".into()));
+        }
+        let mut after = 0u64;
+        let mut previous_cursor = 0u64;
+        let mut graph: Option<ExecutionGraph> = None;
+        let mut starts = Vec::<(String, super::events::ExecutionNodeBinding, (u64, u64, u32), ExecutionGraph, ExecutionGraph, String)>::new();
+        while after < cut {
+            let page = self.event_store
+                .list_stream_after(graph_id, after, cut, 100, 1024 * 1024)
+                .map_err(&corrupt)?;
+            if page.is_empty() {
+                return Err(corrupt("graph cut history is incomplete".into()));
+            }
+            for record in page {
+                if record.stream_id != graph_id
+                    || record.sequence != after.checked_add(1).ok_or_else(|| corrupt("graph cut sequence overflow".into()))?
+                    || record.sequence > cut
+                    || record.commit_cursor <= previous_cursor
+                    || record.scope != RuntimeEventScope::ExecutionGraph
+                    || record.schema_version != 2
+                    || record.actor.as_deref() != Some("execution_commit_service")
+                    || record.transaction_index != 0
+                {
+                    return Err(corrupt("graph cut event envelope or sequence is invalid".into()));
+                }
+                let event = decode_execution_graph_event(&self.event_store, &record).map_err(&corrupt)?;
+                let before = graph.clone();
+                let closure = match &event {
+                    ExecutionGraphEvent::Recovered { recovered_nodes, blocked_nodes, lease_closures, .. }
+                        if !lease_closures.is_empty() => {
+                        if lease_closures.len() != 1 || !recovered_nodes.is_empty() || !blocked_nodes.is_empty() {
+                            return Err(corrupt("graph cut lease closure is not one original release".into()));
+                        }
+                        Some(&lease_closures[0])
+                    }
+                    ExecutionGraphEvent::Checkpoint { cause, bindings, lease_closures, .. }
+                        if !lease_closures.is_empty() => {
+                        if cause != "execution_graph.recovered" || lease_closures.len() != 1 || !bindings.is_empty() {
+                            return Err(corrupt("graph cut lease closure checkpoint is invalid".into()));
+                        }
+                        Some(&lease_closures[0])
+                    }
+                    _ => None,
+                };
+                if let Some(closure) = closure {
+                    let prior = before.as_ref().ok_or_else(|| corrupt("lease closure has no prior graph".into()))?;
+                    let key = super::events::ExecutionBindingLeaseClosure::key(prior, &closure.node_id, &closure.binding);
+                    if record.idempotency_key.as_deref() != Some(key.as_str()) || record.transaction_id != key {
+                        return Err(corrupt("graph cut lease closure transaction identity differs".into()));
+                    }
+                    let matching = starts.iter().filter(|(node, binding, _, _, _, _)|
+                        node == &closure.node_id && binding.attempt == closure.binding.attempt).collect::<Vec<_>>();
+                    if matching.len() != 1 || matching[0].1 != closure.binding {
+                        return Err(corrupt("graph cut lease closure original start is missing or ambiguous".into()));
+                    }
+                    let (_, binding, position, start_before, start_after, start_tx) = matching[0];
+                    binding.validate_start(start_before, &closure.node_id).map_err(&corrupt)?;
+                    let spec = start_after.nodes.iter().find(|node| node.id == closure.node_id)
+                        .ok_or_else(|| corrupt("graph cut lease closure original node missing".into()))?;
+                    let ticket = super::registry::NodeExecutionTicket {
+                        graph_id: graph_id.into(), node_id: closure.node_id.clone(), executor_kind: binding.executor_kind.clone(),
+                        service_class: start_after.service_class, attempt: binding.attempt,
+                        idempotency_key: binding.ticket_idempotency_key.clone(), payload_ref: spec.payload_ref.clone(),
+                    };
+                    super::events::ExecutionNodeBinding::validate_ticket(&ticket, start_after, spec, binding.attempt).map_err(&corrupt)?;
+                    let single = format!("{graph_id}:{}:{}:bound", closure.node_id, position.0);
+                    let wave = format!("{graph_id}:wave:{}:started", position.0);
+                    if (start_tx != &single && start_tx != &wave)
+                        || start_after.node_statuses.get(&closure.node_id) != Some(&harness_contract::execution_graph::ExecutionNodeStatus::Running)
+                        || start_after.recovery_cursor.node_attempts.get(&closure.node_id) != Some(&binding.attempt)
+                        || !closure.matches(prior, &closure.node_id, binding, *position)
+                        || position.0 >= record.sequence || (position.1, position.2) >= (record.commit_cursor, record.transaction_index)
+                    { return Err(corrupt("graph cut lease closure is not bound to its original start".into())); }
+                    let resolved = self.event_store.resolve_read_record(record.clone()).map_err(&corrupt)?;
+                    if super::events::ExecutionBindingLeaseClosure::from_record(&resolved, prior, &closure.node_id, binding)
+                        .map_err(&corrupt)?.as_ref() != Some(closure)
+                    { return Err(corrupt("graph cut lease closure owner record differs".into())); }
+                } else if record.idempotency_key.as_deref() != Some(format!("{graph_id}:revision:{}", record.sequence).as_str()) {
+                    return Err(corrupt("graph cut event idempotency identity differs".into()));
+                }
+                if after == 0 && (!matches!(&event, ExecutionGraphEvent::Planned { .. })
+                    || record.transaction_id != format!("{graph_id}:planned"))
+                {
+                    return Err(corrupt("graph cut has no original planned event".into()));
+                }
+                let mut next = event.project(graph.take()).map_err(&corrupt)?;
+                validate_graph_snapshot(graph_id, &next, &record).map_err(&corrupt)?;
+                if !graph_record_refs_match(&record, &next)
+                    || record.status.as_deref() != super::commit_service::graph_status(&next)
+                {
+                    #[cfg(test)]
+                    eprintln!("NATIVE_GRAPH_OWNER_MISMATCH {}", serde_json::json!({
+                        "graph_id": graph_id, "record": record,
+                        "expected_refs": super::commit_service::graph_identity_refs(&next),
+                        "expected_status": super::commit_service::graph_status(&next),
+                    }));
+                    return Err(corrupt("graph cut event owner binding differs".into()));
+                }
+                if closure.is_some() {
+                    let mut expected = before.clone().ok_or_else(|| corrupt("lease closure has no previous graph".into()))?;
+                    expected.revision = record.sequence;
+                    if next != expected { return Err(corrupt("graph cut lease closure changed graph state".into())); }
+                }
+                let event_bindings = match &event {
+                    ExecutionGraphEvent::NodeTransitioned { node_id, binding: Some(binding), .. } =>
+                        std::collections::BTreeMap::from([(node_id.clone(), binding.clone())]),
+                    ExecutionGraphEvent::NodesStarted { bindings, .. } => bindings.clone(),
+                    ExecutionGraphEvent::Checkpoint { cause, bindings, .. }
+                        if matches!(cause.as_str(), "execution_graph.nodes_started" | "execution_graph.node_transitioned") => bindings.clone(),
+                    _ => std::collections::BTreeMap::new(),
+                };
+                if !event_bindings.is_empty() {
+                    let prior = before.as_ref().ok_or_else(|| corrupt("graph start has no previous graph".into()))?;
+                    for (node, binding) in event_bindings {
+                        starts.push((node, binding, (record.sequence, record.commit_cursor, record.transaction_index), prior.clone(), next.clone(), record.transaction_id.clone()));
+                    }
+                }
+                next.recovery_cursor.commit_cursor = record.commit_cursor;
+                after = record.sequence;
+                previous_cursor = record.commit_cursor;
+                graph = Some(next);
+            }
+        }
+        graph.ok_or_else(|| corrupt("graph cut has no projection".into()))
+    }
+
+    /// Same lookup, with the caller recorded so a miss says where it came from.
     pub(crate) fn load_at(
         &self,
         graph_id: &str,
@@ -817,6 +956,7 @@ impl ExecutionGraphStateStore {
                                     | ExecutionNodeStatus::WaitingExternal
                                     | ExecutionNodeStatus::Paused
                                     | ExecutionNodeStatus::Ready
+                                    | ExecutionNodeStatus::Planned
                             )
                         ) && previous.recovery_cursor.node_attempts.get(node)
                             == Some(&binding.attempt)
@@ -907,6 +1047,24 @@ impl ExecutionGraphStateStore {
             graph_id: graph.id.clone(),
             reason: format!("original binding missing for {node}/{attempt}"),
         })
+    }
+
+    /// Test access to the same authenticated start reader used by the graph owner.
+    #[cfg(feature = "test-fixtures")]
+    pub fn original_binding_start_for_test(
+        &self,
+        graph: &ExecutionGraph,
+        node_id: &str,
+        attempt: u32,
+    ) -> Result<(super::registry::NodeExecutionTicket, (u64, u64, u32)), ExecutionStateStoreError> {
+        let binding = self.current_binding(graph, node_id, attempt)?;
+        let (ticket, _) = self.binding_start_ticket(graph, node_id, &binding)?;
+        let position = self.binding_start_position(graph, node_id, &binding)?
+            .ok_or_else(|| ExecutionStateStoreError::Corrupt {
+                graph_id: graph.id.clone(),
+                reason: "canonical original binding position missing".into(),
+            })?;
+        Ok((ticket, position))
     }
 
     pub(crate) fn binding_start_ticket(
@@ -1124,6 +1282,93 @@ impl ExecutionGraphStateStore {
             .map_err(|error| ExecutionStateStoreError::BlockingTask(error.to_string()))?
     }
 
+    pub(crate) fn child_links_at_cut(
+        &self,
+        parent_execution_id: &str,
+        cut: u64,
+    ) -> Result<Vec<(ExecutionChildLink, crate::DurableRuntimeEvent)>, ExecutionStateStoreError> {
+        let source = execution_lineage_stream_id(parent_execution_id);
+        let corrupt = |reason: &str| ExecutionStateStoreError::Corrupt {
+            graph_id: parent_execution_id.to_string(), reason: reason.to_string(),
+        };
+        let mut after = 0;
+        let mut links = Vec::new();
+        let budget = crate::SourceCheckBudget::default();
+        let (mut pages, mut count, mut bytes) = (0usize, 0usize, 0usize);
+        let mut seen = std::collections::BTreeSet::new();
+        while after < cut {
+            pages = pages.saturating_add(1);
+            if pages > budget.max_pages { return Err(corrupt("lineage page budget exceeded")); }
+            let page = self.event_store.list_stream_after(&source, after, cut, 64, 4 * 1024 * 1024)
+                .map_err(|error| corrupt(&error))?;
+            if page.is_empty() { return Err(corrupt("incomplete lineage cut")); }
+            for event in page {
+                count = count.saturating_add(1);
+                bytes = bytes.saturating_add(serde_json::to_vec(&event)?.len());
+                if count > budget.max_events || bytes > budget.max_bytes { return Err(corrupt("lineage event budget exceeded")); }
+                if event.stream_id != source || event.sequence != after + 1 || event.sequence > cut
+                    || event.scope != RuntimeEventScope::Relation || event.schema_version != 1
+                    || event.kind != "execution.lineage.child_registered.v1"
+                    || event.status.as_deref() != Some("registered")
+                    || event.actor.as_deref() != Some("execution_commit_service")
+                    || event.commit_cursor == 0 || event.transaction_index != 1
+                { return Err(corrupt("invalid lineage registration")); }
+                after = event.sequence;
+                let link: ExecutionChildLink = serde_json::from_value(event.payload.clone())?;
+                if link.parent_execution_id != parent_execution_id || link.parent_node_id.is_empty()
+                    || link.child_execution_id.is_empty() || !seen.insert(link.child_execution_id.clone())
+                    || event.idempotency_key.as_deref() != Some(format!("{}:child:{}", parent_execution_id, link.child_execution_id).as_str())
+                    || event.transaction_id != format!("{}:planned", link.child_execution_id)
+                    || event.refs != vec![
+                        crate::RuntimeEventRef { kind: "execution_graph".into(), id: parent_execution_id.into() },
+                        crate::RuntimeEventRef { kind: "execution_node".into(), id: link.parent_node_id.clone() },
+                        crate::RuntimeEventRef { kind: "execution_graph".into(), id: link.child_execution_id.clone() },
+                    ]
+                { return Err(corrupt("lineage registration binding mismatch")); }
+                links.push((link, event));
+            }
+        }
+        Ok(links)
+    }
+
+    /// Authenticate the immutable planned graph in the same transaction as
+    /// its lineage registration; a current graph projection is not a cut.
+    pub(crate) fn child_planned_at_registration(
+        &self,
+        link: &ExecutionChildLink,
+        registration: &crate::DurableRuntimeEvent,
+    ) -> Result<(ExecutionGraph, crate::DurableRuntimeEvent), ExecutionStateStoreError> {
+        let corrupt = |reason: &str| ExecutionStateStoreError::Corrupt {
+            graph_id: link.child_execution_id.clone(), reason: reason.to_string(),
+        };
+        let events = self.event_store.list_stream_after(&link.child_execution_id, 0, 1, 1, 4 * 1024 * 1024)
+            .map_err(|error| corrupt(&error))?;
+        let event = events.into_iter().next().ok_or_else(|| corrupt("child registration missing"))?;
+        if event.stream_id != link.child_execution_id || event.sequence != 1
+            || event.scope != RuntimeEventScope::ExecutionGraph || event.schema_version != 2
+            || event.actor.as_deref() != Some("execution_commit_service")
+            || event.kind != "execution_graph.planned" || event.transaction_index != 0
+            || event.idempotency_key.as_deref() != Some(format!("{}:revision:1", link.child_execution_id).as_str())
+            || event.transaction_id != format!("{}:planned", link.child_execution_id)
+            || registration.transaction_index != 1
+            || event.transaction_id != registration.transaction_id
+            || event.commit_cursor != registration.commit_cursor
+        { return Err(corrupt("child and lineage registration do not share a transaction")); }
+        let graph = match decode_execution_graph_event(&self.event_store, &event).map_err(|error| corrupt(&error))? {
+            ExecutionGraphEvent::Planned { graph } => graph,
+            _ => return Err(corrupt("child genesis is not a planned graph")),
+        };
+        validate_graph_snapshot(&link.child_execution_id, &graph, &event).map_err(|reason| corrupt(&reason))?;
+        if !graph_record_refs_match(&event, &graph) {
+            return Err(corrupt("child genesis graph/content references differ"));
+        }
+        if graph.id != link.child_execution_id || graph.revision != 1 || graph.objective != link.child_objective
+            || graph.parent_execution.as_ref().is_none_or(|parent|
+                parent.execution_id != link.parent_execution_id || parent.node_id != link.parent_node_id)
+        { return Err(corrupt("child genesis does not match original parent")); }
+        Ok((graph, event))
+    }
+
     pub fn child_links(
         &self,
         parent_execution_id: &str,
@@ -1217,6 +1462,48 @@ impl ExecutionGraphStateStore {
             .await
             .map_err(|error| ExecutionStateStoreError::BlockingTask(error.to_string()))?
     }
+}
+
+fn validate_graph_snapshot(
+    key: &str,
+    graph: &ExecutionGraph,
+    record: &crate::DurableRuntimeEvent,
+) -> Result<(), String> {
+    if graph.id != key || graph.revision != record.sequence {
+        return Err("graph identity/revision mismatch".into());
+    }
+    let lineage = graph.lineage.as_ref().ok_or("graph lineage missing")?;
+    lineage.validate().map_err(|reason| reason.to_string())?;
+    let binding = record.activity_binding().ok_or("graph activity binding missing")?;
+    let parent_activity = graph.parent_execution.as_ref().map(|parent|
+        format!("activity:execution:{}:node:{}", parent.execution_id, parent.node_id));
+    if binding.root_execution_id != key || binding.activity_id != format!("activity:execution:{key}")
+        || binding.node_id.is_some() || binding.session_id != lineage.session_id
+        || binding.turn_id != lineage.turn_id || binding.root_task_id != lineage.root_task_id
+        || binding.task_id != lineage.task_id || binding.generation != lineage.generation
+        || binding.revision != graph.revision || binding.fence != graph.revision
+        || binding.parent_activity_id != parent_activity || binding.initiator_activity_id != parent_activity
+    { return Err("graph activity binding/lineage mismatch".into()); }
+    Ok(())
+}
+
+// The content owner adds precisely the prepared body artifact as a ref when
+// a graph event is externalized.  The caller has already authenticated and
+// decoded that body using its original event origin.
+fn graph_record_refs_match(record: &crate::DurableRuntimeEvent, graph: &ExecutionGraph) -> bool {
+    let mut expected = super::commit_service::graph_identity_refs(graph);
+    match record.payload.pointer("/body/kind").and_then(serde_json::Value::as_str) {
+        Some("inline") => {}
+        Some("artifact_ref") => {
+            let Ok(artifact) = serde_json::from_value::<harness_contract::context::ArtifactRef>(
+                record.payload["body"]["artifact"].clone(),
+            ) else { return false; };
+            let reference = crate::RuntimeEventRef { kind: "artifact".into(), id: artifact.selector };
+            if !expected.contains(&reference) { expected.push(reference); }
+        }
+        _ => return false,
+    }
+    record.refs == expected
 }
 
 fn decode_execution_graph_event(
@@ -1770,9 +2057,9 @@ mod tests {
                 let fresh = (request_index > 0).then(|| self.services());
                 let current = fresh.as_deref().unwrap_or(services);
                 let result = crate::execution_projection::snapshot(current, &self.expected.id, &self.context(current)).await;
-                if fresh.is_some() {
-                    current.shutdown_execution().await;
-                    current.shutdown_maintenance().await;
+                if let Some(ref fresh) = fresh {
+                    fresh.shutdown_execution().await;
+                    fresh.shutdown_maintenance().await;
                 }
                 let projection = result?;
                 if !projection.health.iter().any(|entity| entity.kind == "history_verification" && entity.status.as_deref() == Some("incomplete")) {
@@ -2206,6 +2493,9 @@ mod tests {
 
     #[test]
     fn r1_bounded_history_graph_canonical_checkpoint_and_tail_fail_closed() {
+        if crate::test_support::skip_if_env_absent("COWD_R1_06_FIXTURE_ROOT") {
+            return;
+        }
         let fixture = CanonicalGraphFixture::new();
         let (store, plane) = fixture.cold();
         let recovered = store.load_snapshot(&fixture.expected.id).unwrap();
@@ -2259,6 +2549,9 @@ mod tests {
 
     #[test]
     fn r1_graph_canonical_covered_body_is_not_resolved_but_history_still_rejects() {
+        if crate::test_support::skip_if_env_absent("COWD_R1_06_FIXTURE_ROOT") {
+            return;
+        }
         let fixture = CanonicalGraphFixture::new();
         let old = &fixture.checkpoints[0];
         let latest = fixture.checkpoints.last().unwrap();
@@ -2306,6 +2599,9 @@ mod tests {
 
     #[test]
     fn r1_graph_canonical_latest_real_blob_missing_length_and_digest_fail_closed() {
+        if crate::test_support::skip_if_env_absent("COWD_R1_06_FIXTURE_ROOT") {
+            return;
+        }
         let fixture = CanonicalGraphFixture::new();
         let old = &fixture.checkpoints[0];
         let latest = fixture.checkpoints.last().unwrap();
@@ -2335,6 +2631,9 @@ mod tests {
 
     #[test]
     fn r1_graph_canonical_latest_schema_kind_ref_and_identity_negative_matrix() {
+        if crate::test_support::skip_if_env_absent("COWD_R1_06_FIXTURE_ROOT") {
+            return;
+        }
         let fixture = CanonicalGraphFixture::new();
         let latest = fixture.checkpoints.last().unwrap();
         let mut cases = Vec::new();
@@ -2472,6 +2771,9 @@ mod tests {
 
     #[test]
     fn r1_graph_canonical_tail_first_middle_last_and_missing_checkpoint_fail_closed() {
+        if crate::test_support::skip_if_env_absent("COWD_R1_06_FIXTURE_ROOT") {
+            return;
+        }
         let fixture = CanonicalGraphFixture::new();
         let checkpoint = fixture.checkpoints.last().unwrap().sequence;
         for sequence in [checkpoint + 1, checkpoint + 3, fixture.expected.revision] {
@@ -2551,6 +2853,9 @@ mod tests {
 
     #[test]
     fn r1_graph_canonical_frozen_head_paging_and_budget_boundaries_are_honest() {
+        if crate::test_support::skip_if_env_absent("COWD_R1_06_FIXTURE_ROOT") {
+            return;
+        }
         let fixture = CanonicalGraphFixture::new();
         let head = fixture.expected.revision;
         fixture.backend.reads.lock().unwrap().clear();
@@ -2660,6 +2965,9 @@ mod tests {
 
     #[tokio::test]
     async fn r1_graph_canonical_binding_conflict_uses_real_history_consumer() {
+        if crate::test_support::skip_if_env_absent("COWD_R1_06_FIXTURE_ROOT") {
+            return;
+        }
         let fixture = CanonicalGraphFixture::new();
         let latest = fixture.checkpoints.last().unwrap();
         let (node_id, binding) = &fixture.bindings[0];
@@ -2730,6 +3038,9 @@ mod tests {
     #[tokio::test]
     async fn r1_graph_canonical_history_bindings_and_unreceipted_effect_are_not_replaced_by_snapshot(
     ) {
+        if crate::test_support::skip_if_env_absent("COWD_R1_06_FIXTURE_ROOT") {
+            return;
+        }
         use harness_contract::projection::TerminalEffectSettlement;
         let fixture = CanonicalGraphFixture::new();
         for (node_id, binding) in &fixture.bindings {
@@ -2889,6 +3200,9 @@ mod tests {
 
     #[tokio::test]
     async fn r1_graph_canonical_start_checkpoint_binding_and_covered_history_body_are_distinct() {
+        if crate::test_support::skip_if_env_absent("COWD_R1_06_FIXTURE_ROOT") {
+            return;
+        }
         let mut fixture = CanonicalGraphFixture::new();
         let started = fixture.add_started_checkpoint_and_successor();
         for (node_id, binding) in &fixture.bindings {
@@ -2985,6 +3299,9 @@ mod tests {
 
     #[test]
     fn r1_graph_canonical_checkpoint_required_binding_fields_are_not_invented() {
+        if crate::test_support::skip_if_env_absent("COWD_R1_06_FIXTURE_ROOT") {
+            return;
+        }
         let fixture = CanonicalGraphFixture::new();
         let latest = fixture.checkpoints.last().unwrap();
         let (node_id, binding) = &fixture.bindings[0];
@@ -3020,6 +3337,9 @@ mod tests {
 
     #[tokio::test]
     async fn own843_graph_source_view_requires_its_own_fence_and_real_fault_reads() {
+        if crate::test_support::skip_if_env_absent("COWD_R1_06_FIXTURE_ROOT") {
+            return;
+        }
         let fixture = CanonicalGraphFixture::new();
         let source = fixture.backend.source_mutation_fence().unwrap();
         let inner = fixture.backend.inner.source_mutation_fence().unwrap();
@@ -3093,6 +3413,9 @@ mod tests {
 
     #[tokio::test]
     async fn own843_previously_folded_original_metadata_change_is_rejected_on_resume() {
+        if crate::test_support::skip_if_env_absent("COWD_R1_06_FIXTURE_ROOT") {
+            return;
+        }
         let fixture = CanonicalGraphFixture::new();
         let services = fixture.services();
         let first = crate::execution_projection::snapshot(
@@ -3138,6 +3461,9 @@ mod tests {
 
     #[tokio::test]
     async fn own843_foreign_prefix_owner_cannot_supply_current_history() {
+        if crate::test_support::skip_if_env_absent("COWD_R1_06_FIXTURE_ROOT") {
+            return;
+        }
         let original = CanonicalGraphFixture::new();
         let original_services = original.services();
         let first = crate::execution_projection::snapshot(

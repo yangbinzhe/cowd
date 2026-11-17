@@ -491,6 +491,7 @@ fn agentic_supervisor_actor(
     execution_id: Option<String>,
 ) -> harness_contract::agent_action::AgentActorBinding {
     harness_contract::agent_action::AgentActorBinding {
+        original_execution: None,
         objective_id: projection.objective_id.clone(),
         program_id: projection.program_id.clone(),
         session_id: projection.session_id.clone(),
@@ -735,6 +736,7 @@ impl RuntimeServices {
                 &binding.agent_id,
             ) {
                 AgentAction::TaskRelease(harness_contract::agent_action::TaskReleaseInput {
+                    expected_claim_generation: projection.tasks.get(&task_ref).map(|task| task.claim_generation),
                     task_ref,
                     reason: "coordination response committed".into(),
                 })
@@ -748,14 +750,14 @@ impl RuntimeServices {
                 })
             };
             let observation = self
-                .submit_agent_action(&AgentActionEnvelope {
+                .submit_runtime_supervisor_action(&AgentActionEnvelope {
                     action_id: format!(
                         "runtime-coordination-settle:{}:{}",
                         projection.program_id,
                         packet.graph_id()
                     ),
                     actor: agentic_supervisor_actor(&projection, Some(packet.graph_id().into())),
-                    expected_revision: None,
+                    expected_revision: Some(projection.revision),
                     action,
                 })
                 .await?;
@@ -827,7 +829,7 @@ impl RuntimeServices {
         envelope.expected_revision = Some(projection.revision);
         #[cfg(test)]
         interleave_settlement_1112(self, &envelope);
-        let observation = self.submit_agent_action(&envelope).await?;
+        let observation = self.submit_runtime_supervisor_action(&envelope).await?;
         if observation.status != harness_contract::agent_action::AgentActionStatus::Applied {
             return Err(format!(
                 "agentic_attempt_settlement_rejected:{:?}",
@@ -1139,8 +1141,14 @@ impl RuntimeServices {
         for node in graph.nodes.iter().filter(|node| {
             node.kind == harness_contract::execution_graph::ExecutionNodeKind::AgentTask
         }) {
-            let packet: AgentTaskPacket =
+            let mut packet: AgentTaskPacket =
                 serde_json::from_str(&node.payload_ref).map_err(|error| error.to_string())?;
+            let physical_attempt = graph.recovery_cursor.node_attempts.get(&node.id)
+                .copied().filter(|attempt| *attempt > 0)
+                .ok_or("Agent retirement current node attempt missing")?;
+            self.graph_state_store().current_binding(&graph, &node.id, physical_attempt)
+                .map_err(|error| error.to_string())?;
+            packet.attempt = physical_attempt;
             let Some(binding) = packet.agentic_binding.as_ref() else {
                 continue;
             };
@@ -1260,7 +1268,7 @@ impl RuntimeServices {
             envelope.expected_revision = Some(projection.revision);
             #[cfg(test)]
             interleave_settlement_1112(self, &envelope);
-            let observation = self.submit_agent_action(&envelope).await?;
+            let observation = self.submit_runtime_supervisor_action(&envelope).await?;
             if observation.status != AgentActionStatus::Applied {
                 return Err(format!(
                     "agentic_run_exit_retirement_not_settled:{graph_id}:{task_ref}:{:?}",
@@ -1466,7 +1474,7 @@ impl RuntimeServices {
         envelope.expected_revision = Some(projection.revision);
         #[cfg(test)]
         interleave_settlement_1112(self, &envelope);
-        let observation = self.submit_agent_action(&envelope).await?;
+        let observation = self.submit_runtime_supervisor_action(&envelope).await?;
         if observation.status != harness_contract::agent_action::AgentActionStatus::Applied {
             return Err(format!(
                 "agentic_attempt_settlement_rejected:{}",
@@ -1732,10 +1740,11 @@ impl RuntimeServices {
                         harness_contract::agent_action::TaskReleaseInput {
                             task_ref: task_ref.clone(),
                             reason: "recovered durable coordination reply".into(),
+                            expected_claim_generation: projection.tasks.get(&task_ref).map(|task| task.claim_generation),
                         },
                     ),
                 };
-                let observation = self.submit_agent_action(&release).await?;
+                let observation = self.submit_runtime_supervisor_action(&release).await?;
                 if observation.status != harness_contract::agent_action::AgentActionStatus::Applied
                 {
                     return Err(format!(
@@ -1779,25 +1788,29 @@ impl RuntimeServices {
                     (
                         task.task_id.clone(),
                         execution_graph_id(&execution_id).to_string(),
+                        task.claim_generation,
                     )
                 })
             })
             .collect::<Vec<_>>();
         let mut released_orphan = false;
-        for (task_ref, execution_id) in orphaned_claims {
+        for (task_ref, execution_id, claim_generation) in orphaned_claims {
             // Same namespace translation as the heartbeat: this id is the one
             // the Agent was admitted under, which is an agent-run id.
             let recovery_reason = match self.graph_state_store().load_async(&execution_id).await {
                 Ok(graph) if !agentic_graph_is_terminal(&graph) => continue,
                 Ok(_) => "startup recovered a terminal graph with an unsettled claim",
-                Err(crate::execution_core::graph::ExecutionStateStoreError::NotFound {
-                    ..
-                }) => "startup recovered an orphaned graph reservation",
+                Err(crate::execution_core::graph::ExecutionStateStoreError::NotFound { .. }) => {
+                    return Err(format!(
+                        "orphan claim {task_ref} for {execution_id} has no graph; physical owner closure is unconfirmed"
+                    ));
+                }
                 Err(error) => return Err(error.to_string()),
             };
             let release = AgentActionEnvelope {
                 action_id: format!("startup-release-orphan:{task_ref}:{execution_id}"),
                 actor: harness_contract::agent_action::AgentActorBinding {
+                    original_execution: None,
                     objective_id: projection.objective_id.clone(),
                     program_id: projection.program_id.clone(),
                     session_id: projection.session_id.clone(),
@@ -1815,15 +1828,16 @@ impl RuntimeServices {
                     team_id: None,
                     agent_id: None,
                 },
-                expected_revision: None,
+                expected_revision: Some(projection.revision),
                 action: AgentAction::TaskRelease(
                     harness_contract::agent_action::TaskReleaseInput {
                         task_ref,
                         reason: recovery_reason.to_string(),
+                        expected_claim_generation: Some(claim_generation),
                     },
                 ),
             };
-            let observation = self.submit_agent_action(&release).await?;
+            let observation = self.submit_runtime_supervisor_action(&release).await?;
             if observation.status != harness_contract::agent_action::AgentActionStatus::Applied {
                 return Err(format!(
                     "orphaned claim recovery was rejected: {:?}",
@@ -1848,6 +1862,7 @@ impl RuntimeServices {
         let trigger = AgentActionEnvelope {
             action_id: format!("startup-reconcile:{}:{}", program_id, projection.revision),
             actor: harness_contract::agent_action::AgentActorBinding {
+                original_execution: None,
                 objective_id: projection.objective_id.clone(),
                 program_id: projection.program_id.clone(),
                 session_id: projection.session_id.clone(),
@@ -2460,6 +2475,14 @@ impl RuntimeServices {
                 .map_err(|error| format!("load root Task mission for Agent dispatch: {error}"))?
                 .map(|task| task.mission_id)
                 .unwrap_or_else(|| self.mission_runtime().default_mission_id().to_string());
+            // A Program retry gets a distinct graph; graph-local retry counts
+            // belong to the graph owner, never the Program generation.
+            let mut graph =
+                ExecutionGraph::new(format!("Agent-first {} for {}", mode.as_str(), task.title));
+            graph.id = graph_id.clone();
+            let first_node_attempt = crate::execution_core::graph::ExecutionNodeBinding::next_attempt(
+                &graph, &node_id,
+            )?;
             let mut resource_scopes = context.resource_scopes.clone();
             for shared_scope in [
                 format!("session:{}", projection.session_id),
@@ -2495,7 +2518,7 @@ impl RuntimeServices {
                 team_id: None,
                 graph_id: graph_id.clone(),
                 node_id: node_id.clone(),
-                attempt: u32::try_from(attempt_generation.saturating_add(1)).unwrap_or(u32::MAX),
+                attempt: first_node_attempt,
                 expected_graph_revision: 0,
                 objective,
                 // The Program Task's natural-language acceptance remains a
@@ -2587,9 +2610,6 @@ impl RuntimeServices {
             node.acceptance.criteria.clear();
             node.resource_scopes = intent.resource_scopes.clone();
 
-            let mut graph =
-                ExecutionGraph::new(format!("Agent-first {} for {}", mode.as_str(), task.title));
-            graph.id = graph_id.clone();
             graph.lineage = Some(ExecutionGraphLineage {
                 session_id: context.session_id.clone(),
                 turn_id: context.turn_id.clone(),
@@ -2684,7 +2704,7 @@ impl RuntimeServices {
                             format!("agentic_review_registration_original_missing:{graph_id}")
                         })?
                 } else {
-                    self.submit_agent_action(&attempt).await.map_err(|error| {
+                    self.submit_runtime_supervisor_action(&attempt).await.map_err(|error| {
                         format!("agentic_attempt_registration_result:{graph_id}:{error}")
                     })?
                 };
@@ -2765,6 +2785,30 @@ impl RuntimeServices {
                 )
                 .await?;
                 return Ok(Vec::new());
+            }
+            let node_id = format!("{graph_id}:agent");
+            let store = self.graph_state_store();
+            let mut changes = store.subscribe_commits();
+            loop {
+                let current = store
+                    .load_async(&graph_id)
+                    .await
+                    .map_err(|error| format!("agentic_started_graph_read:{graph_id}:{error}"))?;
+                if current
+                    .recovery_cursor
+                    .node_attempts
+                    .get(&node_id)
+                    .is_some_and(|attempt| *attempt > 0)
+                {
+                    break;
+                }
+                if agentic_graph_is_terminal(&current) {
+                    return Err(format!("agentic_started_graph_terminal:{graph_id}"));
+                }
+                tokio::time::timeout(std::time::Duration::from_secs(30), changes.changed())
+                    .await
+                    .map_err(|_| format!("agentic_started_graph_timeout:{graph_id}"))?
+                    .map_err(|_| format!("agentic_started_graph_subscription_closed:{graph_id}"))?;
             }
             receipts.push(AgenticDispatchReceipt {
                 graph_id,
@@ -2924,6 +2968,10 @@ mod cohort_tests {
         dynamic.tasks.insert(
             "task-dynamic".to_string(),
             AgenticTaskProjection {
+                obligations: Vec::new(),
+                rework_directives: Vec::new(),
+                unsettled_released_attempts: Vec::new(),
+                terminal_note: None,
                 task_id: "task-dynamic".to_string(),
                 team_id: "team-cache".to_string(),
                 title: "Dynamic task".to_string(),
@@ -2949,6 +2997,11 @@ mod cohort_tests {
                 failed_attempts: 0,
                 review_generation: 0,
                 failed_review_attempts: 0,
+                structural_execution_stalls: 0,
+                structural_review_stalls: 0,
+                reviews_applied: 0,
+                review_obligation: None,
+                reviews_accepted: 0,
                 last_failure: None,
                 replacement_task_refs: Vec::new(),
                 supersede_evidence_refs: Vec::new(),

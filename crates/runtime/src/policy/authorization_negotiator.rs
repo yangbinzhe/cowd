@@ -379,12 +379,319 @@ pub(crate) fn is_controlled_recovery_terminal_event(input: &crate::RuntimeEventI
             .any(|reference| reference.kind == "turn" && reference.id == record.turn_id)
 }
 
+/// Produced only while the original negotiator holds its lease registry.
+#[derive(Clone)]
+pub(crate) struct OriginalLeaseConsumption {
+    pub(crate) lease: AuthorizationLease,
+    pub(crate) transition: AuthorizationLeaseTransition,
+    owner: Arc<Mutex<LeaseRegistry>>,
+}
+impl OriginalLeaseConsumption {
+    pub(crate) fn belongs_to(&self, negotiator: &AuthorizationNegotiator) -> bool {
+        Arc::ptr_eq(&self.owner, &negotiator.registry)
+    }
+}
+
+/// Same-call owner member, never constructed from serialized caller data.
+#[derive(Clone)]
+enum OriginalMemberOwner {
+    Host(Arc<crate::conversation::OriginalHostPreparedMember>),
+    Process(Arc<crate::agent_in_process_worker::OriginalProcessPreparedMember>),
+}
+#[derive(Clone)]
+pub(crate) struct PreparedMemberBinding {
+    owner: OriginalMemberOwner,
+    prepared: crate::step_snapshot::PreparedAgentBatchMember,
+}
+
+/// Same private member identity without owning its live execution objects.
+#[derive(Clone)]
+pub(crate) struct RetainedMemberBinding {
+    owner: RetainedMemberOwner,
+    prepared: crate::step_snapshot::PreparedAgentBatchMember,
+}
+#[derive(Clone)]
+enum RetainedMemberOwner {
+    Host(std::sync::Weak<crate::conversation::OriginalHostPreparedMember>),
+    Process(std::sync::Weak<crate::agent_in_process_worker::OriginalProcessPreparedMember>),
+}
+impl RetainedMemberBinding {
+    pub(crate) fn upgrade(&self) -> Option<PreparedMemberBinding> {
+        let owner = match &self.owner {
+            RetainedMemberOwner::Host(member) => OriginalMemberOwner::Host(member.upgrade()?),
+            RetainedMemberOwner::Process(member) => OriginalMemberOwner::Process(member.upgrade()?),
+        };
+        Some(PreparedMemberBinding { owner, prepared: self.prepared.clone() })
+    }
+    pub(crate) fn matches(&self, member: &PreparedMemberBinding) -> bool {
+        self.prepared == member.prepared && match (&self.owner, &member.owner) {
+            (RetainedMemberOwner::Host(a), OriginalMemberOwner::Host(b)) => std::sync::Weak::ptr_eq(a, &Arc::downgrade(b)),
+            (RetainedMemberOwner::Process(a), OriginalMemberOwner::Process(b)) => std::sync::Weak::ptr_eq(a, &Arc::downgrade(b)),
+            _ => false,
+        }
+    }
+    pub(crate) fn prepared(&self) -> &crate::step_snapshot::PreparedAgentBatchMember { &self.prepared }
+}
+
+/// One original Process member policy decision, kept across approval waits.
+/// Its private fields bind the same member, descriptor and Session snapshot.
+pub(crate) struct ProcessMemberEvaluation {
+    member: Arc<crate::agent_in_process_worker::OriginalProcessPreparedMember>,
+    binding: PreparedMemberBinding,
+    request: AuthorizationRequest,
+    effective: EffectiveToolAuthorizationDescriptor,
+    route: PermissionPolicyRoute,
+    risk: RiskLevel,
+    active_mode: PermissionMode,
+    snapshot: harness_contract::policy::SessionExecutionPolicy,
+    expired_lease_source: Option<crate::ExpectedStreamRevision>,
+}
+pub(crate) enum ProcessMemberPreparation {
+    Ready(Arc<PreparedMemberAuthority>),
+    Approval(ProcessMemberEvaluation),
+}
+impl ProcessMemberEvaluation {
+    pub(crate) fn member(&self) -> &Arc<crate::agent_in_process_worker::OriginalProcessPreparedMember> { &self.member }
+    pub(crate) fn binding(&self) -> &PreparedMemberBinding { &self.binding }
+    pub(crate) fn request(&self) -> &AuthorizationRequest { &self.request }
+    pub(crate) fn effective(&self) -> &EffectiveToolAuthorizationDescriptor { &self.effective }
+    pub(crate) fn risk(&self) -> RiskLevel { self.risk }
+    pub(crate) fn snapshot(&self) -> &harness_contract::policy::SessionExecutionPolicy { &self.snapshot }
+}
+impl PreparedMemberBinding {
+    pub(crate) fn retained(&self) -> RetainedMemberBinding {
+        let owner = match &self.owner {
+            OriginalMemberOwner::Host(member) => RetainedMemberOwner::Host(Arc::downgrade(member)),
+            OriginalMemberOwner::Process(member) => RetainedMemberOwner::Process(Arc::downgrade(member)),
+        };
+        RetainedMemberBinding { owner, prepared: self.prepared.clone() }
+    }
+    pub(crate) fn from_process(member: Arc<crate::agent_in_process_worker::OriginalProcessPreparedMember>) -> Result<Self, String> {
+        let prepared = member.effective_prepared().ok_or("original Process member effective hook facts unavailable")?.clone();
+        Ok(Self { owner: OriginalMemberOwner::Process(member), prepared })
+    }
+    pub(crate) fn from_host(member: Arc<crate::conversation::OriginalHostPreparedMember>) -> Self {
+        let prepared = member.prepared().clone();
+        Self { owner: OriginalMemberOwner::Host(member), prepared }
+    }
+    pub(crate) fn prepared(&self) -> &crate::step_snapshot::PreparedAgentBatchMember { &self.prepared }
+    pub(crate) fn process(&self) -> Option<&Arc<crate::agent_in_process_worker::OriginalProcessPreparedMember>> { match &self.owner { OriginalMemberOwner::Process(v) => Some(v), _ => None } }
+    pub(crate) fn host(&self) -> Option<&Arc<crate::conversation::OriginalHostPreparedMember>> { match &self.owner { OriginalMemberOwner::Host(v) => Some(v), _ => None } }
+    pub(crate) fn store(&self) -> &Arc<crate::RuntimeEventStore> { match &self.owner { OriginalMemberOwner::Host(v) => v.store(), OriginalMemberOwner::Process(v) => v.owner().store() } }
+    pub(crate) fn ticket(&self) -> &crate::execution_core::graph::NodeExecutionTicket { match &self.owner { OriginalMemberOwner::Host(v) => v.ticket(), OriginalMemberOwner::Process(v) => v.ticket() } }
+    fn negotiator(&self) -> &AuthorizationNegotiator { match &self.owner { OriginalMemberOwner::Host(v) => v.original_negotiator(), OriginalMemberOwner::Process(v) => v.owner().negotiator() } }
+    fn policy(&self) -> &PermissionPolicy { match &self.owner { OriginalMemberOwner::Host(v) => v.original_policy(), OriginalMemberOwner::Process(v) => v.owner().policy() } }
+    fn actor(&self) -> &'static str { match &self.owner { OriginalMemberOwner::Host(_) => "conversation_runtime", OriginalMemberOwner::Process(_) => "runtime.process_jsonl" } }
+}
+impl PartialEq for PreparedMemberBinding {
+    fn eq(&self, other: &Self) -> bool { match (&self.owner, &other.owner) {
+        (OriginalMemberOwner::Host(a), OriginalMemberOwner::Host(b)) => Arc::ptr_eq(a,b),
+        (OriginalMemberOwner::Process(a), OriginalMemberOwner::Process(b)) => Arc::ptr_eq(a,b),
+        _ => false,
+    } }
+}
+
+/// A candidate lease consumption, constructed by the original negotiator
+/// without changing its registry. This is not an admission or a receipt.
+pub(crate) struct PreparedMemberExistingLease {
+    owner: Arc<Mutex<LeaseRegistry>>,
+    member: RetainedMemberBinding,
+    request: AuthorizationRequest,
+    effective: EffectiveToolAuthorizationDescriptor,
+    assessment: CapabilityAssessment,
+    before: AuthorizationLease,
+    after: AuthorizationLease,
+    transition: AuthorizationLeaseTransition,
+    source: crate::ExpectedStreamRevision,
+    event: crate::RuntimeTransactionEventInput,
+}
+impl PreparedMemberExistingLease {
+    pub(crate) fn member(&self) -> &RetainedMemberBinding { &self.member }
+    pub(crate) fn source(&self) -> &crate::ExpectedStreamRevision { &self.source }
+    pub(crate) fn event(&self) -> &crate::RuntimeTransactionEventInput { &self.event }
+    pub(crate) fn deadline_ms(&self) -> u64 { self.before.expires_at_ms }
+    pub(crate) fn assessment(&self) -> &CapabilityAssessment { &self.assessment }
+}
+
+/// A new lease and its first consumption are staged together; the original
+/// registry is unchanged until their containing checked transaction succeeds.
+pub(crate) struct PreparedMemberNewLease {
+    owner: Arc<Mutex<LeaseRegistry>>,
+    member: RetainedMemberBinding,
+    request: AuthorizationRequest,
+    effective: EffectiveToolAuthorizationDescriptor,
+    fingerprint: String,
+    prior_id: Option<String>,
+    prior_lease: Option<AuthorizationLease>,
+    issued: AuthorizationLease,
+    consumed: AuthorizationLeaseTransition,
+    assessment: CapabilityAssessment,
+    approval_grant_id: Option<String>,
+    source: crate::ExpectedStreamRevision,
+    expired_lease_source: Option<crate::ExpectedStreamRevision>,
+    events: Vec<crate::RuntimeTransactionEventInput>,
+}
+impl PreparedMemberNewLease {
+    pub(crate) fn member(&self) -> &RetainedMemberBinding { &self.member }
+    pub(crate) fn assessment(&self) -> &CapabilityAssessment { &self.assessment }
+    pub(crate) fn source(&self) -> &crate::ExpectedStreamRevision { &self.source }
+    pub(crate) fn events(&self) -> &[crate::RuntimeTransactionEventInput] { &self.events }
+    pub(crate) fn deadline_ms(&self) -> u64 { self.issued.expires_at_ms }
+}
+
+/// Original owner candidate for an existing or newly issued lease.
+pub(crate) enum PreparedMemberLease { Existing(PreparedMemberExistingLease), New(PreparedMemberNewLease) }
+impl PreparedMemberLease {
+    pub(crate) fn member(&self) -> &RetainedMemberBinding { match self { Self::Existing(v) => v.member(), Self::New(v) => v.member() } }
+    pub(crate) fn source(&self) -> &crate::ExpectedStreamRevision { match self { Self::Existing(v) => v.source(), Self::New(v) => v.source() } }
+    pub(crate) fn assessment(&self) -> &CapabilityAssessment { match self { Self::Existing(v) => v.assessment(), Self::New(v) => v.assessment() } }
+    pub(crate) fn events(&self) -> &[crate::RuntimeTransactionEventInput] { match self { Self::Existing(v) => std::slice::from_ref(v.event()), Self::New(v) => v.events() } }
+    pub(crate) fn deadline_ms(&self) -> u64 { match self { Self::Existing(v) => v.deadline_ms(), Self::New(v) => v.deadline_ms() } }
+}
+
+/// Candidate evidence for one original member, not authority to execute it.
+pub(crate) struct PreparedMemberAuthority {
+    lease: PreparedMemberLease,
+    approval: Option<crate::approval_queue::PreparedMemberApproval>,
+    assessment: crate::conversation::PreparedHostMemberAssessment,
+    decision: crate::ToolExecutionPolicyDecision,
+}
+impl PreparedMemberAuthority {
+    pub(crate) fn new(lease: PreparedMemberLease, approval: Option<crate::approval_queue::PreparedMemberApproval>) -> Result<Self, String> {
+        let member = lease.member().upgrade().ok_or("original member owner unavailable")?;
+        if approval.as_ref().is_some_and(|a| !a.member().matches(&member)) {
+            return Err("lease and approval refer to different original members".into());
+        }
+        if let PreparedMemberLease::New(ref candidate) = lease {
+            if candidate.approval_grant_id.as_deref() != approval.as_ref().map(|a| a.grant().grant_id.as_str()) {
+                return Err("staged lease and approval grant differ".into());
+            }
+        } else if approval.is_some() {
+            return Err("existing lease cannot consume unrelated once approval".into());
+        }
+        let timeout_secs = match &member.owner {
+            OriginalMemberOwner::Host(member) => member.timeout_secs(),
+            OriginalMemberOwner::Process(member) => member.original_member_timeout_secs().ok_or("original Process member timeout unavailable")?,
+        };
+        let (request, effective, authorized_lease, capability) = match &lease {
+            PreparedMemberLease::New(value) => (&value.request, &value.effective, value.issued.clone(), &value.assessment),
+            PreparedMemberLease::Existing(value) => (&value.request, &value.effective,
+                execution_snapshot(&value.after, &value.request.idempotency_key), &value.assessment),
+        };
+        let decision = crate::ToolPolicy.authorize(effective, capability, request.idempotency_key.clone(), authorized_lease, timeout_secs)
+            .map_err(|error| error.to_string())?;
+        let assessment = match &member.owner {
+            OriginalMemberOwner::Host(member) => member.prepare_member_assessment(lease.assessment(), approval.as_ref().map(|value| value.grant()))?,
+            OriginalMemberOwner::Process(member) => member.prepare_member_assessment(lease.assessment(), approval.as_ref().map(|value| value.grant()))?,
+        };
+        Ok(Self { lease, approval, assessment, decision })
+    }
+    pub(crate) fn member(&self) -> &RetainedMemberBinding { self.lease.member() }
+    pub(crate) fn approval_guard(&self, member_guard: &PreparedMemberBinding) -> Result<Option<Arc<crate::approval_queue::ApprovalQueue>>, String> {
+        if !self.member().matches(member_guard) { return Err("original member owner changed".into()); }
+        self.approval.as_ref().map(|approval| approval.owner_guard(member_guard.store())).transpose()
+    }
+    pub(crate) fn matches_committed(&self, member_guard: &PreparedMemberBinding, committed: &crate::OriginalCommittedMember) -> bool {
+        if !self.member().matches(member_guard) || !committed.belongs_to(member_guard.store())
+            || !committed.authority().is_some_and(|authority| std::ptr::eq(authority.as_ref(), self)) { return false; }
+        let transaction = &committed.request().transaction;
+        let receipt = &committed.receipt().commit;
+        if receipt.transaction_id != transaction.transaction_id || receipt.commit_cursor == 0
+            || receipt.event_ids.len() != transaction.events.len()
+            || receipt.event_ids.iter().any(String::is_empty)
+            || !self.sources().all(|source| transaction.expected_streams.iter().any(|v| v == source)
+                && receipt.stream_revisions.iter().any(|v| v.stream_id == source.stream_id
+                    && v.expected_revision == source.expected_revision
+                    && source.expected_revision.checked_add(transaction.events.iter().filter(|event| event.event.stream_id == source.stream_id).count() as u64) == Some(v.committed_revision)))
+        { return false; }
+        let member = self.member().prepared();
+        let mut markers = transaction.events.iter().filter(|entry| entry.event.kind == "agentic.batch_member.index"
+            && entry.event.payload.get("outer_key").and_then(serde_json::Value::as_str) == Some(member.outer_key.as_str())
+            && entry.event.payload.get("member_identity").and_then(serde_json::Value::as_str) == Some(member.identity.as_str())
+            && entry.event.payload.get("member_index").and_then(serde_json::Value::as_u64) == u64::try_from(member.index).ok());
+        let Some(marker) = markers.next() else { return false; };
+        if markers.next().is_some() || serde_json::to_value(member_guard.ticket()).ok().as_ref() != marker.event.payload.get("ticket") { return false; }
+        let Some(indices) = marker.event.payload.get("authority_events").and_then(serde_json::Value::as_array) else { return false; };
+        let expected: Vec<_> = self.events().collect();
+        if indices.len() != expected.len() { return false; }
+        let mut previous = None;
+        for (entry, expected) in indices.iter().zip(expected) {
+            let Some(index) = entry.get("transaction_index").and_then(serde_json::Value::as_u64).and_then(|v| usize::try_from(v).ok()) else { return false; };
+            if previous.is_some_and(|old| index <= old)
+                || transaction.events.get(index) != Some(expected)
+                || receipt.event_ids.get(index).is_none_or(String::is_empty)
+                || entry.get("stream_id").and_then(serde_json::Value::as_str) != Some(expected.event.stream_id.as_str())
+                || entry.get("kind").and_then(serde_json::Value::as_str) != Some(expected.event.kind.as_str())
+                || entry.get("idempotency_key").and_then(serde_json::Value::as_str) != expected.idempotency_key.as_deref()
+            { return false; }
+            previous = Some(index);
+        }
+        true
+    }
+    /// Issued (when new), consumed, then optional once approval.
+    pub(crate) fn events(&self) -> impl Iterator<Item = &crate::RuntimeTransactionEventInput> {
+        self.lease.events().iter().chain(self.approval.iter().filter_map(|a| a.event()))
+            .chain(std::iter::once(self.assessment.event()))
+    }
+    pub(crate) fn sources(&self) -> impl Iterator<Item = &crate::ExpectedStreamRevision> {
+        std::iter::once(self.lease.source())
+            .chain(match &self.lease { PreparedMemberLease::New(v) => v.expired_lease_source.as_ref(), PreparedMemberLease::Existing(_) => None })
+            .chain(self.approval.iter().map(|a| a.source()))
+            .chain(std::iter::once(self.assessment.source()))
+    }
+    /// Enter before acquiring any source stream lock. The original approval
+    /// and lease owners are held outside `commit`; the original action owner
+    /// acquires its ordered stream locks inside that synchronous closure.
+    pub(crate) fn with_original_owners_for_checked_commit(
+        &self, services: &crate::RuntimeServices, member_guard: &PreparedMemberBinding,
+        commit: impl FnOnce(&PreparedMemberAuthority) -> Result<Arc<crate::OriginalCommittedMember>, crate::AgentActionServiceError>,
+    ) -> Result<(Arc<crate::OriginalCommittedMember>, bool), crate::AgentActionServiceError> {
+        if !self.member().matches(member_guard) || !Arc::ptr_eq(member_guard.store(), services.event_store()) {
+            return Err(crate::AgentActionServiceError::Corrupt("original member service store changed".into()));
+        }
+        let approval_guard = self.approval_guard(member_guard).map_err(crate::AgentActionServiceError::MemberUnknown)?;
+        let (committed, applied) = member_guard.negotiator().commit_prepared_member_authority(self, member_guard, approval_guard.as_deref(), commit).map_err(|error| {
+            error
+        })?;
+        // The checked owner retains the original request and authority until
+        // both hot owner updates have succeeded. A release error does not
+        // change the committed result or make the member Fresh.
+        let released = applied && services.agent_action_service()
+            .release_original_member_after_owner_apply(&committed).is_ok();
+        let committed = if released { committed.after_original_authority_release() } else { committed };
+        Ok((committed, released))
+    }
+    /// Lease deadline is inclusive; once approval deadline is exclusive.
+    pub(crate) fn deadlines(&self) -> (u64, Option<u64>) {
+        (self.lease.deadline_ms(), self.approval.as_ref().and_then(|a| a.deadline_ms()))
+    }
+    /// Builds the original ToolPolicy input for A's checked action only;
+    /// this candidate is not a capability to dispatch before commit.
+    pub(crate) fn staged_authorization_for_original_action(&self) -> Result<crate::ToolExecutionPolicyDecision, String> {
+        Ok(self.decision.clone())
+    }
+    /// Match only the complete authorization emitted by the original member
+    /// ToolPolicy inputs, including the original owner's timeout.
+    pub(crate) fn matches_staged_authorization(&self, authorization: &harness_contract::tool::ToolExecutionAuthorization) -> bool {
+        &self.decision.authorization == authorization
+    }
+}
+
+// The execution lease is the exact snapshot returned by the original
+// negotiator, which differs for an issued multi-use lease and a reused lease.
+#[derive(Debug, Clone, PartialEq)]
+struct ConsumedLeaseRecord {
+    execution_lease: AuthorizationLease,
+    transition: AuthorizationLeaseTransition,
+}
+
 #[derive(Debug, Clone)]
 struct LeaseRegistry {
     leases: BTreeMap<String, AuthorizationLease>,
     lease_by_fingerprint: BTreeMap<String, String>,
     fingerprint_by_lease: BTreeMap<String, String>,
     consumed_idempotency: BTreeSet<(String, String)>,
+    consumed_transitions: BTreeMap<(String, String), ConsumedLeaseRecord>,
     revoked: BTreeSet<String>,
     /// One live controlled-recovery opportunity per capability fingerprint.
     /// The value is the exact durable turn scope which owns the claim; this
@@ -401,6 +708,7 @@ impl LeaseRegistry {
             lease_by_fingerprint: BTreeMap::new(),
             fingerprint_by_lease: BTreeMap::new(),
             consumed_idempotency: BTreeSet::new(),
+            consumed_transitions: BTreeMap::new(),
             revoked: BTreeSet::new(),
             recovery_claims: BTreeMap::new(),
             transitions: Vec::new(),
@@ -497,27 +805,13 @@ impl AuthorizationNegotiator {
         let active_ceiling = policy.active_mode();
         let fingerprint = capability_fingerprint(request, required_mode);
 
-        if request.parent_lease_id.is_some() && required_mode.rank() > request.parent_ceiling.rank()
-        {
-            return denied_assessment(
-                request,
-                effective,
-                required_mode,
-                active_ceiling,
-                risk,
-                fingerprint,
-                CapabilityGapKind::PermissionCeiling,
-                "requested effect exceeds the parent Mission permission ceiling",
-                false,
-            );
-        }
-
-        let route = policy.route_required_with_context(
-            &request.capability,
-            &request.input,
-            required_mode,
-            &request.context,
-        );
+        let route = match original_policy_route(policy, request) {
+            Ok(route) => route,
+            Err(reason) => return denied_assessment(
+                request, effective, required_mode, active_ceiling, risk, fingerprint,
+                CapabilityGapKind::PermissionCeiling, reason, false,
+            ),
+        };
         if let PermissionPolicyRoute::HardDeny { reason } = &route {
             return denied_assessment(
                 request,
@@ -533,6 +827,7 @@ impl AuthorizationNegotiator {
         }
 
         if let Some(lease) = self.consume_existing(&fingerprint, request, required_mode, now) {
+            crate::conversation::capture_member_consumption(lease.clone());
             return authorized_assessment(
                 request,
                 effective,
@@ -540,7 +835,7 @@ impl AuthorizationNegotiator {
                 active_ceiling,
                 risk,
                 AuthorizationPath::ExistingLease,
-                lease,
+                lease.lease,
                 "existing scoped lease",
             );
         }
@@ -550,10 +845,7 @@ impl AuthorizationNegotiator {
                 standing_grant,
                 reason,
             } => {
-                if requires_human_boundary(&effective, risk, request.effect.approval_class)
-                    && (!standing_grant
-                        || request.effect.approval_class == ToolApprovalClass::Administrator)
-                {
+                if policy_allow_requires_human(request, standing_grant) {
                     return gap_assessment(
                         request,
                         effective,
@@ -572,14 +864,28 @@ impl AuthorizationNegotiator {
                 } else {
                     AuthorizationPath::PolicyAutoGrant
                 };
-                let lease = self.issue_and_consume(
+                let granted = granted_ceiling(policy, path, required_mode, active_ceiling);
+                let Some(lease) = self.issue_and_consume(
                     request,
                     required_mode,
-                    active_ceiling,
+                    granted,
                     &fingerprint,
                     path,
                     now,
-                );
+                ) else {
+                    return denied_assessment(
+                        request,
+                        effective,
+                        required_mode,
+                        active_ceiling,
+                        risk,
+                        fingerprint,
+                        CapabilityGapKind::PermissionCeiling,
+                        "the granted authorization cannot carry the assessed effect",
+                        false,
+                    );
+                };
+                crate::conversation::capture_member_consumption(lease.clone());
                 authorized_assessment(
                     request,
                     effective,
@@ -587,14 +893,12 @@ impl AuthorizationNegotiator {
                     active_ceiling,
                     risk,
                     path,
-                    lease,
+                    lease.lease,
                     &reason,
                 )
             }
             PermissionPolicyRoute::Ask { reason } => {
-                if !request.safe_alternatives.is_empty()
-                    && !requires_human_boundary(&effective, risk, request.effect.approval_class)
-                {
+                if policy_ask_uses_safe_alternative(request) {
                     gap_assessment(
                         request,
                         effective,
@@ -699,14 +1003,34 @@ impl AuthorizationNegotiator {
                 false,
             );
         }
-        let mut lease = self.issue_and_consume(
-            request,
+        let granted = granted_ceiling(
+            policy,
+            AuthorizationPath::HumanApproval,
             required_mode,
             active_ceiling,
+        );
+        let Some(mut lease) = self.issue_and_consume(
+            request,
+            required_mode,
+            granted,
             &fingerprint,
             AuthorizationPath::HumanApproval,
             now,
-        );
+        ) else {
+            return denied_assessment(
+                request,
+                effective,
+                required_mode,
+                active_ceiling,
+                risk,
+                fingerprint,
+                CapabilityGapKind::PermissionCeiling,
+                "the approved authorization cannot carry the assessed effect",
+                false,
+            );
+        };
+        crate::conversation::capture_member_consumption(lease.clone());
+        let mut lease = lease.lease;
         lease.parent_lease_id.clone_from(&request.parent_lease_id);
         authorized_assessment(
             request,
@@ -974,9 +1298,481 @@ impl AuthorizationNegotiator {
         acknowledged
     }
 
+    pub(crate) fn original_consumption(&self, lease: &AuthorizationLease, invocation: &str) -> Option<OriginalLeaseConsumption> {
+        let registry = self.registry.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let record = registry.consumed_transitions.get(&(lease.lease_id.clone(), invocation.to_string()))?;
+        (record.execution_lease == *lease
+            && Self::verify_lease_signature(&record.execution_lease)
+            && Self::verify_lease_signature(&record.transition.lease)
+            && record.transition.kind == AuthorizationLeaseTransitionKind::Consumed
+            && record.transition.idempotency_key.as_deref() == Some(invocation)
+            && authorization_lease_signed_payload(&record.transition.lease) == authorization_lease_signed_payload(&record.execution_lease))
+            .then(|| OriginalLeaseConsumption { lease: record.execution_lease.clone(), transition: record.transition.clone(), owner: Arc::clone(&self.registry) })
+    }
+
     #[must_use]
     pub fn verify_lease_signature(lease: &AuthorizationLease) -> bool {
         !lease.signature.is_empty() && lease.signature == Self::sign(lease)
+    }
+
+    /// Check only the original policy route after an existing-lease attempt.
+    /// This performs no issuance, grant consumption, or authorization.
+    pub(crate) fn host_member_requires_human(
+        &self, member: &crate::conversation::OriginalHostPreparedMember,
+    ) -> Result<bool, String> {
+        if !Arc::ptr_eq(&self.registry, &member.original_negotiator().registry) { return Err("Host negotiator owner differs".into()); }
+        let mut request = member.authorization_request()?;
+        request.effect = Self::compile_effective_descriptor(&request.effect, &request.input).descriptor;
+        let mode = request.effect.required_permission;
+        if request.parent_lease_id.is_some() && mode.rank() > request.parent_ceiling.rank() { return Err("member exceeds parent ceiling".into()); }
+        let policy = member.original_policy();
+        let risk = risk_for_effect(&request.effect.assessment);
+        match policy.route_required_with_context(&request.capability, &request.input, mode, &request.context) {
+            PermissionPolicyRoute::HardDeny { reason } => Err(reason),
+            PermissionPolicyRoute::Allow { standing_grant, .. } => Ok(
+                requires_human_boundary(&request.effect.assessment, risk, request.effect.approval_class)
+                    && (!standing_grant || request.effect.approval_class == ToolApprovalClass::Administrator)),
+            PermissionPolicyRoute::Ask { .. } => {
+                if !request.safe_alternatives.is_empty()
+                    && !requires_human_boundary(&request.effect.assessment, risk, request.effect.approval_class) {
+                    Err("original policy requires a safe alternative".into())
+                } else { Ok(true) }
+            }
+        }
+    }
+
+    /// Prepare the Host owner's exact member after any approval wait, without
+    /// consuming a lease or once approval. The checked owner decides Fresh.
+    pub(crate) fn prepare_host_member_authority(
+        &self, member: Arc<crate::conversation::OriginalHostPreparedMember>,
+        approval: Option<crate::approval_queue::PreparedMemberApproval>,
+    ) -> Result<Arc<PreparedMemberAuthority>, String> {
+        if !Arc::ptr_eq(&self.registry, &member.original_negotiator().registry) {
+            return Err("Host member negotiator owner differs".into());
+        }
+        let request = member.authorization_request()?;
+        let binding = PreparedMemberBinding::from_host(Arc::clone(&member));
+        if approval.as_ref().is_some_and(|value| !value.member().matches(&binding)) {
+            return Err("Host member approval belongs to a different owner".into());
+        }
+        let lease = match self.prepare_member_existing_lease(member.store().as_ref(), member.original_policy(), &request, &binding) {
+            Ok(existing) => return Ok(Arc::new(PreparedMemberAuthority::new(PreparedMemberLease::Existing(existing), None)?)),
+            Err(_) => self.prepare_member_new_lease(member.store().as_ref(), member.original_policy(), &request, &binding, approval.as_ref())?,
+        };
+        Ok(Arc::new(PreparedMemberAuthority::new(PreparedMemberLease::New(lease), approval)?))
+    }
+
+    /// Authenticate and assess this Process member once, before an approval wait.
+    pub(crate) fn prepare_process_member_once(
+        &self, member: Arc<crate::agent_in_process_worker::OriginalProcessPreparedMember>,
+        request: AuthorizationRequest,
+    ) -> Result<ProcessMemberPreparation, String> {
+        let owner = member.owner();
+        let packet = member.packet();
+        let original_context = member.original_permission_context().ok_or("original Process member permission context unavailable")?;
+        if !Arc::ptr_eq(&self.registry, &owner.negotiator().registry)
+            || request.principal_id != format!("agent:{}", packet.agent_id())
+            || request.parent_ceiling != packet.permission_ceiling || request.parent_lease_id.is_some()
+            || request.recovery_scope != format!("execution:{}", packet.graph_id())
+            || &request.context != original_context || !request.safe_alternatives.is_empty() {
+            return Err("Process member authorization request owner differs".into());
+        }
+        let snapshot = owner.policy().execution_policy_control().snapshot();
+        if snapshot.revision != request.policy_revision || snapshot.revision == 0 {
+            return Err("Process policy changed before member assessment".into());
+        }
+        let effective = Self::compile_effective_descriptor(&request.effect, &request.input);
+        let mode = effective.descriptor.required_permission;
+        if mode.rank() > packet.permission_ceiling.rank() { return Err("Process member exceeds parent ceiling".into()); }
+        let frozen = owner.policy().bound_to_snapshot(&snapshot);
+        let route = frozen.route_required_with_context(&request.capability, &request.input, mode, &request.context);
+        if matches!(&route, PermissionPolicyRoute::HardDeny { .. }) { return Err("member is hard denied".into()); }
+        let risk = risk_for_effect(&effective.descriptor.assessment);
+        let binding = PreparedMemberBinding::from_process(Arc::clone(&member))?;
+        let active_mode = frozen.active_mode();
+        let mut evaluation = ProcessMemberEvaluation { member: Arc::clone(&member), binding, request, effective, route, risk, active_mode, snapshot, expired_lease_source: None };
+        let mut expired_lease_source = None;
+        if let Some(existing) = self.prepare_member_existing_lease_evaluated(owner.store().as_ref(), owner.policy(),
+            &evaluation.request, &evaluation.binding, Some(&evaluation), Some(&mut expired_lease_source))? {
+            return Ok(ProcessMemberPreparation::Ready(Arc::new(PreparedMemberAuthority::new(PreparedMemberLease::Existing(existing), None)?)));
+        }
+        evaluation.expired_lease_source = expired_lease_source;
+        let requires_human = match &evaluation.route {
+            PermissionPolicyRoute::Allow { standing_grant, .. } =>
+                requires_human_boundary(&evaluation.effective.descriptor.assessment, evaluation.risk, evaluation.effective.descriptor.approval_class)
+                    && (!standing_grant || evaluation.effective.descriptor.approval_class == ToolApprovalClass::Administrator),
+            PermissionPolicyRoute::Ask { .. } => {
+                if !evaluation.request.safe_alternatives.is_empty()
+                    && !requires_human_boundary(&evaluation.effective.descriptor.assessment, evaluation.risk, evaluation.effective.descriptor.approval_class) {
+                    return Err("original policy requires a safe alternative".into());
+                }
+                true
+            },
+            PermissionPolicyRoute::HardDeny { .. } => return Err("member is hard denied".into()),
+        };
+        if requires_human { return Ok(ProcessMemberPreparation::Approval(evaluation)); }
+        let lease = self.prepare_member_new_lease_evaluated(owner.store().as_ref(), owner.policy(), &evaluation.request,
+            &evaluation.binding, None, Some(&evaluation))?;
+        Ok(ProcessMemberPreparation::Ready(Arc::new(PreparedMemberAuthority::new(PreparedMemberLease::New(lease), None)?)))
+    }
+
+    /// Finish that same original assessment after a matching approval, without rerouting.
+    pub(crate) fn finish_process_member_approval(
+        &self, evaluation: &ProcessMemberEvaluation, approval: crate::approval_queue::PreparedMemberApproval,
+    ) -> Result<Arc<PreparedMemberAuthority>, String> {
+        let owner = evaluation.member.owner();
+        if !Arc::ptr_eq(&self.registry, &owner.negotiator().registry)
+            || owner.policy().execution_policy_control().revision() != evaluation.snapshot.revision
+            || !approval.member().matches(&evaluation.binding) {
+            return Err("original Process approval owner or policy changed".into());
+        }
+        let lease = self.prepare_member_new_lease_evaluated(owner.store().as_ref(), owner.policy(),
+            &evaluation.request, &evaluation.binding, Some(&approval), Some(evaluation))?;
+        Ok(Arc::new(PreparedMemberAuthority::new(PreparedMemberLease::New(lease), Some(approval))?))
+    }
+
+    /// Prepare original issuance and consumption without mutating the live registry.
+    /// Approval, when needed, is prepared by the original queue before this call.
+    pub(crate) fn prepare_member_new_lease(
+        &self, store: &crate::RuntimeEventStore, policy: &PermissionPolicy,
+        request: &AuthorizationRequest, member: &PreparedMemberBinding,
+        approval: Option<&crate::approval_queue::PreparedMemberApproval>,
+    ) -> Result<PreparedMemberNewLease, String> {
+        self.prepare_member_new_lease_evaluated(store, policy, request, member, approval, None)
+    }
+    fn prepare_member_new_lease_evaluated(
+        &self, store: &crate::RuntimeEventStore, policy: &PermissionPolicy,
+        request: &AuthorizationRequest, member: &PreparedMemberBinding,
+        approval: Option<&crate::approval_queue::PreparedMemberApproval>, evaluation: Option<&ProcessMemberEvaluation>,
+    ) -> Result<PreparedMemberNewLease, String> {
+        if !std::ptr::eq(store, member.store().as_ref())
+            || !Arc::ptr_eq(&self.registry, &member.negotiator().registry)
+            || !policy.execution_policy_control().same_owner(&member.policy().execution_policy_control()) {
+            return Err("original Process member owner changed".into());
+        }
+        let original = member.prepared();
+        let input = harness_contract::step::parse_strict_json(&request.input).map_err(|e| e.to_string())?;
+        if request.capability != original.tool || request.idempotency_key != original.identity
+            || request.effect != original.effect || input != original.input
+            || approval.is_some_and(|a| !a.member().matches(member)) {
+            return Err("original batch member and new lease request differ".into());
+        }
+        let effective = evaluation.map(|v| v.effective.clone()).unwrap_or_else(|| Self::compile_effective_descriptor(&request.effect, &request.input));
+        let mut request = request.clone(); request.effect = effective.descriptor.clone();
+        let mode = request.effect.required_permission;
+        if request.parent_lease_id.is_some() && mode.rank() > request.parent_ceiling.rank() {
+            return Err("member exceeds parent ceiling".into());
+        }
+        let route = evaluation.map(|v| v.route.clone()).unwrap_or_else(|| policy.route_required_with_context(&request.capability, &request.input, mode, &request.context));
+        if matches!(&route, PermissionPolicyRoute::HardDeny { .. }) { return Err("member is hard denied".into()); }
+        let risk = evaluation.map_or_else(|| risk_for_effect(&request.effect.assessment), |v| v.risk);
+        let path = if let Some(approval) = approval {
+            validate_approval_grant(approval.grant(), &request, &request.effect.descriptor_hash)?;
+            AuthorizationPath::HumanApproval
+        } else {
+            match route {
+                PermissionPolicyRoute::Allow { standing_grant, .. } => {
+                    if requires_human_boundary(&request.effect.assessment, risk, request.effect.approval_class)
+                        && (!standing_grant || request.effect.approval_class == ToolApprovalClass::Administrator) {
+                        return Err("member requires human approval".into());
+                    }
+                    if standing_grant { AuthorizationPath::StandingGrant } else { AuthorizationPath::PolicyAutoGrant }
+                },
+                _ => return Err("member requires original approval".into()),
+            }
+        };
+        let active_mode = evaluation.map_or_else(|| policy.active_mode(), |v| v.active_mode);
+        let ceiling = granted_ceiling(policy, path, mode, active_mode);
+        if !ceiling.permits(mode) { return Err("member grant cannot authorize effect".into()); }
+        let fingerprint = capability_fingerprint(&request, mode);
+        let registry = self.registry.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let prior_id = registry.lease_by_fingerprint.get(&fingerprint).cloned();
+        let prior_lease = prior_id.as_ref().and_then(|id| registry.leases.get(id)).cloned();
+        if prior_lease.as_ref().is_some_and(|lease| lease.is_active_at(now_ms())) {
+            return Err("active existing member lease requires original reuse".into());
+        }
+        let now = now_ms();
+        let max_uses = match path { AuthorizationPath::StandingGrant => 64,
+            AuthorizationPath::PolicyAutoGrant if mode == PermissionMode::ReadOnly => 32, _ => 1 };
+        let ttl_ms = match path { AuthorizationPath::HumanApproval => 30 * 60 * 1000,
+            AuthorizationPath::StandingGrant => 60 * 60 * 1000, _ => 15 * 60 * 1000 };
+        let mut issued = AuthorizationLease {
+            lease_id: format!("authorization-lease-{}", uuid::Uuid::new_v4()),
+            principal_id: request.principal_id.clone(), parent_lease_id: request.parent_lease_id.clone(),
+            capability: request.capability.clone(), scopes: request.effect.scopes.clone(), ceiling,
+            issued_at_ms: now, expires_at_ms: now.saturating_add(ttl_ms), max_uses, remaining_uses: max_uses,
+            idempotency_key: request.idempotency_key.clone(), policy_revision: request.policy_revision,
+            effect_descriptor_hash: request.effect.descriptor_hash.clone(), signature: String::new(),
+            status: AuthorizationLeaseStatus::Active,
+        };
+        issued.signature = Self::sign(&issued);
+        let mut after = issued.clone(); after.remaining_uses = after.remaining_uses.saturating_sub(1);
+        if after.remaining_uses == 0 { after.status = AuthorizationLeaseStatus::Exhausted; }
+        let first = lease_transition(AuthorizationLeaseTransitionKind::Issued, issued.clone(), None,
+            "authorization negotiator issued a scoped lease");
+        let consumed = lease_transition(AuthorizationLeaseTransitionKind::Consumed, after,
+            Some(request.idempotency_key.clone()), "new authorization lease consumed for the assessed request");
+        let stream_id = format!("authorization-lease:{}", issued.lease_id);
+        if store.stream_revision(&stream_id).map_err(|e| e.to_string())? != 0 {
+            return Err("new lease stream already exists".into());
+        }
+        let mut events = Vec::new();
+        for transition in [&first, &consumed] {
+            events.push(crate::RuntimeTransactionEventInput { event: crate::RuntimeEventInput {
+                stream_id: stream_id.clone(), scope: crate::RuntimeEventScope::Tool,
+                kind: "authorization.lease_transition".into(),
+                status: Some(format!("{:?}", transition.kind).to_ascii_lowercase()),
+                actor: Some(member.actor().into()),
+                refs: vec![crate::RuntimeEventRef { kind: "authorization_lease".into(), id: issued.lease_id.clone() }],
+                payload: serde_json::to_value(transition).map_err(|e| e.to_string())?,
+            }, idempotency_key: Some(transition.transition_id.clone()), schema_version: 1 });
+        }
+        let assessment = authorized_assessment(&request, request.effect.assessment.clone(), mode,
+            active_mode, risk, path, issued.clone(), "original member prepared lease");
+        Ok(PreparedMemberNewLease { owner: Arc::clone(&self.registry), member: member.retained(), request, effective, fingerprint,
+            prior_id, prior_lease, issued, consumed, assessment, approval_grant_id: approval.map(|a| a.grant().grant_id.clone()), source: crate::ExpectedStreamRevision { stream_id, expected_revision: 0 },
+            expired_lease_source: evaluation.and_then(|value| value.expired_lease_source.clone()), events })
+    }
+
+    /// Stage an existing lease consumption; neither the registry nor the store
+    /// changes. The caller must still bind this request to the original member
+    /// and revalidate policy and source inside its checked transaction.
+    pub(crate) fn prepare_member_existing_lease(
+        &self, store: &crate::RuntimeEventStore, policy: &PermissionPolicy,
+        request: &AuthorizationRequest, member: &PreparedMemberBinding,
+    ) -> Result<PreparedMemberExistingLease, String> {
+        self.prepare_member_existing_lease_evaluated(store, policy, request, member, None, None)?
+            .ok_or_else(|| "member lease unavailable".into())
+    }
+    fn prepare_member_existing_lease_evaluated(
+        &self, store: &crate::RuntimeEventStore, policy: &PermissionPolicy,
+        request: &AuthorizationRequest, member: &PreparedMemberBinding, evaluation: Option<&ProcessMemberEvaluation>,
+        expired_source: Option<&mut Option<crate::ExpectedStreamRevision>>,
+    ) -> Result<Option<PreparedMemberExistingLease>, String> {
+        if !std::ptr::eq(store, member.store().as_ref())
+            || !Arc::ptr_eq(&self.registry, &member.negotiator().registry)
+            || !policy.execution_policy_control().same_owner(&member.policy().execution_policy_control()) {
+            return Err("original Process member owner changed".into());
+        }
+        let original = member.prepared();
+        let input = harness_contract::step::parse_strict_json(&request.input).map_err(|e| e.to_string())?;
+        if request.capability != original.tool || request.idempotency_key != original.identity
+            || request.effect != original.effect || input != original.input {
+            return Err("original batch member and lease request differ".into());
+        }
+        let effective = evaluation.map(|v| v.effective.clone()).unwrap_or_else(|| Self::compile_effective_descriptor(&request.effect, &request.input));
+        let mut request = request.clone();
+        request.effect = effective.descriptor.clone();
+        let mode = request.effect.required_permission;
+        if request.parent_lease_id.is_some() && mode.rank() > request.parent_ceiling.rank() {
+            return Err("member exceeds parent ceiling".into());
+        }
+        if matches!(evaluation.map(|v| v.route.clone()).unwrap_or_else(|| policy.route_required_with_context(&request.capability, &request.input, mode, &request.context)), PermissionPolicyRoute::HardDeny { .. }) {
+            return Err("member is hard denied".into());
+        }
+        let fingerprint = capability_fingerprint(&request, mode);
+        let registry = self.registry.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(id) = registry.lease_by_fingerprint.get(&fingerprint) else { return Ok(None); };
+        if registry.revoked.contains(id) || registry.consumed_idempotency.contains(&(id.clone(), request.idempotency_key.clone())) {
+            return Err("member lease revoked or already consumed".into());
+        }
+        let before = registry.leases.get(id).ok_or("member lease unavailable")?.clone();
+        if !before.permits(&request.capability, mode) || !lease_scopes_cover(&before, &request.effect.scopes)
+            || before.principal_id != request.principal_id || before.parent_lease_id != request.parent_lease_id
+            || before.policy_revision == 0 || before.policy_revision != request.policy_revision
+            || before.effect_descriptor_hash != request.effect.descriptor_hash
+            || !Self::verify_lease_signature(&before)
+        { return Err("member lease no longer authorizes request".into()); }
+        let now = now_ms();
+        let naturally_expired = match before.status {
+            AuthorizationLeaseStatus::Active if before.remaining_uses > 0 && now <= before.expires_at_ms => false,
+            AuthorizationLeaseStatus::Active | AuthorizationLeaseStatus::Expired
+                if before.remaining_uses > 0 && now > before.expires_at_ms => true,
+            AuthorizationLeaseStatus::Revoked => return Err("member lease revoked".into()),
+            AuthorizationLeaseStatus::Exhausted => return Err("member lease exhausted".into()),
+            _ => return Err("member lease status or uses invalid".into()),
+        };
+        if before.remaining_uses > before.max_uses { return Err("member lease uses invalid".into()); }
+        let stream_id = format!("authorization-lease:{}", id);
+        let expected_revision = store.stream_revision(&stream_id).map_err(|e| e.to_string())?;
+        if expected_revision == 0 { return Err("existing member lease has no durable source".into()); }
+        let events = store.list_stream_after(&stream_id, expected_revision - 1, expected_revision, 1, 4 * 1024 * 1024)?;
+        let latest = events.first().filter(|_| events.len() == 1).ok_or("existing member lease source missing")?;
+        let persisted: AuthorizationLeaseTransition = serde_json::from_value(latest.payload.clone()).map_err(|e| e.to_string())?;
+        let receipt = store.original_transaction_receipt(&latest.transaction_id).map_err(|e| e.to_string())?
+            .ok_or("existing member lease receipt missing")?;
+        if latest.stream_id != stream_id || latest.sequence != expected_revision
+            || latest.scope != crate::RuntimeEventScope::Tool || latest.kind != "authorization.lease_transition"
+            || latest.actor.as_deref() != Some(member.actor()) || latest.schema_version != 1
+            || latest.idempotency_key.as_deref() != Some(persisted.transition_id.as_str())
+            || latest.status.as_deref() != Some(format!("{:?}", persisted.kind).to_ascii_lowercase().as_str())
+            || latest.refs != vec![crate::RuntimeEventRef { kind: "authorization_lease".into(), id: id.clone() }]
+            || persisted.lease != before || receipt.transaction_id != latest.transaction_id
+            || receipt.commit_cursor == 0 || receipt.commit_cursor != latest.commit_cursor
+            || receipt.event_ids.get(latest.transaction_index as usize) != Some(&latest.event_id)
+            || store.stream_revision(&stream_id).map_err(|e| e.to_string())? != expected_revision
+        { return Err("existing member lease durable source differs".into()); }
+        if naturally_expired {
+            if let Some(output) = expired_source {
+                *output = Some(crate::ExpectedStreamRevision { stream_id, expected_revision });
+            }
+            return Ok(None);
+        }
+        let mut after = before.clone();
+        after.remaining_uses = after.remaining_uses.saturating_sub(1);
+        if after.remaining_uses == 0 { after.status = AuthorizationLeaseStatus::Exhausted; }
+        let transition = lease_transition(AuthorizationLeaseTransitionKind::Consumed, after.clone(),
+            Some(request.idempotency_key.clone()), "existing authorization lease consumed");
+        let event = crate::RuntimeTransactionEventInput { event: crate::RuntimeEventInput {
+            stream_id: stream_id.clone(), scope: crate::RuntimeEventScope::Tool,
+            kind: "authorization.lease_transition".into(), status: Some("consumed".into()),
+            actor: Some(member.actor().into()),
+            refs: vec![crate::RuntimeEventRef { kind: "authorization_lease".into(), id: id.clone() }],
+            payload: serde_json::to_value(&transition).map_err(|e| e.to_string())?,
+        }, idempotency_key: Some(transition.transition_id.clone()), schema_version: 1 };
+        let execution_lease = execution_snapshot(&after, &request.idempotency_key);
+        let assessment = authorized_assessment(&request, request.effect.assessment.clone(), mode,
+            evaluation.map_or_else(|| policy.active_mode(), |v| v.active_mode),
+            evaluation.map_or_else(|| risk_for_effect(&request.effect.assessment), |v| v.risk), AuthorizationPath::ExistingLease,
+            execution_lease, "existing scoped lease");
+        Ok(Some(PreparedMemberExistingLease { owner: Arc::clone(&self.registry), member: member.retained(), request, effective, assessment, before, after, transition,
+            source: crate::ExpectedStreamRevision { stream_id, expected_revision }, event }))
+    }
+
+    /// Publish a staged new lease only after the synchronous original checked
+    /// transaction reports success. Unknown leaves the borrowed candidate held
+    /// by the original caller for its transaction-resolution path.
+    pub(crate) fn commit_prepared_member_new_lease(
+        &self, prepared: &PreparedMemberNewLease, member_guard: &PreparedMemberBinding,
+        commit: impl FnOnce(&PreparedMemberNewLease) -> Result<(Arc<crate::OriginalCommittedMember>, bool), crate::AgentActionServiceError>,
+    ) -> Result<(Arc<crate::OriginalCommittedMember>, bool), crate::AgentActionServiceError> {
+        if !Arc::ptr_eq(&self.registry, &prepared.owner) {
+            return Err(crate::AgentActionServiceError::Corrupt("member lease owner changed".into()));
+        }
+        let mut registry = self.registry.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let current_id = registry.lease_by_fingerprint.get(&prepared.fingerprint).cloned();
+        let current_lease = current_id.as_ref().and_then(|id| registry.leases.get(id)).cloned();
+        if current_id != prepared.prior_id || current_lease != prepared.prior_lease
+            || registry.leases.contains_key(&prepared.issued.lease_id)
+            || !prepared.issued.is_active_at(now_ms()) {
+            return Err(crate::AgentActionServiceError::Corrupt("member issuance source changed".into()));
+        }
+        let result = commit(prepared).map_err(|error| {
+            error
+        })?;
+        if !result.1 { return Ok(result); }
+        let id = prepared.issued.lease_id.clone();
+        registry.lease_by_fingerprint.insert(prepared.fingerprint.clone(), id.clone());
+        registry.fingerprint_by_lease.insert(id.clone(), prepared.fingerprint.clone());
+        let key = (id.clone(), prepared.request.idempotency_key.clone());
+        registry.consumed_idempotency.insert(key.clone());
+        registry.consumed_transitions.insert(key, ConsumedLeaseRecord { execution_lease: prepared.issued.clone(), transition: prepared.consumed.clone() });
+        registry.leases.insert(id, prepared.consumed.lease.clone());
+        Ok(result)
+    }
+
+    /// Hold the original lease owner over the synchronous checked commit.
+    /// An error (including an unknown backend outcome) leaves it unchanged.
+    pub(crate) fn commit_prepared_member_existing_lease(
+        &self, prepared: &PreparedMemberExistingLease, member_guard: &PreparedMemberBinding,
+        commit: impl FnOnce(&PreparedMemberExistingLease) -> Result<(Arc<crate::OriginalCommittedMember>, bool), crate::AgentActionServiceError>,
+    ) -> Result<(Arc<crate::OriginalCommittedMember>, bool), crate::AgentActionServiceError> {
+        if !Arc::ptr_eq(&self.registry, &prepared.owner) { return Err(crate::AgentActionServiceError::Corrupt("member lease owner changed".into())); }
+        let mut registry = self.registry.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let id = &prepared.before.lease_id;
+        let key = (id.clone(), prepared.request.idempotency_key.clone());
+        if registry.revoked.contains(id) || registry.consumed_idempotency.contains(&key)
+            || registry.leases.get(id) != Some(&prepared.before)
+            || !prepared.before.is_active_at(now_ms())
+        { return Err(crate::AgentActionServiceError::Corrupt("member lease changed before checked commit".into())); }
+        let result = commit(prepared).map_err(|error| {
+            error
+        })?;
+        if !result.1 { return Ok(result); }
+        registry.leases.insert(id.clone(), prepared.after.clone());
+        registry.consumed_idempotency.insert(key.clone());
+        registry.consumed_transitions.insert(key, ConsumedLeaseRecord { execution_lease: execution_snapshot(&prepared.after, &prepared.request.idempotency_key), transition: prepared.transition.clone() });
+        Ok(result)
+    }
+
+    /// The approval and lease locks cover the original synchronous checked
+    /// transaction and their hot state changes only on its successful return.
+    pub(crate) fn commit_prepared_member_authority(
+        &self, prepared: &PreparedMemberAuthority, member_guard: &PreparedMemberBinding,
+        approval_guard: Option<&crate::approval_queue::ApprovalQueue>,
+        commit: impl FnOnce(&PreparedMemberAuthority) -> Result<Arc<crate::OriginalCommittedMember>, crate::AgentActionServiceError>,
+    ) -> Result<(Arc<crate::OriginalCommittedMember>, bool), crate::AgentActionServiceError> {
+        let commit_lease = || {
+            let actual_commit = || {
+                let committed = commit(prepared)?;
+                let matches = prepared.matches_committed(member_guard, &committed);
+                Ok((committed, matches))
+            };
+            match &prepared.lease {
+                PreparedMemberLease::Existing(lease) => self.commit_prepared_member_existing_lease(lease, member_guard, |_| actual_commit()),
+                PreparedMemberLease::New(lease) => self.commit_prepared_member_new_lease(lease, member_guard, |_| actual_commit()),
+            }
+        };
+        match prepared.approval.as_ref() {
+            Some(approval) => approval_guard.ok_or_else(|| crate::AgentActionServiceError::MemberUnknown("original approval owner unavailable".into()))?.commit_prepared_member_approval(approval, member_guard, |_| commit_lease()),
+            None => commit_lease(),
+        }
+    }
+
+    /// Publish the already committed retained transaction to its original
+    /// owners. A mismatch leaves the retained transaction owned for resolution.
+    /// Never returns a Fresh or rolled-back result for a committed handle.
+    pub(crate) fn apply_recovered_member_authority(
+        &self, prepared: &Arc<PreparedMemberAuthority>, member_guard: &PreparedMemberBinding,
+        approval_guard: Option<&crate::approval_queue::ApprovalQueue>, committed: &crate::OriginalCommittedMember,
+    ) -> Result<(), String> {
+        if !committed.authority().is_some_and(|original| Arc::ptr_eq(original, prepared))
+            || !prepared.matches_committed(member_guard, committed) {
+            return Err("recovered member is not this original authority transaction".into());
+        }
+        let apply_lease = || {
+            let mut registry = self.registry.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            match &prepared.lease {
+                PreparedMemberLease::Existing(candidate) => {
+                    if !Arc::ptr_eq(&self.registry, &candidate.owner) { return Err("recovered lease owner changed".into()); }
+                    let id = &candidate.before.lease_id;
+                    let key = (id.clone(), candidate.request.idempotency_key.clone());
+                    if registry.consumed_idempotency.contains(&key) {
+                        if registry.consumed_transitions.get(&key) == Some(&ConsumedLeaseRecord { execution_lease: execution_snapshot(&candidate.after, &candidate.request.idempotency_key), transition: candidate.transition.clone() }) { return Ok(()); }
+                        return Err("recovered member consumption conflicts".into());
+                    }
+                    if registry.revoked.contains(id) || registry.leases.get(id) != Some(&candidate.before) {
+                        return Err("recovered lease hot projection changed".into());
+                    }
+                    registry.leases.insert(id.clone(), candidate.after.clone());
+                    registry.consumed_idempotency.insert(key.clone());
+                    registry.consumed_transitions.insert(key, ConsumedLeaseRecord { execution_lease: execution_snapshot(&candidate.after, &candidate.request.idempotency_key), transition: candidate.transition.clone() });
+                }
+                PreparedMemberLease::New(candidate) => {
+                    if !Arc::ptr_eq(&self.registry, &candidate.owner) { return Err("recovered issuer owner changed".into()); }
+                    let id = candidate.issued.lease_id.clone();
+                    let key = (id.clone(), candidate.request.idempotency_key.clone());
+                    if registry.consumed_idempotency.contains(&key) {
+                        if registry.consumed_transitions.get(&key) == Some(&ConsumedLeaseRecord { execution_lease: candidate.issued.clone(), transition: candidate.consumed.clone() }) { return Ok(()); }
+                        return Err("recovered issuance conflicts".into());
+                    }
+                    let current_id = registry.lease_by_fingerprint.get(&candidate.fingerprint).cloned();
+                    let current_lease = current_id.as_ref().and_then(|id| registry.leases.get(id)).cloned();
+                    if current_id != candidate.prior_id || current_lease != candidate.prior_lease
+                        || registry.leases.contains_key(&id) { return Err("recovered issuer hot projection changed".into()); }
+                    registry.lease_by_fingerprint.insert(candidate.fingerprint.clone(), id.clone());
+                    registry.fingerprint_by_lease.insert(id.clone(), candidate.fingerprint.clone());
+                    registry.consumed_idempotency.insert(key.clone());
+                    registry.consumed_transitions.insert(key, ConsumedLeaseRecord { execution_lease: candidate.issued.clone(), transition: candidate.consumed.clone() });
+                    registry.leases.insert(id, candidate.consumed.lease.clone());
+                }
+            }
+            Ok(())
+        };
+        match prepared.approval.as_ref() {
+            Some(approval) => approval_guard.ok_or("original approval owner unavailable")?.apply_recovered_member_approval(approval, member_guard, apply_lease),
+            None => apply_lease(),
+        }
     }
 
     fn consume_existing(
@@ -985,7 +1781,7 @@ impl AuthorizationNegotiator {
         request: &AuthorizationRequest,
         required_mode: PermissionMode,
         now: u64,
-    ) -> Option<AuthorizationLease> {
+    ) -> Option<OriginalLeaseConsumption> {
         let mut registry = self
             .registry
             .lock()
@@ -1015,7 +1811,8 @@ impl AuthorizationNegotiator {
                 return None;
             }
             if already_consumed {
-                return Some(execution_snapshot(lease, &request.idempotency_key));
+                let record = registry.consumed_transitions.get(&idempotency)?.clone();
+                return Some(OriginalLeaseConsumption { lease: record.execution_lease, transition: record.transition, owner: Arc::clone(&self.registry) });
             }
             if !lease.is_active_at(now) {
                 return None;
@@ -1029,25 +1826,31 @@ impl AuthorizationNegotiator {
                 lease.clone(),
             )
         };
-        registry.consumed_idempotency.insert(idempotency);
-        registry.transitions.push(lease_transition(
-            AuthorizationLeaseTransitionKind::Consumed,
-            consumed_snapshot,
-            Some(request.idempotency_key.clone()),
-            "existing authorization lease consumed",
-        ));
-        Some(result)
+        registry.consumed_idempotency.insert(idempotency.clone());
+        let consumed = lease_transition(
+            AuthorizationLeaseTransitionKind::Consumed, consumed_snapshot,
+            Some(request.idempotency_key.clone()), "existing authorization lease consumed",
+        );
+        registry.consumed_transitions.insert(idempotency, ConsumedLeaseRecord { execution_lease: result.clone(), transition: consumed.clone() });
+        registry.transitions.push(consumed.clone());
+        Some(OriginalLeaseConsumption { lease: result, transition: consumed, owner: Arc::clone(&self.registry) })
     }
 
     fn issue_and_consume(
         &self,
         request: &AuthorizationRequest,
         required_mode: PermissionMode,
-        active_ceiling: PermissionMode,
+        granted_ceiling: PermissionMode,
         fingerprint: &str,
         path: AuthorizationPath,
         now: u64,
-    ) -> AuthorizationLease {
+    ) -> Option<OriginalLeaseConsumption> {
+        // A lease that cannot authorize its own effect is never issued: the
+        // consumer (`ToolPolicy::authorize`) and the reuse path
+        // (`consume_existing`) both test `lease.permits(capability, mode)`.
+        if !granted_ceiling.permits(required_mode) {
+            return None;
+        }
         let max_uses = match path {
             AuthorizationPath::StandingGrant => 64,
             AuthorizationPath::PolicyAutoGrant if required_mode == PermissionMode::ReadOnly => 32,
@@ -1065,7 +1868,7 @@ impl AuthorizationNegotiator {
             parent_lease_id: request.parent_lease_id.clone(),
             capability: request.capability.clone(),
             scopes: request.effect.scopes.clone(),
-            ceiling: active_ceiling,
+            ceiling: granted_ceiling,
             issued_at_ms: now,
             expires_at_ms: now.saturating_add(ttl_ms),
             max_uses,
@@ -1103,13 +1906,13 @@ impl AuthorizationNegotiator {
             None,
             "authorization negotiator issued a scoped lease",
         ));
-        registry.transitions.push(lease_transition(
-            AuthorizationLeaseTransitionKind::Consumed,
-            lease,
-            Some(request.idempotency_key.clone()),
-            "new authorization lease consumed for the assessed request",
-        ));
-        execution_lease
+        let consumed = lease_transition(
+            AuthorizationLeaseTransitionKind::Consumed, lease,
+            Some(request.idempotency_key.clone()), "new authorization lease consumed for the assessed request",
+        );
+        registry.consumed_transitions.insert((execution_lease.lease_id.clone(), request.idempotency_key.clone()), ConsumedLeaseRecord { execution_lease: execution_lease.clone(), transition: consumed.clone() });
+        registry.transitions.push(consumed.clone());
+        Some(OriginalLeaseConsumption { lease: execution_lease, transition: consumed, owner: Arc::clone(&self.registry) })
     }
 
     fn sign(lease: &AuthorizationLease) -> String {
@@ -1131,6 +1934,16 @@ pub(crate) fn persist_authorization_transition(
     actor: &str,
     transition: &AuthorizationLeaseTransition,
 ) -> Result<(), String> {
+    persist_authorization_transition_event(store, stream_id, actor, transition).map(|_| ())
+}
+
+/// Return the original durable event, never a synthesized stream revision.
+pub(crate) fn persist_authorization_transition_event(
+    store: &crate::RuntimeEventStore,
+    stream_id: &str,
+    actor: &str,
+    transition: &AuthorizationLeaseTransition,
+) -> Result<crate::DurableRuntimeEvent, String> {
     // The whole read-revision-then-append window runs under the per-stream
     // in-process lock. Parallel Team agents and the parent model stream no
     // longer race the CAS revision; the bounded retry remains only as a
@@ -1142,9 +1955,31 @@ pub(crate) fn persist_authorization_transition(
                 .event_by_idempotency_key(stream_id, &transition.transition_id)
                 .map_err(|error| error.to_string())?
             {
-                if existing.kind == "authorization.lease_transition" && existing.payload == payload
+                if existing.stream_id == stream_id
+                    && existing.scope == crate::RuntimeEventScope::Tool
+                    && existing.kind == "authorization.lease_transition"
+                    && existing.actor.as_deref() == Some(actor)
+                    && existing.idempotency_key.as_deref() == Some(transition.transition_id.as_str())
+                    && existing.payload == payload
+                    && !existing.event_id.is_empty() && existing.commit_cursor != 0
+                    && !existing.transaction_id.is_empty()
                 {
-                    return Ok(());
+                    // This is a cross-operation re-entry, not the receipt
+                    // returned by this call's append. Authenticate it once
+                    // before exposing it as an original producer capture.
+                    let receipt = store.original_transaction_receipt(&existing.transaction_id)
+                        .map_err(|error| error.to_string())?
+                        .ok_or_else(|| "original authorization transition receipt missing".to_string())?;
+                    let source = receipt.stream_revisions.first()
+                        .ok_or_else(|| "original authorization transition source missing".to_string())?;
+                    if receipt.transaction_id != existing.transaction_id || receipt.commit_cursor != existing.commit_cursor
+                        || receipt.event_ids.as_slice() != [existing.event_id.clone()]
+                        || receipt.stream_revisions.len() != 1 || source.stream_id != stream_id
+                        || source.committed_revision != existing.sequence
+                        || source.expected_revision.checked_add(1) != Some(existing.sequence) {
+                        return Err("original authorization transition receipt mismatch".into());
+                    }
+                    return Ok(existing);
                 }
                 return Err(format!(
                     "authorization transition idempotency collision: {}",
@@ -1178,7 +2013,19 @@ pub(crate) fn persist_authorization_transition(
                 }],
             };
             match store.append_transaction_locked(request) {
-                Ok(_) => return Ok(()),
+                Ok(receipt) => {
+                    let event = store.event_by_idempotency_key(stream_id, &transition.transition_id)
+                        .map_err(|error| error.to_string())?
+                        .ok_or_else(|| "committed authorization transition event unavailable".to_string())?;
+                    if event.payload != payload || event.kind != "authorization.lease_transition"
+                        || event.stream_id != stream_id || event.scope != crate::RuntimeEventScope::Tool
+                        || event.actor.as_deref() != Some(actor)
+                        || event.transaction_id != receipt.transaction_id
+                        || event.commit_cursor != receipt.commit_cursor
+                        || !receipt.event_ids.contains(&event.event_id)
+                    { return Err("authorization transition receipt/event mismatch".into()); }
+                    return Ok(event);
+                },
                 Err(crate::RuntimeEventStoreError::StaleRevision { .. }) if attempt < 2 => continue,
                 Err(crate::RuntimeEventStoreError::TransactionConflict { .. }) if attempt < 2 => {
                     continue;
@@ -1191,6 +2038,125 @@ pub(crate) fn persist_authorization_transition(
             transition.transition_id
         ))
     })
+}
+
+/// Original owner mapping used when constructing an authorization request.
+pub(crate) fn safe_alternatives_for_effect(kind: harness_contract::tool::ToolEffectKind) -> Vec<String> {
+    use harness_contract::tool::ToolEffectKind;
+    match kind {
+        ToolEffectKind::Read => Vec::new(),
+        ToolEffectKind::Write => vec!["return a patch or proposed change without applying it".to_string()],
+        ToolEffectKind::Network => vec!["use already-authorized local or cached evidence".to_string()],
+        ToolEffectKind::Process | ToolEffectKind::Package => vec!["inspect and report the required operation without executing it".to_string()],
+        ToolEffectKind::System | ToolEffectKind::Destructive | ToolEffectKind::Unknown => Vec::new(),
+    }
+}
+
+/// Current policy evaluation does not issue or consume an execution lease.
+/// A caller must authenticate the exact original request and separately bind
+/// any required approval to its owner and checked transaction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CurrentPolicyDisposition {
+    Allowed,
+    RequiresCurrentLeaseOrApproval,
+    RequiresCurrentLease,
+    SafeAlternativeUnlessCurrentLease,
+    Denied,
+    Unknown,
+}
+
+fn original_policy_route(
+    policy: &PermissionPolicy, request: &AuthorizationRequest,
+) -> Result<PermissionPolicyRoute, &'static str> {
+    if request.parent_lease_id.is_some()
+        && request.effect.required_permission.rank() > request.parent_ceiling.rank()
+    { return Err("requested effect exceeds the parent Mission permission ceiling"); }
+    Ok(policy.route_required_with_context(
+        &request.capability, &request.input, request.effect.required_permission, &request.context,
+    ))
+}
+
+fn policy_allow_requires_human(request: &AuthorizationRequest, standing_grant: bool) -> bool {
+    let effect = &request.effect.assessment;
+    requires_human_boundary(effect, risk_for_effect(effect), request.effect.approval_class)
+        && (!standing_grant || request.effect.approval_class == ToolApprovalClass::Administrator)
+}
+
+fn policy_ask_uses_safe_alternative(request: &AuthorizationRequest) -> bool {
+    let effect = &request.effect.assessment;
+    !request.safe_alternatives.is_empty()
+        && !requires_human_boundary(effect, risk_for_effect(effect), request.effect.approval_class)
+}
+
+pub(crate) fn classify_current_policy_without_lease(
+    policy: &PermissionPolicy, request: &AuthorizationRequest,
+) -> CurrentPolicyDisposition {
+    // The consumer builds this request under the original live policy lock;
+    // an old call's policy revision cannot authorize the current conclusion.
+    if request.policy_revision == 0 || request.policy_revision != policy.execution_policy_control().revision() {
+        return CurrentPolicyDisposition::Unknown;
+    }
+    // Match assess_effective: the original descriptor and exact input must be
+    // compiled by the same owner before any policy decision.
+    let effective = AuthorizationNegotiator::compile_effective_descriptor(&request.effect, &request.input);
+    let mut request = request.clone();
+    request.effect = effective.descriptor;
+    let request = &request;
+    let route = match original_policy_route(policy, request) {
+        Ok(route) => route,
+        Err(_) => return CurrentPolicyDisposition::Denied,
+    };
+    match route {
+        PermissionPolicyRoute::HardDeny { .. } => CurrentPolicyDisposition::Denied,
+        PermissionPolicyRoute::Allow { standing_grant, .. } => {
+            if policy_allow_requires_human(request, standing_grant) {
+                return CurrentPolicyDisposition::RequiresCurrentLeaseOrApproval;
+            }
+            let path = if standing_grant { AuthorizationPath::StandingGrant } else { AuthorizationPath::PolicyAutoGrant };
+            let granted = granted_ceiling(policy, path, request.effect.required_permission, policy.active_mode());
+            if granted.rank() < request.effect.required_permission.rank() {
+                // assess_compiled checks an already-existing lease before
+                // trying to issue under the current hard ceiling.
+                CurrentPolicyDisposition::RequiresCurrentLease
+            } else { CurrentPolicyDisposition::Allowed }
+        }
+        PermissionPolicyRoute::Ask { .. } => {
+            if policy_ask_uses_safe_alternative(request)
+            { CurrentPolicyDisposition::SafeAlternativeUnlessCurrentLease }
+            else { CurrentPolicyDisposition::RequiresCurrentLeaseOrApproval }
+        }
+    }
+}
+
+/// The ceiling a lease may carry for one assessed effect.
+///
+/// An auto grant is bounded by the ambient Session authority: the lease
+/// carries the Session ceiling, never the effect floor. An explicit standing
+/// grant (an operator rule that names the tool and the subject) and an
+/// explicit human approval are the authority for that effect, so their lease
+/// must carry the granted mode - otherwise the assessment claims an
+/// authorization that the consumer rejects. No authorization may cross the
+/// immutable packet ceiling.
+fn granted_ceiling(
+    policy: &PermissionPolicy,
+    path: AuthorizationPath,
+    required_mode: PermissionMode,
+    active_ceiling: PermissionMode,
+) -> PermissionMode {
+    let requested = match path {
+        AuthorizationPath::StandingGrant | AuthorizationPath::HumanApproval => {
+            if required_mode.rank() > active_ceiling.rank() {
+                required_mode
+            } else {
+                active_ceiling
+            }
+        }
+        _ => active_ceiling,
+    };
+    match policy.hard_ceiling() {
+        Some(hard) if requested.rank() > hard.rank() => hard,
+        _ => requested,
+    }
 }
 
 fn transition_ends_hot_lease(transition: &AuthorizationLeaseTransition) -> bool {
@@ -1218,6 +2184,7 @@ fn release_terminal_lease(registry: &mut LeaseRegistry, lease_id: &str) {
         .collect::<Vec<_>>();
     for key in consumed_keys {
         registry.consumed_idempotency.remove(&key);
+        registry.consumed_transitions.remove(&key);
     }
     if let Some(fingerprint) = registry.fingerprint_by_lease.remove(lease_id) {
         if registry
@@ -1382,6 +2349,23 @@ fn required_mode_for_effect(
         && assessment.reversibility == EffectReversibility::Compensatable
         && assessment.novelty == EffectNovelty::Routine
         && assessment.data_sensitivity != DataClassification::Secret;
+    // A bounded read-only compute is a process whose authority is exactly the
+    // file scopes it declares, executed inside the kernel-enforced read-only
+    // sandbox. The tool contract states that envelope; the lease must cover
+    // the declared scopes (the effect's own scopes - never a widened one), so
+    // a read-only lease that names those files can certify it. A process that
+    // is not bounded by that contract - unbounded file scope, the workspace
+    // root, a Shell scope, writes, network - keeps the conservative mode.
+    let bounded_read_only_compute = tools::tool_orchestrator::effect_is_bounded_read_only_compute(
+        descriptor,
+    ) && assessment.externality == EffectExternality::Workspace
+        && !matches!(assessment.reversibility, EffectReversibility::Irreversible)
+        && matches!(assessment.novelty, EffectNovelty::Routine)
+        && matches!(
+            assessment.blast_radius,
+            EffectBlastRadius::Item | EffectBlastRadius::Workspace
+        )
+        && !matches!(assessment.data_sensitivity, DataClassification::Secret);
     let assessed_mode =
         if matches!(
             assessment.externality,
@@ -1390,6 +2374,8 @@ fn required_mode_for_effect(
             || matches!(assessment.data_sensitivity, DataClassification::Secret)
         {
             PermissionMode::DangerFullAccess
+        } else if bounded_read_only_compute {
+            PermissionMode::ReadOnly
         } else if (assessment.externality == EffectExternality::Workspace && !file_observation)
             || (!internal_control
                 && matches!(
@@ -1416,7 +2402,7 @@ fn required_mode_for_effect(
     }
 }
 
-fn risk_for_effect(assessment: &EffectAssessment) -> RiskLevel {
+pub(crate) fn risk_for_effect(assessment: &EffectAssessment) -> RiskLevel {
     if assessment.blast_radius >= EffectBlastRadius::System
         || assessment.reversibility == EffectReversibility::Irreversible
     {
@@ -1471,7 +2457,24 @@ fn lease_scopes_cover(lease: &AuthorizationLease, requested: &[PermissionScope])
     requested.iter().all(|scope| lease.scopes.contains(scope))
 }
 
-fn execution_snapshot(lease: &AuthorizationLease, idempotency_key: &str) -> AuthorizationLease {
+/// Check immutable signed lease identity for an already authenticated
+/// same-call execution lease and its original consumption event.  The caller
+/// must authenticate the complete execution lease from the original producer;
+/// the transition alone cannot reconstruct its mutable execution fields.
+pub(crate) fn consumed_transition_matches_original_execution(
+    transition: &AuthorizationLeaseTransition,
+    authorization: &harness_contract::tool::ToolExecutionAuthorization,
+) -> bool {
+    let lease = &authorization.authorization_lease;
+    transition.kind == AuthorizationLeaseTransitionKind::Consumed
+        && transition.idempotency_key.as_deref() == Some(authorization.request_id.as_str())
+        && lease.idempotency_key == authorization.request_id
+        && AuthorizationNegotiator::verify_lease_signature(lease)
+        && AuthorizationNegotiator::verify_lease_signature(&transition.lease)
+        && authorization_lease_signed_payload(&transition.lease) == authorization_lease_signed_payload(lease)
+}
+
+pub(crate) fn execution_snapshot(lease: &AuthorizationLease, idempotency_key: &str) -> AuthorizationLease {
     let mut snapshot = lease.clone();
     snapshot.idempotency_key = idempotency_key.to_string();
     snapshot.remaining_uses = 1;
@@ -1606,6 +2609,115 @@ mod tests {
     use harness_contract::tool::{ToolApprovalClass, ToolIdempotency, ToolPermissionMode};
 
     use super::*;
+
+    /// The bounded read-only compute contract, stated as an effect: a process
+    /// whose only file content is the declared file scope, no network, no
+    /// writes, no system mutation.
+    fn bounded_compute_descriptor(
+        target: Option<&str>,
+        sensitivity: harness_contract::policy::DataClassification,
+    ) -> harness_contract::tool::ToolEffectDescriptor {
+        harness_contract::tool::ToolEffectDescriptor {
+            tool_id: "execute_code".to_string(),
+            descriptor_hash: "sha256:bounded-compute".to_string(),
+            effect_kind: harness_contract::tool::ToolEffectKind::Process,
+            idempotency: ToolIdempotency::Unknown,
+            scopes: target
+                .map(|target| {
+                    vec![harness_contract::policy::PermissionScope {
+                        resource: PermissionResource::File,
+                        operation: PermissionOperation::Read,
+                        target: Some(target.to_string()),
+                    }]
+                })
+                .unwrap_or_default(),
+            required_permission: ToolPermissionMode::ReadOnly,
+            approval_class: ToolApprovalClass::Policy,
+            uses_network: false,
+            spawns_process: true,
+            mutates_packages: false,
+            mutates_system: false,
+            assessment: EffectAssessment {
+                externality: EffectExternality::Workspace,
+                reversibility: EffectReversibility::Reversible,
+                novelty: EffectNovelty::Routine,
+                blast_radius: EffectBlastRadius::Item,
+                data_sensitivity: sensitivity,
+                ..EffectAssessment::default()
+            },
+        }
+    }
+
+    #[test]
+    fn a_bounded_read_only_compute_is_admissible_under_a_read_only_ceiling() {
+        let descriptor = bounded_compute_descriptor(
+            Some("crates/tools/src/lib.rs"),
+            harness_contract::policy::DataClassification::Internal,
+        );
+        assert_eq!(
+            required_mode_for_effect(&descriptor, &descriptor.assessment),
+            PermissionMode::ReadOnly
+        );
+    }
+
+    #[test]
+    fn an_empty_file_set_compute_stays_admissible() {
+        let descriptor = bounded_compute_descriptor(
+            None,
+            harness_contract::policy::DataClassification::Internal,
+        );
+        assert_eq!(
+            required_mode_for_effect(&descriptor, &descriptor.assessment),
+            PermissionMode::ReadOnly
+        );
+    }
+
+    #[test]
+    fn a_secret_compute_is_refused_even_when_its_shape_is_bounded() {
+        let descriptor = bounded_compute_descriptor(
+            Some(".env"),
+            harness_contract::policy::DataClassification::Secret,
+        );
+        assert_eq!(
+            required_mode_for_effect(&descriptor, &descriptor.assessment),
+            PermissionMode::DangerFullAccess
+        );
+    }
+
+    #[test]
+    fn an_unbounded_compute_is_not_admissible_under_a_read_only_ceiling() {
+        let mut descriptor = bounded_compute_descriptor(
+            Some("."),
+            harness_contract::policy::DataClassification::Internal,
+        );
+        descriptor.scopes[0].target = Some(".".to_string());
+        assert_ne!(
+            required_mode_for_effect(&descriptor, &descriptor.assessment),
+            PermissionMode::ReadOnly
+        );
+        let mut networked = bounded_compute_descriptor(
+            Some("crates/tools/src/lib.rs"),
+            harness_contract::policy::DataClassification::Internal,
+        );
+        networked.uses_network = true;
+        assert_ne!(
+            required_mode_for_effect(&networked, &networked.assessment),
+            PermissionMode::ReadOnly
+        );
+        let mut shell = bounded_compute_descriptor(
+            Some("crates/tools/src/lib.rs"),
+            harness_contract::policy::DataClassification::Internal,
+        );
+        shell.scopes.push(harness_contract::policy::PermissionScope {
+            resource: PermissionResource::Shell,
+            operation: PermissionOperation::Execute,
+            target: None,
+        });
+        assert_ne!(
+            required_mode_for_effect(&shell, &shell.assessment),
+            PermissionMode::ReadOnly
+        );
+    }
 
     fn persist_transitions(
         store: &crate::RuntimeEventStore,
@@ -2690,6 +3802,8 @@ mod tests {
             ToolPermissionMode::WorkspaceWrite,
             EffectExternality::Workspace,
         ));
+        assert_eq!(classify_current_policy_without_lease(&policy, &request), CurrentPolicyDisposition::Allowed);
+        assert!(negotiator.transitions_awaiting_persistence().is_empty(), "current policy check must not issue or consume a lease");
         let first = negotiator.assess(&policy, &request);
         let second = negotiator.assess(&policy, &request);
         assert_eq!(first.path, AuthorizationPath::StandingGrant);
@@ -2749,10 +3863,11 @@ mod tests {
         );
         descriptor.approval_class = ToolApprovalClass::User;
         descriptor.assessment.blast_radius = EffectBlastRadius::ExternalAccount;
-        let assessment = AuthorizationNegotiator::new().assess(
-            &PermissionPolicy::new(PermissionMode::DangerFullAccess),
-            &request(descriptor),
-        );
+        let policy = PermissionPolicy::new(PermissionMode::DangerFullAccess);
+        let request = request(descriptor);
+        assert_eq!(classify_current_policy_without_lease(&policy, &request),
+            CurrentPolicyDisposition::RequiresCurrentLeaseOrApproval);
+        let assessment = AuthorizationNegotiator::new().assess(&policy, &request);
         assert_eq!(assessment.path, AuthorizationPath::HumanApproval);
         assert_eq!(
             assessment.gap.as_ref().map(|gap| gap.kind),
@@ -2773,6 +3888,7 @@ mod tests {
             PermissionMode::WorkspaceWrite,
             EffectExternality::Workspace,
         ));
+        assert_eq!(classify_current_policy_without_lease(&policy, &request), CurrentPolicyDisposition::Denied);
         let assessment = AuthorizationNegotiator::new().assess(&policy, &request);
         assert_eq!(assessment.path, AuthorizationPath::HardDeny);
         assert!(assessment.lease.is_none());
@@ -3023,11 +4139,82 @@ mod tests {
             AuthorizationLeaseTransitionKind::Consumed
         );
 
+        let store = crate::RuntimeEventStore::for_test();
+        let source = format!("authorization-lease:{}", lease.lease_id);
+        for transition in &transitions {
+            persist_authorization_transition(&store, &source, "runtime.process_jsonl", transition).unwrap();
+        }
+        let receipt = store.append(crate::RuntimeEventInput {
+            stream_id: "test:proof-acquisition".into(), scope: crate::RuntimeEventScope::ExecutionNode,
+            kind: "test.acquisition".into(), status: None, actor: None, refs: vec![], payload: serde_json::json!({}),
+        }).unwrap();
+        let grant = harness_contract::tool::ToolExecutionAuthorization {
+            request_id: lease.idempotency_key.clone(), tool_id: lease.capability.clone(),
+            descriptor_hash: lease.effect_descriptor_hash.clone(), policy_revision: lease.policy_revision,
+            scope: lease.scopes[0].clone(), authorization_lease: lease.clone(), timeout_lease: "test".into(), idempotency_key: None,
+        };
+        let before = capture_proof_lease_control(&store, &grant, &lease.principal_id, receipt.commit_cursor).unwrap();
+        assert_eq!(before.source().expected_revision, 2);
+        assert!(before.explicit_revocation().is_none());
+        let original_request = request({
+            let mut descriptor = effect(PermissionMode::ReadOnly, EffectExternality::Internal);
+            descriptor.assessment.blast_radius = EffectBlastRadius::Item;
+            descriptor
+        });
+        let (current_source, eligible, deadline) = capture_current_same_call_lease(
+            &store, &grant, receipt.commit_cursor, &original_request,
+        ).unwrap();
+        assert_eq!(current_source, *before.source());
+        assert!(eligible);
+        assert_eq!(deadline, lease.expires_at_ms.checked_add(1));
+        let mut foreign_call = original_request.clone();
+        foreign_call.idempotency_key.push_str(":other");
+        assert!(capture_current_same_call_lease(&store, &grant, receipt.commit_cursor, &foreign_call).is_err());
+        let mut later_policy = original_request.clone();
+        later_policy.policy_revision += 1;
+        assert!(!capture_current_same_call_lease(&store, &grant, receipt.commit_cursor, &later_policy).unwrap().1);
+        assert!(capture_proof_lease_control(&store, &grant, "foreign-principal", receipt.commit_cursor).is_err());
+
         assert!(negotiator.revoke(&lease.lease_id));
-        assert_eq!(
-            negotiator.drain_transitions()[0].kind,
-            AuthorizationLeaseTransitionKind::Revoked
-        );
+        let revoked = negotiator.drain_transitions();
+        assert_eq!(revoked[0].kind, AuthorizationLeaseTransitionKind::Revoked);
+        persist_authorization_transition(&store, &source, "runtime.process_jsonl", &revoked[0]).unwrap();
+        let after = capture_proof_lease_control(&store, &grant, &lease.principal_id, receipt.commit_cursor).unwrap();
+        assert_eq!(after.source().expected_revision, 3);
+        assert!(after.explicit_revocation().is_some());
+        assert!(capture_current_same_call_lease(&store, &grant, receipt.commit_cursor, &original_request).is_err());
+        let mut invalid = revoked[0].clone();
+        invalid.transition_id.push_str(":invalid-consumption");
+        invalid.kind = AuthorizationLeaseTransitionKind::Consumed;
+        invalid.idempotency_key = Some("different-call".into());
+        invalid.lease.status = AuthorizationLeaseStatus::Active;
+        invalid.lease.remaining_uses = 1;
+        persist_authorization_transition(&store, &source, "runtime.process_jsonl", &invalid).unwrap();
+        assert!(capture_proof_lease_control(&store, &grant, &lease.principal_id, receipt.commit_cursor).is_err());
+
+        // A long-running call may return after its valid consumed lease expires.
+        let long_call_owner = AuthorizationNegotiator::new();
+        let long_call = long_call_owner.assess(&PermissionPolicy::new(PermissionMode::ReadOnly), &original_request);
+        let long_lease = long_call.lease.unwrap();
+        let mut long_events = long_call_owner.drain_transitions();
+        long_call_owner.reconcile_expirations_at(long_lease.expires_at_ms.saturating_add(1));
+        long_events.extend(long_call_owner.drain_transitions());
+        let long_store = crate::RuntimeEventStore::for_test();
+        let long_stream = format!("authorization-lease:{}", long_lease.lease_id);
+        for transition in &long_events {
+            persist_authorization_transition(&long_store, &long_stream, "runtime.process_jsonl", transition).unwrap();
+        }
+        let long_receipt = long_store.append(crate::RuntimeEventInput {
+            stream_id: "test:long-call-result".into(), scope: crate::RuntimeEventScope::ExecutionNode,
+            kind: "test.result".into(), status: None, actor: None, refs: vec![], payload: serde_json::json!({}),
+        }).unwrap();
+        let long_grant = harness_contract::tool::ToolExecutionAuthorization {
+            request_id: long_lease.idempotency_key.clone(), tool_id: long_lease.capability.clone(),
+            descriptor_hash: long_lease.effect_descriptor_hash.clone(), policy_revision: long_lease.policy_revision,
+            scope: long_lease.scopes[0].clone(), authorization_lease: long_lease.clone(), timeout_lease: "test".into(), idempotency_key: None,
+        };
+        assert!(capture_proof_lease_control(&long_store, &long_grant, &long_lease.principal_id, long_receipt.commit_cursor).is_ok());
+        assert!(!capture_current_same_call_lease(&long_store, &long_grant, long_receipt.commit_cursor, &original_request).unwrap().1);
     }
 
     #[test]
@@ -3096,6 +4283,25 @@ mod tests {
             .expect("durable consumed transition");
         assert_eq!(consumed.lease.lease_id, lease.lease_id);
         assert_eq!(consumed.lease.status, AuthorizationLeaseStatus::Exhausted);
+        let stream = format!("authorization-lease:{}", lease.lease_id);
+        for transition in &transitions {
+            persist_authorization_transition(&store, &stream, "runtime.process_jsonl", transition).unwrap();
+        }
+        let receipt = store.append(crate::RuntimeEventInput {
+            stream_id: "test:one-shot-original-call".into(), scope: crate::RuntimeEventScope::ExecutionNode,
+            kind: "test.original-call".into(), status: None, actor: None, refs: vec![], payload: serde_json::json!({}),
+        }).unwrap();
+        let grant = harness_contract::tool::ToolExecutionAuthorization {
+            request_id: lease.idempotency_key.clone(), tool_id: lease.capability.clone(),
+            descriptor_hash: lease.effect_descriptor_hash.clone(), policy_revision: lease.policy_revision,
+            scope: lease.scopes[0].clone(), authorization_lease: lease.clone(), timeout_lease: "test".into(), idempotency_key: None,
+        };
+        let original_request = request(effect(PermissionMode::WorkspaceWrite, EffectExternality::Workspace));
+        assert!(!capture_current_same_call_lease(&store, &grant, receipt.commit_cursor, &original_request).unwrap().1,
+            "an exhausted original call cannot authorize a new conclusion");
+        let mut other_request = original_request.clone();
+        other_request.idempotency_key.push_str(":different");
+        assert!(capture_current_same_call_lease(&store, &grant, receipt.commit_cursor, &other_request).is_err());
     }
 
     #[test]
@@ -3357,6 +4563,337 @@ pub(crate) fn validate_historical_authorization_issuer(
         return Err("historical authorization issuer provenance or immutable grant mismatch".into());
     }
     Ok(())
+}
+
+/// A current journal cut for one original, already authenticated proof grant.
+/// This is an observation of the lease owner, not a new authorization grant.
+#[derive(Debug, Clone)]
+pub(crate) struct ProofLeaseControl {
+    source: crate::ExpectedStreamRevision,
+    explicit_revocation: Option<crate::DurableRuntimeEvent>,
+    current_lease: AuthorizationLease,
+}
+
+impl ProofLeaseControl {
+    pub(crate) fn source(&self) -> &crate::ExpectedStreamRevision { &self.source }
+    pub(crate) fn explicit_revocation(&self) -> Option<&crate::DurableRuntimeEvent> {
+        self.explicit_revocation.as_ref()
+    }
+}
+
+/// Authenticate a new-chain member lease from the proof owner's private
+/// same-call evidence. Historical authority is not a new-write grant.
+pub(crate) fn capture_member_proof_lease_control(
+    store: &Arc<crate::RuntimeEventStore>,
+    facts: &crate::agentic::review_evidence::AuthenticatedMemberLeaseEvidence,
+) -> Result<ProofLeaseControl, String> {
+    if !facts.belongs_to(store) { return Err("member lease proof store differs".into()); }
+    let grant = facts.authorization(); let lease = &grant.authorization_lease;
+    let action = facts.action(); let index = facts.index(); let receipt = facts.transaction();
+    let issuer = facts.issuer(); let consume = facts.consume(); let assessment = facts.assessment();
+    if lease.lease_id.is_empty() || lease.principal_id != facts.principal_id()
+        || lease.policy_revision == 0 || grant.policy_revision != lease.policy_revision
+        || grant.descriptor_hash != lease.effect_descriptor_hash || grant.tool_id != lease.capability
+        || grant.request_id.is_empty() || !AuthorizationNegotiator::verify_lease_signature(lease)
+        || receipt.transaction_id != action.transaction_id || receipt.commit_cursor == 0
+        || action.commit_cursor != receipt.commit_cursor || index.commit_cursor != receipt.commit_cursor
+        || consume.commit_cursor != receipt.commit_cursor || assessment.commit_cursor != receipt.commit_cursor
+        || index.transaction_id != receipt.transaction_id || consume.transaction_id != receipt.transaction_id
+        || assessment.transaction_id != receipt.transaction_id
+        || receipt.event_ids.get(action.transaction_index as usize) != Some(&action.event_id)
+        || receipt.event_ids.get(index.transaction_index as usize) != Some(&index.event_id)
+        || receipt.event_ids.get(consume.transaction_index as usize) != Some(&consume.event_id)
+        || receipt.event_ids.get(assessment.transaction_index as usize) != Some(&assessment.event_id)
+        || consume.transaction_index >= assessment.transaction_index
+        || facts.effect_receipt().commit_cursor <= receipt.commit_cursor {
+        return Err("member lease original transaction or later effect differs".into());
+    }
+    let refs = index.payload["authority_events"].as_array().ok_or("member lease index coordinates missing")?;
+    let coordinate_matches = |event: &crate::DurableRuntimeEvent| refs.iter().filter(|entry| {
+        entry["stream_id"].as_str() == Some(event.stream_id.as_str())
+            && entry["kind"].as_str() == Some(event.kind.as_str())
+            && entry["idempotency_key"].as_str() == event.idempotency_key.as_deref()
+            && entry["transaction_index"].as_u64() == Some(u64::from(event.transaction_index))
+    }).count() == 1;
+    if !coordinate_matches(consume) || !coordinate_matches(assessment)
+        || (issuer.transaction_id == receipt.transaction_id
+            && (!coordinate_matches(issuer) || issuer.commit_cursor != receipt.commit_cursor
+                || issuer.transaction_index >= consume.transaction_index
+                || receipt.event_ids.get(issuer.transaction_index as usize) != Some(&issuer.event_id)))
+        || (issuer.transaction_id != receipt.transaction_id && issuer.commit_cursor >= receipt.commit_cursor) {
+        return Err("member lease issuer or index provenance differs".into());
+    }
+    let stream = format!("authorization-lease:{}", lease.lease_id);
+    let head = store.stream_revision(&stream).map_err(|e| e.to_string())?;
+    if head == 0 { return Err("member lease source is missing".into()); }
+    let mut after = 0u64; let mut previous_cursor = 0u64; let mut previous_index = 0u32;
+    let mut previous_transaction = String::new(); let mut previous_uses: Option<u32> = None;
+    let mut consumption_closed = false; let mut previous_status: Option<AuthorizationLeaseStatus> = None;
+    let mut found_issuer = false; let mut found_consume = false;
+    let mut current = None; let mut revocation = None; let signed = authorization_lease_signed_payload(lease);
+    let mut owner_actor: Option<String> = None;
+    while after < head {
+        let page = store.list_stream_after(&stream, after, head, 64, 4 * 1024 * 1024)?;
+        if page.is_empty() { return Err("member lease history incomplete".into()); }
+        for event in page {
+            if event.stream_id != stream || event.sequence != after + 1 || event.sequence > head
+                || event.commit_cursor == 0 || event.commit_cursor < previous_cursor
+                || (event.commit_cursor == previous_cursor && (event.transaction_id != previous_transaction
+                    || event.transaction_index <= previous_index))
+                || event.scope != crate::RuntimeEventScope::Tool || event.schema_version != 1
+                || event.kind != "authorization.lease_transition" {
+                return Err("member lease transition envelope differs".into());
+            }
+            after = event.sequence; previous_cursor = event.commit_cursor; previous_index = event.transaction_index;
+            previous_transaction = event.transaction_id.clone();
+            let transition: AuthorizationLeaseTransition = serde_json::from_value(event.payload.clone()).map_err(|e| e.to_string())?;
+            let actor = event.actor.as_deref().ok_or("member lease actor missing")?;
+            if !matches!(actor, "conversation_runtime" | "conversation_runtime.early_tool" | "runtime.process_jsonl")
+                || owner_actor.as_deref().is_some_and(|old| old != actor)
+                || event.idempotency_key.as_deref() != Some(transition.transition_id.as_str())
+                || event.refs != vec![crate::RuntimeEventRef { kind: "authorization_lease".into(), id: lease.lease_id.clone() }]
+                || transition.lease.signature != lease.signature
+                || authorization_lease_signed_payload(&transition.lease) != signed {
+                return Err("member lease signed authority differs".into());
+            }
+            owner_actor.get_or_insert_with(|| actor.to_string());
+            let in_member = event.transaction_id == receipt.transaction_id;
+            if in_member {
+                if receipt.event_ids.get(event.transaction_index as usize) != Some(&event.event_id)
+                    || !coordinate_matches(&event)
+                    || !receipt.stream_revisions.iter().any(|source| source.stream_id == stream
+                        && source.expected_revision < event.sequence && source.committed_revision >= event.sequence)
+                    || (event.event_id != issuer.event_id && event.event_id != consume.event_id) {
+                    return Err("member lease event is not the original checked event".into());
+                }
+            } else {
+                // Other member transactions require their own original owner
+                // witness; a receipt or event kind alone is not sufficient.
+                if event.transaction_id == format!("authorization-transition:{}", transition.transition_id) {
+                let original = store.original_transaction_receipt(&event.transaction_id).map_err(|e| e.to_string())?
+                    .ok_or("lease transition original receipt missing")?;
+                if event.transaction_index != 0 || original.transaction_id != event.transaction_id
+                    || original.commit_cursor != event.commit_cursor || original.event_ids.as_slice() != [event.event_id.clone()]
+                    || original.stream_revisions.len() != 1
+                    || original.stream_revisions[0].stream_id != stream
+                    || original.stream_revisions[0].expected_revision.checked_add(1) != Some(event.sequence)
+                    || original.stream_revisions[0].committed_revision != event.sequence {
+                    return Err("original lease transition receipt differs".into());
+                }
+                } else {
+                    // The proof owner authenticates the other member's action,
+                    // index and exact checked receipt; a lease payload alone
+                    // never establishes that transaction's authority.
+                    crate::agentic::review_evidence::authenticate_original_member_lease_transition(store, &event)?;
+                }
+            }
+            if event.sequence == 1 {
+                if event.event_id != issuer.event_id || transition.kind != AuthorizationLeaseTransitionKind::Issued
+                    || event.status.as_deref() != Some("issued") || transition.lease.status != AuthorizationLeaseStatus::Active
+                    || transition.lease.remaining_uses == 0 || transition.lease.remaining_uses != transition.lease.max_uses {
+                    return Err("member lease original issuer differs".into());
+                }
+                previous_uses = Some(transition.lease.remaining_uses); found_issuer = true;
+            } else {
+                match transition.kind {
+                    AuthorizationLeaseTransitionKind::Issued => return Err("member lease issuer ambiguous".into()),
+                    AuthorizationLeaseTransitionKind::Consumed => {
+                        if event.status.as_deref() != Some("consumed") || consumption_closed
+                            || previous_uses.and_then(|uses| uses.checked_sub(1)) != Some(transition.lease.remaining_uses)
+                            || !matches!((transition.lease.status, transition.lease.remaining_uses),
+                                (AuthorizationLeaseStatus::Active, 1..) | (AuthorizationLeaseStatus::Exhausted, 0)) {
+                            return Err("member lease consume transition differs".into());
+                        }
+                        previous_uses = Some(transition.lease.remaining_uses);
+                        consumption_closed = transition.lease.remaining_uses == 0;
+                        if event.event_id == consume.event_id {
+                            if found_consume || transition.idempotency_key.as_deref() != Some(grant.request_id.as_str())
+                                || (issuer.transaction_id != receipt.transaction_id
+                                    && execution_snapshot(&transition.lease, &grant.request_id) != *lease)
+                                || (issuer.transaction_id == receipt.transaction_id
+                                    && serde_json::from_value::<AuthorizationLeaseTransition>(issuer.payload.clone())
+                                        .map_err(|e| e.to_string())?.lease != *lease) {
+                                return Err("member lease original consumption differs".into());
+                            }
+                            found_consume = true;
+                        } else if transition.idempotency_key.as_deref() == Some(grant.request_id.as_str()) {
+                            return Err("member lease original consumption ambiguous".into());
+                        }
+                    }
+                    AuthorizationLeaseTransitionKind::Expired | AuthorizationLeaseTransitionKind::Revoked => {
+                        let revoked = transition.kind == AuthorizationLeaseTransitionKind::Revoked;
+                        let expected = if revoked { AuthorizationLeaseStatus::Revoked } else { AuthorizationLeaseStatus::Expired };
+                        let original_transition_allowed = if revoked {
+                            previous_status.is_some_and(|status| status != AuthorizationLeaseStatus::Revoked)
+                        } else { previous_status == Some(AuthorizationLeaseStatus::Active) };
+                        if !original_transition_allowed || transition.lease.status != expected || previous_uses != Some(transition.lease.remaining_uses)
+                            || event.status.as_deref() != Some(if revoked { "revoked" } else { "expired" }) {
+                            return Err("member lease terminal transition differs".into());
+                        }
+                        consumption_closed = true;
+                        if revoked && revocation.replace(event.clone()).is_some() { return Err("member lease revocation ambiguous".into()); }
+                    }
+                }
+            }
+            previous_status = Some(transition.lease.status);
+            current = Some(transition.lease);
+        }
+    }
+    if !found_issuer || !found_consume || store.stream_revision(&stream).map_err(|e| e.to_string())? != head {
+        return Err("member lease source incomplete or changed".into());
+    }
+    Ok(ProofLeaseControl { source: crate::ExpectedStreamRevision { stream_id: stream, expected_revision: head },
+        explicit_revocation: revocation, current_lease: current.ok_or("member lease state missing")? })
+}
+
+/// Read the exact lease belonging to an independently authenticated original
+/// Step/request. The caller decides whether a later explicit revocation affects
+/// this proof; exhaustion or expiry after the original acquisition is not a
+/// retroactive denial. The returned cut must be fenced by the original commit.
+pub(crate) fn capture_proof_lease_control(
+    store: &crate::RuntimeEventStore,
+    grant: &harness_contract::tool::ToolExecutionAuthorization,
+    principal_id: &str,
+    receipt_cursor: u64,
+) -> Result<ProofLeaseControl, String> {
+    let lease = &grant.authorization_lease;
+    if receipt_cursor == 0 || principal_id.is_empty() || lease.principal_id != principal_id
+        || lease.lease_id.is_empty() || lease.policy_revision == 0
+        || grant.policy_revision != lease.policy_revision
+        || grant.descriptor_hash != lease.effect_descriptor_hash
+        || grant.tool_id != lease.capability || grant.request_id.is_empty()
+        || !AuthorizationNegotiator::verify_lease_signature(lease)
+    { return Err("proof lease original authority does not match its authenticated request".into()); }
+    let stream = format!("authorization-lease:{}", lease.lease_id);
+    let head = store.stream_revision(&stream).map_err(|error| error.to_string())?;
+    if head == 0 { return Err("proof lease owner has no durable issuer".into()); }
+    let mut after = 0;
+    let mut previous_cursor = 0;
+    let mut issuer = None;
+    let mut matching_consumptions = 0usize;
+    let mut explicit_revocation = None;
+    let mut previous_uses = None;
+    let mut no_more_consumption = false;
+    let mut current_lease = None;
+    let signed = authorization_lease_signed_payload(lease);
+    while after < head {
+        let page = store.list_stream_after(&stream, after, head, 64, 4 * 1024 * 1024)?;
+        if page.is_empty() { return Err("proof lease transition history incomplete".into()); }
+        for event in page {
+            if event.stream_id != stream || event.sequence != after + 1 || event.sequence > head
+                || event.commit_cursor == 0 || event.commit_cursor <= previous_cursor
+                || event.scope != crate::RuntimeEventScope::Tool || event.schema_version != 1
+                || event.kind != "authorization.lease_transition" || event.transaction_index != 0
+            { return Err("proof lease transition envelope invalid".into()); }
+            after = event.sequence;
+            previous_cursor = event.commit_cursor;
+            let transition: AuthorizationLeaseTransition = serde_json::from_value(event.payload.clone())
+                .map_err(|error| format!("proof lease transition malformed: {error}"))?;
+            if event.actor.as_deref().is_none_or(|actor| !matches!(actor, "conversation_runtime" | "conversation_runtime.early_tool" | "runtime.process_jsonl"))
+                || event.idempotency_key.as_deref() != Some(transition.transition_id.as_str())
+                || event.transaction_id != format!("authorization-transition:{}", transition.transition_id)
+                || event.refs != vec![crate::RuntimeEventRef { kind: "authorization_lease".into(), id: lease.lease_id.clone() }]
+                || transition.lease.signature != lease.signature
+                || authorization_lease_signed_payload(&transition.lease) != signed
+            { return Err("proof lease transition authority mismatch".into()); }
+            current_lease = Some(transition.lease.clone());
+            if event.sequence == 1 {
+                validate_historical_authorization_issuer(&event, grant, receipt_cursor)?;
+                if transition.lease.status != AuthorizationLeaseStatus::Active
+                    || transition.lease.remaining_uses == 0
+                    || transition.lease.remaining_uses != transition.lease.max_uses
+                { return Err("proof lease issuer has invalid original uses".into()); }
+                previous_uses = Some(transition.lease.remaining_uses);
+                issuer = Some(event.actor.clone());
+                continue;
+            }
+            if issuer.as_ref() != Some(&event.actor) { return Err("proof lease transition owner changed".into()); }
+            match transition.kind {
+                AuthorizationLeaseTransitionKind::Issued => return Err("proof lease issuer is ambiguous".into()),
+                AuthorizationLeaseTransitionKind::Consumed => {
+                    if event.status.as_deref() != Some("consumed")
+                        || no_more_consumption
+                        || previous_uses.and_then(|uses: u32| uses.checked_sub(1)) != Some(transition.lease.remaining_uses)
+                        || transition.lease.remaining_uses > transition.lease.max_uses
+                        || !matches!((transition.lease.status, transition.lease.remaining_uses),
+                            (AuthorizationLeaseStatus::Active, 1..) | (AuthorizationLeaseStatus::Exhausted, 0))
+                    { return Err("proof lease consumption status invalid".into()); }
+                    previous_uses = Some(transition.lease.remaining_uses);
+                    no_more_consumption = transition.lease.remaining_uses == 0;
+                    if transition.idempotency_key.as_deref() == Some(grant.request_id.as_str()) {
+                        if event.commit_cursor >= receipt_cursor { return Err("proof lease consumed after acquisition".into()); }
+                        matching_consumptions += 1;
+                    }
+                }
+                AuthorizationLeaseTransitionKind::Expired | AuthorizationLeaseTransitionKind::Revoked => {
+                    let expected = if transition.kind == AuthorizationLeaseTransitionKind::Expired { "expired" } else { "revoked" };
+                    let expected_status = if transition.kind == AuthorizationLeaseTransitionKind::Expired {
+                        AuthorizationLeaseStatus::Expired
+                    } else { AuthorizationLeaseStatus::Revoked };
+                    if event.status.as_deref() != Some(expected) || transition.lease.status != expected_status {
+                        return Err("proof lease terminal status invalid".into());
+                    }
+                    if previous_uses != Some(transition.lease.remaining_uses) {
+                        return Err("proof lease terminal transition changed remaining uses".into());
+                    }
+                    no_more_consumption = true;
+                    // A one-shot call can finish after its lease naturally
+                    // expires. The authenticated consume, not the receipt
+                    // time, establishes the original acquisition authority.
+                    // An explicit revocation remains a separate current fact.
+                    if transition.kind == AuthorizationLeaseTransitionKind::Revoked {
+                        if explicit_revocation.replace(event).is_some() { return Err("proof lease revocation is ambiguous".into()); }
+                    }
+                }
+            }
+        }
+    }
+    if matching_consumptions != 1 { return Err("proof lease original consumption is missing or ambiguous".into()); }
+    if store.stream_revision(&stream).map_err(|error| error.to_string())? != head {
+        return Err("proof lease changed while capturing current control".into());
+    }
+    Ok(ProofLeaseControl {
+        source: crate::ExpectedStreamRevision { stream_id: stream, expected_revision: head },
+        explicit_revocation,
+        current_lease: current_lease.ok_or("proof lease current owner state missing")?,
+    })
+}
+
+/// Current reuse of the exact call's lease, without consuming or issuing it.
+/// The caller must authenticate the call and include this source in its CAS.
+pub(crate) fn capture_current_same_call_lease(
+    store: &crate::RuntimeEventStore,
+    grant: &harness_contract::tool::ToolExecutionAuthorization,
+    receipt_cursor: u64,
+    request: &AuthorizationRequest,
+) -> Result<(crate::ExpectedStreamRevision, bool, Option<u64>), String> {
+    if request.policy_revision == 0 || grant.request_id != request.idempotency_key {
+        return Err("current lease is not bound to the authenticated call".into());
+    }
+    let control = capture_proof_lease_control(store, grant, &request.principal_id, receipt_cursor)?;
+    let compiled = AuthorizationNegotiator::compile_effective_descriptor(&request.effect, &request.input);
+    let lease = &control.current_lease;
+    if lease.principal_id != request.principal_id
+        || lease.parent_lease_id != request.parent_lease_id
+        || lease.effect_descriptor_hash != compiled.descriptor.descriptor_hash
+        || !lease.permits(&request.capability, compiled.descriptor.required_permission)
+        || !lease_scopes_cover(lease, &compiled.descriptor.scopes)
+        || !AuthorizationNegotiator::verify_lease_signature(lease)
+    { return Err("same-call lease identity or original authority mismatch".into()); }
+    if control.explicit_revocation.is_some() {
+        return Err("same-call lease was explicitly revoked".into());
+    }
+    // This result may be used only for a separately authenticated current
+    // write. An exhausted historical call can still be read as committed
+    // evidence, but it cannot authorize a new conclusion.
+    let eligible = lease.is_active_at(now_ms()) && lease.policy_revision == request.policy_revision;
+    // Lease is valid through expires_at_ms inclusive; represent the
+    // equivalent exclusive deadline without overflowing u64::MAX.
+    Ok((control.source, eligible, lease.expires_at_ms.checked_add(1)))
+}
+
+pub(crate) fn current_authority_deadline_valid(exclusive_deadline_ms: Option<u64>) -> bool {
+    exclusive_deadline_ms.is_none_or(|deadline| now_ms() < deadline)
 }
 
 #[cfg(feature = "test-fixtures")]

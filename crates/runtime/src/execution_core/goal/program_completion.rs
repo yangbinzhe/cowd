@@ -1,6 +1,6 @@
 //! Prepare, but never independently commit, the Goal half of Program closure.
 use super::*;
-use crate::AgenticProgramProjection;
+use crate::{AgenticProgramProjection, ExpectedStreamRevision};
 
 pub(crate) struct PreparedProgramConclusion {
     pub goal: GoalContract,
@@ -8,6 +8,178 @@ pub(crate) struct PreparedProgramConclusion {
     pub event: RuntimeTransactionEventInput,
     pub gaps: Vec<String>,
     pub source_frame: AssessmentSourceFrame,
+    verified_proofs: Vec<std::sync::Arc<PreparedVerifiedProof>>,
+    proof_seal: Option<PreparedProofSeal>,
+    pub runtime_trigger: Option<RuntimeObservation>,
+    pub rejection_trigger: Option<String>,
+}
+
+/// One successful coverage check and its authenticated facts, scoped to this
+/// preparation. Neither the snapshot nor the frame can be replaced by a
+/// caller after the owner constructs this value.
+pub(crate) struct PreparedVerifiedProof {
+    condition: String,
+    snapshot: crate::agentic::review_evidence::ProofInputSnapshot,
+    proof: crate::agentic::review_evidence::VerifiedConclusionProof,
+}
+
+impl PreparedVerifiedProof {
+    pub(crate) fn condition(&self) -> &str { &self.condition }
+    pub(crate) fn snapshot(&self) -> &crate::agentic::review_evidence::ProofInputSnapshot { &self.snapshot }
+    pub(crate) fn proof(&self) -> &crate::agentic::review_evidence::VerifiedConclusionProof { &self.proof }
+}
+
+struct PreparedProofSeal {
+    store: std::sync::Arc<crate::RuntimeEventStore>,
+    program: AgenticProgramProjection,
+    goal: GoalContract,
+    event: RuntimeTransactionEventInput,
+    expected_stream_revision: u64,
+    gaps: Vec<String>,
+    sources: Vec<ExpectedStreamRevision>,
+    // Holds the original Process input owner's scope leases and file
+    // descriptors through the synchronous conclusion commit.
+    _process_inputs: Option<std::sync::Arc<crate::agentic::review_evidence::ProcessInputFrame>>,
+}
+
+/// The original, already-authenticated conclusion use and material guards.
+/// A weak store prevents a cycle when the original transaction owner retains it.
+pub(crate) struct OriginalConclusionProofCustody {
+    store: std::sync::Weak<crate::RuntimeEventStore>,
+    program_id: String,
+    goal: GoalContract,
+    verified_proofs: Vec<std::sync::Arc<PreparedVerifiedProof>>,
+    frame: Option<std::sync::Arc<crate::agentic::review_evidence::ProcessInputFrame>>,
+}
+
+impl OriginalConclusionProofCustody {
+    pub(crate) fn matches(&self, store: &std::sync::Arc<crate::RuntimeEventStore>, program_id: &str, goal: &GoalContract) -> bool {
+        self.store.upgrade().is_some_and(|owner| std::sync::Arc::ptr_eq(&owner, store))
+            && self.program_id == program_id && &self.goal == goal
+    }
+    pub(crate) fn verified_proofs(&self) -> &[std::sync::Arc<PreparedVerifiedProof>] { &self.verified_proofs }
+    pub(crate) fn frame(&self) -> Option<&crate::agentic::review_evidence::ProcessInputFrame> { self.frame.as_deref() }
+    pub(crate) fn frame_handle(&self) -> Option<std::sync::Arc<crate::agentic::review_evidence::ProcessInputFrame>> { self.frame.clone() }
+    pub(crate) fn current_approval_sources(&self, store: &crate::RuntimeEventStore, session: &str) -> Result<std::collections::BTreeMap<String, u64>, String> {
+        let mut sources = std::collections::BTreeMap::new();
+        for call in self.verified_proofs.iter().flat_map(|verified| verified.proof().authenticated_historical_calls()) {
+            let Some(approval) = call.approval() else { continue; };
+            let current = crate::ApprovalQueue::capture_proof_control_from_store(store, session, approval.approval_id())?;
+            if &current.request().context != approval.context() { return Err("original approval context changed".into()); }
+            let mut grants = current.grants().iter().filter(|grant| grant.grant_id == approval.grant_id() && grant.approval_id == approval.approval_id());
+            let grant = grants.next().ok_or("original approval grant missing")?;
+            if grants.next().is_some() || grant.revoked_at_ms.is_some() || grant.status == harness_contract::policy::approval::ApprovalGrantStatus::Revoked {
+                return Err("original approval revoked or ambiguous".into());
+            }
+            let source = current.source();
+            if sources.insert(source.stream_id.clone(), source.expected_revision).is_some_and(|old| old != source.expected_revision) {
+                return Err("original approval owner observations conflict".into());
+            }
+        }
+        Ok(sources)
+    }
+
+    /// A Graph material coordinate is immutable, but it must have belonged
+    /// to the original checked cut; the terminal Graph CAS is a separate
+    /// current-node control, not a replacement for this material identity.
+    pub(crate) fn graph_material_in_original_cut(&self, graph: &str, receipt: &crate::CheckedAppendReceipt) -> bool {
+        self.verified_proofs.iter().flat_map(|verified| verified.snapshot().dependency_frame().material_events())
+            .filter(|event| event.stream_id == graph)
+            .all(|event| receipt.validation.sources.iter().any(|source|
+                source.stream_id == graph && event.sequence <= source.committed_revision))
+    }
+    /// Recheck only the exact File dependencies authenticated at A; retain
+    /// their original workspace lease and verified descriptors through B.
+    pub(crate) fn refresh_original_files(&self) -> Result<(), String> {
+        let frame = self.frame.as_deref().ok_or("original material frame unavailable")?;
+        for verified in &self.verified_proofs {
+            for (target, digest, bytes) in verified.snapshot().dependency_frame().protected_files() {
+                frame.retain_original_file(target, digest, bytes)?;
+            }
+        }
+        Ok(())
+    }
+    /// Check the original already-held guards, without reconstructing proof.
+    pub(crate) fn guards_cover(&self) -> bool {
+        let Some(frame) = self.frame.as_deref() else { return false; };
+        let required = crate::agentic::review_evidence::required_review_conditions(&self.goal);
+        let mut used = vec![false; self.verified_proofs.len()];
+        for condition in required {
+            let Some(review) = self.goal.reviews.iter().rev().find(|review| review.criterion_ref == condition) else { return false; };
+            let Some(proof) = review.verification.as_ref() else { return false; };
+            let Some((index, verified)) = self.verified_proofs.iter().enumerate().find(|(index, verified)|
+                !used[*index] && verified.condition() == condition && verified.proof().matches_proof(proof)) else { return false; };
+            used[index] = true;
+            for fact in verified.snapshot().dependency_frame().canonical_facts() {
+                if fact["grade"] == "bounded_process_history" {
+                    let inputs = &fact["execution"]["fact"]["admission"]["inputs"];
+                    let Some(inputs) = inputs.as_array() else { return false; };
+                    if !inputs.is_empty() {
+                        let Some(key) = fact["execution"]["fact"]["admission"]["binding"]["call_key"].as_str() else { return false; };
+                        if !frame.retains_process_input_run(key) { return false; }
+                    }
+                }
+            }
+            if verified.snapshot().dependency_frame().file_dependencies().any(|(target, _, _, _, digest)|
+                !frame.retains_exact_file(target, digest, None)) { return false; }
+            if proof.reads.iter().any(|read| {
+                if read.content_ref.starts_with("artifact://") {
+                    !frame.retains_pinned_read(&read.content_ref, &read.sha256, read.bytes)
+                } else {
+                    !verified.snapshot().dependency_frame().file_dependencies().any(|(target, _, _, _, digest)|
+                        target.path.workspace_relative_path == read.content_ref
+                            && digest.trim_start_matches("sha256:") == read.sha256.trim_start_matches("sha256:")
+                            && frame.retains_exact_file(target, &read.sha256, Some(read.bytes)))
+                }
+            }) { return false; }
+        }
+        used.into_iter().all(|entry| entry)
+    }
+}
+
+impl PreparedProgramConclusion {
+    pub(crate) fn verified_proofs(&self) -> &[std::sync::Arc<PreparedVerifiedProof>] {
+        &self.verified_proofs
+    }
+
+    /// Reuse the original preparation's guards when a current-control
+    /// reader needs them; do not create a second owner frame at commit.
+    pub(crate) fn process_input_frame(&self) -> Option<&crate::agentic::review_evidence::ProcessInputFrame> {
+        self.proof_seal.as_ref().and_then(|seal| seal._process_inputs.as_deref())
+    }
+
+    /// Seal the same owner frame before its original checked transaction.
+    pub(crate) fn original_proof_custody(
+        &self, store: &std::sync::Arc<crate::RuntimeEventStore>, program: &AgenticProgramProjection,
+    ) -> Result<Option<std::sync::Arc<OriginalConclusionProofCustody>>, String> {
+        self.verify_prepared_proof_scope(store, program)?;
+        let Some(seal) = &self.proof_seal else { return Ok(None); };
+        Ok(Some(std::sync::Arc::new(OriginalConclusionProofCustody {
+            store: std::sync::Arc::downgrade(store), program_id: program.program_id.clone(),
+            goal: seal.goal.clone(), verified_proofs: self.verified_proofs.clone(), frame: seal._process_inputs.clone(),
+        })))
+    }
+
+    /// Check before commit mutates the source frame. Current controls and
+    /// transaction CAS are separate and must still be checked by the owner.
+    pub(crate) fn verify_prepared_proof_scope(
+        &self, store: &std::sync::Arc<crate::RuntimeEventStore>, program: &AgenticProgramProjection,
+    ) -> Result<(), String> {
+        let Some(seal) = &self.proof_seal else {
+            if self.goal.completion == GoalCompletion::Satisfied || !self.verified_proofs.is_empty() {
+                return Err("satisfied conclusion has no prepared proof scope".into());
+            }
+            return Ok(());
+        };
+        if !std::sync::Arc::ptr_eq(&seal.store, store) || &seal.program != program
+            || seal.goal != self.goal || seal.event != self.event
+            || seal.expected_stream_revision != self.expected_stream_revision
+            || seal.gaps != self.gaps || self.runtime_trigger.is_some() || self.rejection_trigger.is_some()
+            || seal.sources != self.source_frame.sources().cloned().collect::<Vec<_>>() {
+            return Err("prepared proof store, target or conclusion changed".into());
+        }
+        Ok(())
+    }
 }
 
 const COMPLETION_REOPENED_EVENT_KIND: &str = "agentic.completion_reopened";
@@ -150,6 +322,405 @@ pub(crate) fn delivered_result_refs(
 use crate::agentic::review_evidence::evidence_contains;
 
 impl GoalStore {
+    /// Reuse the dispatch owner's stranded facts and the graph's original
+    /// bounded replan history. The graph cut joins the conclusion CAS.
+    pub(crate) fn exhausted_program_work_cut(
+        &self, program: &AgenticProgramProjection,
+    ) -> Result<Option<Vec<ExpectedStreamRevision>>, String> {
+        let now = crate::tool_invocation::now_ms();
+        let Some(root) = program.root_execution_id.as_deref() else { return Ok(None) };
+        if self.projection(&format!("goal:{root}"))?.as_ref().is_some_and(|goal|
+            goal.goal.completion == GoalCompletion::WaitingExternalDecision
+                || goal.goal.waiting.as_ref().is_some_and(|waiting| waiting.reason_code == "waiting_external_decision"))
+        { return Ok(None); }
+        let state_store = crate::ExecutionGraphStateStore::new(Arc::clone(&self.event_store));
+        let root_revision = self.event_store.stream_revision(root).map_err(|error| error.to_string())?;
+        let root_graph = match state_store.load(root) {
+            Ok(graph) => Some(graph),
+            Err(crate::execution_core::graph::ExecutionStateStoreError::NotFound { .. }) => None,
+            Err(error) => return Err(error.to_string()),
+        };
+        if self.event_store.stream_revision(root).map_err(|error| error.to_string())? != root_revision {
+            return Ok(None);
+        }
+        if root_graph.as_ref().is_some_and(|graph| graph.nodes.iter().any(|node| {
+            node.executor_kind != crate::execution_core::graph::executors::AgenticProgramWaitExecutor::KIND
+                && matches!(graph.node_statuses.get(&node.id), Some(
+                    harness_contract::execution_graph::ExecutionNodeStatus::WaitingInput
+                    | harness_contract::execution_graph::ExecutionNodeStatus::WaitingApproval
+                    | harness_contract::execution_graph::ExecutionNodeStatus::WaitingExternal
+                    | harness_contract::execution_graph::ExecutionNodeStatus::Paused))
+        })) { return Ok(None); }
+        let lineage_stream = crate::execution_core::graph::execution_lineage_stream_id(root);
+        let lineage_revision = self.event_store.stream_revision(&lineage_stream).map_err(|error| error.to_string())?;
+        let links = state_store.child_links(root).map_err(|error| error.to_string())?;
+        if self.event_store.stream_revision(&lineage_stream).map_err(|error| error.to_string())? != lineage_revision {
+            return Ok(None);
+        }
+        let mut cuts = vec![ExpectedStreamRevision { stream_id: lineage_stream, expected_revision: lineage_revision },
+            ExpectedStreamRevision { stream_id: root.to_string(), expected_revision: root_revision }];
+        for link in links {
+            let child_revision = self.event_store.stream_revision(&link.child_execution_id).map_err(|error| error.to_string())?;
+            let child = match state_store.load(&link.child_execution_id) {
+                Ok(child) => child,
+                Err(crate::execution_core::graph::ExecutionStateStoreError::NotFound { .. }) => {
+                    cuts.push(ExpectedStreamRevision { stream_id: link.child_execution_id, expected_revision: child_revision });
+                    continue;
+                }
+                Err(error) => return Err(error.to_string()),
+            };
+            if self.event_store.stream_revision(&child.id).map_err(|error| error.to_string())? != child_revision {
+                return Ok(None);
+            }
+            let child_active = child.nodes.iter().any(|node| !child.node_statuses.get(&node.id)
+                .copied().unwrap_or(harness_contract::execution_graph::ExecutionNodeStatus::Planned).is_terminal());
+            if crate::execution_core::graph::executors::agentic_program_ids(&child).is_empty()
+                && child.nodes.iter().any(|node| node.kind == harness_contract::execution_graph::ExecutionNodeKind::AgentTask)
+                && child_active {
+                return Ok(None);
+            }
+            if crate::execution_core::graph::executors::graph_belongs_to_program(&child, &program.program_id) {
+                if child_active {
+                    return Ok(None);
+                }
+                cuts.push(ExpectedStreamRevision { stream_id: child.id, expected_revision: child_revision });
+            }
+        }
+        // A Task the dispatch side durably recorded as disconnected has no live
+        // work left: it failed, nobody is attempting it, its lease is gone and
+        // the root graph is terminal, so no agent will ever pick it up again.
+        // It therefore does not keep the Program waiting.
+        let disconnected = self.disconnected_task_refs(program)?;
+        let unsettled = program.tasks.values().filter(|task| {
+            Self::task_blocks_the_program_cut(
+                task.status,
+                !task.active_attempts.is_empty(),
+                task.lease_expires_at_ms.is_some_and(|until| until > now),
+                disconnected.contains(&task.task_id),
+            )
+        }).collect::<Vec<_>>();
+        if unsettled.is_empty() { return Ok(Some(cuts)); }
+        let stranded = crate::agentic::execution::dispatch::stranded_task_refs(program);
+        if unsettled.iter().any(|task| !task.active_attempts.is_empty()
+            || task.lease_expires_at_ms.is_some_and(|until| until > now)
+            || !stranded.contains(&task.task_id)) { return Ok(None); }
+        let Some(graph) = root_graph else { return Ok(None) };
+        let resumes = graph.nodes.iter().filter(|node|
+            node.executor_kind == crate::execution_core::graph::executors::AgenticProgramWaitExecutor::KIND)
+            .filter_map(|node| graph.node_results.get(&node.id))
+            .filter_map(|result| result.result_ref.as_deref())
+            .filter(|reference| reference.starts_with(&format!("agentic-program-checkpoint:{}:revision:", program.program_id))
+                && reference.ends_with(":task_stranded"))
+            .count();
+        if resumes < crate::execution_core::graph::executors::MAX_TASK_STRAND_RESUMES { return Ok(None); }
+        Ok(Some(cuts))
+    }
+
+    /// Whether one Task still keeps the Program waiting for work.
+    ///
+    /// A Task with no active attempt, no live lease and a durable disconnect
+    /// record has no live work left: the dispatch side recorded that the root
+    /// graph was already terminal, so no agent will ever pick it up again and
+    /// nothing will replan it. Every other Task still waits - a live attempt,
+    /// a live lease and a Task the dispatcher never recorded a disconnect for
+    /// all keep the Program open.
+    fn task_blocks_the_program_cut(
+        status: crate::AgenticTaskStatus,
+        has_active_attempts: bool,
+        has_live_lease: bool,
+        disconnected: bool,
+    ) -> bool {
+        if disconnected
+            && matches!(status, crate::AgenticTaskStatus::Rework | crate::AgenticTaskStatus::Published)
+            && !has_active_attempts && !has_live_lease
+        {
+            return false;
+        }
+        has_active_attempts || has_live_lease || matches!(status,
+            crate::AgenticTaskStatus::Published | crate::AgenticTaskStatus::Claimed
+                | crate::AgenticTaskStatus::Submitted | crate::AgenticTaskStatus::Rework
+                | crate::AgenticTaskStatus::CancelRequested)
+    }
+
+    /// Whether every Task still in the waiting bucket is durably disconnected:
+    /// it failed, has no active attempt and no live lease, and the dispatch
+    /// side recorded that the root graph was already terminal. An empty
+    /// waiting bucket is not a disconnected Program, and a Task the dispatcher
+    /// never recorded a disconnect for is not disconnected either - the
+    /// process-local dispatch starvation ledger is never consulted.
+    fn waiting_tasks_are_all_durably_disconnected(
+        waiting: &[(&str, crate::AgenticTaskStatus, bool, bool)],
+        disconnected: &[String],
+    ) -> bool {
+        if waiting.is_empty() { return false; }
+        waiting.iter().all(|(task_id, status, has_active_attempts, has_live_lease)| {
+            disconnected.iter().any(|recorded| recorded == task_id)
+                && matches!(status, crate::AgenticTaskStatus::Rework | crate::AgenticTaskStatus::Published)
+                && !has_active_attempts && !has_live_lease
+        })
+    }
+
+    /// The durable shape the loop-exit trigger reads: every Task still in the
+    /// waiting bucket is disconnected by a durable record. It reads no
+    /// process-local state, so the same Program reads the same way after a
+    /// restart.
+    pub(crate) fn program_tasks_all_durably_disconnected(
+        &self,
+        program: &AgenticProgramProjection,
+    ) -> Result<bool, String> {
+        let now = crate::tool_invocation::now_ms();
+        let disconnected = self.disconnected_task_refs(program)?;
+        let waiting = program.tasks.values()
+            .filter(|task| matches!(task.status,
+                crate::AgenticTaskStatus::Published | crate::AgenticTaskStatus::Claimed
+                    | crate::AgenticTaskStatus::Submitted | crate::AgenticTaskStatus::Rework
+                    | crate::AgenticTaskStatus::CancelRequested))
+            .map(|task| (task.task_id.as_str(), task.status,
+                !task.active_attempts.is_empty(),
+                task.lease_expires_at_ms.is_some_and(|until| until > now)))
+            .collect::<Vec<_>>();
+        Ok(Self::waiting_tasks_are_all_durably_disconnected(&waiting, &disconnected))
+    }
+
+    /// Tasks the dispatch side durably recorded as disconnected: the dispatch
+    /// was attempted after the root graph had already become terminal, so no
+    /// agent can ever pick them up again and nothing will ever replan them.
+    ///
+    /// The record is a durable event on the program's dispatch stream
+    /// (`agentic.dispatch.declined`, written by
+    /// `AgentActionService::record_dispatch_decline`), not the process-local
+    /// dispatch starvation ledger: the ledger is process memory, and a
+    /// conclusion may not depend on it.
+    fn disconnected_task_refs(
+        &self,
+        program: &AgenticProgramProjection,
+    ) -> Result<Vec<String>, String> {
+        const DISPATCH_DECLINED_EVENT_KIND: &str = "agentic.dispatch.declined";
+        const ROOT_GRAPH_TERMINAL_REASON: &str = "root_graph_terminal";
+        let now = crate::tool_invocation::now_ms();
+        let candidates = program.tasks.values().filter(|task| {
+            matches!(task.status, crate::AgenticTaskStatus::Rework | crate::AgenticTaskStatus::Published)
+                && task.active_attempts.is_empty()
+                && !task.lease_expires_at_ms.is_some_and(|until| until > now)
+        }).collect::<Vec<_>>();
+        if candidates.is_empty() { return Ok(Vec::new()); }
+        let stream_id = format!("agentic-dispatch:{}", program.program_id);
+        let revision = self.event_store.stream_revision(&stream_id).map_err(|error| error.to_string())?;
+        if revision == 0 { return Ok(Vec::new()); }
+        let mut latest = std::collections::BTreeMap::<String, String>::new();
+        for event in self.read_conclusion_events(&stream_id, revision)? {
+            if event.kind != DISPATCH_DECLINED_EVENT_KIND { continue; }
+            let Some(task_ref) = event.payload.get("task_ref").and_then(|value| value.as_str()) else { continue; };
+            let Some(reason) = event.payload.get("reason").and_then(|value| value.as_str()) else { continue; };
+            latest.insert(task_ref.to_string(), reason.to_string());
+        }
+        Ok(candidates.into_iter()
+            .filter(|task| latest.get(&task.task_id).is_some_and(|reason| reason == ROOT_GRAPH_TERMINAL_REASON))
+            .map(|task| task.task_id.clone())
+            .collect())
+    }
+
+    /// Count the original rejection events after the last verified Goal gain.
+    /// A legacy marker without code and action identity cannot prove sameness.
+    pub(crate) fn exhausted_completion_rejection(
+        &self, program: &AgenticProgramProjection,
+    ) -> Result<Option<String>, String> {
+        let Some(limit) = completion_reopen_bound()? else { return Ok(None) };
+        if program.completion_request.is_some() || self.exhausted_program_work_cut(program)?.is_none() { return Ok(None); }
+        let Some(root) = program.root_execution_id.as_deref() else { return Ok(None) };
+        let Some(goal) = self.projection(&format!("goal:{root}"))? else { return Ok(None) };
+        let mut last_gain = 0;
+        let mut seen = std::collections::BTreeSet::new();
+        let mut accepted = std::collections::BTreeSet::new();
+        for event in self.read_conclusion_events(&format!("goal:{}", goal.goal.id), goal.stream_revision)? {
+            if let Some(value) = event.payload.get("goal") {
+                let snapshot: GoalContract = serde_json::from_value(value.clone()).map_err(|error| error.to_string())?;
+                let facts = snapshot.criteria.iter().filter(|criterion| matches!(criterion.status, AcceptanceStatus::Satisfied | AcceptanceStatus::Waived))
+                    .map(|criterion| format!("criterion:{}:{:?}", criterion.id, criterion.status))
+                    .chain(snapshot.obligations.iter().filter(|obligation| matches!(obligation.state,
+                        ObjectiveObligationState::Satisfied | ObjectiveObligationState::Waived))
+                        .map(|obligation| format!("obligation:{}:{:?}", obligation.obligation_id, obligation.state)))
+                    .collect::<std::collections::BTreeSet<_>>();
+                if facts.difference(&accepted).next().is_some() { last_gain = last_gain.max(event.commit_cursor); }
+                accepted = facts;
+            }
+            if event.kind == "goal.observation" {
+                {
+                    let value = self.event_store.resolve_observation_record(&event)?;
+                    let observation: RuntimeObservation = serde_json::from_value(value).map_err(|error| error.to_string())?;
+                    if seen.insert(observation.idempotency_fingerprint()) && observation.has_verified_gain() {
+                        last_gain = last_gain.max(event.commit_cursor);
+                    }
+                }
+            }
+        }
+        let events = self.read_conclusion_events(&format!("agentic-program:{}", program.program_id), program.revision)?;
+        for event in &events {
+            if event.kind == "agentic.action_applied" {
+                if let Ok(envelope) = serde_json::from_value::<harness_contract::agent_action::AgentActionEnvelope>(event.payload["envelope"].clone()) {
+                    if matches!(envelope.action, harness_contract::agent_action::AgentAction::TaskReview(ref input)
+                        if input.decision == harness_contract::agent_action::TaskReviewDecision::Accept) {
+                        last_gain = last_gain.max(event.commit_cursor);
+                    }
+                }
+            }
+        }
+        let mut counts = std::collections::BTreeMap::<String, u64>::new();
+        let mut exhausted = None;
+        for event in events.into_iter().filter(|event| event.commit_cursor > last_gain && event.kind == COMPLETION_REJECTED_EVENT_KIND) {
+            let Some(code) = event.payload.get("code").and_then(serde_json::Value::as_str) else { continue };
+            let Some(action) = event.payload.get("action") else { continue };
+            let Some(action_id) = event.payload.get("request_action_id").and_then(serde_json::Value::as_str) else { continue };
+            let Ok(envelope) = serde_json::from_value::<harness_contract::agent_action::AgentActionEnvelope>(event.payload["envelope"].clone()) else { continue };
+            if !matches!(&envelope.action, harness_contract::agent_action::AgentAction::ObjectiveCompleteRequest(_))
+                || envelope.action_id != action_id || envelope.actor.program_id != program.program_id
+                || envelope.actor.objective_id != program.objective_id
+                || envelope.actor.session_id != program.session_id || envelope.actor.turn_id != program.turn_id
+                || envelope.actor.root_execution_id != program.root_execution_id
+                || event.actor.as_deref() != Some(envelope.actor.actor_id.as_str())
+                || event.payload["objective_id"] != program.objective_id
+                || serde_json::to_value(&envelope.action).map_err(|error| error.to_string())? != *action
+            { continue; }
+            let mut normalized = envelope.action.clone();
+            if let harness_contract::agent_action::AgentAction::ObjectiveCompleteRequest(input) = &mut normalized {
+                input.result_refs.sort();
+                input.evidence_refs.sort();
+                input.unresolved.sort();
+                input.recommended_next_actions.sort();
+            }
+            let identity = serde_json::to_string(&(code, &event.payload["objective_id"], normalized, &event.payload["gap"]))
+                .map_err(|error| error.to_string())?;
+            let count = counts.entry(identity).or_default();
+            *count = count.saturating_add(1);
+            if *count >= limit { exhausted = Some(action_id.to_string()); }
+        }
+        Ok(exhausted)
+    }
+
+    fn read_conclusion_events(&self, stream: &str, through: u64) -> Result<Vec<crate::DurableRuntimeEvent>, String> {
+        let mut events = Vec::new();
+        let mut cursor = 0;
+        while cursor < through {
+            let page = self.event_store.list_stream_after(stream, cursor, through, 128, usize::MAX)?;
+            if page.is_empty() { return Err("conclusion event stream ended before its source fence".into()); }
+            for event in page {
+                if event.sequence != cursor + 1 { return Err("conclusion event stream has a gap".into()); }
+                cursor = event.sequence;
+                events.push(event);
+            }
+        }
+        Ok(events)
+    }
+
+    pub(crate) fn prepare_rejected_program_conclusion(
+        &self, program: &AgenticProgramProjection, action_id: &str,
+    ) -> Result<PreparedProgramConclusion, String> {
+        if self.exhausted_completion_rejection(program)?.as_deref() != Some(action_id) {
+            return Err("completion rejection has not exhausted its original resource bound".into());
+        }
+        let root = program.root_execution_id.as_deref().ok_or("missing root binding")?;
+        let projection = self.projection(&format!("goal:{root}"))?.ok_or("missing bound Goal")?;
+        if projection.goal.completion != GoalCompletion::Open || projection.goal.terminal.is_some() {
+            return Err("Goal is not open".into());
+        }
+        let mut source_frame = AssessmentSourceFrame::capture(program, &projection).map_err(|error| error.to_string())?;
+        for cut in self.exhausted_program_work_cut(program)?.ok_or("Program has live work")? {
+            source_frame.pin(cut).map_err(|error| error.to_string())?;
+        }
+        let mut goal = projection.goal;
+        goal.evidence_refs.extend(projection.progress.evidence_refs.iter().cloned());
+        goal.evidence_refs.extend(program.tasks.values()
+            .filter(|task| task.status == crate::AgenticTaskStatus::Accepted)
+            .flat_map(|task| task.evidence_refs.iter().chain(&task.artifact_refs).cloned()));
+        goal.evidence_refs.sort();
+        goal.evidence_refs.dedup();
+        goal.revision = goal.revision.saturating_add(1);
+        goal.completion = GoalCompletion::Blocked;
+        goal.phase = "completed".into();
+        goal.waiting = None;
+        let fence = format!("agentic-objective:{}:runtime:{}", program.program_id, program.revision);
+        let rejection = self.event_store.event_by_idempotency_key(
+            &format!("agentic-program:{}", program.program_id), &format!("completion-rejected:{action_id}"),
+        ).map_err(|error| error.to_string())?.ok_or("completion rejection disappeared")?;
+        let code = rejection.payload["code"].as_str().ok_or("completion rejection code missing")?;
+        let gap = rejection.payload["gap"].as_str().ok_or("completion rejection reason missing")?;
+        let reason = format!("The configured completion resource bound was exhausted by the same durable rejection without verified progress; the objective remains unmet: {code}: {gap}");
+        goal.terminal = Some(ObjectiveTerminal { kind: ObjectiveTerminalKind::Blocked,
+            terminal_fence: fence.clone(), authority_revision: program.revision, reason: reason.clone(),
+            evidence_refs: goal.evidence_refs.clone(), diagnostics: Vec::new(), committed_at_ms: crate::tool_invocation::now_ms() });
+        validate_goal(&goal)?;
+        let event = goal_event(&goal, "goal.blocked", "blocked", "runtime.objective_supervisor".into(),
+            vec![RuntimeEventRef { kind: "program".into(), id: program.program_id.clone() }],
+            serde_json::json!({"goal": goal, "rejection_action_id": action_id}), format!("program-conclusion:{fence}"));
+        Ok(PreparedProgramConclusion { goal, expected_stream_revision: projection.stream_revision, event,
+            gaps: vec![reason], source_frame, verified_proofs: Vec::new(), proof_seal: None, runtime_trigger: None, rejection_trigger: Some(action_id.into()) })
+    }
+
+    /// Prepare an honest blocked verdict from an already committed Runtime
+    /// observation. The Program owner commits this with the Program verdict.
+    pub(crate) fn prepare_runtime_program_conclusion(
+        &self,
+        program: &AgenticProgramProjection,
+        trigger: &RuntimeObservation,
+    ) -> Result<PreparedProgramConclusion, String> {
+        if program.completion_request.is_some() || self.exhausted_program_work_cut(program)?.is_none() {
+            return Err("runtime conclusion cannot replace a completion request or live work".into());
+        }
+        let root = program.root_execution_id.as_deref().ok_or("missing root binding")?;
+        let projection = self.projection(&format!("goal:{root}"))?.ok_or("missing bound Goal")?;
+        let committed_trigger = self.event_store.event_by_idempotency_key(
+            &format!("goal:{}", projection.goal.id),
+            &format!("direct:{}", trigger.idempotency_fingerprint()),
+        ).map_err(|error| error.to_string())?.ok_or("runtime stall observation was not committed by its owner")?;
+        if projection.goal.completion != GoalCompletion::Open
+            || projection.goal.terminal.is_some()
+            || trigger.source != "runtime.program_stall"
+            || trigger.goal_id() != projection.goal.id
+            || trigger.identity.graph_id != root
+            || trigger.source_revision != program.revision
+            || trigger.result_class != harness_contract::goal::ObservationResultClass::Failed
+            || !projection.observations.contains(trigger)
+            || committed_trigger.sequence != projection.stream_revision
+            || serde_json::from_value::<RuntimeObservation>(self.event_store.resolve_observation_record(&committed_trigger)?)
+                .map_err(|error| error.to_string())? != *trigger
+        {
+            return Err("runtime conclusion trigger is not a committed bound stall observation".into());
+        }
+        let mut source_frame = AssessmentSourceFrame::capture(program, &projection)
+            .map_err(|error| error.to_string())?;
+        for cut in self.exhausted_program_work_cut(program)?.ok_or("Program has live work")? {
+            source_frame.pin(cut).map_err(|error| error.to_string())?;
+        }
+        let mut goal = projection.goal;
+        goal.evidence_refs.extend(projection.progress.evidence_refs.iter().cloned());
+        goal.evidence_refs.extend(program.tasks.values()
+            .filter(|task| task.status == crate::AgenticTaskStatus::Accepted)
+            .flat_map(|task| task.evidence_refs.iter().chain(&task.artifact_refs).cloned()));
+        goal.evidence_refs.sort();
+        goal.evidence_refs.dedup();
+        goal.revision = goal.revision.saturating_add(1);
+        goal.completion = GoalCompletion::Blocked;
+        goal.phase = "completed".into();
+        goal.waiting = None;
+        let fence = format!("agentic-objective:{}:runtime:{}", program.program_id, program.revision);
+        goal.terminal = Some(ObjectiveTerminal {
+            kind: ObjectiveTerminalKind::Blocked,
+            terminal_fence: fence.clone(),
+            authority_revision: program.revision,
+            reason: trigger.summary.clone(),
+            evidence_refs: goal.evidence_refs.clone(),
+            diagnostics: Vec::new(),
+            committed_at_ms: crate::tool_invocation::now_ms(),
+        });
+        validate_goal(&goal)?;
+        let event = goal_event(&goal, "goal.blocked", "blocked", "runtime.objective_supervisor".into(),
+            vec![RuntimeEventRef { kind: "program".into(), id: program.program_id.clone() }],
+            serde_json::json!({"goal": goal, "runtime_trigger": trigger.idempotency_fingerprint()}),
+            format!("program-conclusion:{fence}"));
+        Ok(PreparedProgramConclusion { goal, expected_stream_revision: projection.stream_revision,
+            event, gaps: vec![trigger.summary.clone()], source_frame, verified_proofs: Vec::new(), proof_seal: None, runtime_trigger: Some(trigger.clone()), rejection_trigger: None })
+    }
+
     pub(crate) fn prepare_program_conclusion(
         &self,
         program: &AgenticProgramProjection,
@@ -218,10 +789,9 @@ impl GoalStore {
             .as_ref()
             .and_then(|queries| queries.get())
             .and_then(|queries| queries.history_reader());
-        let process_frame = self
-            .process_input_verifier
-            .as_ref()
-            .map(crate::agentic::review_evidence::ProcessInputVerifier::frame);
+        let process_frame = Some(self.process_input_verifier.as_ref()
+            .map(crate::agentic::review_evidence::ProcessInputVerifier::frame)
+            .unwrap_or_else(crate::agentic::review_evidence::ProcessInputFrame::without_process_verifier));
         let readers = crate::agentic::review_evidence::ResultContentReaders {
             artifacts: self.proof_artifacts.as_deref(),
             history: history.as_deref(),
@@ -239,10 +809,10 @@ impl GoalStore {
                     .verification
                     .as_ref()
                     .ok_or_else(|| "latest review proof missing".to_string())?;
-                let snapshot = crate::agentic::review_evidence::validate_applied_proof_inputs(
+                let (snapshot, verified) = crate::agentic::review_evidence::validate_applied_proof_for_conclusion(
                     &self.event_store,
                     program,
-                    Some(&goal),
+                    &goal,
                     proof,
                     readers,
                 )?;
@@ -259,7 +829,8 @@ impl GoalStore {
                     &goal, program, review, &results, &evidence, &snapshot,
                 )
                 .map_err(|error| error.to_string())?;
-                proof_inputs.insert(condition.clone(), snapshot);
+                proof_inputs.insert(condition.clone(), (snapshot, verified, review.clone(), results, evidence.clone(),
+                    goal.spec_revision, goal.spec_digest.clone()));
                 Ok::<(), String>(())
             })();
             if let Err(error) = &assessment {
@@ -490,21 +1061,49 @@ impl GoalStore {
             serde_json::json!({"goal": goal, "request_revision": request.program_revision}),
             format!("program-conclusion:{fence}"),
         );
+        let mut verified_proofs = Vec::new();
+        for (condition, (snapshot, verified, reviewed, results, checked_evidence, spec_revision, spec_digest)) in proof_inputs {
+            let final_review = goal.reviews.iter().rev().find(|review| review.criterion_ref == condition)
+                .ok_or("prepared coverage review disappeared")?;
+            let mut final_results = final_review.result_refs.clone();
+            if goal.user_intent_criterion_id.as_ref() == Some(&condition) {
+                final_results.extend(delivered_result_refs(program, &goal, &request.result_refs));
+            }
+            for obligation in goal.obligations.iter().filter(|obligation|
+                obligation.required && obligation.obligation_id == condition) {
+                final_results.extend(obligation.artifact_refs.iter().cloned());
+            }
+            if final_review != &reviewed || final_results != results || goal.evidence_refs != checked_evidence
+                || goal.spec_revision != spec_revision || goal.spec_digest != spec_digest {
+                return Err("prepared coverage inputs changed during conclusion preparation".into());
+            }
+            for source in verified.current_heads() {
+                source_frame.pin(source.clone()).map_err(|error| error.to_string())?;
+            }
+            for (target, digest, bytes) in snapshot.dependency_frame().protected_files() {
+                process_frame.as_ref().ok_or("original File frame unavailable")?
+                    .retain_original_file(target, digest, bytes)?;
+            }
+            verified_proofs.push(std::sync::Arc::new(PreparedVerifiedProof {
+                condition, snapshot, proof: verified,
+            }));
+        }
+        let proof_seal = Some(PreparedProofSeal {
+            store: std::sync::Arc::clone(&self.event_store), program: program.clone(),
+            goal: goal.clone(), event: event.clone(), expected_stream_revision: projection.stream_revision,
+            gaps: gaps.clone(), sources: source_frame.sources().cloned().collect(),
+            _process_inputs: process_frame.map(std::sync::Arc::new),
+        });
         Ok(PreparedProgramConclusion {
             goal,
             expected_stream_revision: projection.stream_revision,
             event,
             gaps,
-            source_frame: {
-                for snapshot in proof_inputs.into_values() {
-                    for source in snapshot.sources {
-                        source_frame
-                            .pin(source)
-                            .map_err(|error| error.to_string())?;
-                    }
-                }
-                source_frame
-            },
+            verified_proofs,
+            proof_seal,
+            runtime_trigger: None,
+            rejection_trigger: None,
+            source_frame,
         })
     }
 }
@@ -845,6 +1444,97 @@ mod tests {
         mechanical_fixture_with_request(historical_review, true)
     }
 
+    fn stall_observation(program: &AgenticProgramProjection) -> RuntimeObservation {
+        use harness_contract::goal::{ContextDelta, CostDelta, EvidenceDelta,
+            InformationGain, ObservationFailureClass, ObservationFreshness, ObservationResultClass,
+            ParallelismDelta, RuntimeObservationIdentity, RuntimeObservationKind};
+        RuntimeObservation {
+            identity: RuntimeObservationIdentity { workspace_id: "workspace-test".into(),
+                session_id: program.session_id.clone(), turn_id: Some(program.turn_id.clone()),
+                task_id: None, graph_id: program.root_execution_id.clone().unwrap(),
+                goal_id: "goal:root-completion".into(), node_id: None },
+            kind: RuntimeObservationKind::GraphProgress, source: "runtime.program_stall".into(),
+            source_revision: program.revision, freshness: ObservationFreshness { observed_at_ms: 1,
+                valid_until_ms: None, policy_revision: "goal-observation-v2".into() },
+            summary: "verified budget exhausted".into(), fingerprint: "stall:fixture".into(),
+            evidence_refs: vec![], observed_evidence: vec![], criterion_deltas: vec![],
+            evidence_delta: EvidenceDelta::default(), effect_deltas: vec![], conflict_deltas: vec![],
+            unknown_deltas: vec![], cost_delta: CostDelta::default(), information_gain: InformationGain::default(),
+            context_delta: ContextDelta::default(), parallelism_delta: ParallelismDelta::default(),
+            result_class: ObservationResultClass::Failed, failure_class: Some(ObservationFailureClass::Unknown),
+        }
+    }
+
+
+    #[test]
+    fn runtime_stall_does_not_close_published_work() {
+        use harness_contract::agent_action::TaskPublishInput;
+        let (_, goals, actions, actor) = mechanical_fixture_with_request(false, false);
+        let apply = |id: &str, action| actions.apply(&AgentActionEnvelope {
+            action_id: id.into(), actor: actor.clone(), expected_revision: None, action,
+        }).unwrap();
+        let team = apply("wait-team", AgentAction::TeamCreate(TeamCreateInput {
+            name: "Waiting team".into(), mission: "Produce the original result".into(), objective: None,
+        }));
+        assert_eq!(team.status, AgentActionStatus::Applied);
+        let task = apply("wait-task", AgentAction::TaskPublish(TaskPublishInput {
+            team_ref: team.changed_refs[0].clone(), title: "Produce".into(),
+            objective: "Produce the original result".into(), acceptance: "Durable result".into(),
+            criterion_source: Default::default(), acceptance_checks: vec![], required_capabilities: vec![],
+            depends_on: vec![], obligation_refs: vec![], purpose: Default::default(),
+            execution_requirements: vec![], expertise_hints: vec![],
+        }));
+        assert_eq!(task.status, AgentActionStatus::Applied);
+        let program = actions.project(&actor.program_id).unwrap();
+        let trigger = stall_observation(&program);
+        goals.record_observation(trigger.clone()).unwrap();
+        assert!(goals.prepare_runtime_program_conclusion(&program, &trigger).is_err());
+        assert!(actions.project(&actor.program_id).unwrap().objective_verdict.is_none());
+        assert_eq!(goals.get("goal:root-completion").unwrap().unwrap().completion, GoalCompletion::Open);
+    }
+
+    #[test]
+    fn runtime_stall_does_not_close_external_decision_wait() {
+        let (_, goals, actions, actor) = mechanical_fixture_with_request(false, false);
+        let goal = goals.get("goal:root-completion").unwrap().unwrap();
+        goals.revise(&goal.id, goal.revision, goal.user_sequence + 1, "external decision pending", |goal| {
+            goal.waiting = Some(harness_contract::goal::WaitDescriptor {
+                reason_code: "waiting_external_decision".into(), reason: "await the user decision".into(),
+                required_refs: vec!["approval:pending".into()], generation: 1,
+            });
+            vec!["waiting".into()]
+        }).unwrap();
+        let program = actions.project(&actor.program_id).unwrap();
+        let trigger = stall_observation(&program);
+        goals.record_observation(trigger.clone()).unwrap();
+        assert!(goals.prepare_runtime_program_conclusion(&program, &trigger).is_err());
+        assert!(actions.project(&actor.program_id).unwrap().objective_verdict.is_none());
+        assert_eq!(goals.get("goal:root-completion").unwrap().unwrap().completion, GoalCompletion::Open);
+    }
+
+
+    #[test]
+    fn runtime_stall_trigger_cannot_outlive_new_goal_progress() {
+        let (_, goals, actions, actor) = mechanical_fixture_with_request(false, false);
+        let program = actions.project(&actor.program_id).unwrap();
+        let trigger = stall_observation(&program);
+        goals.record_observation(trigger.clone()).unwrap();
+        let mut gain = stall_observation(&program);
+        gain.source = "runtime.tool_batch".into();
+        gain.fingerprint = "new-proof-after-stall".into();
+        gain.result_class = harness_contract::goal::ObservationResultClass::Succeeded;
+        gain.failure_class = None;
+        gain.evidence_delta.added = vec!["tool://later-proof".into()];
+        gain.information_gain.distinguishing_evidence_refs = vec!["tool://later-proof".into()];
+        gain.information_gain.provenance = harness_contract::MeasureProvenance::Observed;
+        goals.record_observation(gain).unwrap();
+        assert!(goals.prepare_runtime_program_conclusion(&program, &trigger).is_err());
+        assert!(actions.project(&actor.program_id).unwrap().objective_verdict.is_none());
+        assert_eq!(goals.get("goal:root-completion").unwrap().unwrap().completion, GoalCompletion::Open);
+    }
+
+
+
     fn mechanical_fixture_with_request(
         historical_review: bool,
         request_completion: bool,
@@ -877,6 +1567,7 @@ mod tests {
         let goals = GoalStore::new(Arc::clone(&events));
         let actions = crate::AgentActionService::new(Arc::clone(&events));
         let actor = AgentActorBinding {
+            original_execution: None,
             objective_id,
             program_id,
             session_id: "session-completion".into(),
@@ -1036,246 +1727,10 @@ mod tests {
             crate::agentic::review_evidence::ResultContentReaders::default(),
         )
         .is_err());
-        crate::agentic::execution::reviewed_goal_fixture::with_native_goal_before_a(
-            |services, program, prepared, _| {
-                let goal = services
-                    .goal_store()
-                    .get(&prepared.goal.id)
-                    .unwrap()
-                    .unwrap();
-                let mut proof = goal.reviews.last().unwrap().verification.clone().unwrap();
-                assert_eq!(proof.input_set.as_ref().unwrap().version, 2);
-                let history = services.session_history_reader();
-                let readers = crate::agentic::review_evidence::ResultContentReaders {
-                    artifacts: Some(services.artifact_store().as_ref()),
-                    history: history.as_deref(),
-                    process_inputs: None,
-                };
-                crate::agentic::review_evidence::validate_proof_inputs(
-                    services.event_store(),
-                    program,
-                    Some(&goal),
-                    &proof,
-                    readers,
-                )
-                .expect("real effect donor is valid before mutation");
-                proof.effect_manifest_digest = None;
-                proof.effect_source_refs.clear();
-                let error = crate::agentic::review_evidence::validate_proof_inputs(
-                    services.event_store(),
-                    program,
-                    Some(&goal),
-                    &proof,
-                    readers,
-                )
-                .err()
-                .expect("v2 missing effect facts must fail real validation");
-                assert!(!error.contains("unsupported"), "{error}");
-            },
-        )
-        .await;
+
     }
 
-    #[tokio::test]
-    async fn external_decision_review_requires_current_source_revision_and_final_cas() {
-        crate::agentic::execution::reviewed_goal_fixture::with_native_approval_before_a(|services, program, prepared, _| {
-            let goal = services.goal_store().get(&prepared.goal.id).unwrap().unwrap();
-            let history = services.session_history_reader();
-            let readers = crate::agentic::review_evidence::ResultContentReaders {
-                artifacts: Some(services.artifact_store().as_ref()), history: history.as_deref(), process_inputs: None,
-            };
-            let proof = crate::agentic::review_evidence::required_review_conditions(&goal).iter()
-                .filter_map(|condition| goal.reviews.iter().rev().find(|review| &review.criterion_ref == condition))
-                .filter_map(|review| review.verification.as_ref())
-                .find(|proof| !proof.result_source_revisions.is_empty()).expect("real selected approval donor");
-            let (source, revision) = proof.result_source_revisions.iter().next().unwrap();
-            let source = source.clone();
-            let revision = *revision;
-            assert_eq!(services.event_store().stream_revision(&source).unwrap(), revision);
-            assert!(prepared.source_frame.sources().any(|cut| cut.stream_id == source && cut.expected_revision == revision));
-            crate::agentic::review_evidence::validate_proof_inputs(services.event_store(), program,
-                Some(&goal), proof, readers).expect("actual current approval is accepted");
-            let mut missing = proof.clone();
-            missing.result_source_revisions.remove(&source);
-            assert!(crate::agentic::review_evidence::validate_proof_inputs(services.event_store(), program,
-                Some(&goal), &missing, readers).err().unwrap().contains("external decision source"));
-            let mut revised = proof.clone();
-            revised.result_source_revisions.insert(source.clone(), revision + 1);
-            assert!(crate::agentic::review_evidence::validate_proof_inputs(services.event_store(), program,
-                Some(&goal), &revised, readers).err().unwrap().contains("external decision source"));
-            let events = services.event_store().clone();
-            let fault_source = source.clone();
-            let before_goal = goal.clone();
-            let error = crate::agentic::execution::reviewed_goal_fixture::with_native_conclusion_append_hook(
-                move |transaction| {
-                    assert!(transaction.expected_streams.iter().any(|cut|
-                        cut.stream_id == fault_source && cut.expected_revision == revision));
-                    events.append(RuntimeEventInput { stream_id: fault_source, scope: RuntimeEventScope::Approval,
-                        kind: "test.concurrent_external_decision_source".into(), status: None, actor: None,
-                        refs: vec![], payload: serde_json::json!({}) }).unwrap();
-                },
-                || services.agent_action_service().commit_program_conclusion(program, prepared),
-            ).err().expect("actual final approval storage CAS must fail");
-            match error {
-                crate::AgentActionServiceError::Store(crate::RuntimeEventStoreError::StaleRevision {
-                    stream_id, expected, actual,
-                }) => { assert_eq!(stream_id, source); assert_eq!(expected, revision); assert_eq!(actual, revision + 1); }
-                error => panic!("wrong failure layer: {error}"),
-            }
-            assert_eq!(services.goal_store().get(&goal.id).unwrap().unwrap(), before_goal);
-            assert!(services.agent_action_service().project(&program.program_id).unwrap().objective_verdict.is_none());
-        }).await;
-        crate::agentic::execution::reviewed_goal_fixture::with_native_approval_before_a(
-            |services, program, prepared, _| {
-                let after = services
-                    .agent_action_service()
-                    .commit_program_conclusion(program, prepared)
-                    .unwrap();
-                assert_eq!(after.status, crate::AgenticProgramStatus::Verified);
-            },
-        )
-        .await;
-    }
 
-    #[tokio::test]
-    async fn a_satisfied_review_that_later_work_invalidated_says_so_in_the_gap() {
-        // Naming only "review required" showed the model the same gap string it
-        // had already answered once, so it repeated the same action: one live run
-        // satisfied the review, had a Task reworked, and then re-issued the
-        // identical completion request four times.
-        let events = Arc::new(RuntimeEventStore::for_test());
-        let goals = GoalStore::new(Arc::clone(&events));
-        let actions = crate::AgentActionService::new(Arc::clone(&events));
-        let actor = AgentActorBinding {
-            objective_id: "objective-completion".into(),
-            program_id: "program-completion".into(),
-            session_id: "session-completion".into(),
-            turn_id: "turn-completion".into(),
-            root_execution_id: Some("root-completion".into()),
-            required_team_count: 0,
-            exact_team_count: None,
-            objective_summary: "Preserve original acceptance".into(),
-            model_lease: "test".into(),
-            permission_ceiling: Some(harness_contract::policy::PermissionMode::ReadOnly),
-            resource_scopes: vec![],
-            actor_id: "root-completion-actor".into(),
-            kind: AgentActorKind::Root,
-            execution_id: None,
-            team_id: None,
-            agent_id: None,
-        };
-        actions
-            .apply(&AgentActionEnvelope {
-                action_id: "open".into(),
-                actor: actor.clone(),
-                expected_revision: None,
-                action: AgentAction::ObjectiveCompleteRequest(ObjectiveCompleteRequestInput {
-                    result_refs: vec!["tool://result".into()],
-                    evidence_refs: vec!["tool://evidence".into()],
-                    unresolved: vec![],
-                    blocked: false,
-                    blocked_reason: None,
-                    human_review_required: false,
-                    recommended_next_actions: vec![],
-                }),
-            })
-            .unwrap();
-        goals
-            .create(GoalContract {
-                input_contract: None,
-                id: "goal:root-completion".into(),
-                session_id: actor.session_id.clone(),
-                objective: actor.objective_summary.clone(),
-                criteria: vec![AcceptanceCriterion {
-                    id: "user_intent".into(),
-                    statement: actor.objective_summary.clone(),
-                    statement_ref: None,
-                    source_refs: vec!["session_message:original".into()],
-                    required_evidence: vec!["execution_graph:root-completion".into()],
-                    status: AcceptanceStatus::Open,
-                    waiver: None,
-                }],
-                constraints: vec![],
-                phase: "execution".into(),
-                evidence_refs: vec![],
-                unresolved: vec![],
-                blockers: vec![],
-                scope: GoalScope::UserObjective,
-                user_intent_criterion_id: Some("user_intent".into()),
-                source_intent_ref: Some("session_message:original".into()),
-                execution_binding: Some(GoalExecutionBinding {
-                    objective_id: actor.objective_id.clone(),
-                    session_id: actor.session_id.clone(),
-                    turn_id: actor.turn_id.clone(),
-                    root_execution_id: "root-completion".into(),
-                    agentic_program_id: actor.program_id.clone(),
-                }),
-                spec_revision: 1,
-                spec_digest: "original-spec".into(),
-                review_refs: vec![],
-                waiting: None,
-                participation_requirement: None,
-                obligations: vec![],
-                recovery: None,
-                terminal: None,
-                completion: GoalCompletion::Open,
-                revision: 1,
-                user_sequence: 1,
-                // The prior satisfaction covered a different delivered set than the
-                // one the active request now cites: later work invalidated it.
-                reviews: vec![ObjectiveReviewRecord {
-                    review_id: "prior".into(),
-                    criterion_ref: "user_intent".into(),
-                    spec_revision: 1,
-                    input_manifest_digest: "original-spec".into(),
-                    result_refs: vec!["tool://superseded".into()],
-                    evidence_refs: vec!["tool://evidence".into()],
-                    reviewer_actor: "reviewer".into(),
-                    reviewer_execution_id: None,
-                    producer_refs: vec!["agent:producer".into()],
-                    decision: "satisfied".into(),
-                    reason_ref: "artifact://prior-report".into(),
-                    verification: None,
-                }],
-            })
-            .unwrap();
-        let program = actions.project(&actor.program_id).unwrap();
-        let prepared = goals.prepare_program_conclusion(&program).unwrap();
-        assert!(prepared.goal.terminal.is_none());
-        let gap = prepared
-            .gaps
-            .iter()
-            .find(|gap| gap.starts_with("original_intent_review_required:"))
-            .expect("the intent gap");
-        assert!(
-            gap.contains("previous_satisfied_review_invalidated"),
-            "the gap must announce that the earlier satisfaction no longer holds: {gap}"
-        );
-        assert!(
-            gap.contains("tool://superseded") && gap.contains("tool://result"),
-            "it must name both the old and the current set: {gap}"
-        );
-        // A satisfaction that still covers the request is not called invalidated.
-        crate::agentic::execution::reviewed_goal_fixture::with_native_goal_before_a(
-            |services, program, prepared, _| {
-                assert!(prepared.gaps.is_empty());
-                assert!(
-                    prepared
-                        .gaps
-                        .iter()
-                        .all(|gap| !gap.contains("previous_satisfied_review_invalidated")),
-                    "a still-current satisfaction is not invalidated: {:?}",
-                    prepared.gaps
-                );
-                let after = services
-                    .agent_action_service()
-                    .commit_program_conclusion(program, prepared)
-                    .unwrap();
-                assert_eq!(after.status, crate::AgenticProgramStatus::Verified);
-            },
-        )
-        .await;
-    }
 
     #[tokio::test]
     async fn historical_root_review_without_effect_digest_cannot_hide_a_later_effect() {
@@ -1295,641 +1750,18 @@ mod tests {
             .gaps
             .iter()
             .any(|gap| gap.starts_with("original_intent_review_required:")));
-        crate::agentic::execution::reviewed_goal_fixture::with_native_goal_before_a(|services, program, prepared, _| {
-            let goal = services.goal_store().get(&prepared.goal.id).unwrap().unwrap();
-            let proof = goal.reviews.last().unwrap().verification.as_ref().unwrap();
-            assert_eq!(proof.input_set.as_ref().unwrap().version, 2);
-            let history = services.session_history_reader();
-            let readers = crate::agentic::review_evidence::ResultContentReaders {
-                artifacts: Some(services.artifact_store().as_ref()), history: history.as_deref(), process_inputs: None,
-            };
-            crate::agentic::review_evidence::validate_proof_inputs(services.event_store(), program,
-                Some(&goal), proof, readers).expect("unmodified v2 effect donor");
-            services.event_store().append(RuntimeEventInput {
-                stream_id: format!("session:{}", program.session_id), scope: RuntimeEventScope::Session,
-                kind: "tool.invocation.completed".into(), status: Some("completed".into()),
-                actor: Some("conversation_runtime".into()), refs: vec![],
-                payload: serde_json::json!({"tool_name":"unclassified_mutation","test_fault":"legacy-missing-descriptor"}),
-            }).unwrap();
-            let error = crate::agentic::review_evidence::validate_proof_inputs(services.event_store(), program,
-                Some(&goal), proof, readers).err().expect("actual unknown effect cannot be hidden by a v2 donor");
-            assert!(!error.contains("unsupported"), "{error}");
-            assert!(services.agent_action_service().project(&program.program_id).unwrap().objective_verdict.is_none());
-        }).await;
+
     }
 
-    #[test]
-    fn graph_identity_cannot_replace_original_review_and_gap_reopens_durably() {
-        let (events, goals, actions, actor) = mechanical_fixture(false);
-        let before = actions.project(&actor.program_id).unwrap();
-        let prepared = goals.prepare_program_conclusion(&before).unwrap();
-        assert!(prepared.goal.terminal.is_none());
-        assert!(prepared
-            .gaps
-            .iter()
-            .any(|gap| gap.starts_with("original_intent_review_required:")));
-        actions
-            .commit_program_conclusion(&before, prepared)
-            .unwrap();
-        let restarted = crate::AgentActionService::new(events);
-        let after = restarted.project(&actor.program_id).unwrap();
-        assert_eq!(after.status, crate::AgenticProgramStatus::Open);
-        assert!(after.completion_request.is_none());
-        assert!(goals
-            .get("goal:root-completion")
-            .unwrap()
-            .unwrap()
-            .waiting
-            .is_some());
-        let new_work = restarted
-            .apply(&AgentActionEnvelope {
-                action_id: "fill-gap".into(),
-                actor,
-                expected_revision: Some(after.revision),
-                action: AgentAction::TeamCreate(TeamCreateInput {
-                    name: "Required review".into(),
-                    mission: "fill original gap".into(),
-                    objective: None,
-                }),
-            })
-            .unwrap();
-        assert_eq!(new_work.status, AgentActionStatus::Applied);
-    }
 
-    #[test]
-    fn reconciling_an_existing_completion_request_reopens_goal_for_missing_review() {
-        let (events, goals, actions, actor) = mechanical_fixture(false);
-        let before = actions.project(&actor.program_id).unwrap();
-        assert_eq!(
-            before.status,
-            crate::AgenticProgramStatus::CompletionRequested
-        );
-        assert!(before.completion_request.is_some());
-        assert!(goals
-            .get("goal:root-completion")
-            .unwrap()
-            .unwrap()
-            .waiting
-            .is_none());
 
-        let supervisor =
-            crate::execution_core::goal::ObjectiveSupervisor::new(Arc::new(GoalStore::new(events)));
-        let reconciled = crate::agentic::supervision::reconcile_completion_request(
-            &actions,
-            &supervisor,
-            &actor.program_id,
-        )
-        .unwrap()
-        .expect("existing request must be reduced");
 
-        assert_eq!(reconciled.status, crate::AgenticProgramStatus::Open);
-        assert!(reconciled.completion_request.is_none());
-        let goal = goals.get("goal:root-completion").unwrap().unwrap();
-        assert_eq!(goal.completion, GoalCompletion::Open);
-        assert_eq!(
-            goal.waiting
-                .as_ref()
-                .map(|waiting| waiting.reason_code.as_str()),
-            Some("completion_gap")
-        );
-        assert!(goal
-            .waiting
-            .as_ref()
-            .expect("waiting")
-            .required_refs
-            .iter()
-            .any(|reference| reference.starts_with("original_intent_review_required:user_intent")));
-        // The gap names the cited results no review covers, so the model can
-        // complete the review instead of re-issuing a partial one.
-        let mut goal = goal;
-        let required_refs = goal.waiting.take().expect("waiting").required_refs;
-        assert!(required_refs
-            .iter()
-            .any(|reference| reference.contains("uncovered_result_refs: tool://result")));
-    }
 
-    #[tokio::test]
-    async fn later_gap_review_supersedes_an_earlier_satisfied_review() {
-        crate::agentic::execution::reviewed_goal_fixture::with_native_goal_before_a(
-            |services, before, baseline, envelope| {
-                let goals = services.goal_store();
-                let actions = services.agent_action_service();
-                let actor = &envelope.actor;
-                let goal_id = baseline.goal.id.clone();
-                let current_goal = goals.get(&goal_id).unwrap().unwrap();
-                assert!(baseline.gaps.is_empty());
 
-                goals
-                    .revise(
-                        goal_id.as_str(),
-                        current_goal.revision,
-                        current_goal.user_sequence + 1,
-                        "review found a gap",
-                        |goal| {
-                            let mut review = goal.reviews.last().unwrap().clone();
-                            review.review_id = "later-gap".into();
-                            review.decision = "gap".into();
-                            goal.reviews.push(review);
-                            vec!["reviews".into()]
-                        },
-                    )
-                    .unwrap();
-                let program = actions.project(&actor.program_id).unwrap();
-                let prepared = goals.prepare_program_conclusion(&program).unwrap();
-                assert!(prepared
-                    .gaps
-                    .iter()
-                    .any(|gap| gap.starts_with("original_intent_review_required:")));
-                let reopened = actions
-                    .commit_program_conclusion(&program, prepared)
-                    .unwrap();
-                assert_eq!(reopened.status, crate::AgenticProgramStatus::Open);
-                assert!(goals
-                    .get(goal_id.as_str())
-                    .unwrap()
-                    .unwrap()
-                    .terminal
-                    .is_none());
-            },
-        )
-        .await;
-    }
 
-    #[tokio::test]
-    async fn new_counterevidence_invalidates_a_previous_positive_review() {
-        crate::agentic::execution::reviewed_goal_fixture::with_native_goal_before_a(
-            |services, program, baseline, envelope| {
-                assert!(baseline.gaps.is_empty());
-                let actions = services.agent_action_service();
-                let original = services
-                    .goal_store()
-                    .get(&baseline.goal.id)
-                    .unwrap()
-                    .unwrap();
-                let note = services
-                    .event_store()
-                    .event_by_idempotency_key(
-                        &format!("agentic-program:{}", program.program_id),
-                        "agent-action:mechanical-unrelated-note",
-                    )
-                    .unwrap()
-                    .unwrap();
-                assert_eq!(note.status.as_deref(), Some("applied"));
-                let current = actions.project(&program.program_id).unwrap();
-                assert!(
-                    services
-                        .goal_store()
-                        .prepare_program_conclusion(&current)
-                        .unwrap()
-                        .gaps
-                        .is_empty(),
-                    "the actual unrelated MessagePublish preserves selected current proof"
-                );
-                let goal_id = original.id.clone();
-                services
-                    .goal_store()
-                    .revise(
-                        &goal_id,
-                        original.revision,
-                        original.user_sequence + 1,
-                        "new acceptance risk",
-                        |goal| {
-                            goal.spec_revision += 1;
-                            goal.spec_digest = "actual changed acceptance policy".into();
-                            vec!["spec_revision".into(), "spec_digest".into()]
-                        },
-                    )
-                    .unwrap();
-                let prepared = services
-                    .goal_store()
-                    .prepare_program_conclusion(&current)
-                    .unwrap();
-                assert!(prepared
-                    .gaps
-                    .iter()
-                    .any(|gap| gap.starts_with("original_intent_review_required:")));
-                assert!(prepared.goal.terminal.is_none());
-            },
-        )
-        .await;
-    }
 
-    #[tokio::test]
-    async fn goal_cas_conflict_cannot_commit_half_a_program_terminal() {
-        crate::agentic::execution::reviewed_goal_fixture::with_native_goal_before_a(|services, before, baseline, envelope| {
-        let goals = services.goal_store();
-        let actions = services.agent_action_service();
-        let actor = &envelope.actor;
-        let goal_id = baseline.goal.id.clone();
-        let goal_stream_id = baseline.event.event.stream_id.clone();
-        let current_goal = goals.get(&goal_id).unwrap().unwrap();
-        assert!(baseline.gaps.is_empty());
 
-        let before = actions.project(&actor.program_id).unwrap();
-        let prepared = goals.prepare_program_conclusion(&before).unwrap();
-        assert!(prepared.gaps.is_empty());
-        let concurrent_goals = Arc::clone(goals);
-        let fault_goal_id = goal_id.clone();
-        let source = goal_stream_id.clone();
-        let expected = prepared.expected_stream_revision;
-        let error = crate::agentic::execution::reviewed_goal_fixture::with_native_conclusion_append_hook(
-            move |transaction| {
-                assert!(transaction.expected_streams.iter().any(|cut|
-                    cut.stream_id == source && cut.expected_revision == expected));
-                concurrent_goals.revise(&fault_goal_id, current_goal.revision,
-                    current_goal.user_sequence + 1, "concurrent new requirement", |goal| {
-                        goal.constraints.push("new requirement".into());
-                        vec!["constraints".into()]
-                    }).unwrap();
-            },
-            || actions.commit_program_conclusion(&before, prepared),
-        ).err().expect("actual Goal storage CAS");
-        match error {
-            crate::AgentActionServiceError::Store(crate::RuntimeEventStoreError::StaleRevision {
-                stream_id, expected: found, actual,
-            }) => { assert_eq!(stream_id, goal_stream_id); assert_eq!(found, expected); assert_eq!(actual, expected + 1); }
-            error => panic!("wrong failure layer: {error}"),
-        }
-        assert_eq!(
-            actions.project(&actor.program_id).unwrap().revision,
-            before.revision
-        );
-        assert!(
-            goals
-                .get(goal_id.as_str())
-                .unwrap()
-                .unwrap()
-                .terminal
-                .is_none()
-        );
 
-        }).await;
-    }
-
-    #[tokio::test]
-    async fn real_a_verdict_is_bound_into_b_with_goal_and_program_source_fences() {
-        crate::agentic::execution::reviewed_goal_fixture::with_native_goal_before_a(
-            |services, program, prepared, _| {
-                let committed = services
-                    .agent_action_service()
-                    .commit_program_conclusion(program, prepared)
-                    .unwrap();
-                let goal = services
-                    .goal_store()
-                    .get(&committed.objective_verdict.as_ref().unwrap().goal_id)
-                    .unwrap()
-                    .unwrap();
-                services
-                    .event_store()
-                    .append(RuntimeEventInput {
-                        stream_id: format!("agentic-program:{}", program.program_id),
-                        scope: RuntimeEventScope::Program,
-                        kind: "agentic.task_lease_renewed".into(),
-                        status: None,
-                        actor: None,
-                        refs: vec![],
-                        payload: serde_json::json!({}),
-                    })
-                    .unwrap();
-                crate::agentic::execution::reviewed_goal_fixture::assert_native_sources_final_b(
-                    services,
-                    services.commit_service(),
-                    &goal,
-                    false,
-                );
-            },
-        )
-        .await;
-    }
-
-    #[tokio::test]
-    async fn program_cas_conflict_cannot_commit_half_a_goal_terminal() {
-        crate::agentic::execution::reviewed_goal_fixture::with_native_goal_before_a(
-            |services, before, baseline, envelope| {
-                let events = services.event_store();
-                let goals = services.goal_store();
-                let actions = services.agent_action_service();
-                let actor = &envelope.actor;
-                let goal_id = baseline.goal.id.clone();
-                let program_stream_id = format!("agentic-program:{}", before.program_id);
-                let current_goal = goals.get(&goal_id).unwrap().unwrap();
-                assert!(baseline.gaps.is_empty());
-
-                let before = actions.project(&actor.program_id).unwrap();
-                let prepared = goals.prepare_program_conclusion(&before).unwrap();
-                events
-                    .append(RuntimeEventInput {
-                        stream_id: program_stream_id.as_str().into(),
-                        scope: RuntimeEventScope::Program,
-                        kind: "test.concurrent_observation".into(),
-                        status: None,
-                        actor: None,
-                        refs: vec![],
-                        payload: serde_json::json!({}),
-                    })
-                    .unwrap();
-                let error = actions
-                    .commit_program_conclusion(&before, prepared)
-                    .err()
-                    .expect("non-lease Program fence must reject the valid v2 prepared A");
-                match error {
-                    crate::AgentActionServiceError::Store(
-                        crate::RuntimeEventStoreError::StaleRevision {
-                            stream_id,
-                            expected,
-                            actual,
-                        },
-                    ) => {
-                        assert_eq!(stream_id, program_stream_id);
-                        assert_eq!(expected, before.revision);
-                        assert_eq!(actual, before.revision + 1);
-                    }
-                    error => panic!("wrong Program fence failure layer: {error}"),
-                }
-                let goal = goals.get(goal_id.as_str()).unwrap().unwrap();
-                assert_eq!(goal.revision, current_goal.revision);
-                assert!(goal.terminal.is_none());
-                assert!(actions
-                    .project(&actor.program_id)
-                    .unwrap()
-                    .objective_verdict
-                    .is_none());
-            },
-        )
-        .await;
-    }
-
-    #[tokio::test]
-    async fn lease_renewals_do_not_starve_an_already_verified_current_goal() {
-        crate::agentic::execution::reviewed_goal_fixture::with_native_goal_before_a(|services, before, baseline, envelope| {
-        let events = services.event_store();
-        let goals = services.goal_store();
-        let actions = services.agent_action_service();
-        let actor = &envelope.actor;
-        let goal_id = baseline.goal.id.clone();
-        assert!(baseline.gaps.is_empty());
-
-        let before = actions.project(&actor.program_id).unwrap();
-        let prepared = goals.prepare_program_conclusion(&before).unwrap();
-        assert!(prepared.gaps.is_empty());
-        for renewal in 0..25 {
-            events.append(RuntimeEventInput {
-                stream_id: format!("agentic-program:{}", actor.program_id),
-                scope: RuntimeEventScope::Program,
-                kind: "agentic.task_lease_renewed".into(),
-                status: Some("renewed".into()), actor: Some("worker".into()), refs: vec![],
-                payload: serde_json::json!({"task_ref":"optional-task", "agent_id":"worker", "execution_id":format!("worker-{renewal}")}),
-            }).unwrap();
-        }
-        let committed = actions.commit_program_conclusion(&before, prepared).unwrap();
-        assert_eq!(committed.status, crate::AgenticProgramStatus::Verified);
-        assert_eq!(committed.revision, before.revision + 26);
-        assert_eq!(goals.get(goal_id.as_str()).unwrap().unwrap().completion,
-            GoalCompletion::Satisfied);
-
-        }).await;
-    }
-
-    #[tokio::test]
-    async fn lease_renewal_rebase_cannot_bypass_a_new_goal_revision() {
-        crate::agentic::execution::reviewed_goal_fixture::with_native_goal_before_a(|services, before, baseline, envelope| {
-        let events = services.event_store();
-        let goals = services.goal_store();
-        let actions = services.agent_action_service();
-        let actor = &envelope.actor;
-        let goal_id = baseline.goal.id.clone();
-        let current_goal = goals.get(&goal_id).unwrap().unwrap();
-        assert!(baseline.gaps.is_empty());
-
-        let before = actions.project(&actor.program_id).unwrap();
-        let prepared = goals.prepare_program_conclusion(&before).unwrap();
-        events.append(RuntimeEventInput {
-            stream_id: format!("agentic-program:{}", actor.program_id),
-            scope: RuntimeEventScope::Program, kind: "agentic.task_lease_renewed".into(),
-            status: Some("renewed".into()), actor: None, refs: vec![],
-            payload: serde_json::json!({"task_ref":"task", "agent_id":"worker", "execution_id":"run"}),
-        }).unwrap();
-        goals.revise(goal_id.as_str(), current_goal.revision, current_goal.user_sequence + 1, "new user requirement", |goal| {
-            goal.objective = "A revised objective must be reviewed again".into();
-            vec!["objective".into()]
-        }).unwrap();
-        assert!(actions.commit_program_conclusion(&before, prepared).is_err());
-        let current = goals.get(goal_id.as_str()).unwrap().unwrap();
-        assert_eq!(current.revision, current_goal.revision + 1);
-        assert!(current.terminal.is_none());
-        assert!(actions.project(&actor.program_id).unwrap().objective_verdict.is_none());
-
-        }).await;
-    }
-
-    #[tokio::test]
-    async fn ordinary_goal_writers_cannot_bypass_the_program_atomic_conclusion() {
-        crate::agentic::execution::reviewed_goal_fixture::with_native_goal_before_a(
-            |services, before, baseline, envelope| {
-                let events = services.event_store();
-                let goals = services.goal_store();
-                let actions = services.agent_action_service();
-                let actor = &envelope.actor;
-                let goal_id = baseline.goal.id.clone();
-                let goal_stream_id = baseline.event.event.stream_id.clone();
-                let current_goal = goals.get(&goal_id).unwrap().unwrap();
-                assert!(baseline.gaps.is_empty());
-
-                let goal_id = goal_id.as_str();
-                let before = events.stream_revision(goal_stream_id.as_str()).unwrap();
-                let terminal = ObjectiveTerminal {
-                    kind: ObjectiveTerminalKind::Satisfied,
-                    terminal_fence: "bypass".into(),
-                    authority_revision: 1,
-                    reason: "attempt ordinary completion".into(),
-                    evidence_refs: vec!["execution_graph:root-completion".into()],
-                    diagnostics: vec![],
-                    committed_at_ms: 1,
-                };
-                for error in [
-                    goals
-                        .terminal_event(
-                            goal_id,
-                            GoalCompletion::Satisfied,
-                            terminal.evidence_refs.clone(),
-                            terminal.reason.clone(),
-                            terminal.terminal_fence.clone(),
-                        )
-                        .unwrap_err(),
-                    goals
-                        .complete(
-                            goal_id,
-                            current_goal.revision,
-                            GoalCompletion::Satisfied,
-                            "done",
-                        )
-                        .unwrap_err(),
-                    goals
-                        .complete_objective(goal_id, current_goal.revision, terminal)
-                        .unwrap_err(),
-                ] {
-                    assert!(error.contains("program_terminal_authority"), "{error}");
-                }
-                assert_eq!(
-                    events.stream_revision(goal_stream_id.as_str()).unwrap(),
-                    before
-                );
-                let program = actions.project(&actor.program_id).unwrap();
-                let prepared = goals.prepare_program_conclusion(&program).unwrap();
-                assert!(prepared.gaps.is_empty());
-                actions
-                    .commit_program_conclusion(&program, prepared)
-                    .unwrap();
-                assert_eq!(
-                    goals.get(goal_id).unwrap().unwrap().completion,
-                    GoalCompletion::Satisfied
-                );
-            },
-        )
-        .await;
-    }
-
-    #[tokio::test]
-    async fn valid_current_review_commits_goal_and_program_together() {
-        crate::agentic::execution::reviewed_goal_fixture::with_native_goal_before_a(
-            |services, before, baseline, envelope| {
-                let events = services.event_store();
-                let goals = services.goal_store();
-                let actions = services.agent_action_service();
-                let actor = &envelope.actor;
-                let goal_id = baseline.goal.id.clone();
-                let goal_stream_id = baseline.event.event.stream_id.clone();
-                let program_stream_id = format!("agentic-program:{}", before.program_id);
-                assert!(baseline.gaps.is_empty());
-
-                let before = actions.project(&actor.program_id).unwrap();
-                let prepared = goals.prepare_program_conclusion(&before).unwrap();
-                let after = actions
-                    .commit_program_conclusion(&before, prepared)
-                    .unwrap();
-                let goal = goals.get(goal_id.as_str()).unwrap().unwrap();
-                assert_eq!(goal.completion, GoalCompletion::Satisfied);
-                assert_eq!(after.status, crate::AgenticProgramStatus::Verified);
-                assert_eq!(
-                    after.objective_verdict.as_ref().unwrap().terminal_fence,
-                    goal.terminal.as_ref().unwrap().terminal_fence
-                );
-                let goal_event = events.list_stream(goal_stream_id.as_str()).unwrap();
-                let program_event = events.list_stream(program_stream_id.as_str()).unwrap();
-                assert!(!goal_event.is_empty());
-                assert_eq!(
-                    goal_event.last().unwrap().transaction_id,
-                    program_event.last().unwrap().transaction_id
-                );
-            },
-        )
-        .await;
-    }
-
-    #[tokio::test]
-    async fn original_obligations_and_new_spec_cannot_be_erased_by_task_completion() {
-        crate::agentic::execution::reviewed_goal_fixture::with_native_goal_before_a(
-            |services, before, baseline, envelope| {
-                let goals = services.goal_store();
-                let actions = services.agent_action_service();
-                let actor = &envelope.actor;
-                let goal_id = baseline.goal.id.clone();
-                let current_goal = goals.get(&goal_id).unwrap().unwrap();
-                assert!(baseline.gaps.is_empty());
-
-                goals
-                    .revise(
-                        goal_id.as_str(),
-                        current_goal.revision,
-                        current_goal.user_sequence + 1,
-                        "retain required verification",
-                        |goal| {
-                            goal.obligations
-                                .push(harness_contract::goal::ObjectiveObligation {
-                                    obligation_id: "original-verification".into(),
-                                    required: true,
-                                    success_predicate: "verify the user's actual result".into(),
-                                    producer: Default::default(),
-                                    evidence_requirement: Default::default(),
-                                    state: ObjectiveObligationState::Open,
-                                    artifact_refs: vec![],
-                                    evidence_refs: vec![],
-                                    reread_receipts: vec![],
-                                    verifier_decision: None,
-                                    diagnostic_code: None,
-                                });
-                            goal.spec_revision = 2;
-                            goal.spec_digest = "new-spec".into();
-                            vec![
-                                "obligations".into(),
-                                "spec_revision".into(),
-                                "spec_digest".into(),
-                            ]
-                        },
-                    )
-                    .unwrap();
-                let program = actions.project(&actor.program_id).unwrap();
-                let prepared = goals.prepare_program_conclusion(&program).unwrap();
-                assert!(prepared.goal.terminal.is_none());
-                assert!(prepared
-                    .gaps
-                    .iter()
-                    .any(|gap| gap.contains("original-verification")));
-                assert!(prepared
-                    .gaps
-                    .iter()
-                    .any(|gap| gap.starts_with("original_intent_review_required:")));
-                actions
-                    .commit_program_conclusion(&program, prepared)
-                    .unwrap();
-                let original = goals.get(goal_id.as_str()).unwrap().unwrap();
-                assert_eq!(
-                    original.obligations.len(),
-                    current_goal.obligations.len() + 1
-                );
-                assert_eq!(
-                    original.obligations.last().unwrap().obligation_id,
-                    "original-verification"
-                );
-                assert!(original.obligations.last().unwrap().required);
-                assert_eq!(
-                    original.obligations.last().unwrap().state,
-                    ObjectiveObligationState::Open
-                );
-            },
-        )
-        .await;
-    }
-
-    #[test]
-    fn repeated_completion_rejections_do_not_invent_a_default_business_round_terminal() {
-        let (events, goals, actions, actor) = mechanical_fixture(false);
-        assert_eq!(completion_reopen_bound().unwrap(), None);
-        for attempt in 0..20 {
-            events.append(RuntimeEventInput {
-                stream_id: format!("agentic-program:{}", actor.program_id), scope: RuntimeEventScope::Program,
-                kind: COMPLETION_REJECTED_EVENT_KIND.into(), status: Some("rejected".into()), actor: Some(actor.actor_id.clone()),
-                refs: vec![], payload: serde_json::json!({"program_id":actor.program_id,"gap":"review still required","request_action_id":format!("rejection-{attempt}")}),
-            }).unwrap();
-        }
-        let program = actions.project(&actor.program_id).unwrap();
-        let prepared = goals.prepare_program_conclusion(&program).unwrap();
-        assert!(prepared.goal.terminal.is_none());
-        assert_eq!(prepared.goal.completion, GoalCompletion::Open);
-        assert!(prepared.goal.waiting.is_some());
-        assert!(!prepared.gaps.is_empty());
-        actions
-            .commit_program_conclusion(&program, prepared)
-            .unwrap();
-        let goal = goals.get("goal:root-completion").unwrap().unwrap();
-        assert_eq!(goal.completion, GoalCompletion::Open);
-        assert!(goal.terminal.is_none());
-        assert!(actions
-            .project(&actor.program_id)
-            .unwrap()
-            .completion_request
-            .is_none());
-    }
 
     #[test]
     fn completion_reopen_resource_limit_is_explicit_and_invalid_values_do_not_fail_open() {
@@ -1947,4 +1779,86 @@ mod tests {
             0
         );
     }
+
+    #[test]
+    fn a9_disconnected_task_does_not_keep_the_program_waiting() {
+        // The dispatch side recorded that the root graph was already terminal:
+        // nobody will ever pick this Task up again, so it must not keep the
+        // Program waiting.
+        assert!(!GoalStore::task_blocks_the_program_cut(
+            crate::AgenticTaskStatus::Rework, false, false, true));
+        assert!(!GoalStore::task_blocks_the_program_cut(
+            crate::AgenticTaskStatus::Published, false, false, true));
+    }
+
+    #[test]
+    fn a9_task_without_a_disconnect_record_still_keeps_the_program_waiting() {
+        // No disconnect record: the Task may still be dispatched, so it waits.
+        assert!(GoalStore::task_blocks_the_program_cut(
+            crate::AgenticTaskStatus::Rework, false, false, false));
+        assert!(GoalStore::task_blocks_the_program_cut(
+            crate::AgenticTaskStatus::Published, false, false, false));
+    }
+
+    #[test]
+    fn a9_active_attempt_or_live_lease_still_keeps_the_program_waiting() {
+        // Fail closed: an attempt or a lease is live work, whatever the
+        // dispatch side recorded.
+        assert!(GoalStore::task_blocks_the_program_cut(
+            crate::AgenticTaskStatus::Rework, true, false, true));
+        assert!(GoalStore::task_blocks_the_program_cut(
+            crate::AgenticTaskStatus::Rework, false, true, true));
+        assert!(GoalStore::task_blocks_the_program_cut(
+            crate::AgenticTaskStatus::Submitted, true, false, true));
+    }
+
+    #[test]
+    fn a9_task_outside_the_unsettled_bucket_never_waits() {
+        assert!(!GoalStore::task_blocks_the_program_cut(
+            crate::AgenticTaskStatus::Blocked, false, false, false));
+        assert!(!GoalStore::task_blocks_the_program_cut(
+            crate::AgenticTaskStatus::Accepted, false, false, false));
+    }
+
+
+    #[test]
+    fn a9_waiting_bucket_all_durably_disconnected_is_the_new_trigger_shape() {
+        // The only waiting Task failed, has no attempt and no live lease, and
+        // the dispatch side durably recorded the root graph as terminal.
+        assert!(GoalStore::waiting_tasks_are_all_durably_disconnected(
+            &[("task:one", crate::AgenticTaskStatus::Rework, false, false)],
+            &["task:one".to_string()]));
+    }
+
+    #[test]
+    fn a9_a_stranded_task_without_a_disconnect_record_never_triggers_the_new_arm() {
+        // A Task the dispatcher only counted as starved has no durable
+        // disconnect record, so the new arm must not fire on it - and the
+        // process-local starvation ledger is never consulted.
+        assert!(!GoalStore::waiting_tasks_are_all_durably_disconnected(
+            &[("task:one", crate::AgenticTaskStatus::Rework, false, false)],
+            &[]));
+        assert!(!GoalStore::waiting_tasks_are_all_durably_disconnected(
+            &[("task:one", crate::AgenticTaskStatus::Rework, false, false)],
+            &["task:other".to_string()]));
+    }
+
+    #[test]
+    fn a9_a_waiting_task_with_an_attempt_or_a_lease_never_triggers_the_new_arm() {
+        assert!(!GoalStore::waiting_tasks_are_all_durably_disconnected(
+            &[("task:one", crate::AgenticTaskStatus::Rework, true, false)],
+            &["task:one".to_string()]));
+        assert!(!GoalStore::waiting_tasks_are_all_durably_disconnected(
+            &[("task:one", crate::AgenticTaskStatus::Rework, false, true)],
+            &["task:one".to_string()]));
+        assert!(!GoalStore::waiting_tasks_are_all_durably_disconnected(
+            &[("task:one", crate::AgenticTaskStatus::Submitted, false, false)],
+            &["task:one".to_string()]));
+    }
+
+    #[test]
+    fn a9_an_empty_waiting_bucket_never_triggers_the_new_arm() {
+        assert!(!GoalStore::waiting_tasks_are_all_durably_disconnected(&[], &["task:one".to_string()]));
+    }
+
 }

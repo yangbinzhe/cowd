@@ -213,7 +213,11 @@ async fn send_message_applies_request_profile_and_records_telemetry() {
     );
 
     let events = sink.events();
-    assert_eq!(events.len(), 6);
+    assert!(matches!(events.as_slice(), [
+        TelemetryEvent::HttpRequestStarted { .. }, TelemetryEvent::SessionTrace(_),
+        TelemetryEvent::HttpRequestSucceeded { .. }, TelemetryEvent::SessionTrace(_),
+        TelemetryEvent::Analytics(_), TelemetryEvent::SessionTrace(_)
+    ]));
     assert!(matches!(
         &events[0],
         TelemetryEvent::HttpRequestStarted {
@@ -391,7 +395,11 @@ async fn stream_message_parses_sse_events_with_tool_use() {
     }
     drop(server);
 
-    assert_eq!(events.len(), 6);
+    assert!(matches!(events.as_slice(), [
+        StreamEvent::MessageStart(_), StreamEvent::ContentBlockStart(_),
+        StreamEvent::ContentBlockDelta(_), StreamEvent::ContentBlockStop(_),
+        StreamEvent::MessageDelta(_), StreamEvent::MessageStop(_)
+    ]));
     assert!(matches!(
         &events[0],
         StreamEvent::MessageStart(start)

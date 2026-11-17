@@ -68,6 +68,7 @@ fn read_xai_base_url_prefers_env_override() {
 #[test]
 fn provider_client_configured_protocol_selects_responses_without_detection() {
     let client = ProviderClient::from_config(&ProviderConfig {
+        reasoning_effort: None,
         name: "openai".to_string(),
         base_url: "https://api.openai.com/v1".to_string(),
         api_key: "sk-test".to_string(),
@@ -89,6 +90,7 @@ fn provider_client_configured_protocol_selects_responses_without_detection() {
 #[test]
 fn provider_client_missing_protocol_uses_local_detection() {
     let client = ProviderClient::from_config(&ProviderConfig {
+        reasoning_effort: None,
         name: "deepseek".to_string(),
         base_url: "https://api.deepseek.com/v1".to_string(),
         api_key: "sk-test".to_string(),

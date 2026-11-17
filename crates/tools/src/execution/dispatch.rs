@@ -99,13 +99,13 @@ pub(crate) fn execute_with_lease(
         "grep_search" => {
             if input.get("searches").is_some() {
                 from_value::<GrepSearchBatchInput>(input)
-                    .and_then(|parsed| run_grep_search_batch(lease, parsed))
+                    .and_then(|parsed| run_grep_search_batch(lease, parsed, input))
             } else if input.get("language").is_some() {
                 from_value::<GrepSearchLanguageInput>(input)
                     .and_then(|parsed| run_grep_search_language(lease, parsed))
             } else {
                 from_value::<GrepSearchInput>(input)
-                    .and_then(|parsed| run_grep_search(lease, parsed))
+                    .and_then(|parsed| run_grep_search(lease, parsed, input))
             }
         }
         "workspace_snapshot" => from_value::<WorkspaceSnapshotInput>(input)

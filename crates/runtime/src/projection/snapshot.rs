@@ -6,25 +6,45 @@ pub async fn snapshot(
     execution_id: &str,
     context: &ProjectionQueryContext,
 ) -> Result<ExecutionProjection, RuntimeServicesError> {
+    let mut budget = history::RequestBudget::default();
+    budget.enable_incremental();
+    for attempt in 0..=3 {
+        match snapshot_once(services, execution_id, context, &mut budget).await {
+            Err(error) if attempt < 3 && history::is_graph_ahead_of_cut(&error) => {
+                budget.restart_after_cut_race()?;
+            }
+            result => return result,
+        }
+    }
+    unreachable!("bounded snapshot loop returns on its last attempt")
+}
+
+async fn snapshot_once(
+    services: &RuntimeServices,
+    execution_id: &str,
+    context: &ProjectionQueryContext,
+    budget: &mut history::RequestBudget,
+) -> Result<ExecutionProjection, RuntimeServicesError> {
     // Freeze the durable consumption boundary before reading materialized
     // stores. Concurrent commits may be replayed once, but cannot be skipped
     // by advertising a cursor newer than the state observed below.
     validate_context(services, context)?;
-    let mut budget = history::RequestBudget::default();
-    budget.enable_incremental();
     budget.capture_source_fence(services)?;
     let cursor = services.event_store().durable_commit_cursor()?;
     let graph = services
         .execution_supervisor()
         .graph_projection(execution_id)
         .await?;
+    if graph.commit_cursor > cursor {
+        return Err(RuntimeServicesError::Invariant("history prefix: graph ahead of requested cut".into()));
+    }
     let scope = ExecutionProjectionScope::load_budgeted(
         services,
         execution_id,
         &graph,
         context.detail_scope == ProjectionDetailScope::Full,
         cursor,
-        &mut budget,
+        budget,
     )?;
     validate_projection_scope(&scope, context)?;
     let cache_key = ExecutionProjectionCacheKey::new(execution_id, graph.revision, cursor, context);
@@ -51,7 +71,7 @@ pub async fn snapshot(
         context,
         graph,
         cursor,
-        &mut budget,
+        budget,
         scope,
     )
     .await?;
@@ -92,6 +112,48 @@ pub async fn snapshot(
         }
     }
     Ok(projection)
+}
+
+#[cfg(test)]
+mod cut_race_tests {
+    use super::*;
+    use harness_contract::execution_graph::{ExecutionGraph, ExecutionGraphCommand};
+
+    #[tokio::test]
+    async fn real_graph_advancing_past_cut_can_be_retried_with_fresh_source() {
+        let services = RuntimeServices::in_memory().unwrap();
+        let mut graph = ExecutionGraph::new("projection cut race");
+        crate::test_support::attach_execution_graph_lineage(&mut graph);
+        let graph = services.commit_service().register_graph(graph).unwrap().graph;
+        let old_cut = services.event_store().durable_commit_cursor().unwrap();
+        let old_projection = services.graph_state_store().projection(&graph.id).unwrap();
+        let mut budget = history::RequestBudget::default();
+        budget.enable_incremental();
+        budget.capture_source_fence(&services).unwrap();
+        let scope = ExecutionProjectionScope::load_budgeted(
+            &services, &graph.id, &old_projection, true, old_cut, &mut budget,
+        ).unwrap();
+        let current = services.commit_service().apply_command(&graph,
+            &ExecutionGraphCommand::Start { expected_revision: graph.revision }).unwrap().graph;
+        let error = history::load_scope_budgeted(&services, &scope, old_cut, false, &mut budget).unwrap_err();
+        assert!(history::is_graph_ahead_of_cut(&error));
+        let before_retry = budget.consumed_work();
+        budget.restart_after_cut_race().unwrap();
+        assert!(budget.request_source.is_none());
+        assert_eq!(budget.consumed_work(), (before_retry.0 + 1, before_retry.1));
+        let context = ProjectionQueryContext {
+            principal: "test".into(), workspace_id: services.workspace_key().to_string(),
+            session_scopes: Vec::new(), mission_scopes: Vec::new(),
+            visibility_grants: vec![format!("workspace:{}", services.workspace_key()), "resource:*".into()],
+            detail_scope: ProjectionDetailScope::Full, authorization_revision: 1,
+        };
+        let projection = snapshot_once(&services, &graph.id, &context, &mut budget).await.unwrap();
+        assert_eq!(projection.graph.revision, current.revision);
+        assert!(projection.cursor > old_cut);
+        assert!(projection.graph.commit_cursor <= projection.cursor);
+        services.shutdown_execution().await;
+        services.shutdown_maintenance().await;
+    }
 }
 
 async fn snapshot_with_graph(

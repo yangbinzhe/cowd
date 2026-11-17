@@ -63,6 +63,7 @@ fn fixture() -> (crate::DurableRuntimeEvent, ToolEffectDescriptor) {
         }],
     };
     let outcome = RuntimeToolExecutionOutcome {
+        pending_agent_batch: None,
         tool_use_id: "801-call".into(),
         tool_name: "web_fetch".into(),
         status: RuntimeToolExecutionStatus::Executed,
@@ -166,7 +167,12 @@ fn own823n_cold_and_live_reject_unknown_unjoined_unsupported_empty_and_process_s
 fn own823n_shared_original_validator_rejects_foreign_key_call_input_descriptor_step_attempt_and_policy(
 ) {
     let (original, effect) = fixture();
-    for fault in 0..10 {
+    // Faults 10-12 pin the call-identity spelling contract. A composite
+    // `<session>:<call>:<attempt>` once reached the grant from the Host, and
+    // the durable binding compares the grant against this call's own
+    // `tool_use_id`. Fault 12 is the one that matters: the pair is made
+    // self-consistent, so only a real per-call comparison can refuse it.
+    for fault in 0..13 {
         let mut changed = original.clone();
         match fault {
             0 => changed.payload["idempotency_key"] = json!("foreign-key"),
@@ -188,6 +194,20 @@ fn own823n_shared_original_validator_rejects_foreign_key_call_input_descriptor_s
                 changed.payload["local_network_authorization"]["authorization_lease"]["signature"] =
                     json!("foreign-signature")
             }
+            10 => {
+                changed.payload["local_network_authorization"]["request_id"] =
+                    json!("801-session:801-call:3")
+            }
+            11 => {
+                changed.payload["local_network_authorization"]["authorization_lease"]
+                    ["idempotency_key"] = json!("801-session:801-call:3")
+            }
+            12 => {
+                let composite = json!("801-session:801-call:3");
+                changed.payload["local_network_authorization"]["request_id"] = composite.clone();
+                changed.payload["local_network_authorization"]["authorization_lease"]
+                    ["idempotency_key"] = composite;
+            }
             _ => unreachable!(),
         }
         assert!(
@@ -195,6 +215,82 @@ fn own823n_shared_original_validator_rejects_foreign_key_call_input_descriptor_s
             "{fault}"
         );
     }
+}
+
+/// The call identity a network grant carries is this call's own `tool_use_id`,
+/// in the grant and in its lease. The bare form is what the Host emits and what
+/// the durable binding accepts; every composite spelling is refused, including
+/// the ones where the grant and its lease agree on the composite.
+#[test]
+fn own823n_the_grant_call_identity_is_the_bare_call_id() {
+    let (original, effect) = fixture();
+    let grant = &original.payload["local_network_authorization"];
+    assert_eq!(grant["request_id"], json!("801-call"));
+    assert_eq!(
+        grant["authorization_lease"]["idempotency_key"],
+        json!("801-call")
+    );
+    assert_eq!(original.payload["tool_use_id"], json!("801-call"));
+    validate_receipt(&original, &effect).unwrap();
+    for composite in [
+        "801-session:801-call:3",
+        "801-call:3",
+        "801-session:801-call",
+        "801-session:801-call:3:extra",
+    ] {
+        let mut changed = original.clone();
+        changed.payload["local_network_authorization"]["request_id"] = json!(composite);
+        changed.payload["local_network_authorization"]["authorization_lease"]["idempotency_key"] =
+            json!(composite);
+        assert!(
+            validate_receipt(&changed, &effect).is_err(),
+            "{composite}"
+        );
+    }
+}
+
+/// A network effect that provably sent nothing closes: the fact records a
+/// pre-send refusal, which is the only evidence that distinguishes "failed
+/// before any effect" from "failed while an effect may already exist". The
+/// latter has no such evidence and stays refused.
+#[test]
+fn own823n_a_pre_send_refusal_is_the_evidence_that_nothing_was_sent() {
+    let (original, effect) = fixture();
+    let mut outcome: RuntimeToolExecutionOutcome =
+        serde_json::from_value(original.payload["outcome"].clone()).unwrap();
+    let EvidenceTargetIdentity::LocalNetwork { operation } =
+        &mut outcome.observed_evidence[0].target
+    else {
+        unreachable!()
+    };
+    operation.operations = vec![harness_contract::context::LocalNetworkOperation {
+        ordinal: 1,
+        input_sha256: "b".repeat(64),
+        endpoint: "https://example.invalid".into(),
+        terminal: harness_contract::context::LocalNetworkTerminal::NotStarted {
+            reason_code: "network_policy_before_send".into(),
+        },
+    }];
+    assert!(
+        ExecutionCommitService::lease_recovery_process_closed(&outcome, &effect),
+        "a recorded pre-send refusal proves nothing was sent, so it closes"
+    );
+    assert_eq!(
+        ExecutionCommitService::local_network_refusal_reason(&outcome, &effect),
+        None
+    );
+    // The same shape with an unknown terminal is not evidence of anything.
+    if let EvidenceTargetIdentity::LocalNetwork { operation } = &mut outcome.observed_evidence[0].target
+    {
+        operation.operations[0].terminal =
+            harness_contract::context::LocalNetworkTerminal::Unknown {
+                reason_code: "network_transport_unknown".into(),
+            };
+    }
+    assert!(
+ !ExecutionCommitService::lease_recovery_process_closed(&outcome, &effect),
+        "an unknown terminal is not evidence that nothing was sent"
+    );
 }
 
 #[test]
@@ -454,4 +550,65 @@ fn own823n_historical_issuer_allows_mutable_32_use_snapshot_but_not_signature_or
         let original_grant = serde_json::from_value(original.payload["local_network_authorization"].clone()).unwrap();
         assert!(crate::authorization_negotiator::validate_historical_authorization_issuer(&changed, &original_grant, original.commit_cursor).is_err(), "issuer {fault}");
     }
+}
+
+/// U: the failure path's pre-send subset is provable, and every other shape
+/// still refuses.
+///
+/// The reader is unchanged by U: it already reads the observed evidence first
+/// and then judges the per-operation facts. U only makes the failure path
+/// produce those facts, so this pins what a failure can and cannot prove.
+#[test]
+fn u_pre_send_subset_is_provable_and_every_other_shape_still_refuses() {
+    let (original, effect) = fixture();
+    let outcome: RuntimeToolExecutionOutcome =
+        serde_json::from_value(original.payload["outcome"].clone()).unwrap();
+    // U-P1: every operation is a pre-send refusal, so "nothing was sent" is
+    // provable and the ring does not appear.
+    let mut proven = outcome.clone();
+    let EvidenceTargetIdentity::LocalNetwork { operation } =
+        &mut proven.observed_evidence[0].target
+    else {
+        unreachable!()
+    };
+    operation.operations[0].terminal = LocalNetworkTerminal::NotStarted {
+        reason_code: "network_policy_before_send".into(),
+    };
+    assert!(
+        ExecutionCommitService::local_network_refusal_reason(&proven, &effect).is_none(),
+        "a pre-send refusal proves that nothing was sent"
+    );
+    // U-N1: no fact at all keeps the original ring.
+    let mut missing = outcome.clone();
+    missing.observed_evidence.clear();
+    assert_eq!(
+        ExecutionCommitService::local_network_refusal_reason(&missing, &effect),
+        Some("network_effect_without_observation")
+    );
+    // U-N1b: an operation whose terminal is unknown is not a proof.
+    let mut unknown = outcome.clone();
+    let EvidenceTargetIdentity::LocalNetwork { operation } =
+        &mut unknown.observed_evidence[0].target
+    else {
+        unreachable!()
+    };
+    operation.operations[0].terminal = LocalNetworkTerminal::Unknown {
+        reason_code: "timeout".into(),
+    };
+    assert_eq!(
+        ExecutionCommitService::local_network_refusal_reason(&unknown, &effect),
+        Some("network_observation_operation_invalid")
+    );
+    // U-N2: an incomplete coverage cannot prove anything either.
+    let mut incomplete = outcome.clone();
+    let EvidenceTargetIdentity::LocalNetwork { operation } =
+        &mut incomplete.observed_evidence[0].target
+    else {
+        unreachable!()
+    };
+    operation.coverage_complete = false;
+    assert_eq!(
+        ExecutionCommitService::local_network_refusal_reason(&incomplete, &effect),
+        Some("network_observation_incomplete")
+    );
 }

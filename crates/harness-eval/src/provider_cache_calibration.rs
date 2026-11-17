@@ -455,6 +455,7 @@ mod tests {
                 providers: HashMap::from([(
                     "fixture".into(),
                     model_protocol::provider_config::ProviderConfig {
+                        reasoning_effort: None,
                         name: "fixture".into(),
                         base_url: format!("http://{address}/v1"),
                         api_key: "fixture-only".into(),

@@ -4693,6 +4693,10 @@ mod tests {
         // template-driven collaboration route. Keep the reviewed catalog
         // cardinality explicit so a future route change must update its
         // contract and tests deliberately.
-        assert_eq!(routes.len(), 479);
+        // R4-034-fixture-fix: the reviewed catalog oracle now includes the two landed routes.
+        // Reviewed since the 479 baseline: GET /api/runtime/executions/:id/read-evidence
+        // and POST /api/skills/:id/first-install-reviews are part of the contract now, so
+        // the audited cardinality for this catalog is 481.
+        assert_eq!(routes.len(), 481);
     }
 }

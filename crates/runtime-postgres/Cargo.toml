@@ -11,6 +11,8 @@ test-fixtures = ["runtime/test-fixtures"]
 [dependencies]
 postgres = { version = "0.19", features = ["with-serde_json-1"] }
 runtime = { path = "../runtime" }
+session = { path = "../session" }
+session-postgres = { path = "../session-postgres" }
 serde = { version = "1", features = ["derive"] }
 serde_json.workspace = true
 sha2 = "0.10"
@@ -21,8 +23,6 @@ uuid = { version = "1", features = ["v4"] }
 runtime = { path = "../runtime", features = ["test-fixtures"] }
 async-trait = "0.1"
 harness-contract = { path = "../harness-contract" }
-session = { path = "../session" }
-session-postgres = { path = "../session-postgres" }
 tempfile = "3"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 

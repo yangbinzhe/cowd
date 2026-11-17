@@ -83,6 +83,10 @@ struct WorkingPin {
     source_hash: String,
     offset: u64,
     lease_digest: String,
+    /// The artifact visibility scope this pin was authorized under. A later
+    /// read of the pin must present the same scope, so an authorization is
+    /// captured once and cannot be widened later.
+    visibility_scope: String,
 }
 #[derive(Default, Serialize, Deserialize)]
 struct WorkingState {
@@ -103,6 +107,22 @@ fn binding(context: &memory::MemoryTurnContext) -> Result<(String, String), Stri
         digest(&lease),
     ))
 }
+/// The Session binding check for one working-context call.
+///
+/// The caller's authenticated Session and the Runtime Memory binding must be
+/// the same Session: the visible scope of a read is derived from that
+/// binding, so a mismatch must be refused before any scope is derived.
+pub fn authorize_session_binding(
+    authenticated_session: Option<&str>,
+    memory_session: &str,
+) -> Result<(), String> {
+    match authenticated_session {
+        Some(session) if session == memory_session => Ok(()),
+        Some(_) => Err("working context Session binding mismatch".to_string()),
+        None => Err("working context requires an authenticated Session binding".to_string()),
+    }
+}
+
 fn read_state(store: &RuntimeEventStore, stream: &str) -> Result<(u64, WorkingState), String> {
     let revision = store.stream_revision(stream).map_err(|e| e.to_string())?;
     if revision == 0 {
@@ -122,6 +142,8 @@ struct SourcePage {
     total: u64,
     bytes: Vec<u8>,
     media_type: String,
+    /// The artifact visibility scope the bytes were read under.
+    visibility_scope: String,
 }
 impl RuntimeServices {
     /// Persist a private Agent report through the original Memory owner.
@@ -283,6 +305,7 @@ impl RuntimeServices {
         context: &memory::MemoryTurnContext,
         source: &WorkingSource,
         offset: u64,
+        visibility_scopes: &[String],
     ) -> Result<SourcePage, String> {
         if source.key().len() > 1024 {
             return Err("working source reference exceeds metadata capacity".into());
@@ -291,12 +314,19 @@ impl RuntimeServices {
             WorkingSource::Artifact { content_ref } => {
                 let store = Arc::clone(self.artifact_store());
                 let content_ref = content_ref.clone();
-                let scope = format!("session:{}", context.session_id);
+                let authorized = visibility_scopes.to_vec();
                 tokio::task::spawn_blocking(move || {
                     let artifact = store.resolve(&content_ref).map_err(|e| e.to_string())?;
                     if offset > artifact.bytes {
                         return Err("working source offset exceeds original bytes".into());
                     }
+                    // The reader presents only the scopes its own binding proves.
+                    // The artifact's recorded scope decides the rest, so an
+                    // authorized call never widens into another artifact.
+                    if !authorized.iter().any(|candidate| candidate == &artifact.visibility_scope) {
+                        return Err("artifact visibility scope is not authorized".into());
+                    }
+                    let scope = artifact.visibility_scope.clone();
                     let bytes = store
                         .read_blocking(
                             &artifact,
@@ -309,6 +339,7 @@ impl RuntimeServices {
                         total: artifact.bytes,
                         bytes,
                         media_type: artifact.media_type,
+                        visibility_scope: scope,
                     })
                 })
                 .await
@@ -339,6 +370,7 @@ impl RuntimeServices {
                     total,
                     bytes: entry.content.as_bytes()[offset as usize..end].to_vec(),
                     media_type: "text/markdown; charset=utf-8".into(),
+                    visibility_scope: String::new(),
                 })
             }
         }
@@ -346,11 +378,18 @@ impl RuntimeServices {
 
     /// Pin/expand changes only this Agent's working selection. Every read,
     /// including an idempotent retry, resolves the current source authority.
+    /// Execute one working-context command.
+    ///
+    /// `visibility_scopes` are the artifact visibility scopes this caller is
+    /// authorized for. A source artifact is readable only when its own
+    /// recorded visibility scope is one of them: an authorized tool call is
+    /// not a license to see every artifact.
     pub async fn working_context_command(
         &self,
         context: &memory::MemoryTurnContext,
         action_id: &str,
         command: WorkingContextInput,
+        visibility_scopes: Vec<String>,
     ) -> Result<Value, String> {
         let (stream, lease_digest) = binding(context)?;
         if let WorkingContextInput::List { cursor } = &command {
@@ -364,7 +403,9 @@ impl RuntimeServices {
         let command_digest = digest(&serde_json::to_vec(&command).map_err(|e| e.to_string())?);
         let (source, pin) = match &command {
             WorkingContextInput::Pin { source } => {
-                let page = self.working_source_page(context, source, 0).await?;
+                let page = self
+                    .working_source_page(context, source, 0, &visibility_scopes)
+                    .await?;
                 (
                     source.clone(),
                     Some(WorkingPin {
@@ -372,6 +413,7 @@ impl RuntimeServices {
                         source_hash: page.hash,
                         offset: 0,
                         lease_digest,
+                        visibility_scope: page.visibility_scope,
                     }),
                 )
             }
@@ -380,7 +422,9 @@ impl RuntimeServices {
                 source_hash,
                 offset,
             } => {
-                let page = self.working_source_page(context, source, *offset).await?;
+                let page = self
+                    .working_source_page(context, source, *offset, &visibility_scopes)
+                    .await?;
                 if &page.hash != source_hash {
                     return Err(
                         "working source changed; inspect and pin its current version".into(),
@@ -393,6 +437,7 @@ impl RuntimeServices {
                         source_hash: page.hash,
                         offset: *offset,
                         lease_digest,
+                        visibility_scope: page.visibility_scope,
                     }),
                 )
             }
@@ -484,7 +529,12 @@ impl RuntimeServices {
                 );
             } else {
                 match self
-                    .working_source_page(context, &pin.source, pin.offset)
+                    .working_source_page(
+                        context,
+                        &pin.source,
+                        pin.offset,
+                        std::slice::from_ref(&pin.visibility_scope),
+                    )
                     .await
                 {
                     Ok(page) if page.hash == pin.source_hash => {
@@ -586,6 +636,9 @@ mod tests {
             .await
             .unwrap()
     }
+    fn session_scope(context: &memory::MemoryTurnContext) -> Vec<String> {
+        vec![format!("session:{}", context.session_id)]
+    }
     fn page_bytes(window: &Value) -> Vec<u8> {
         let entry = &window["entries"][0];
         let text = entry["content"].as_str().unwrap();
@@ -611,11 +664,11 @@ mod tests {
             source: source.clone(),
         };
         let mut page = services
-            .working_context_command(&context, "pin-1", command.clone())
+            .working_context_command(&context, "pin-1", command.clone(), session_scope(&context))
             .await
             .unwrap();
         let repeated = services
-            .working_context_command(&context, "pin-1", command)
+            .working_context_command(&context, "pin-1", command, session_scope(&context))
             .await
             .unwrap();
         assert_eq!(page["revision"], repeated["revision"]);
@@ -626,7 +679,8 @@ mod tests {
                     "pin-1",
                     WorkingContextInput::Unpin {
                         source: source.clone()
-                    }
+                    },
+                    session_scope(&context)
                 )
                 .await
                 .unwrap_err()
@@ -641,7 +695,8 @@ mod tests {
                         source: source.clone(),
                         source_hash: "wrong".into(),
                         offset: 0
-                    }
+                    },
+                    session_scope(&context)
                 )
                 .await
                 .unwrap_err()
@@ -661,6 +716,7 @@ mod tests {
                     &context,
                     &format!("expand-{index}"),
                     serde_json::from_value(next.clone()).unwrap(),
+                    session_scope(&context),
                 )
                 .await
                 .unwrap();
@@ -681,7 +737,12 @@ mod tests {
                 .contains("binding changed")
         );
         let unpinned = services
-            .working_context_command(&context, "unpin", WorkingContextInput::Unpin { source })
+            .working_context_command(
+                &context,
+                "unpin",
+                WorkingContextInput::Unpin { source },
+                session_scope(&context),
+            )
             .await
             .unwrap();
         assert_eq!(unpinned["coverage"]["active_references"], 0);
@@ -715,7 +776,8 @@ mod tests {
                     source: WorkingSource::Artifact {
                         content_ref: first.selector.clone()
                     }
-                }
+                },
+                session_scope(&context),
             ),
             services.working_context_command(
                 &context,
@@ -724,7 +786,8 @@ mod tests {
                     source: WorkingSource::Artifact {
                         content_ref: second.selector.clone()
                     }
-                }
+                },
+                session_scope(&context),
             ),
         );
         a.unwrap();
@@ -770,6 +833,7 @@ mod tests {
                             content_ref: stored.selector,
                         },
                     },
+                    session_scope(&context),
                 )
                 .await
                 .unwrap();
@@ -797,6 +861,7 @@ mod tests {
                     &context,
                     "directory-read",
                     serde_json::from_value(next).unwrap(),
+                    session_scope(&context),
                 )
                 .await
                 .unwrap();
@@ -811,6 +876,7 @@ mod tests {
                         content_ref: expected.first().unwrap().clone(),
                     },
                 },
+                session_scope(&context),
             )
             .await
             .unwrap();
@@ -819,7 +885,8 @@ mod tests {
                 .working_context_command(
                     &context,
                     "old-page",
-                    serde_json::from_value(saved_next).unwrap()
+                    serde_json::from_value(saved_next).unwrap(),
+                    session_scope(&context),
                 )
                 .await
                 .unwrap_err()

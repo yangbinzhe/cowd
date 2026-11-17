@@ -29,6 +29,7 @@ pub(super) fn agentic_claim_actor(
         .map(|task| task.team_id.clone())
         .unwrap_or_default();
     harness_contract::agent_action::AgentActorBinding {
+        original_execution: None,
         objective_id: projection.objective_id.clone(),
         program_id: projection.program_id.clone(),
         session_id: projection.session_id.clone(),
@@ -186,10 +187,20 @@ pub(super) async fn renew_agentic_claim_if_active(
     let mut attempt = 0;
     loop {
         attempt += 1;
-        let generation = action_service
-            .project(&actor.program_id)
-            .map(|projection| projection.revision)
-            .unwrap_or_default();
+        let projection = match action_service.project(&actor.program_id) {
+            Ok(projection) => projection,
+            Err(_) => return false,
+        };
+        let Some(current) = projection.tasks.get(task_ref) else {
+            return false;
+        };
+        if current.status != AgenticTaskStatus::Claimed
+            || current.claimant.as_deref() != actor.agent_id.as_deref()
+            || current.claim_execution_id.as_deref() != Some(execution_id)
+        {
+            return false;
+        }
+        let generation = projection.revision;
         let event = crate::RuntimeTransactionEventInput {
             event: crate::RuntimeEventInput {
                 stream_id: stream_id.clone(),

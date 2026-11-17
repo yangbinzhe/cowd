@@ -1,6 +1,6 @@
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use chrono::Utc;
@@ -59,15 +59,19 @@ async fn concurrent_instance_writes_preserve_explicit_agent_instance_scope_witho
         }));
     }
     let mut counts = BTreeMap::new();
+    let mut written_ids = BTreeSet::new();
     for task in tasks {
         let (instance, ids) = task.await.expect("task");
         for id in ids {
+            assert!(written_ids.insert(id));
             let stored = memory.recall(&id).await.expect("recall").expect("entry");
             assert_eq!(stored.scope, MemoryScope::AgentInstance(instance.clone()));
             assert_eq!(stored.source_agent.as_deref(), Some(instance.as_str()));
         }
         counts.insert(instance, 3usize);
     }
-    assert_eq!(counts.len(), 8);
-    assert_eq!(memory.list_layer(MemoryLayer::L3).await.unwrap().len(), 24);
+    assert_eq!(counts, (1..=8).map(|slot| (format!("instance:researcher:{slot}"), 3)).collect());
+    let listed = memory.list_layer(MemoryLayer::L3).await.unwrap();
+    assert_eq!(listed.len(), written_ids.len());
+    assert_eq!(listed.iter().map(|entry| entry.id).collect::<BTreeSet<_>>(), written_ids);
 }
