@@ -203,9 +203,6 @@ pub(super) fn member_dispatch_rank(
         task.expertise_hints.join(" "),
     ));
     let semantic_relevance = member_terms.intersection(&task_terms).count();
-    let digest = Sha256::digest(
-        format!("{}|{}|{}", task.task_id, member.agent_id, mode.as_str()).as_bytes(),
-    );
     (
         (!preferred_reviewer) as u8,
         (!(mode == DispatchMode::Execute
@@ -216,7 +213,7 @@ pub(super) fn member_dispatch_rank(
             ))) as u8,
         active_execution_load,
         Reverse(semantic_relevance),
-        format!("{digest:x}"),
+        member.agent_id.clone(),
     )
 }
 

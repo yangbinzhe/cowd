@@ -4589,6 +4589,13 @@ impl RuntimeServices {
 
     /// Resolve the registered ingress owner for this exact Program lineage.
     /// Missing or displaced ingress is not permission to write a conclusion.
+    pub(crate) fn has_original_session_owner(&self, session_id: &str) -> bool {
+        self.original_session_owners
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains_key(session_id)
+    }
+
     pub(crate) fn original_conclusion_owner(
         &self, program: &crate::AgenticProgramProjection,
     ) -> Option<OriginalConclusionOwner> {

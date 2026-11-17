@@ -2786,6 +2786,30 @@ impl RuntimeServices {
                 .await?;
                 return Ok(Vec::new());
             }
+            let node_id = format!("{graph_id}:agent");
+            let store = self.graph_state_store();
+            let mut changes = store.subscribe_commits();
+            loop {
+                let current = store
+                    .load_async(&graph_id)
+                    .await
+                    .map_err(|error| format!("agentic_started_graph_read:{graph_id}:{error}"))?;
+                if current
+                    .recovery_cursor
+                    .node_attempts
+                    .get(&node_id)
+                    .is_some_and(|attempt| *attempt > 0)
+                {
+                    break;
+                }
+                if agentic_graph_is_terminal(&current) {
+                    return Err(format!("agentic_started_graph_terminal:{graph_id}"));
+                }
+                tokio::time::timeout(std::time::Duration::from_secs(30), changes.changed())
+                    .await
+                    .map_err(|_| format!("agentic_started_graph_timeout:{graph_id}"))?
+                    .map_err(|_| format!("agentic_started_graph_subscription_closed:{graph_id}"))?;
+            }
             receipts.push(AgenticDispatchReceipt {
                 graph_id,
                 task_ref: task_ref.to_string(),

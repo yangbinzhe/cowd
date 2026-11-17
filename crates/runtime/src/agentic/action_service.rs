@@ -3628,6 +3628,55 @@ impl AgentActionService {
         Ok(Some(ExpectedStreamRevision { stream_id: graph.id, expected_revision: graph.revision }))
     }
 
+    fn agent_graph_lease_matches(
+        &self,
+        envelope: &AgentActionEnvelope,
+        projection: &AgenticProgramProjection,
+    ) -> bool {
+        use harness_contract::agent::AgentTaskPacket;
+        use harness_contract::execution_graph::ExecutionNodeKind;
+        let graphs = self
+            .graphs
+            .clone()
+            .unwrap_or_else(|| crate::ExecutionGraphStateStore::new(Arc::clone(&self.store)));
+        let Some(execution_id) = envelope.actor.execution_id.as_deref() else {
+            return false;
+        };
+        let Ok(graph) = graphs.load(execution_id) else {
+            return false;
+        };
+        let Some(lineage) = graph.lineage.as_ref() else {
+            return false;
+        };
+        if graph.id != execution_id
+            || lineage.session_id != envelope.actor.session_id
+            || lineage.turn_id != envelope.actor.turn_id
+        {
+            return false;
+        }
+        graph.nodes.iter().any(|node| {
+            if node.kind != ExecutionNodeKind::AgentTask {
+                return false;
+            }
+            let Ok(packet) = serde_json::from_str::<AgentTaskPacket>(&node.payload_ref) else {
+                return false;
+            };
+            let Some(scope) = packet.agentic_binding.as_ref() else {
+                return false;
+            };
+            packet.graph_id() == graph.id
+                && packet.session_id() == envelope.actor.session_id
+                && scope.program_id == envelope.actor.program_id
+                && scope.agent_id == envelope.actor.actor_id
+                && envelope.actor.agent_id.as_deref() == Some(scope.agent_id.as_str())
+                && envelope.actor.team_id.as_deref() == Some(scope.team_id.as_str())
+                && projection.agent_is_active_in(&scope.agent_id, &scope.team_id)
+                && projection
+                    .membership_for(&scope.agent_id, &scope.team_id)
+                    .is_some_and(|membership| membership.membership_id == scope.membership_id)
+        })
+    }
+
     fn apply_locked(
         &self,
         envelope: &AgentActionEnvelope,
@@ -4296,7 +4345,9 @@ impl AgentActionService {
                         && envelope.actor.team_id.as_deref() == Some(task.team_id.as_str())
                         && projection.agent_is_active_in(&attempt.agent_id, &task.team_id)
                 });
-            if !leased {
+            let graph_leased = !envelope.action.requires_original_physical_execution()
+                && self.agent_graph_lease_matches(envelope, &projection);
+            if !leased && !graph_leased {
                 return Err(AgentActionServiceError::Corrupt(
                     "agent actor original execution or active attempt lease required".into(),
                 ));
