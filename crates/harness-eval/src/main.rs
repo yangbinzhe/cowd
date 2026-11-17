@@ -1,9 +1,9 @@
 use harness_eval::{
-    default_report_root, run_auto_strategy_paired, run_certification_manifest, run_eval_cli,
-    run_paired_performance, run_provider_cache_calibration, terminal_gate_report_with_report,
-    write_auto_strategy_report, AutoStrategyPairedOptions, CliEvalDisposition, HarnessEvalLevel,
-    HarnessEvalReportStore, HarnessEvalRunnerOptions, PairedPerformanceOptions,
-    ProviderCacheCalibrationOptions,
+    default_report_root, project_outer_cleanup_report, run_auto_strategy_paired,
+    run_certification_manifest, run_eval_cli, run_paired_performance, run_provider_cache_calibration,
+    terminal_gate_report_with_report, write_auto_strategy_report, AutoStrategyPairedOptions,
+    CliEvalDisposition, HarnessEvalLevel, HarnessEvalReportStore, HarnessEvalRunnerOptions,
+    OuterCleanupReceipts, PairedPerformanceOptions, ProviderCacheCalibrationOptions,
 };
 use std::{path::PathBuf, time::Duration};
 
@@ -32,6 +32,215 @@ fn run() -> Result<CliEvalDisposition, String> {
         return Ok(CliEvalDisposition::Finished);
     }
     match args.first().map(String::as_str) {
+        Some("canonical-gate") => {
+            // The canonical read of a persisted report: it re-verifies an
+            // outer cleanup projection from the receipts the report names, so
+            // the same document always reads the same way.
+            let report_path = PathBuf::from(required_option(&args[1..], "--report")?);
+            let bytes = std::fs::read(&report_path)
+                .map_err(|error| format!("report {} unreadable: {error}", report_path.display()))?;
+            let report: serde_json::Value = serde_json::from_slice(&bytes)
+                .map_err(|error| format!("report is not JSON: {error}"))?;
+            let gate = harness_eval::evaluate_report_gate(&report);
+            println!("canonical-gate-status: {}", gate.status);
+            println!("canonical-gate-passed: {}", gate.passed);
+            println!("canonical-gate-failed: {}", gate.failed);
+            return Ok(CliEvalDisposition::Finished);
+        }
+        Some("project-outer-cleanup") => {
+            // The outer cleanup happens after the harness exits, so it is
+            // projected from the durable receipts instead of claimed by the
+            // report. A missing, late or foreign receipt leaves the
+            // observation unobserved and never produces a passing report.
+            let output = PathBuf::from(required_option(&args[1..], "--output")?);
+            let harness_report_path =
+                PathBuf::from(required_option(&args[1..], "--harness-report")?);
+            let inner_receipt_path =
+                PathBuf::from(required_option(&args[1..], "--inner-receipt")?);
+            let final_receipt_path = optional_option(&args[1..], "--final-receipt")
+                .map(PathBuf::from);
+            let (harness_bytes, harness_mtime) = read_receipt(&harness_report_path)?;
+            let (inner_bytes, inner_mtime) = read_receipt(&inner_receipt_path)?;
+            let (final_bytes, final_mtime) = match &final_receipt_path {
+                Some(path) => match read_receipt(path) {
+                    Ok(value) => value,
+                    Err(_) => (Vec::new(), None),
+                },
+                None => (Vec::new(), None),
+            };
+            // An unreadable outer receipt is an absent fact, not a crash: the
+            // projection reports it as unobserved and never as observed.
+            let cleanup_result_path =
+                optional_option(&args[1..], "--cleanup-result").map(PathBuf::from);
+            let owner_report_path =
+                optional_option(&args[1..], "--owner-report").map(PathBuf::from);
+
+            let (cleanup, cleanup_digest, cleanup_mtime) =
+                match optional_option(&args[1..], "--cleanup-result") {
+                    Some(path) => match read_receipt(&PathBuf::from(path)) {
+                        Ok((bytes, mtime)) => {
+                            let digest = harness_eval::receipt_digest(&bytes);
+                            (Some(parse_receipt(&bytes)?), Some(digest), mtime)
+                        }
+                        Err(_) => (None, None, None),
+                    },
+                    None => (None, None, None),
+                };
+            let shutdown_validation_path =
+                optional_option(&args[1..], "--shutdown-validation").map(PathBuf::from);
+            let shutdown_validation = match &shutdown_validation_path {
+                Some(path) => match read_receipt(path) {
+                    Ok((bytes, _)) => Some(parse_receipt(&bytes)?),
+                    Err(_) => None,
+                },
+                None => None,
+            };
+            let (owner_report, owner_mtime) = match optional_option(&args[1..], "--owner-report")
+            {
+                Some(path) => match read_receipt(&PathBuf::from(path)) {
+                    Ok((bytes, mtime)) => (Some(parse_receipt(&bytes)?), mtime),
+                    Err(_) => (None, None),
+                },
+                None => (None, None),
+            };
+            let manifest_path = optional_option(&args[1..], "--manifest").map(PathBuf::from);
+            let (manifest, manifest_mtime, manifest_digest) = match &manifest_path {
+                Some(path) => match read_receipt(path) {
+                    Ok((bytes, mtime)) => (
+                        Some(parse_receipt(&bytes)?),
+                        mtime,
+                        Some(harness_eval::receipt_digest(&bytes)),
+                    ),
+                    Err(_) => (None, None, None),
+                },
+                None => (None, None, None),
+            };
+            let sealed_key_path = optional_option(&args[1..], "--sealed-key").or_else(|| {
+                // The owner report names the sealed evidence key; an explicit
+                // path only overrides it.
+                owner_report
+                    .as_ref()
+                    .and_then(|owner| owner.pointer("/encrypted_evidence/key_reference"))
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string)
+            });
+            let shutdown_receipt_sha256 = shutdown_validation
+                .as_ref()
+                .and_then(|value| value.get("receipt_sha256"))
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string);
+            let owner_report_digest = match &owner_report_path {
+                Some(path) => match read_receipt(path) {
+                    Ok((bytes, _)) => Some(harness_eval::receipt_digest(&bytes)),
+                    Err(_) => None,
+                },
+                None => None,
+            };
+            let shutdown_validation_digest = match &shutdown_validation_path {
+                Some(path) => match read_receipt(path) {
+                    Ok((bytes, _)) => Some(harness_eval::receipt_digest(&bytes)),
+                    Err(_) => None,
+                },
+                None => None,
+            };
+            let receipts = OuterCleanupReceipts {
+                harness_report: parse_receipt(&harness_bytes)?,
+                harness_report_sha256: harness_eval::receipt_digest(&harness_bytes),
+                inner_receipt: parse_receipt(&inner_bytes)?,
+                inner_receipt_sha256: harness_eval::receipt_digest(&inner_bytes),
+                final_receipt: if final_bytes.is_empty() {
+                    serde_json::Value::Null
+                } else {
+                    parse_receipt(&final_bytes)?
+                },
+                final_receipt_sha256: harness_eval::receipt_digest(&final_bytes),
+                cleanup_result: cleanup,
+                cleanup_result_sha256: cleanup_digest,
+                shutdown_validation,
+                shutdown_validation_sha256: shutdown_validation_digest,
+                shutdown_receipt_sha256,
+                owner_report,
+                owner_report_sha256: owner_report_digest,
+                manifest,
+                manifest_sha256: manifest_digest,
+                sealed_key_path: sealed_key_path.clone(),
+                sources: harness_eval::ReceiptSources {
+                    harness_report: harness_report_path.display().to_string(),
+                    inner_receipt: inner_receipt_path.display().to_string(),
+                    final_receipt: final_receipt_path
+                        .as_ref()
+                        .map(|path| path.display().to_string())
+                        .unwrap_or_default(),
+                    cleanup_result: cleanup_result_path.map(|path| path.display().to_string()),
+                    shutdown_validation: shutdown_validation_path
+                        .map(|path| path.display().to_string()),
+                    owner_report: owner_report_path
+                        .as_ref()
+                        .map(|path| path.display().to_string()),
+                    manifest: manifest_path.map(|path| path.display().to_string()),
+                    sealed_key: sealed_key_path.clone(),
+                },
+                harness_report_mtime_ms: harness_mtime,
+                final_receipt_mtime_ms: final_mtime,
+                owner_report_mtime_ms: owner_mtime,
+            };
+            let projection =
+                project_outer_cleanup_report(&receipts.harness_report, &receipts);
+            let scenario_output = optional_option(&args[1..], "--scenario-output")
+                .map(PathBuf::from);
+            let scenario_artifact = optional_option(&args[1..], "--scenario-artifact")
+                .map(PathBuf::from);
+            let mut projected_report = projection.report.clone();
+            harness_eval::apply_gate_verdict(
+                &mut projected_report,
+                projection.gate.status == "passed",
+            );
+            let body = serde_json::to_string_pretty(&projected_report)
+                .map_err(|error| error.to_string())?;
+            if let Some(parent) = output.parent() {
+                std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+            }
+            std::fs::write(&output, body).map_err(|error| error.to_string())?;
+            match &projection.verdict {
+                Ok(facts) => {
+                    println!("outer-cleanup-projection: observed");
+                    println!(
+                        "outer-cleanup-projection-detail: run_id={} scenario={} remaining_owned={}",
+                        facts.run_id, facts.scenario, facts.remaining_owned
+                    );
+                    println!("outer-cleanup-gate: {}", projection.gate.status);
+                    if let (Some(artifact), Some(output)) = (&scenario_artifact, &scenario_output) {
+                        let mut artifact = parse_receipt(&read_receipt(artifact)?.0)?;
+                        harness_eval::project_scenario_artifact(&mut artifact, facts);
+                        harness_eval::apply_gate_verdict_to_scenario(
+                            &mut artifact,
+                            projection.gate.status == "passed",
+                        );
+                        let body = serde_json::to_string_pretty(&artifact)
+                            .map_err(|error| error.to_string())?;
+                        if let Some(parent) = output.parent() {
+                            std::fs::create_dir_all(parent)
+                                .map_err(|error| error.to_string())?;
+                        }
+                        std::fs::write(output, body).map_err(|error| error.to_string())?;
+                        println!("outer-cleanup-scenario: {}", output.display());
+                    }
+                }
+                Err(gap) => {
+                    println!("outer-cleanup-projection: {}", gap.reason());
+                    println!("outer-cleanup-detail: {}", gap.detail());
+                    println!("outer-cleanup-gate: {}", projection.gate.status);
+                    std::process::exit(3);
+                }
+            }
+            if projection.gate.status != "passed" {
+                // The outer cleanup was observed; the remaining verdict is the
+                // business one and it is not this projection's to decide.
+                println!("outer-cleanup-gate-not-passed: {}", projection.gate.status);
+                std::process::exit(4);
+            }
+            return Ok(CliEvalDisposition::Finished);
+        }
         Some("provider-cache-calibration") => {
             let output = PathBuf::from(required_option(&args[1..], "--output")?);
             let report = run_provider_cache_calibration(ProviderCacheCalibrationOptions {
@@ -232,8 +441,8 @@ fn run() -> Result<CliEvalDisposition, String> {
             );
             if report.status != "passed" {
                 return Err(format!(
-                    "certification gate failed with {} required source failures and {} required check failures",
-                    report.required_source_failures, report.required_check_failures
+                    "certification gate {} with {} required source failures and {} required check failures",
+                    report.status, report.required_source_failures, report.required_check_failures
                 ));
             }
             return Ok(CliEvalDisposition::Finished);
@@ -344,4 +553,28 @@ mod cli_disposition_tests {
             assert_eq!(exit_for(Err(text.into())), std::process::ExitCode::FAILURE);
         }
     }
+}
+
+/// Read a receipt file with its modification time; a missing receipt is an
+/// error the caller turns into an unobserved projection, never a default.
+fn read_receipt(path: &std::path::Path) -> Result<(Vec<u8>, Option<u64>), String> {
+    let bytes = std::fs::read(path)
+        .map_err(|error| format!("receipt {} unreadable: {error}", path.display()))?;
+    let mtime = std::fs::metadata(path)
+        .and_then(|meta| meta.modified())
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|value| value.as_millis() as u64);
+    Ok((bytes, mtime))
+}
+
+fn parse_receipt(bytes: &[u8]) -> Result<serde_json::Value, String> {
+    serde_json::from_slice(bytes).map_err(|error| format!("receipt is not JSON: {error}"))
+}
+
+fn optional_option(args: &[String], name: &str) -> Option<String> {
+    args.iter()
+        .position(|value| value == name)
+        .and_then(|index| args.get(index + 1))
+        .cloned()
 }

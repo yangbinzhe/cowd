@@ -194,13 +194,12 @@ impl HarnessEvalReportGate {
     fn from_items(items: Vec<HarnessEvalReportGateItem>) -> Self {
         let total = items.len();
         let passed = items.iter().filter(|item| item.status == "passed").count();
-        let failed = items
-            .iter()
-            .filter(|item| item.required && item.status != "passed")
-            .count();
+        let (status, failed) = crate::required_evidence_status(
+            items.iter().filter(|item| item.required).map(|item| item.status.as_str()),
+        );
         Self {
             kind: "harness_eval.report_gate".to_string(),
-            status: if failed == 0 { "passed" } else { "failed" }.to_string(),
+            status: status.to_string(),
             total,
             passed,
             failed,
@@ -978,10 +977,39 @@ pub(crate) fn complete_metric_tokens(metrics: &Value) -> Option<u32> {
         .then_some(total)
 }
 
+pub(crate) fn timeline_bodies_observed(observation: &Value) -> bool {
+    observation.get("timeline_unobserved_bodies").and_then(Value::as_u64) == Some(0)
+        && observation.get("timeline_body_observation").and_then(Value::as_str) == Some("observed")
+}
+
 fn timeline_coverage_complete(observation: &Value) -> bool {
     observation.get("timeline_drained").and_then(Value::as_bool) == Some(true)
         && observation.get("cursor_monotonic").and_then(Value::as_bool) == Some(true)
         && observation.get("omitted_changes").and_then(Value::as_u64) == Some(0)
+        && timeline_bodies_observed(observation)
+}
+
+#[cfg(test)]
+#[test]
+fn u5_unobserved_timeline_is_not_complete_report_coverage() {
+    let mut observation = serde_json::json!({
+        "timeline_drained": true, "cursor_monotonic": true, "omitted_changes": 0,
+        "timeline_unobserved_bodies": 1, "timeline_body_observation": "unobserved"
+    });
+    assert!(!timeline_coverage_complete(&observation));
+    observation["timeline_unobserved_bodies"] = serde_json::json!(0);
+    assert!(!timeline_coverage_complete(&observation));
+    observation["timeline_body_observation"] = serde_json::json!("observed");
+    assert!(timeline_coverage_complete(&observation));
+    observation.as_object_mut().unwrap().remove("timeline_unobserved_bodies");
+    assert!(!timeline_coverage_complete(&observation));
+    observation["timeline_unobserved_bodies"] = serde_json::json!("0");
+    assert!(!timeline_coverage_complete(&observation));
+    observation["timeline_unobserved_bodies"] = serde_json::json!(0);
+    observation.as_object_mut().unwrap().remove("timeline_body_observation");
+    assert!(!timeline_coverage_complete(&observation));
+    observation["timeline_body_observation"] = serde_json::json!(true);
+    assert!(!timeline_coverage_complete(&observation));
 }
 
 pub(crate) fn canonical_total_tokens(report: &Value) -> Option<u32> {
@@ -989,6 +1017,9 @@ pub(crate) fn canonical_total_tokens(report: &Value) -> Option<u32> {
         let leaves = report
             .pointer("/live_gateway_scenarios/scenarios/0/sessions")?
             .as_array()?;
+        if !leaves.iter().all(|leaf| timeline_bodies_observed(&leaf["observation_integrity"])) {
+            return None;
+        }
         let usage = u5_stage_usage(leaves).ok()?;
         if usage != report["u5_usage"] {
             return None;
@@ -1257,6 +1288,20 @@ fn u5_acceptance_checks_pass(checks: &[Value]) -> bool {
 }
 
 fn u5_stage_gate(report: &Value) -> HarnessEvalReportGate {
+    u5_stage_gate_with_outer(report, None)
+}
+
+/// The focused U5 gate, optionally with a bound outer cleanup projection.
+///
+/// Without the projection the gate stays `pending_outer_cleanup`: the outer
+/// cleanup happens after the harness exits, so the harness alone can never
+/// decide it. With a bound projection the same five items decide `passed`.
+/// A report that claims the projection by itself is refused, because the
+/// claim is only read together with the receipts that back it.
+pub(crate) fn u5_stage_gate_with_outer(
+    report: &Value,
+    outer: Option<&crate::outer_cleanup::OuterCleanupFacts>,
+) -> HarnessEvalReportGate {
     let live = &report["live_gateway_scenarios"];
     let pairs = live["scenarios"].as_array();
     let pair = pairs.and_then(|p| p.first()).unwrap_or(&Value::Null);
@@ -1266,6 +1311,7 @@ fn u5_stage_gate(report: &Value) -> HarnessEvalReportGate {
         l.len() == 2
             && l.iter().all(|v| {
                 v["status"] == "passed"
+                    && timeline_bodies_observed(&v["observation_integrity"])
                     && v["metrics"]["tool_calls"].as_u64().is_some()
                     && v.pointer("/acceptance/passed") == Some(&Value::Bool(true))
                     && v.pointer("/actor_cleanup/passed") == Some(&Value::Bool(true))
@@ -1285,12 +1331,14 @@ fn u5_stage_gate(report: &Value) -> HarnessEvalReportGate {
     let cancel_leaf_ok = leaves.is_some_and(|l| {
         l.len() == 2
             && l[0]["status"] == "cancelled"
+            && timeline_bodies_observed(&l[0]["observation_integrity"])
             && l[0].pointer("/actor_cleanup/passed") == Some(&Value::Bool(true))
             && l[0].pointer("/physical_cancellation/local_response_cancel_observed")
                 == Some(&Value::Bool(true))
             && l[0].pointer("/physical_cancellation/remote_server_inference_stop")
                 == Some(&json!("unknown"))
             && l[1]["status"] == "passed"
+            && timeline_bodies_observed(&l[1]["observation_integrity"])
             && l[1].pointer("/acceptance/passed") == Some(&Value::Bool(true))
             && l[1].pointer("/actor_cleanup/passed") == Some(&Value::Bool(true))
             && l[1]
@@ -1317,7 +1365,9 @@ fn u5_stage_gate(report: &Value) -> HarnessEvalReportGate {
             report.get("u5_lifecycle_aborted").is_none()
                 && report["level"] == "deep"
                 && report["authorized_real_model"] == true
-                && live["status"] == "pending_outer_cleanup"
+                && (live["status"] == "pending_outer_cleanup"
+                    || live["status"] == "uncertain"
+                    || (outer.is_some() && live["status"] == "passed"))
                 && live["claim_scope"] == "focused"
                 && live["health_status"] == "passed"
                 && live["selection_status"] == "passed"
@@ -1343,7 +1393,11 @@ fn u5_stage_gate(report: &Value) -> HarnessEvalReportGate {
             } else {
                 "u5_original_capacity_witness"
             },
-            pair["status"] == "pending_outer_cleanup"
+            (pair["status"] == "pending_outer_cleanup"
+                || (outer.is_some() && pair["status"] == "passed"))
+                && (outer.is_none()
+                    || pair.pointer("/acceptance/checks/outer_cleanup_observed")
+                        == Some(&Value::Bool(true)))
                 && pair.pointer("/acceptance/checks/internal_passed") == Some(&Value::Bool(true))
                 && [
                     "identity",
@@ -1389,7 +1443,7 @@ fn u5_stage_gate(report: &Value) -> HarnessEvalReportGate {
                 .is_some_and(|s| s.len() == 64),
         ),
     ];
-    let items = checks
+    let mut items = checks
         .iter()
         .map(|(name, ok)| {
             HarnessEvalReportGateItem::new(
@@ -1401,25 +1455,96 @@ fn u5_stage_gate(report: &Value) -> HarnessEvalReportGate {
             )
         })
         .collect::<Vec<_>>();
-    let failed = checks.iter().filter(|(_, ok)| !*ok).count();
+    if pair["status"] == "uncertain" && pair["acceptance"]["checks"]["observation_status"] == "uncertain" {
+        for item in &mut items {
+            if !cancellation && item.name == "u5_original_capacity_witness" && item.status == "failed" {
+                item.status = "uncertain".into();
+                item.evidence = "original capacity evidence budget exhausted".into();
+            }
+        }
+    }
+    let (status, failed) = crate::required_evidence_status(items.iter().map(|item| item.status.as_str()));
+    let passed = items.iter().filter(|item| item.status == "passed").count();
     HarnessEvalReportGate {
         kind: "harness_eval.u5_internal_gate".into(),
-        status: if failed == 0 {
-            "pending_outer_cleanup"
+        status: if status == "passed" {
+            if outer.is_some() {
+                "passed"
+            } else {
+                "pending_outer_cleanup"
+            }
         } else {
-            "failed"
+            status
         }
         .into(),
         total: items.len(),
-        passed: items.len() - failed,
+        passed,
         failed,
         items,
     }
 }
 
+/// The outer cleanup projection of one harness report.
+#[derive(Debug, Clone)]
+pub struct OuterCleanupProjection {
+    /// The projected report (the original report when nothing was observed).
+    pub report: Value,
+    /// The gate re-evaluated on the projected report.
+    pub gate: HarnessEvalReportGate,
+    /// The bound outer cleanup facts, or the typed gap.
+    pub verdict:
+        Result<crate::outer_cleanup::OuterCleanupFacts, crate::outer_cleanup::OuterCleanupGap>,
+}
+
+/// Project the durable outer cleanup facts into a harness report.
+///
+/// The gate accepts a projected report only together with the receipts that
+/// back it: without them the report keeps its `pending_outer_cleanup`
+/// disposition, and a report that claims the observation by itself stays
+/// unobserved.
+#[must_use]
+pub fn project_outer_cleanup_report(
+    report: &Value,
+    receipts: &crate::outer_cleanup::OuterCleanupReceipts,
+) -> OuterCleanupProjection {
+    let mut projected = report.clone();
+    let verdict = crate::outer_cleanup::observe_outer_cleanup(receipts);
+    let gate = match &verdict {
+        Ok(facts) => {
+            crate::outer_cleanup::project_outer_cleanup(&mut projected, facts);
+            u5_stage_gate_with_outer(&projected, Some(facts))
+        }
+        Err(gap) => {
+            if let Some(object) = projected.as_object_mut() {
+                object.insert("outer_cleanup_projection".into(), gap.to_json());
+            }
+            u5_stage_gate_with_outer(&projected, None)
+        }
+    };
+    // The projected report carries the re-evaluated gate, never the original
+    // pending disposition.
+    if let Some(object) = projected.as_object_mut() {
+        object.insert(
+            "report_gate".into(),
+            serde_json::to_value(&gate).unwrap_or(Value::Null),
+        );
+        object.insert("status".into(), json!(gate.status));
+    }
+    OuterCleanupProjection {
+        report: projected,
+        gate,
+        verdict,
+    }
+}
+
 pub fn evaluate_report_gate(report: &Value) -> HarnessEvalReportGate {
     if report["kind"] == "harness_eval.u5_internal" {
-        return u5_stage_gate(report);
+        // A projected report carries the receipts it was projected from. The
+        // canonical read re-verifies them, so the same output always reads
+        // the same way and a deleted or replaced receipt leaves the
+        // observation unobserved instead of self-certified.
+        let outer = crate::outer_cleanup::verify_persisted_projection(report);
+        return u5_stage_gate_with_outer(report, outer.as_ref());
     }
     if report.get("kind").and_then(Value::as_str)
         == Some("harness_eval.paired_public_api_performance")
@@ -1577,6 +1702,17 @@ pub fn evaluate_report_gate(report: &Value) -> HarnessEvalReportGate {
         format!("scenario_capabilities={}", scenarios.len()),
         "fix failed capability rows before accepting the report",
     ));
+    if !scenarios.is_empty() {
+        let (status, failures) = crate::required_evidence_status(scenarios.iter().map(|item| {
+            if (level != "deep" || focused_live_claim)
+                && item["capability"] == "next_gen_harness_closure"
+                && item["status"] == "not_observed" { "passed" }
+            else { item["status"].as_str().unwrap_or("incomplete") }
+        }));
+        if failures == 0 && matches!(status, "uncertain" | "incomplete") {
+            items.last_mut().expect("scenario item just added").status = status.into();
+        }
+    }
     items.push(HarnessEvalReportGateItem::new(
         "runtime_actions_recorded",
         runtime_actions >= 3,
@@ -1979,13 +2115,37 @@ fn push_terminal_gate_items(
             "retain the original client lease-release and detach outcome",
         ),
     ] {
-        items.push(HarnessEvalReportGateItem::new(
+        let mut item = HarnessEvalReportGateItem::new(
             format!("{prefix}_{suffix}"),
             passed,
             true,
             format!("scenarios={}", scenarios.len()),
             hint,
-        ));
+        );
+        // Missing evidence in an explicitly incomplete observation is not a
+        // proven negative. Present-but-invalid evidence remains a failure.
+        let field = match suffix {
+            "business_outcome" => "business_observation",
+            "execution_physically_settled" => "terminal_observation",
+            "current_public_ack" => "delivery_observation",
+            "actor_cleanup" => "session_actor_cleanup",
+            _ => unreachable!(),
+        };
+        let ready = |scenario: &Value| match suffix {
+            "business_outcome" => business_observation_ready(scenario),
+            "execution_physically_settled" => execution_observation_ready(
+                &scenario[field], scenario["execution_id"].as_str().unwrap_or(""),
+                scenario["session_id"].as_str().unwrap_or(""), scenario["turn_id"].as_str().unwrap_or("")),
+            "current_public_ack" => delivery_observation_ready(scenario),
+            "actor_cleanup" => scenario[field]["status"] == "passed",
+            _ => false,
+        };
+        let incomplete = !passed && scenarios.iter().any(|scenario| {
+            matches!(scenario["status"].as_str(), Some("uncertain" | "incomplete")) && scenario[field].is_null()
+        }) && scenarios.iter().all(|scenario| ready(scenario) ||
+            (matches!(scenario["status"].as_str(), Some("uncertain" | "incomplete")) && scenario[field].is_null()));
+        if incomplete { item.status = "incomplete".into(); }
+        items.push(item);
     }
 }
 
@@ -2140,6 +2300,7 @@ fn push_deep_live_gate_item(items: &mut Vec<HarnessEvalReportGateItem>, level: &
             .get("observation_integrity")
             .unwrap_or(&Value::Null);
         observation.get("status").and_then(Value::as_str) == Some("passed")
+            && timeline_bodies_observed(observation)
             && observation.get("cursor_monotonic").and_then(Value::as_bool) == Some(true)
             && observation.get("timeline_drained").and_then(Value::as_bool) == Some(true)
             && observation
@@ -2168,6 +2329,14 @@ fn push_deep_live_gate_item(items: &mut Vec<HarnessEvalReportGateItem>, level: &
         ),
         "run deep evaluation against an explicit isolated COWD_EVAL_GATEWAY_URL and retain durable session, terminal, execution and cursor traces for every live scenario",
     ));
+    if matches!(live["status"].as_str(), Some("uncertain" | "incomplete"))
+        && live_scenarios.len() >= required_live_scenarios
+        && live["health_status"] == "passed"
+        && live["selection_status"] == "passed"
+        && live_scenarios.iter().all(|scenario| scenario["status"] != "failed")
+    {
+        items.last_mut().expect("deep live item just added").status = live["status"].as_str().unwrap_or("incomplete").into();
+    }
 }
 
 struct ExecutionLevelGateContext<'a> {
@@ -2640,7 +2809,7 @@ mod gate_tests {
                 "fresh_context_confirmed":true,"ack":ack,"current_context":current
             },
             "business_observation":{"kind":"runtime.outcome.recorded.v1","execution_scope":"session","execution_id":execution,"session_id":session,"turn_id":turn,"event_status":"succeeded","terminal_class":"succeeded","verified_verdict":"satisfied"},
-            "usage_observation_integrity":{"timeline_drained":true,"cursor_monotonic":true,"omitted_changes":0},
+            "usage_observation_integrity":{"timeline_drained":true,"cursor_monotonic":true,"omitted_changes":0,"timeline_unobserved_bodies":0,"timeline_body_observation":"observed"},
             "metrics":{"provider_attempt_count":1,"provider_usage_records":1,"usage_unknown_attempts":0,"provider_attempt_cache_dimensions_unknown_count":0,"model_rounds":1,"input_tokens":1,"output_tokens":1,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"total_tokens":2}
         })
     }
@@ -2793,7 +2962,7 @@ mod gate_tests {
                 "total_usage": {"total_tokens": total, "usage_source": "live_gateway_canonical_usage"},
                 "provider_cache": {"physical_provider_attempts": 1, "usage_unknown_attempts": 0}
             },
-            "live_gateway_scenarios": {"scenarios": [{"observation_integrity":{"timeline_drained":true,"cursor_monotonic":true,"omitted_changes":0},"metrics": {
+            "live_gateway_scenarios": {"scenarios": [{"observation_integrity":{"timeline_drained":true,"cursor_monotonic":true,"omitted_changes":0,"timeline_unobserved_bodies":0,"timeline_body_observation":"observed"},"metrics": {
                 "provider_attempt_count": 1, "provider_usage_records": 1,
                 "usage_unknown_attempts": 0, "model_rounds": 1,
                 "provider_attempt_cache_dimensions_unknown_count":0,
@@ -2937,6 +3106,23 @@ mod gate_tests {
             .iter()
             .find(|item| item.name == name)
             .expect("gate item")
+    }
+
+    #[test]
+    fn required_unknown_gate_stays_unaccepted_without_counting_as_failure() {
+        let item = |status: &str| HarnessEvalReportGateItem {
+            name: "evidence".into(), status: status.into(), required: true,
+            evidence: "fixture".into(), repair_hint: "retain evidence".into(),
+        };
+        for status in ["uncertain", "incomplete"] {
+            let gate = HarnessEvalReportGate::from_items(vec![item("passed"), item(status)]);
+            assert_eq!(gate.status, status);
+            assert_eq!(gate.failed, 0);
+            assert_ne!(gate.status, "passed");
+        }
+        let gate = HarnessEvalReportGate::from_items(vec![item("uncertain"), item("failed")]);
+        assert_eq!(gate.status, "failed");
+        assert_eq!(gate.failed, 1);
     }
 
     fn verified_agentic_program_closure() -> Value {
@@ -3444,7 +3630,7 @@ mod gate_tests {
         let mut scenario = terminal_sample("candidate", 0);
         scenario["scenario_id"] = json!("live_group_theory_ai_research_simulation");
         scenario["production_trace"] = json!({"session_id":scenario["session_id"],"terminal_id":scenario["terminal_id"],"execution_id":scenario["execution_id"]});
-        scenario["observation_integrity"] = json!({"status":"passed","cursor_monotonic":true,"timeline_drained":true,"message_pages_drained":true,"omitted_changes":0,"stall_detected":false});
+        scenario["observation_integrity"] = json!({"status":"passed","cursor_monotonic":true,"timeline_drained":true,"message_pages_drained":true,"omitted_changes":0,"stall_detected":false,"timeline_unobserved_bodies":0,"timeline_body_observation":"observed"});
         let report = json!({
             "level": "deep",
             "live_gateway_scenarios": {
@@ -3941,6 +4127,7 @@ pub(crate) mod u5_stage_tests {
     fn leaf(id: &str, input: u64, output: u64) -> Value {
         json!({"session_id":format!("session-{id}"),"turn_id":format!("turn-{id}"),"execution_id":format!("root-{id}"),
             "status":"passed","metrics":{"tool_calls":1},"acceptance":{"passed":true,"checks":[{"name":"original_read_and_ACK","passed":true}]},"actor_cleanup":{"passed":true},
+            "observation_integrity":{"timeline_unobserved_bodies":0,"timeline_body_observation":"observed"},
             "u5_provider_events":[{"kind":"context.provider_request_packed","payload":{"request_id":id}},
             {"kind":"context.provider_attempt_outcome","payload":{"request_id":id,"usage_status":"known","cache_dimensions_status":"known","usage":{"input_tokens":input,"output_tokens":output,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}}]})
     }
@@ -4120,6 +4307,8 @@ pub(crate) mod u5_stage_tests {
             ("/live_gateway_scenarios/selected_scenario_ids",json!(["live_u5_shared_session_fairness","live_tool_evidence"])),
             ("/live_gateway_scenarios/health_status",json!("failed")),
             ("/live_gateway_scenarios/scenarios/0/sessions/0/status",json!("cancelled")),
+            ("/live_gateway_scenarios/scenarios/0/sessions/0/observation_integrity/timeline_unobserved_bodies",Value::Null),
+            ("/live_gateway_scenarios/scenarios/0/sessions/0/observation_integrity/timeline_body_observation",json!("unobserved")),
             ("/live_gateway_scenarios/scenarios/0/sessions/0/actor_cleanup/passed",json!(false)),
             ("/live_gateway_scenarios/scenarios/0/sessions/0/acceptance/checks/0/passed",json!(false)),
             ("/live_gateway_scenarios/scenarios/0/sessions/0/turn_id",json!("turn-b")),
