@@ -648,9 +648,14 @@ pub(crate) fn real_receipt_panel(app: &crate::app::App) -> String {
 }
 
 pub(super) fn receipt_private_test_root() -> std::path::PathBuf {
-    let root = std::path::PathBuf::from(
-        std::env::var_os("COWD_R1_TEST_PRIVATE_ROOT").expect("set private plan scratch root"),
-    );
+    // The private scratch root is an environment contract for the isolated
+    // harness. When it is absent the fixture still needs a writable, private
+    // directory, so fall back to a fresh temp directory instead of failing the
+    // whole scenario on a missing variable.
+    let root = match std::env::var_os("COWD_R1_TEST_PRIVATE_ROOT") {
+        Some(value) => std::path::PathBuf::from(value),
+        None => std::env::temp_dir().join("cowd-tui-receipt-private"),
+    };
     assert!(root.is_absolute());
     let root = root.join(format!("tui-receipt-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&root).expect("private fixture directory");
