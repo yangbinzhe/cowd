@@ -2740,6 +2740,8 @@ impl RuntimeServices {
             {
                 return Err("r393 post-append registration observation unavailable".into());
             }
+            let store = self.graph_state_store();
+            let mut changes = store.subscribe_commits();
             let admission = async {
                 #[cfg(test)]
                 if REGISTRATION_FAULT_393.try_with(|fault| *fault)
@@ -2787,8 +2789,7 @@ impl RuntimeServices {
                 return Ok(Vec::new());
             }
             let node_id = format!("{graph_id}:agent");
-            let store = self.graph_state_store();
-            let mut changes = store.subscribe_commits();
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
             loop {
                 let current = store
                     .load_async(&graph_id)
@@ -2805,10 +2806,20 @@ impl RuntimeServices {
                 if agentic_graph_is_terminal(&current) {
                     return Err(format!("agentic_started_graph_terminal:{graph_id}"));
                 }
-                tokio::time::timeout(std::time::Duration::from_secs(30), changes.changed())
-                    .await
-                    .map_err(|_| format!("agentic_started_graph_timeout:{graph_id}"))?
-                    .map_err(|_| format!("agentic_started_graph_subscription_closed:{graph_id}"))?;
+                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                if remaining.is_zero() {
+                    return Err(format!("agentic_started_graph_timeout:{graph_id}"));
+                }
+                let wait = std::time::Duration::from_millis(20).min(remaining);
+                match tokio::time::timeout(wait, changes.changed()).await {
+                    Err(_) => {}
+                    Ok(Err(_)) => {
+                        return Err(format!(
+                            "agentic_started_graph_subscription_closed:{graph_id}"
+                        ));
+                    }
+                    Ok(Ok(())) => {}
+                }
             }
             receipts.push(AgenticDispatchReceipt {
                 graph_id,
