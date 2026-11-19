@@ -1659,32 +1659,6 @@ impl RuntimeServices {
             })
             .collect::<Vec<_>>();
         let mut stranded_attempts = stranded_attempts;
-        let mut claim_only = std::collections::BTreeSet::new();
-        if stranded_attempts.is_empty() {
-            if let Some(task) = projection.tasks.get(task_ref) {
-                if task.status == AgenticTaskStatus::Claimed {
-                    if let (Some(execution_id), Some(agent_id)) =
-                        (task.claim_execution_id.clone(), task.claimant.clone())
-                    {
-                        // A claim whose graph was never admitted has no attempt
-                        // record, so the durable Task projection is the only
-                        // owner left to recover. Without this the claim keeps a
-                        // missing graph forever and no work can be re-admitted.
-                        stranded_attempts.push((
-                            task.task_id.clone(),
-                            AgenticTaskAttemptProjection {
-                                execution_id: execution_id.clone(),
-                                agent_id,
-                                membership_id: String::new(),
-                                mode: harness_contract::agent_action::AgentAttemptMode::Execute,
-                                generation: task.claim_generation.saturating_sub(1),
-                            },
-                        ));
-                        claim_only.insert(execution_id);
-                    }
-                }
-            }
-        }
         let mut settled_attempt = false;
         for (task_ref, attempt) in stranded_attempts {
             projection = self
@@ -1711,12 +1685,7 @@ impl RuntimeServices {
                 .load_async(execution_graph_id(&attempt.execution_id))
                 .await
             {
-                Ok(graph)
-                    if !agentic_graph_is_terminal(&graph)
-                        && !claim_only.contains(&attempt.execution_id) =>
-                {
-                    continue
-                }
+                Ok(graph) if !agentic_graph_is_terminal(&graph) => continue,
                 Ok(_) => "startup recovered a terminal Agent graph with an unsettled Task attempt",
                 Err(crate::execution_core::graph::ExecutionStateStoreError::NotFound {
                     ..
@@ -1829,16 +1798,12 @@ impl RuntimeServices {
         for (task_ref, execution_id, claim_generation) in orphaned_claims {
             // Same namespace translation as the heartbeat: this id is the one
             // the Agent was admitted under, which is an agent-run id.
-            let recovery_reason = match self.graph_state_store().load_async(&execution_id).await {
-                Ok(graph) if !agentic_graph_is_terminal(&graph) => continue,
-                Ok(_) => "startup recovered a terminal graph with an unsettled claim",
-                Err(crate::execution_core::graph::ExecutionStateStoreError::NotFound { .. }) => {
-                    return Err(format!(
-                        "orphan claim {task_ref} for {execution_id} has no graph; physical owner closure is unconfirmed"
-                    ));
-                }
-                Err(error) => return Err(error.to_string()),
-            };
+            // A claim with no attempt record has no admitted physical owner:
+            // dispatch writes the attempt in the same transaction as the
+            // claim, so an empty attempt set means the only remaining owner is
+            // the durable Task projection. Release it instead of consulting a
+            // lease graph that no worker is driving.
+            let recovery_reason = "startup recovered a claim with no admitted physical attempt";
             let release = AgentActionEnvelope {
                 action_id: format!("startup-release-orphan:{task_ref}:{execution_id}"),
                 actor: harness_contract::agent_action::AgentActorBinding {

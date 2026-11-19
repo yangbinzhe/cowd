@@ -2011,17 +2011,6 @@ async fn startup_reconcile_releases_missing_graph_claim_without_waiting_for_leas
     );
 
     let pre = actions.project("program-dispatch").expect("projection");
-    let lease_graph = services
-        .graph_state_store()
-        .load(missing_execution)
-        .expect("claimed execution graph");
-    let claimed_packet: AgentTaskPacket =
-        serde_json::from_str(&lease_graph.nodes[0].payload_ref).expect("claimed packet");
-    services
-        .agent_runtime()
-        .publish_run_exit_for_test(&claimed_packet)
-        .await
-        .expect("claimed run exit");
     let recovered = services
         .recover_agentic_programs_on_startup()
         .await
