@@ -2018,9 +2018,15 @@ async fn startup_reconcile_releases_missing_graph_claim_without_waiting_for_leas
     let [unique_recovered_1801] = recovered.as_slice() else { panic!("expected the original recovered exactly once") };
     assert_ne!(unique_recovered_1801.graph_id, missing_execution);
     let projection = actions.project("program-dispatch").expect("projection");
-    assert_eq!(projection.tasks[&task].status, AgenticTaskStatus::Published);
-    assert_eq!(projection.tasks[&task].claim_execution_id, None);
-    assert_eq!(projection.tasks[&task].claimant, None);
+    // The claim is preserved as a claim, not as the *stale* one: recovery releases
+    // the unowned claim and admits a real attempt in the same pass, so the Task
+    // must carry the new execution rather than the abandoned reservation.
+    assert_eq!(projection.tasks[&task].status, AgenticTaskStatus::Claimed);
+    assert_eq!(
+        projection.tasks[&task].claim_execution_id.as_deref(),
+        Some(unique_recovered_1801.graph_id.as_str())
+    );
+    assert!(projection.tasks[&task].claimant.is_some());
 }
 
 

@@ -7895,6 +7895,16 @@ fn actionable(
         }
         super::program::AgenticProgramStatus::Open => {}
     }
+    // A Task Runtime already deferred past its own dispatch bound is not slow
+    // work: no member can take it. Say so with the Task named, because a model
+    // told only "wait" would keep polling a Task that can never start.
+    let stranded = crate::agentic::execution::dispatch::stranded_task_refs(projection);
+    if !stranded.is_empty() {
+        actions.push(format!(
+            "Tasks [{}] have no Agent able to progress them: Runtime already deferred their dispatch past its bound. Replan, replace or withdraw them - waiting cannot start them.",
+            stranded.join(", ")
+        ));
+    }
     if !goal_gaps.is_empty() {
         // Explicit assessment supplies current Goal gaps separately; this names what is
         // still missing rather than what one reopen happened to record. The
@@ -8506,7 +8516,10 @@ fn attach_completion_assessment(
                     json!({"status":"unknown","error":error.to_string()}),
                 );
             }
-            observation.actionable = vec![format!("Completion assessment is unavailable: {error}. Inspect the original bound sources; no completion readiness is established.")];
+            // Append rather than replace: an unavailable assessment is one fact
+            // about the page, not a reason to drop the hints that still name
+            // work the root must act on.
+            observation.actionable.push(format!("Completion assessment is unavailable: {error}. Inspect the original bound sources; no completion readiness is established."));
         }
     }
 }

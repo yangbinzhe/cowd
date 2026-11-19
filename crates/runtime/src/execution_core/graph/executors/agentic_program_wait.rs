@@ -872,6 +872,16 @@ async fn wait_disposition(
             reason: "all_tasks_accepted",
         });
     }
+    // A Task Runtime itself has already failed to place past its bound is not
+    // late work, it is unreachable. Waiting for it starves the root even while
+    // other Tasks still run, so the barrier must be handed back once - the
+    // resume count bounds how many times that can happen per revision.
+    if !crate::agentic::execution::dispatch::stranded_task_refs(projection).is_empty() {
+        return Ok(WaitDisposition::Resume {
+            revision: projection.revision,
+            reason: "task_stranded",
+        });
+    }
     let active_graphs = active_agentic_child_graphs(
         &request.root_execution_id,
         &request.program_id,

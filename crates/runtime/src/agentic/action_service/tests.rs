@@ -2549,7 +2549,7 @@ fn completion_cannot_bypass_real_artifact_and_task_review() {
     }
 
 #[test]
-fn task_claim_requires_a_roster_agent_and_expired_lease_is_reclaimable() {
+fn task_claim_requires_a_roster_agent_and_an_expired_lease_waits_for_physical_closure() {
     let service = AgentActionService::new(Arc::new(RuntimeEventStore::for_test()));
     let team = service
         .apply(&root(
@@ -2632,7 +2632,11 @@ fn task_claim_requires_a_roster_agent_and_expired_lease_is_reclaimable() {
     task_projection.claimant = Some("agent:abandoned".to_string());
     task_projection.claim_execution_id = Some("execution:abandoned".to_string());
     task_projection.lease_expires_at_ms = Some(10);
-    assert!(validate_transition(&projection, &claimant, 11, None).is_none());
+    assert_eq!(
+        validate_transition(&projection, &claimant, 11, None),
+        Some(("task_physical_closure_unconfirmed", task.clone())),
+        "an expired claim is not adoptable by another execution until the original owner's physical closure is confirmed"
+    );
 
     let expired_submit = managed(
         "expired-submit",
