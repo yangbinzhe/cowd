@@ -412,8 +412,30 @@ impl DispatchFlight {
     }
 }
 
-impl Drop for DispatchFlight {
-    fn drop(&mut self) {
+/// Take a dispatch flight, waiting briefly when another pass still owns it.
+///
+/// Returning immediately on a busy flight silently dropped the second caller's
+/// attempt: the pass never reached member selection, so the deferral was never
+/// recorded, and a Task that can never be placed was never recognised as
+/// unreachable. The wait is bounded - real contention still ends in a decline.
+async fn await_dispatch_flight(
+    active: Arc<Mutex<BTreeSet<String>>>,
+    key: String,
+) -> Option<DispatchFlight> {
+    const WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+    let deadline = tokio::time::Instant::now() + WAIT;
+    loop {
+        if let Some(flight) = DispatchFlight::acquire(Arc::clone(&active), key.clone()) {
+            return Some(flight);
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return None;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+}
+
+impl Drop for DispatchFlight {    fn drop(&mut self) {
         self.active
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -2186,7 +2208,7 @@ impl RuntimeServices {
             DispatchMode::Review => task.review_generation,
             DispatchMode::Coordination(revision) => revision,
         };
-        let Some(_flight) = DispatchFlight::acquire(
+        let Some(_flight) = await_dispatch_flight(
             self.agentic_dispatch_flights(),
             format!(
                 "{}|{}|{}|{}",
@@ -2195,7 +2217,9 @@ impl RuntimeServices {
                 mode.as_str(),
                 attempt_generation
             ),
-        ) else {
+        )
+        .await
+        else {
             return self.decline_dispatch(
                 &projection.program_id,
                 task_ref,
