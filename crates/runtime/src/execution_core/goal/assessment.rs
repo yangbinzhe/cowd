@@ -1150,7 +1150,10 @@ impl CompletionAssessment {
         if facts.teams < facts.required_teams {
             remaining.push(ClosureStep::Team);
         }
-        if facts.published == 0 && facts.required_teams > 0 && !facts.teams_forbidden {
+        if facts.published == 0
+            && !facts.teams_forbidden
+            && (facts.required_teams > 0 || facts.teams > 0)
+        {
             remaining.push(ClosureStep::PublishTask);
         }
         if facts.unclaimed > 0 {
