@@ -2217,7 +2217,7 @@ impl RuntimeEventStoreBackend for EphemeralRuntimeEventStore {
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        Ok(ids
+        let mut statuses = ids
             .into_iter()
             .map(|id| {
                 let status = state
@@ -2228,7 +2228,12 @@ impl RuntimeEventStoreBackend for EphemeralRuntimeEventStore {
                     .and_then(|event| event.status.clone());
                 (id, status)
             })
-            .collect())
+            .collect::<Vec<_>>();
+        // The set of streams a scope/kind query discovers carries no order of
+        // its own; returning hash iteration order made the result differ between
+        // runs for the same durable state.
+        statuses.sort_by(|left, right| left.0.cmp(&right.0));
+        Ok(statuses)
     }
     fn all_events(&self, limit: usize) -> Result<Vec<DurableRuntimeEvent>, String> {
         Ok(self.matching_limited(|_| true, limit, true))
