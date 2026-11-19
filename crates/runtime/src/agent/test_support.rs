@@ -30,6 +30,55 @@ impl TestPostgresExecutorCache {
     }
 }
 
+/// Resolve the PostgreSQL instance the runtime fixtures use.
+///
+/// Configuration stays in `COWD_TEST_POSTGRES_URL`, but a local server is
+/// detected instead of required: several trees run their tests side by side and
+/// a hard-coded single instance turned every other tree into a failure. Standard
+/// `PG*` variables describe the local server when they are present.
+fn detected_postgres_url() -> Option<String> {
+    static URL: OnceLock<Option<String>> = OnceLock::new();
+    URL.get_or_init(|| {
+        if let Ok(url) = std::env::var("COWD_TEST_POSTGRES_URL") {
+            if !url.trim().is_empty() {
+                return Some(url);
+            }
+        }
+        let host = std::env::var("PGHOST").unwrap_or_else(|_| "127.0.0.1".to_string());
+        let port = std::env::var("PGPORT").unwrap_or_else(|_| "5432".to_string());
+        let user = std::env::var("PGUSER").unwrap_or_else(|_| "postgres".to_string());
+        let database = std::env::var("PGDATABASE").unwrap_or_else(|_| "postgres".to_string());
+        let passwords: Vec<String> = match std::env::var("PGPASSWORD") {
+            Ok(password) => vec![password],
+            Err(_) => vec!["postgres".to_string(), String::new()],
+        };
+        for password in passwords {
+            let url = format!("postgres://{user}:{password}@{host}:{port}/{database}");
+            if postgres_accepts(&url) {
+                return Some(url);
+            }
+        }
+        None
+    })
+    .clone()
+}
+
+/// A listening socket is not a usable server: the local default can be another
+/// project's instance that rejects this fixture's credentials. Detection has to
+/// authenticate, so a wrong guess skips the test instead of failing it.
+fn postgres_accepts(url: &str) -> bool {
+    let mut config =
+        PostgresConnectionConfig::new("runtime-test-probe", "runtime.test.pg", "cowd-runtime-test");
+    config.max_connections = 1;
+    config.min_idle_connections = None;
+    config.checkout_timeout_ms = 5_000;
+    let resolver = storage::StaticSecretRefResolver::new([(
+        "runtime.test.pg".to_string(),
+        url.to_string(),
+    )]);
+    PostgresExecutor::connect(config, &resolver).is_ok()
+}
+
 fn postgres_executor() -> PostgresExecutor {
     static EXECUTOR: OnceLock<TestPostgresExecutorCache> = OnceLock::new();
     let config = storage::test_fixture_pool_budget(1, None).map(|budget| {
@@ -40,8 +89,11 @@ fn postgres_executor() -> PostgresExecutor {
         config.checkout_timeout_ms = storage::test_fixture_checkout_timeout_ms();
         config
     });
-    let snapshot = std::env::var("COWD_TEST_POSTGRES_URL")
-        .map_err(|_| "COWD_TEST_POSTGRES_URL is required".to_string())
+    let snapshot = detected_postgres_url()
+        .ok_or_else(|| {
+            "no PostgreSQL server: set COWD_TEST_POSTGRES_URL or PGHOST/PGPORT/PGUSER/PGPASSWORD"
+                .to_string()
+        })
         .map(|url| {
             storage::test_fixture_postgres_url_snapshot(
                 "runtime.test.pg",
@@ -139,6 +191,9 @@ mod fixture_cache_tests {
 #[track_caller]
 pub(crate) fn skip_if_env_absent(var: &str) -> bool {
     if std::env::var_os(var).is_some() {
+        return false;
+    }
+    if var == "COWD_TEST_POSTGRES_URL" && detected_postgres_url().is_some() {
         return false;
     }
     eprintln!("COWD_TEST_SKIPPED: {var} is absent; this test needs a private environment");
