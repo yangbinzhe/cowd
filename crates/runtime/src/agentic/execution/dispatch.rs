@@ -1658,6 +1658,33 @@ impl RuntimeServices {
                 attempt_filter.is_none_or(|selected| attempt.execution_id == selected)
             })
             .collect::<Vec<_>>();
+        let mut stranded_attempts = stranded_attempts;
+        let mut claim_only = std::collections::BTreeSet::new();
+        if stranded_attempts.is_empty() {
+            if let Some(task) = projection.tasks.get(task_ref) {
+                if task.status == AgenticTaskStatus::Claimed {
+                    if let (Some(execution_id), Some(agent_id)) =
+                        (task.claim_execution_id.clone(), task.claimant.clone())
+                    {
+                        // A claim whose graph was never admitted has no attempt
+                        // record, so the durable Task projection is the only
+                        // owner left to recover. Without this the claim keeps a
+                        // missing graph forever and no work can be re-admitted.
+                        stranded_attempts.push((
+                            task.task_id.clone(),
+                            AgenticTaskAttemptProjection {
+                                execution_id: execution_id.clone(),
+                                agent_id,
+                                membership_id: String::new(),
+                                mode: harness_contract::agent_action::AgentAttemptMode::Execute,
+                                generation: task.claim_generation.saturating_sub(1),
+                            },
+                        ));
+                        claim_only.insert(execution_id);
+                    }
+                }
+            }
+        }
         let mut settled_attempt = false;
         for (task_ref, attempt) in stranded_attempts {
             projection = self
@@ -1684,7 +1711,12 @@ impl RuntimeServices {
                 .load_async(execution_graph_id(&attempt.execution_id))
                 .await
             {
-                Ok(graph) if !agentic_graph_is_terminal(&graph) => continue,
+                Ok(graph)
+                    if !agentic_graph_is_terminal(&graph)
+                        && !claim_only.contains(&attempt.execution_id) =>
+                {
+                    continue
+                }
                 Ok(_) => "startup recovered a terminal Agent graph with an unsettled Task attempt",
                 Err(crate::execution_core::graph::ExecutionStateStoreError::NotFound {
                     ..
@@ -2763,6 +2795,9 @@ impl RuntimeServices {
             .await;
             if let Err(error) = admission {
                 let reason = format!("physical Agent graph admission failed: {error}");
+                eprintln!(
+                    "DISPATCH_SETTLE task={task_ref} mode={mode:?} graph={graph_id} reason={reason}"
+                );
                 if mode == DispatchMode::Review {
                     match self.graph_state_store().load_current_async(&graph_id).await {
                         Err(crate::execution_core::graph::ExecutionStateStoreError::NotFound { .. }) => {

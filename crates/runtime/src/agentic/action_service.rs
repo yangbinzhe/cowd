@@ -663,9 +663,10 @@ impl AgentActionService {
         });
         let request = AppendTransactionRequest {
             transaction_id: format!(
-                "agentic-wait-disposition:{}:{revision}",
+                "agentic-wait-disposition:{}:{revision}:{disposition}",
                 record.program_id,
-                revision = record.revision
+                revision = record.revision,
+                disposition = record.disposition
             ),
             expected_streams: Vec::new(),
             events: vec![RuntimeTransactionEventInput {
@@ -8507,5 +8508,17 @@ fn attach_completion_assessment(
             }
             observation.actionable = vec![format!("Completion assessment is unavailable: {error}. Inspect the original bound sources; no completion readiness is established.")];
         }
+    }
+}
+
+#[cfg(test)]
+impl AgentActionService {
+    /// Test-only entry for fixtures outside this module to commit Runtime's
+    /// supervisor dispatch without widening production visibility.
+    pub(crate) fn apply_runtime_supervisor_internal_for_test(
+        &self,
+        envelope: &AgentActionEnvelope,
+    ) -> Result<AgentActionObservation, AgentActionServiceError> {
+        self.apply_runtime_supervisor(envelope)
     }
 }

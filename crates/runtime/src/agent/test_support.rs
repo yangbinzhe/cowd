@@ -616,6 +616,63 @@ pub(crate) fn install_original_dispatch_session(
     (execution_id, lease)
 }
 
+/// Install the original dispatch Session owner **and** the root Task aggregate
+/// its ingress claims, in the order the product requires.
+///
+/// The root Task is what the Session ingress names as both `primary_task_id`
+/// and `root_task_id`; without it the Program projection has no root work to
+/// attach a dispatched attempt to. Creating it here keeps every dispatch
+/// fixture on the same shape instead of repeating the aggregate boilerplate.
+pub(crate) fn install_original_dispatch_fixture(
+    services: &crate::RuntimeServices,
+    session_id: &str,
+    turn_id: &str,
+    request_id: &str,
+    task_id: &str,
+) -> (
+    String,
+    crate::execution_core::services::ActiveExecutionBusLease,
+) {
+    let installed = install_original_dispatch_session(services, session_id, turn_id, request_id, task_id);
+    if services
+        .task_runtime_port()
+        .get(task_id)
+        .expect("root task read")
+        .is_none()
+    {
+        let spec = services
+            .task_runtime_port()
+            .bind_task_spec(
+                session_id,
+                None,
+                harness_contract::task::TaskSpec::new(format!("{task_id} root task")),
+            )
+            .expect("root task spec");
+        services
+            .task_aggregate_service()
+            .create(harness_contract::task::TaskCreateCommand {
+                task_id: task_id.to_string(),
+                mission_id: services.mission_runtime().default_mission_id().to_string(),
+                kind: harness_contract::task::TaskKind::Root,
+                origin: harness_contract::task::TaskOrigin::User,
+                origin_session_id: session_id.to_string(),
+                origin_turn_id: turn_id.to_string(),
+                root_task_id: task_id.to_string(),
+                parent_task_id: None,
+                predecessor_task_id: None,
+                mission_assignment: harness_contract::task::TaskMissionAssignment::Default,
+                mission_assigned_by: "fixture".to_string(),
+                spec,
+                evidence_refs: vec![harness_contract::reality::EvidenceRef::observed(
+                    "test_fixture",
+                    format!("test://{request_id}/root"),
+                )],
+            })
+            .expect("root task aggregate");
+    }
+    installed
+}
+
 /// Register the graph an Agent actor uses to prove it holds a live attempt
 /// lease, and check that the registered graph really carries that proof.
 ///
@@ -799,4 +856,279 @@ pub(crate) fn agent_assignment(
         scope_refs: Vec::new(),
         capability_policy: Vec::new(),
     }
+}
+
+/// Register and start the physical Agent execution that owns a Program Task.
+///
+/// The A-family Program-wait fixtures must act under a real compiled AgentTask
+/// binding: Runtime's own supervisor records the attempt dispatch, the packet is
+/// compiled from a real intent, and the node is bound Running so the artifact
+/// gate can authenticate the original execution.
+pub(crate) fn register_physical_agent_child(
+    services: &crate::RuntimeServices,
+    root_execution_id: &str,
+    parent_node_id: &str,
+    program_id: &str,
+    child_id: &str,
+    task_ref: &str,
+    actor: &harness_contract::agent_action::AgentActorBinding,
+) -> harness_contract::agent_action::OriginalAgentExecution {
+    use harness_contract::agent::{
+        AgentCapability, AgentTaskIntent, AgenticExecutionBinding, AgenticExecutionFocus,
+    };
+    use harness_contract::agent_action::{
+        AgentAction, AgentActionEnvelope, AgentActorKind, AgentAttemptMode,
+        TaskAttemptDispatchInput,
+    };
+    use harness_contract::execution_graph::{
+        ExecutionGraph, ExecutionNodeKind, ExecutionNodeSpec,
+    };
+
+    let actions = services.agent_action_service();
+    let projection = actions.project(program_id).expect("program projection");
+    let execution_task_id = projection
+        .execution_task_id(task_ref)
+        .expect("physical execution task id");
+    let session_id = actor.session_id.clone();
+    let turn_id = actor.turn_id.clone();
+    services.publish_session_execution_policy(
+        &session_id,
+        crate::permissions::SessionExecutionPolicyControl::from_policy(
+            harness_contract::policy::SessionExecutionPolicy::from_profile(
+                harness_contract::policy::AutonomyProfileId::Autonomous,
+                1,
+                harness_contract::policy::SessionExecutionPolicyOrigin::ConfigDefault,
+            ),
+        ),
+    );
+    let root_task_id = format!("task:{program_id}");
+    let mission_id = services.mission_runtime().default_mission_id().to_string();
+    if services
+        .task_runtime_port()
+        .get(&root_task_id)
+        .expect("root task read")
+        .is_none()
+    {
+        let spec = services
+            .task_runtime_port()
+            .bind_task_spec(
+                &session_id,
+                None,
+                harness_contract::task::TaskSpec::new(format!("{program_id} root task")),
+            )
+            .expect("root task spec");
+        services
+            .task_aggregate_service()
+            .create(harness_contract::task::TaskCreateCommand {
+                task_id: root_task_id.clone(),
+                mission_id: mission_id.clone(),
+                kind: harness_contract::task::TaskKind::Root,
+                origin: harness_contract::task::TaskOrigin::User,
+                origin_session_id: session_id.clone(),
+                origin_turn_id: turn_id.clone(),
+                root_task_id: root_task_id.clone(),
+                parent_task_id: None,
+                predecessor_task_id: None,
+                mission_assignment: harness_contract::task::TaskMissionAssignment::Default,
+                mission_assigned_by: "fixture".to_string(),
+                spec,
+                evidence_refs: vec![harness_contract::reality::EvidenceRef::observed(
+                    "test_fixture",
+                    format!("test://{program_id}/root"),
+                )],
+            })
+            .expect("root task aggregate");
+    }
+    let agent_id = actor.agent_id.clone().expect("agent id");
+    let team_id = actor.team_id.clone().expect("team id");
+    let membership_id = projection
+        .membership_for(&agent_id, &team_id)
+        .expect("active membership")
+        .membership_id
+        .clone();
+    let catalog = services.agent_runtime().catalog();
+    if catalog.get(&agent_id).is_none() {
+        catalog.upsert(crate::AgentCatalogEntry {
+            definition_ref: harness_contract::agent::AgentDefinitionRevisionRef::new(
+                harness_contract::agent::AgentDefinitionId::new(
+                    harness_contract::agent::DefinitionScope::Builtin,
+                    "cowd/direct",
+                )
+                .expect("builtin direct definition id"),
+                1,
+            )
+            .expect("builtin direct definition revision"),
+            agent_id: agent_id.clone(),
+            name: "program wait fixture agent".to_string(),
+            description: "program wait physical child fixture".to_string(),
+            capabilities: vec!["read".to_string()],
+            skill_refs: Vec::new(),
+            scope: harness_contract::agent::DefinitionScope::Builtin,
+            evaluation: harness_contract::evaluation::EvaluationContract::single_release_gate(
+                "program-wait-fixture",
+                "fixture",
+            ),
+        });
+    }
+    let definition_ref = catalog
+        .get(&agent_id)
+        .expect("invited agent catalog entry")
+        .definition_ref
+        .clone();
+    let task_team_id = projection
+        .tasks
+        .get(task_ref)
+        .expect("program task")
+        .team_id
+        .clone();
+    let objective = projection
+        .tasks
+        .get(task_ref)
+        .map(|task| task.objective.clone())
+        .unwrap_or_else(|| "complete the program task".to_string());
+    let node_id = format!("{child_id}:agent");
+    let intent = AgentTaskIntent {
+        selected_agent_id: Some(agent_id.clone()),
+        definition_ref: Some(definition_ref),
+        granted_capabilities: vec![AgentCapability::Read],
+        principal_id: "runtime.agentic".to_string(),
+        source_turn_id: turn_id.clone(),
+        run_id: format!("{child_id}:run"),
+        task_id: execution_task_id.clone(),
+        root_task_id: root_task_id.clone(),
+        parent_task_id: Some(root_task_id.clone()),
+        session_id: session_id.clone(),
+        mission_id: mission_id.clone(),
+        team_id: None,
+        graph_id: child_id.to_string(),
+        node_id: node_id.clone(),
+        attempt: 1,
+        expected_graph_revision: 0,
+        objective,
+        required_acceptance: Default::default(),
+        output_acceptance: Vec::new(),
+        acceptance: Vec::new(),
+        constraints: Vec::new(),
+        context_refs: vec![format!("program:{program_id}"), format!("task:{task_ref}")],
+        evidence_refs: Vec::new(),
+        resource_scopes: vec![format!("program:{program_id}")],
+        allowed_tools: Vec::new(),
+        allowed_skills: Vec::new(),
+        permission_ceiling: harness_contract::policy::PermissionMode::ReadOnly,
+        model_lease: "test".to_string(),
+        budget_lease: harness_contract::context::ChildExecutionBudgetReservation::single(
+            "budget", "agent", "agent", 1, u64::MAX, 1,
+        ),
+        deadline_at_ms: u64::MAX,
+        managed_invocation: None,
+        idempotency_key: format!("{node_id}:attempt"),
+        agentic_binding: Some(AgenticExecutionBinding {
+            program_id: program_id.to_string(),
+            agent_id: agent_id.clone(),
+            membership_id: membership_id.clone(),
+            team_id: team_id.clone(),
+            task_team_id,
+            source_spec_revision: projection.revision,
+            task_purpose: None,
+            focus: AgenticExecutionFocus::TaskExecute {
+                task_ref: task_ref.to_string(),
+            },
+        }),
+    };
+    let mut graph = ExecutionGraph::new("Agentic child");
+    graph.id = child_id.to_string();
+    graph.lineage = Some(harness_contract::execution_graph::ExecutionGraphLineage {
+        session_id: session_id.clone(),
+        turn_id: turn_id.clone(),
+        root_task_id: root_task_id.clone(),
+        task_id: execution_task_id,
+        generation: 1,
+    });
+    graph.parent_execution = Some(harness_contract::execution_graph::ExecutionParentBinding {
+        execution_id: root_execution_id.to_string(),
+        node_id: parent_node_id.to_string(),
+    });
+    let mut node = ExecutionNodeSpec::new(
+        ExecutionNodeKind::AgentTask,
+        crate::execution_core::graph::executors::AgentTaskExecutor::KIND,
+        serde_json::to_string(&intent).expect("AgentTask intent"),
+    );
+    node.id = node_id.clone();
+    node.idempotency_key = intent.idempotency_key.clone();
+    node.acceptance.criteria = intent.acceptance.clone();
+    node.resource_scopes.push(format!("program:{program_id}"));
+    graph.nodes.push(node);
+    let mut graph = services
+        .compile_graph_agent_intents(graph)
+        .expect("compile AgentTask intent");
+    {
+        use harness_contract::agent::{AgentDisplayIdentity, AgentTaskPacket};
+        let mut packet: AgentTaskPacket = serde_json::from_str(&graph.nodes[0].payload_ref)
+            .expect("compiled AgentTask packet");
+        if let Some(binding) = packet.binding.as_mut() {
+            binding.display = Some(AgentDisplayIdentity {
+                agent_id: agent_id.clone(),
+                role_id: "agent".to_string(),
+                role_display_name: None,
+                label: "Program wait fixture".to_string(),
+                role_label: "Agent".to_string(),
+                focus_label: None,
+                locale: "en".to_string(),
+                provenance: format!("runtime.agentic:{program_id}"),
+                digest: "fixture-display".to_string(),
+            });
+            binding.binding_digest = crate::agent::binding::recompute_binding_digest(binding)
+                .expect("recompute binding digest");
+        }
+        graph.nodes[0].payload_ref = serde_json::to_string(&packet).expect("compiled packet");
+    }
+    services
+        .commit_service()
+        .register_graph(graph)
+        .expect("register Agent child");
+    let supervisor = harness_contract::agent_action::AgentActorBinding {
+        original_execution: None,
+        objective_id: projection.objective_id.clone(),
+        program_id: projection.program_id.clone(),
+        session_id: projection.session_id.clone(),
+        turn_id: projection.turn_id.clone(),
+        root_execution_id: projection.root_execution_id.clone(),
+        required_team_count: projection.required_team_count,
+        exact_team_count: projection.exact_team_count,
+        objective_summary: projection.objective_summary.clone(),
+        model_lease: projection.model_lease.clone(),
+        permission_ceiling: Some(projection.permission_ceiling),
+        resource_scopes: projection.resource_scopes.clone(),
+        actor_id: "runtime.program-supervisor".to_string(),
+        kind: AgentActorKind::Supervisor,
+        execution_id: Some(child_id.to_string()),
+        team_id: None,
+        agent_id: None,
+    };
+    let dispatch = actions
+        .apply_runtime_supervisor_internal_for_test(&AgentActionEnvelope {
+            action_id: format!("{child_id}:dispatch"),
+            actor: supervisor,
+            expected_revision: None,
+            action: AgentAction::TaskAttemptDispatch(TaskAttemptDispatchInput {
+                task_ref: task_ref.to_string(),
+                execution_id: child_id.to_string(),
+                agent_ref: agent_id,
+                membership_id,
+                mode: AgentAttemptMode::Execute,
+                generation: 0,
+            }),
+        })
+        .expect("dispatch physical Agent attempt");
+    assert_eq!(
+        dispatch.status,
+        harness_contract::agent_action::AgentActionStatus::Applied,
+        "physical Agent attempt dispatch was rejected: {:?}",
+        dispatch.error
+    );
+    let graph = services
+        .graph_state_store()
+        .load(child_id)
+        .expect("registered Agent child");
+    bind_running_graph_node(services.commit_service(), &graph, &node_id).1
 }

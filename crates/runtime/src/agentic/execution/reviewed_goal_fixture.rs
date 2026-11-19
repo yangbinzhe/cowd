@@ -190,6 +190,17 @@ pub(super) fn root(action_id: &str, action: AgentAction) -> AgentActionEnvelope 
     }
 }
 
+/// Root envelope carrying the ingress execution chosen by the D-K fixture.
+pub(super) fn root_in_dispatch(
+    execution_id: &str,
+    action_id: &str,
+    action: AgentAction,
+) -> AgentActionEnvelope {
+    let mut envelope = root(action_id, action);
+    envelope.actor.root_execution_id = Some(execution_id.to_string());
+    envelope
+}
+
 /// An Agent actor that holds a registered attempt lease.
 ///
 /// The product accepts two proofs for an Agent actor: an original execution, or
@@ -204,7 +215,22 @@ pub(super) fn agent_with_lease(
     execution_id: &str,
     action: AgentAction,
 ) -> AgentActionEnvelope {
-    let envelope = agent(action_id, team_id, agent_id, execution_id, action);
+    let mut envelope = agent(action_id, team_id, agent_id, execution_id, action);
+    let projection = services
+        .agent_action_service()
+        .project(&envelope.actor.program_id)
+        .expect("program projection");
+    envelope.actor.objective_id = projection.objective_id.clone();
+    envelope.actor.program_id = projection.program_id.clone();
+    envelope.actor.session_id = projection.session_id.clone();
+    envelope.actor.turn_id = projection.turn_id.clone();
+    envelope.actor.root_execution_id = projection.root_execution_id.clone();
+    envelope.actor.required_team_count = projection.required_team_count;
+    envelope.actor.exact_team_count = projection.exact_team_count;
+    envelope.actor.objective_summary = projection.objective_summary.clone();
+    envelope.actor.model_lease = projection.model_lease.clone();
+    envelope.actor.permission_ceiling = Some(projection.permission_ceiling);
+    envelope.actor.resource_scopes = projection.resource_scopes.clone();
     register_agent_lease_graph(services, &envelope);
     envelope
 }

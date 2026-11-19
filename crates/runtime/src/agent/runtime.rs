@@ -1864,6 +1864,39 @@ impl AgentRuntime {
         }
     }
 
+    /// Publish an authenticated local exit for a packet that no live worker
+    /// owns, so a fixture can drive the post-exit reconciliation without
+    /// inventing a second run. The facts go through the same persistence path
+    /// every other run fact uses.
+    #[cfg(test)]
+    pub(crate) async fn publish_run_exit_for_test(
+        &self,
+        packet: &AgentTaskPacket,
+    ) -> Result<(), String> {
+        let digest = run_packet_sha256(packet)?;
+        let admitted = RunExitFact {
+            schema_version: 1,
+            agent_id: packet.agent_id().into(),
+            run_id: packet.run_id().into(),
+            graph_id: packet.graph_id().into(),
+            node_id: packet.node_id().into(),
+            attempt: packet.attempt,
+            packet_sha256: digest.clone(),
+            backend_packet_sha256: None,
+            owner_epoch: self.owner_epoch.as_ref().clone(),
+            backend: backend_from_packet(packet)?,
+            phase: LocalRunPhase::Admitted,
+            process_envelope: None,
+        };
+        self.persist_run_fact_until_durable(&admitted, "agent.run_admitted")
+            .await;
+        let mut exit = admitted;
+        exit.phase = LocalRunPhase::NotStarted;
+        self.persist_run_fact_until_durable(&exit, "agent.local_exit")
+            .await;
+        Ok(())
+    }
+
     /// Publish the authenticated local exit of a run exactly once.
     ///
     /// `agent.local_exit` is written through the same authenticated channel,
