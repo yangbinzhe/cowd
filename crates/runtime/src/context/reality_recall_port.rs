@@ -632,9 +632,8 @@ mod tests {
     }
 
     impl MatrixFixture {
-        fn isolated() -> Self {
-            let url = std::env::var("COWD_TEST_POSTGRES_URL")
-                .expect("COWD_TEST_POSTGRES_URL is required");
+        fn isolated() -> Option<Self> {
+            let url = crate::test_support::detected_postgres_url()?;
             let resolver = StaticSecretRefResolver::new([("runtime.recall.unit".to_string(), url)]);
             let executor = PostgresExecutor::connect(
                 PostgresConnectionConfig::new(
@@ -662,6 +661,7 @@ mod tests {
                 executor,
                 schema,
             }
+            .into()
         }
     }
 
@@ -720,10 +720,11 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires COWD_TEST_POSTGRES_URL"]
     fn matrix_scenario_port_refuses_unleased_snapshot_and_returns_candidate_only() {
         let home = tempfile::tempdir().unwrap();
-        let fixture = MatrixFixture::isolated();
+        let Some(fixture) = MatrixFixture::isolated() else {
+            return;
+        };
         let repository = Arc::clone(&fixture.repository);
         let snapshot = repository
             .create_source_snapshot(MatrixSourceSnapshotInput {
@@ -783,10 +784,11 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires COWD_TEST_POSTGRES_URL"]
     fn recall_port_injects_only_binding_leased_fact_and_matrix_evidence() {
         let home = tempfile::tempdir().unwrap();
-        let fixture = MatrixFixture::isolated();
+        let Some(fixture) = MatrixFixture::isolated() else {
+            return;
+        };
         let repository = Arc::clone(&fixture.repository);
         let snapshot = repository
             .create_source_snapshot(MatrixSourceSnapshotInput {

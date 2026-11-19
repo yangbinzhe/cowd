@@ -7135,10 +7135,11 @@ fn continuation_resource_limit_is_explicit_and_supports_long_tasks() {
 #[test]
 fn both_rollback_paths_share_one_bound() {
     // Only the production half of the file: this test's own source would
-    // otherwise count itself.
+    // otherwise count itself. The boundary is the first test module, not any
+    // test-only import near the top of the file.
     let source = include_str!("host_presentation.rs");
     let production = source
-        .split("#[cfg(test)]")
+        .split("\n#[cfg(test)]\nmod ")
         .next()
         .expect("production code precedes the test module");
     assert_eq!(

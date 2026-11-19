@@ -36,7 +36,7 @@ impl TestPostgresExecutorCache {
 /// detected instead of required: several trees run their tests side by side and
 /// a hard-coded single instance turned every other tree into a failure. Standard
 /// `PG*` variables describe the local server when they are present.
-fn detected_postgres_url() -> Option<String> {
+pub(crate) fn detected_postgres_url() -> Option<String> {
     static URL: OnceLock<Option<String>> = OnceLock::new();
     URL.get_or_init(|| {
         if let Ok(url) = std::env::var("COWD_TEST_POSTGRES_URL") {

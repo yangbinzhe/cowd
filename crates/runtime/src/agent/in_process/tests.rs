@@ -6155,6 +6155,8 @@ async fn scoped_executor_propagates_runtime_authorization_for_normal_agent_tools
         fact_refs: vec!["fact:exact".into()],
         matrix_snapshot_refs: vec!["matrix:source_snapshot:exact".into()],
     };
+    let workspace = tempfile::tempdir().expect("workspace");
+    std::fs::write(workspace.path().join("README.md"), b"readme").expect("readme");
     let executor = ScopedRuntimeToolExecutor {
         tool_batch: None,
         host: Arc::new(LeaseCheckingHost(reality_lease.clone())),
@@ -6168,12 +6170,10 @@ async fn scoped_executor_propagates_runtime_authorization_for_normal_agent_tools
         execution_id: "graph".to_string(),
         node_id: "node".to_string(),
         attempt: 1,
-        workspace_root: std::path::PathBuf::from("/workspace"),
+        workspace_root: workspace.path().to_path_buf(),
         path_identity_resolver: Arc::new(
-            crate::path_identity::WorkspacePathIdentityResolver::discover(
-                &std::env::current_dir().expect("current directory"),
-            )
-            .expect("path identities"),
+            crate::path_identity::WorkspacePathIdentityResolver::discover(workspace.path())
+                .expect("path identities"),
         ),
         scope_locks: Arc::new(ScopeLockManager::new()),
         commit_service: None,
