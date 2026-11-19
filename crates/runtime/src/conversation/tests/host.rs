@@ -550,14 +550,12 @@ fn a_program_with_teams_but_no_tasks_still_owes_publish_task() {
         steps.iter().any(|step| step == "publish_task"),
         "three Teams and no Tasks must still owe publish_task: {steps:?}"
     );
-    // The raw view also names the exit request, because with no completion request
-    // on file that is the only remaining step. It is the model's own decision
-    // rather than an obligation, so the terminal-request site filters it out
-    // before deciding whether tools are owed - otherwise every unfinished Program
-    // would look like it owed the exit action and never get a tool-less terminal.
+    // Nothing has been delivered, so the exit request is not owed yet: asking to
+    // complete a Program with no artifact would be a completion claim with no
+    // subject. The rung appears once a deliverable exists.
     assert!(
-        steps.iter().any(|step| step == "objective_complete_request"),
-        "the view names the exit request while none exists: {steps:?}"
+        !steps.iter().any(|step| step == "objective_complete_request"),
+        "no deliverable means no exit request yet: {steps:?}"
     );
     let owed = steps
         .iter()

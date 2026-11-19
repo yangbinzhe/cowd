@@ -9327,11 +9327,13 @@ mod next_turn_contract_tests {
     }
 
     #[test]
-    fn missing_goal_is_unknown_not_empty_known_criteria() {
+    fn a_program_without_a_goal_never_reports_empty_known_criteria() {
         let services = crate::RuntimeServices::in_memory().unwrap();
-        let program = crate::AgenticProgramProjection::empty("program:zero", "objective:zero");
+        let mut program = crate::AgenticProgramProjection::empty("program:zero", "objective:zero");
+        program.session_id = "session".into();
+        program.turn_id = "turn".into();
         let refs = citable_refs(&program, &services, "session", "turn");
-        assert_eq!(refs["goal"]["status"], "unknown");
+        assert_eq!(refs["goal"]["status"], "not_applicable");
         assert!(refs["criteria"].is_null());
         assert_eq!(refs["coverage"]["accepted_results_omitted"], 0);
     }

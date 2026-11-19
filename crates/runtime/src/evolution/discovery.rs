@@ -770,7 +770,15 @@ impl EvolutionDiscoveryService {
                 id: next.case_id.clone(),
             }],
             serde_json::json!({"index": next_index}),
-            Some(format!("case-index:{}:{}", next.case_id, next.revision)),
+            // The index key must stay unique per attempt: the case stream CAS is
+            // what prevents a double application, while two concurrent signals
+            // legitimately build the same next revision under their own
+            // transactions, and a reused key there is refused as belonging to
+            // another transaction.
+            Some(format!(
+                "case-index:{}:{}:{reason}",
+                next.case_id, next.revision
+            )),
         );
         let mut expected_streams = vec![
             ExpectedStreamRevision {

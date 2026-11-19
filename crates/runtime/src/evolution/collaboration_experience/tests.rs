@@ -252,7 +252,15 @@ fn invalid_terminal_source_keeps_cursor_and_does_not_manufacture_an_episode() {
         })
         .unwrap();
     assert!(projector(&store).project_available(64).is_err());
-    assert!(store.projection_checkpoint(PROJECTOR_ID).unwrap().is_none());
+    // Admission may reserve the page with a pending marker before processing it,
+    // but an invalid source must never advance the committed cursor.
+    assert!(
+        store
+            .projection_checkpoint(PROJECTOR_ID)
+            .unwrap()
+            .is_none_or(|entry| entry.source_cursor == 0),
+        "an invalid terminal source must not advance the projection cursor"
+    );
     assert!(
         store
             .replay_scope_kind(RuntimeEventScope::Evolution, EPISODE_KIND)

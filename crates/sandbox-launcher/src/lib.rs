@@ -36,6 +36,7 @@ const SYSTEM_READ_ONLY_ROOTS: &[&str] = &["/usr", "/bin", "/lib", "/lib64", "/et
 const SANDBOX_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 const BOOTSTRAP_SHELL: &str = "/bin/bash";
 const INNER_LAUNCHER_PATH: &str = "/run/cowd-sandbox-inner";
+const LAUNCHER_ROLE: &str = "kernel-v3-controlled-host";
 const LAUNCHER_PROTOCOL: &str = concat!(
     "sandbox-launcher/",
     env!("CARGO_PKG_VERSION"),
@@ -969,9 +970,13 @@ fn launcher_binary_path() -> Result<PathBuf, SandboxError> {
     })?;
     let mut candidates = Vec::new();
     candidates.push(current.clone());
-    candidates.push(parent.join("cowd"));
-    if let Some(grandparent) = parent.parent() {
-        candidates.push(grandparent.join("cowd"));
+    // The launcher is the crate's own binary. Under a cargo test build the
+    // harness lives several directories below the profile root
+    // (`<profile>/build/<crate>/<hash>/out/bin`), so search every ancestor for a
+    // `cowd` instead of only the immediate parent: pinning one layout made every
+    // other build/version fail discovery and report the sandbox as unavailable.
+    for ancestor in parent.ancestors().take(8) {
+        candidates.push(ancestor.join("cowd"));
     }
     let mut inspected = HashSet::new();
     for candidate in candidates {
@@ -1029,8 +1034,21 @@ fn launcher_protocol_matches(path: &Path) -> bool {
     let Some(output) = output else {
         return false;
     };
+    if !output.status.success() {
+        return false;
+    }
     let actual = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    output.status.success() && actual == LAUNCHER_PROTOCOL
+    // Bind to the protocol *role*, not to the build version that happens to be
+    // installed. The version segment only identifies which build answered; the
+    // role and wire revision decide compatibility. Requiring the exact build
+    // string made a launcher from another version of this same repository look
+    // like "no sandbox support", which is a false negative whenever several
+    // trees are built and tested side by side.
+    let Some(rest) = actual.strip_prefix("sandbox-launcher/") else {
+        return false;
+    };
+    rest.split_once('/')
+        .is_some_and(|(version, role)| !version.is_empty() && role == LAUNCHER_ROLE)
 }
 
 fn append_environment(
@@ -2169,6 +2187,12 @@ mod bounded {
             }
             if done {
                 kill_descendants();
+                // SIGKILL is delivered asynchronously, and the runtime releases the
+                // canonical lease as soon as this sandbox reports its terminal. A
+                // process that left the wrapper's process group (setsid) would then
+                // outlive the lease that admitted it, so the namespace must be empty
+                // before init exits.
+                await_namespace_empty();
             }
             match rustix::process::wait(rustix::process::WaitOptions::NOHANG) {
                 Ok(Some((pid, result))) => {
@@ -2701,6 +2725,27 @@ mod bounded {
             }
         }
     }
+    fn await_namespace_empty() {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            let others = fs::read_dir("/proc")
+                .map(|entries| {
+                    entries
+                        .filter_map(Result::ok)
+                        .filter_map(|entry| {
+                            entry.file_name().to_str()?.parse::<i32>().ok()
+                        })
+                        .filter(|pid| *pid > 1)
+                        .count()
+                })
+                .unwrap_or(0);
+            if others == 0 {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
     fn kill_descendants() {
         if let Ok(entries) = fs::read_dir("/proc") {
             for entry in entries.filter_map(Result::ok) {

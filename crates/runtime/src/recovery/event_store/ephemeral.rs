@@ -1435,6 +1435,43 @@ impl RuntimeEventStoreBackend for EphemeralRuntimeEventStore {
             })?,
         })
     }
+    /// The process-local backend answers the same commit-control question the
+    /// durable backend answers: begin under the owner, commit only when the
+    /// owner wins, and finish with the real outcome. Original Session dispatch
+    /// registers its attempt through this path, so a test composition must not
+    /// be unable to exercise the production entry at all.
+    fn append_checked_transaction_cancellable(
+        &self,
+        request: CheckedAppendRequest,
+        validator: &dyn CheckedSourceValidator,
+        control: &dyn RuntimeTransactionCommitControl,
+        _claim: &RuntimeOriginalSessionClaim<'_>,
+    ) -> RuntimeEventStoreResult<Option<CheckedAppendReceipt>> {
+        if !control
+            .begin()
+            .map_err(RuntimeEventStoreError::InvalidTransaction)?
+        {
+            return Ok(None);
+        }
+        control.before_commit();
+        if !control
+            .commit_wins()
+            .map_err(RuntimeEventStoreError::InvalidTransaction)?
+        {
+            control.finish(RuntimeTransactionOutcome::RolledBack);
+            return Ok(None);
+        }
+        match self.append_checked_transaction(request, validator) {
+            Ok(receipt) => {
+                control.finish(RuntimeTransactionOutcome::Committed);
+                Ok(Some(receipt))
+            }
+            Err(error) => {
+                control.finish(RuntimeTransactionOutcome::RolledBack);
+                Err(error)
+            }
+        }
+    }
     fn original_checked_terminal_winner(
         &self,
         request: &CheckedAppendRequest,

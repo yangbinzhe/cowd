@@ -161,17 +161,20 @@ fn t_refused_admitted_call_writes_one_consumable_rejection_fact() {
     );
 }
 
-#[test]
-fn own832_retirement_execute_preserves_preclaim_and_claim_identity_fences() {
-    let store = Arc::new(RuntimeEventStore::for_test());
-    let service = AgentActionService::new(Arc::clone(&store));
+#[tokio::test]
+async fn own832_retirement_execute_preserves_preclaim_and_claim_identity_fences() {
+    let services = Arc::new(crate::RuntimeServices::in_memory().expect("runtime"));
+    let store = Arc::clone(services.event_store());
+    let service = services.agent_action_service();
     let (_, worker, _, task_ref) = team_with_reviewer_and_task(
+        &services,
         &service,
         &store,
         "own832",
         "original evidence",
         Default::default(),
-    );
+    )
+    .await;
     let mut task = service.project("program-1").unwrap().tasks[&task_ref].clone();
     task.status = AgenticTaskStatus::CancelRequested;
     task.claim_generation = 1;
@@ -481,6 +484,43 @@ fn managed_with_lease(
     envelope
 }
 
+/// Submit an envelope through Runtime's internal supervisor entry.
+///
+/// A Supervisor actor is not allowed to act through the public `apply` gate;
+/// the production owner that emits these actions uses this entry. The action
+/// transition still runs unchanged, including every rejection.
+fn apply_supervisor(
+    service: &AgentActionService,
+    envelope: AgentActionEnvelope,
+) -> AgentActionObservation {
+    service
+        .apply_runtime_supervisor(&envelope)
+        .expect("runtime supervisor action")
+}
+
+/// A managed envelope whose frozen Program binding is the live one.
+///
+/// The physical provisioning fixture opens the Program with the Session
+/// ingress graph as its root, so a fixture actor built from the static
+/// root() binding would be refused before reaching the action it tests.
+fn managed_with_lease_in_program(
+    service: &AgentActionService,
+    store: &Arc<RuntimeEventStore>,
+    action_id: &str,
+    team_id: &str,
+    agent_id: &str,
+    action: AgentAction,
+) -> AgentActionEnvelope {
+    let mut envelope = managed_with_lease(service, store, action_id, team_id, agent_id, action);
+    let projection = service.project("program-1").expect("program projection");
+    envelope.actor.objective_id = projection.objective_id;
+    envelope.actor.program_id = projection.program_id;
+    envelope.actor.session_id = projection.session_id;
+    envelope.actor.turn_id = projection.turn_id;
+    envelope.actor.root_execution_id = projection.root_execution_id;
+    envelope
+}
+
 fn supervisor(action_id: &str, execution_id: &str, action: AgentAction) -> AgentActionEnvelope {
     let mut envelope = root(action_id, action);
     envelope.actor.actor_id = "runtime.program-supervisor".to_string();
@@ -675,10 +715,7 @@ fn typed_decline_settles_only_its_opportunity_and_survives_cold_replay() {
     };
     let execution = format!("execution:{}", agents[0]);
     assert_eq!(
-        service
-            .apply(&dispatch(&agents[0], &execution, 0))
-            .unwrap()
-            .status,
+        apply_supervisor(&service, dispatch(&agents[0], &execution, 0)).status,
         AgentActionStatus::Applied
     );
     let message = AgentAction::MessagePublish(
@@ -691,7 +728,7 @@ fn typed_decline_settles_only_its_opportunity_and_survives_cold_replay() {
     let decline = managed("decline", &team, &agents[0], message.clone());
     for invalid in [
         root("forged-decline", message.clone()),
-        managed("other-decline", &team, &agents[1], message.clone()),
+        managed_with_lease(&service, &store, "other-decline", &team, &agents[1], message.clone()),
     ] {
         assert_eq!(
             service.apply(&invalid).unwrap().status,
@@ -734,11 +771,11 @@ fn typed_decline_settles_only_its_opportunity_and_survives_cold_replay() {
         Some(execution.as_str())
     );
     assert_eq!(entry.intent_generation, Some(0));
-    let recovered = AgentActionService::new(store);
+    let recovered = AgentActionService::new(Arc::clone(&store));
     assert_eq!(recovered.project("program-1").unwrap(), projection);
     assert!(recovered.apply(&decline).unwrap().duplicate);
     let claim = |id: &str, agent: &str| {
-        managed(
+        let envelope = managed(
             id,
             &team,
             agent,
@@ -746,7 +783,15 @@ fn typed_decline_settles_only_its_opportunity_and_survives_cold_replay() {
                 task_ref: task.clone(),
                 reason: Some("I can perform this work".into()),
             }),
-        )
+        );
+        crate::test_support::register_agent_lease_graph(
+            &store,
+            &recovered.project("program-1").unwrap(),
+            &envelope.actor,
+            envelope.actor.execution_id.as_deref().unwrap(),
+            &task,
+        );
+        envelope
     };
     assert_eq!(
         recovered
@@ -758,18 +803,14 @@ fn typed_decline_settles_only_its_opportunity_and_survives_cold_replay() {
         "task_opportunity_declined"
     );
     assert_eq!(
-        recovered
-            .apply(&dispatch(&agents[0], "fresh-execution-same-generation", 0))
-            .unwrap()
+        apply_supervisor(&recovered, dispatch(&agents[0], "fresh-execution-same-generation", 0))
             .error
             .unwrap()
             .code,
         "task_opportunity_declined"
     );
     assert_eq!(
-        recovered
-            .apply(&dispatch(&agents[1], "stale-generation", 7))
-            .unwrap()
+        apply_supervisor(&recovered, dispatch(&agents[1], "stale-generation", 7))
             .error
             .unwrap()
             .code,
@@ -777,10 +818,7 @@ fn typed_decline_settles_only_its_opportunity_and_survives_cold_replay() {
     );
     let second_execution = format!("execution:{}", agents[1]);
     assert_eq!(
-        recovered
-            .apply(&dispatch(&agents[1], &second_execution, 0))
-            .unwrap()
-            .status,
+        apply_supervisor(&recovered, dispatch(&agents[1], &second_execution, 0)).status,
         AgentActionStatus::Applied
     );
     assert_eq!(
@@ -1797,6 +1835,14 @@ fn topic_observations_cross_teams_and_resume_from_durable_execution_cursor() {
         AgentAction::StateInspect(next),
     );
     changed_run.actor.execution_id = Some("another-physical-run".into());
+    let projection = service.project("program-1").unwrap();
+    crate::test_support::register_agent_lease_graph(
+        &store,
+        &projection,
+        &changed_run.actor,
+        "another-physical-run",
+        &format!("task:{cross_team_peer}"),
+    );
     assert_eq!(
         service.apply(&changed_run).unwrap().status,
         AgentActionStatus::Rejected
@@ -1830,7 +1876,7 @@ fn topic_observations_cross_teams_and_resume_from_durable_execution_cursor() {
 fn a_program_level_read_names_the_outstanding_rungs() {
     let turn = "turn-rungs";
     let service = AgentActionService::new(Arc::new(RuntimeEventStore::for_test()));
-    service
+    let team_ref = service
         .apply(&root_in_turn(
             turn,
             "rung-team",
@@ -1840,7 +1886,26 @@ fn a_program_level_read_names_the_outstanding_rungs() {
                 objective: None,
             }),
         ))
-        .expect("team mutation");
+        .expect("team mutation")
+        .changed_refs[0]
+        .clone();
+    service
+        .apply(&root_in_turn(
+            turn,
+            "rung-agent",
+            AgentAction::AgentInvite(AgentInviteInput {
+                team_ref,
+                role: "worker".to_string(),
+                mission: "hold the review".to_string(),
+                required_capabilities: vec!["read".to_string()],
+                existing_agent_ref: None,
+                definition_ref: None,
+                model_profile_ref: None,
+                expertise_hints: Vec::new(),
+                execution_requirements: Vec::new(),
+            }),
+        ))
+        .expect("member");
     let page = service
         .apply(&root_in_turn(
             turn,
@@ -2484,7 +2549,7 @@ fn completion_cannot_bypass_real_artifact_and_task_review() {
     }
 
 #[test]
-fn task_claim_requires_a_roster_agent_and_expired_lease_is_reclaimable() {
+fn task_claim_requires_a_roster_agent_and_an_expired_lease_waits_for_physical_closure() {
     let service = AgentActionService::new(Arc::new(RuntimeEventStore::for_test()));
     let team = service
         .apply(&root(
@@ -2567,7 +2632,11 @@ fn task_claim_requires_a_roster_agent_and_expired_lease_is_reclaimable() {
     task_projection.claimant = Some("agent:abandoned".to_string());
     task_projection.claim_execution_id = Some("execution:abandoned".to_string());
     task_projection.lease_expires_at_ms = Some(10);
-    assert!(validate_transition(&projection, &claimant, 11, None).is_none());
+    assert_eq!(
+        validate_transition(&projection, &claimant, 11, None),
+        Some(("task_physical_closure_unconfirmed", task.clone())),
+        "an expired claim is not adoptable by another execution until the original owner's physical closure is confirmed"
+    );
 
     let expired_submit = managed(
         "expired-submit",
@@ -2771,8 +2840,9 @@ fn repeated_identical_physical_failure_blocks_for_explicit_replan() {
             AgentActionStatus::Applied
         );
         assert_eq!(
-            service
-                .apply(&supervisor(
+            apply_supervisor(
+                &service,
+                supervisor(
                     &format!("failure-settle-{attempt}"),
                     &execution_id,
                     AgentAction::TaskAttemptFail(TaskAttemptFailInput {
@@ -2782,9 +2852,9 @@ fn repeated_identical_physical_failure_blocks_for_explicit_replan() {
                         reason: "provider failure: unavailable capability".to_string(),
                         retryable: true,
                     }),
-                ))
-                .expect("settle")
-                .status,
+                ),
+            )
+            .status,
             AgentActionStatus::Applied
         );
     }
@@ -3116,7 +3186,7 @@ fn published_task_supersedes_across_teams_without_failure_and_rejects_invalid_re
             task_ref: source.clone(),
             replacement_task_refs: replacements,
             reason: "new evidence favors work by the other team before execution".into(),
-            evidence_refs: vec!["artifact://replanning-evidence".into()],
+            evidence_refs: vec!["tool://replanning-evidence".into()],
         })
     };
     let before = service.project("program-1").unwrap();
@@ -3134,11 +3204,32 @@ fn published_task_supersedes_across_teams_without_failure_and_rejects_invalid_re
             before.revision
         );
     }
-    let mut foreign_lead = root("foreign-lead", action(vec![successor.clone()]));
+    let foreign_agent = service
+        .apply(&root(
+            "foreign-lead-member",
+            AgentAction::AgentInvite(
+                serde_json::from_value(json!({
+                    "team_ref": second_team.clone(),
+                    "role": "lead",
+                    "mission": "own the replacement team",
+                    "required_capabilities": ["read"],
+                }))
+                .unwrap(),
+            ),
+        ))
+        .unwrap()
+        .changed_refs[0]
+        .clone();
+    let mut foreign_lead = managed_with_lease(
+        &service,
+        &store,
+        "foreign-lead",
+        &second_team,
+        &foreign_agent,
+        action(vec![successor.clone()]),
+    );
     foreign_lead.actor.kind = AgentActorKind::TeamLead;
-    foreign_lead.actor.team_id = Some(second_team.clone());
-    foreign_lead.actor.agent_id = Some("foreign-lead-agent".into());
-    foreign_lead.actor.execution_id = Some("foreign-lead-execution".into());
+    let before_foreign = service.project("program-1").unwrap().revision;
     let rejected = service.apply(&foreign_lead).unwrap();
     assert_eq!(rejected.status, AgentActionStatus::Rejected);
     assert_eq!(
@@ -3147,7 +3238,7 @@ fn published_task_supersedes_across_teams_without_failure_and_rejects_invalid_re
     );
     assert_eq!(
         service.project("program-1").unwrap().revision,
-        before.revision
+        before_foreign
     );
 
     let commit = root(
@@ -3303,19 +3394,21 @@ fn failed_task_supersede_is_cas_idempotent_recoverable_and_not_fake_completion()
             }),
         ))
         .expect("claim");
-    service
-        .apply(&supervisor(
-            "supersede-attempt-failed",
-            &format!("execution:{worker}:{team}"),
-            AgentAction::TaskAttemptFail(TaskAttemptFailInput {
-                task_ref: source.clone(),
-                execution_id: format!("execution:{worker}:{team}"),
-                mode: harness_contract::agent_action::AgentAttemptMode::Execute,
-                reason: "provider returned a reproducible counterexample".to_string(),
-                retryable: true,
-            }),
-        ))
-        .expect("attempt failure");
+    let failed = apply_supervisor(
+            &service,
+            supervisor(
+                "supersede-attempt-failed",
+                &format!("execution:{worker}:{team}"),
+                AgentAction::TaskAttemptFail(TaskAttemptFailInput {
+                    task_ref: source.clone(),
+                    execution_id: format!("execution:{worker}:{team}"),
+                    mode: harness_contract::agent_action::AgentAttemptMode::Execute,
+                    reason: "provider returned a reproducible counterexample".to_string(),
+                    retryable: true,
+                }),
+            ),
+        );
+    assert_eq!(failed.status, AgentActionStatus::Applied, "{failed:?}");
 
     let cycle_rejected = service
         .apply(&root(
@@ -3590,15 +3683,26 @@ fn new_run_membership_authorizes_incremental_work_and_leave_revokes_it() {
                 before_old_run_write,
                 "a revoked delegated run must not write Program state"
             );
-            let result = service
-                .apply(&managed_with_lease(&service, &store, 
-                    &format!("{prefix}-{label}"),
-                    &teams[1],
-                    &agent_id,
-                    action,
-                ))
-                .unwrap();
-            assert_eq!(result.status, expected, "{prefix}-{label}: {result:?}");
+            let result = service.apply(&managed_with_lease(
+                &service,
+                &store,
+                &format!("{prefix}-{label}"),
+                &teams[1],
+                &agent_id,
+                action,
+            ));
+            match (expected, result) {
+                (_, Ok(observation)) => {
+                    assert_eq!(
+                        observation.status, expected,
+                        "{prefix}-{label}: {observation:?}"
+                    );
+                }
+                (AgentActionStatus::Rejected, Err(error))
+                    if format!("{error:?}")
+                        .contains("agent actor original execution required for new action") => {}
+                (_, Err(error)) => panic!("{prefix}-{label}: {error:?}"),
+            }
         }
     }
     let projection = service.project("program-1").unwrap();
@@ -4372,124 +4476,15 @@ fn a_resolved_reopen_advertises_the_exit_and_labels_the_record_as_history() {
 
 /// A Team with a worker and a distinct reviewer, plus a submitted Task. Returns
 /// `(team_id, worker_id, reviewer_id, task_id)`.
-fn team_with_reviewer_and_task(
+async fn team_with_reviewer_and_task(
+    services: &Arc<crate::RuntimeServices>,
     service: &AgentActionService,
     store: &Arc<RuntimeEventStore>,
     tag: &str,
     acceptance: &str,
     criterion_source: harness_contract::agent_action::CriterionSource,
 ) -> (String, String, String, String) {
-    let team = service
-        .apply(&root(
-            &format!("{tag}-team"),
-            AgentAction::TeamCreate(TeamCreateInput {
-                name: "Delivery".to_string(),
-                mission: "produce and independently verify evidence".to_string(),
-                objective: None,
-            }),
-        ))
-        .expect("team")
-        .changed_refs[0]
-        .clone();
-    let worker = service
-        .apply(&root(
-            &format!("{tag}-worker"),
-            AgentAction::AgentInvite(AgentInviteInput {
-                team_ref: team.clone(),
-                role: "implementer".to_string(),
-                mission: "produce the report".to_string(),
-                required_capabilities: vec!["read".to_string()],
-                existing_agent_ref: None,
-                definition_ref: None,
-                model_profile_ref: None,
-                expertise_hints: Vec::new(),
-                execution_requirements: Vec::new(),
-            }),
-        ))
-        .expect("worker")
-        .changed_refs[0]
-        .clone();
-    let reviewer = service
-        .apply(&root(
-            &format!("{tag}-reviewer"),
-            AgentAction::AgentInvite(AgentInviteInput {
-                team_ref: team.clone(),
-                role: "reviewer".to_string(),
-                mission: "verify evidence independently".to_string(),
-                required_capabilities: vec!["read".to_string()],
-                existing_agent_ref: None,
-                definition_ref: None,
-                model_profile_ref: None,
-                expertise_hints: Vec::new(),
-                execution_requirements: Vec::new(),
-            }),
-        ))
-        .expect("reviewer")
-        .changed_refs[0]
-        .clone();
-    let task = service
-        .apply(&root(
-            &format!("{tag}-task"),
-            AgentAction::TaskPublish(TaskPublishInput {
-                team_ref: team.clone(),
-                title: "Research".to_string(),
-                objective: "Read source".to_string(),
-                acceptance: acceptance.to_string(),
-                acceptance_checks: Vec::new(),
-                criterion_source,
-                required_capabilities: vec!["read".to_string()],
-                depends_on: Vec::new(),
-                obligation_refs: Vec::new(),
-                purpose: Default::default(),
-                execution_requirements: Vec::new(),
-                expertise_hints: Vec::new(),
-            }),
-        ))
-        .expect("task")
-        .changed_refs[0]
-        .clone();
-    let claim = service
-        .apply(&managed_with_lease(&service, &store, 
-            &format!("{tag}-claim"),
-            &team,
-            &worker,
-            AgentAction::TaskClaim(TaskClaimInput {
-                task_ref: task.clone(),
-                reason: None,
-            }),
-        ))
-        .expect("claim submitted review fixture");
-    assert_eq!(claim.status, AgentActionStatus::Applied);
-    let committed = service
-        .apply(&managed_with_lease(&service, &store, 
-            &format!("{tag}-artifact"),
-            &team,
-            &worker,
-            AgentAction::ArtifactCommit(ArtifactCommitInput {
-                content_ref: "artifact://review-fixture-body".to_string(),
-                kind: "report".to_string(),
-                title: "Review fixture".to_string(),
-                relates_to: vec![task.clone()],
-            }),
-        ))
-        .expect("commit review fixture");
-    assert_eq!(committed.status, AgentActionStatus::Applied);
-    let submitted = service
-        .apply(&managed_with_lease(&service, &store, 
-            &format!("{tag}-submit"),
-            &team,
-            &worker,
-            AgentAction::TaskSubmit(TaskSubmitInput {
-                task_ref: task.clone(),
-                deliverable: None,
-                artifact_refs: vec![committed.changed_refs[0].clone()],
-                evidence_refs: vec!["tool://review-fixture".to_string()],
-                unresolved: Vec::new(),
-            }),
-        ))
-        .expect("submit review fixture");
-    assert_eq!(submitted.status, AgentActionStatus::Applied);
-    (team, worker, reviewer, task)
+    provision_agent_execution(services, service, store, tag, acceptance, criterion_source).await
 }
 
 /// A payload that says nothing about provenance is the operator's own
@@ -4614,14 +4609,19 @@ fn invented_criterion_is_durably_labeled_for_author_and_reviewer() {
     );
 }
 
-fn create_bound_review_goal(store: Arc<RuntimeEventStore>, objective: &str, program_id: &str) {
+fn create_bound_review_goal(
+    store: Arc<RuntimeEventStore>,
+    objective: &str,
+    program_id: &str,
+    root_execution_id: &str,
+) {
     let goal: GoalContract = serde_json::from_value(json!({
-        "id": "goal:root-execution-1", "session_id": "session-1", "objective": objective,
+        "id": format!("goal:{root_execution_id}"), "session_id": "session-1", "objective": objective,
         "criteria": [{"id": "user_intent", "statement": objective, "status": "open"}],
         "phase": "executing", "scope": "user_objective", "completion": "open",
         "user_intent_criterion_id": "user_intent", "source_intent_ref": "session_message:original",
         "execution_binding": {"objective_id": "objective-1", "session_id": "session-1",
-            "turn_id": "turn-1", "root_execution_id": "root-execution-1",
+            "turn_id": "turn-1", "root_execution_id": root_execution_id,
             "agentic_program_id": program_id},
         "spec_revision": 1, "spec_digest": "original-intent-digest", "revision": 1,
         "user_sequence": 1
@@ -4636,6 +4636,22 @@ fn create_bound_review_goal(store: Arc<RuntimeEventStore>, objective: &str, prog
 async fn program_evidence_alias_preflight_preserves_scope_and_content_guards() {
     let services = crate::RuntimeServices::in_memory().unwrap();
     let service = services.agent_action_service();
+    let objective_id = harness_contract::agent_action::root_objective_id("session-1", "turn-1");
+    let program_id = harness_contract::agent_action::program_id_for_objective(&objective_id);
+    let original = crate::test_support::register_running_agent_action_graph(
+        Arc::clone(services.event_store()),
+        "root-execution-1",
+        "root-execution-1:root",
+        "session-1",
+        "turn-1",
+    );
+    let root_action = |id: &str, action: AgentAction| {
+        let mut envelope = root(id, action);
+        envelope.actor.objective_id = objective_id.clone();
+        envelope.actor.program_id = program_id.clone();
+        envelope.actor.actor_id = "root:session-1".into();
+        envelope
+    };
     let content = services
         .artifact_store()
         .write_bytes(
@@ -4650,7 +4666,7 @@ async fn program_evidence_alias_preflight_preserves_scope_and_content_guards() {
         .await
         .unwrap();
     service
-        .apply(&root(
+        .apply(&root_action(
             "alias-team",
             AgentAction::TeamCreate(TeamCreateInput {
                 name: "Evidence".into(),
@@ -4659,21 +4675,21 @@ async fn program_evidence_alias_preflight_preserves_scope_and_content_guards() {
             }),
         ))
         .unwrap();
-    let committed = service
-        .apply(&root(
-            "alias-content",
-            AgentAction::ArtifactCommit(ArtifactCommitInput {
-                content_ref: content.selector.clone(),
-                kind: "report".into(),
-                title: "Evidence".into(),
-                relates_to: Vec::new(),
-            }),
-        ))
-        .unwrap();
+    let mut artifact = root_action(
+        "alias-content",
+        AgentAction::ArtifactCommit(ArtifactCommitInput {
+            content_ref: content.selector.clone(),
+            kind: "report".into(),
+            title: "Evidence".into(),
+            relates_to: Vec::new(),
+        }),
+    );
+    artifact.actor.original_execution = Some(original);
+    let committed = service.apply(&artifact).unwrap();
     assert_eq!(committed.status, AgentActionStatus::Applied);
     let logical = &committed.changed_refs[0];
     let alias = format!("artifact://{}", logical.strip_prefix("artifact:").unwrap());
-    let actor = root(
+    let actor = root_action(
         "scope",
         AgentAction::StateInspect(StateInspectInput::default()),
     )
@@ -4739,22 +4755,43 @@ async fn program_evidence_alias_preflight_preserves_scope_and_content_guards() {
 
 
 
-#[test]
-fn review_rejects_a_goal_from_another_program_even_with_matching_wording() {
-    let store = Arc::new(RuntimeEventStore::for_test());
-    let service = AgentActionService::new(Arc::clone(&store));
+#[tokio::test]
+async fn review_rejects_a_goal_from_another_program_even_with_matching_wording() {
+    let services = Arc::new(crate::RuntimeServices::in_memory().expect("runtime"));
+    let store = Arc::clone(services.event_store());
+    let service = services.agent_action_service();
     let (team, _, reviewer, task) = team_with_reviewer_and_task(
+        &services,
         &service,
         &store,
-        "wrong-goal",
-        "test objective",
+        "review-goal",
+        "independent review fixture",
         harness_contract::agent_action::CriterionSource::OperatorDerived,
+    )
+    .await;
+    let root_execution_id = service
+        .project("program-1")
+        .expect("program projection")
+        .root_execution_id
+        .expect("program root execution");
+    create_bound_review_goal(
+        Arc::clone(&store),
+        "test objective",
+        "program-other",
+        &root_execution_id,
     );
-    create_bound_review_goal(Arc::clone(&store), "test objective", "program-other");
+    let _reviewer_lease = managed_with_lease_in_program(
+        &service,
+        &store,
+        "wrong-goal-lease",
+        &team,
+        &reviewer,
+        AgentAction::StateInspect(StateInspectInput::default()),
+    );
     let before = service.project("program-1").unwrap();
     let cursor = store.durable_commit_cursor().unwrap();
     let receipt = service
-        .apply(&managed_with_lease(&service, &store, 
+        .apply(&managed_with_lease_in_program(&service, &store, 
             "wrong-goal-review",
             &team,
             &reviewer,
@@ -4780,21 +4817,32 @@ fn review_rejects_a_goal_from_another_program_even_with_matching_wording() {
 }
 
 
-#[test]
-fn rework_without_operator_wording_is_refused() {
-    let store = Arc::new(RuntimeEventStore::for_test());
-    let service = AgentActionService::new(Arc::clone(&store));
+#[tokio::test]
+async fn rework_without_operator_wording_is_refused() {
+    let services = Arc::new(crate::RuntimeServices::in_memory().expect("runtime"));
+    let store = Arc::clone(services.event_store());
+    let service = services.agent_action_service();
     let (team, _worker, reviewer, task) = team_with_reviewer_and_task(
+        &services,
         &service,
         &store,
         "invented",
         "must identify every TODO/FIXME/unwrap",
         harness_contract::agent_action::CriterionSource::AgentInvented,
+    )
+    .await;
+    let _reviewer_lease = managed_with_lease_in_program(
+        &service,
+        &store,
+        "invented-lease",
+        &team,
+        &reviewer,
+        AgentAction::StateInspect(StateInspectInput::default()),
     );
     let before = service.project("program-1").unwrap();
     let cursor = store.durable_commit_cursor().unwrap();
     let refused = service
-        .apply(&managed_with_lease(&service, &store, 
+        .apply(&managed_with_lease_in_program(&service, &store, 
             "rework-invented",
             &team,
             &reviewer,
@@ -5604,4 +5652,330 @@ fn gb3_p2_missing_continuation_source_is_unknown_and_recovers_without_rewriting_
     assert_eq!(rebuild_rework_rounds(&store, "child", 1, &mut Vec::new()).unwrap()["task"], 1);
     let after = store.list_stream(&program_stream("child")).unwrap();
     assert_eq!(serde_json::to_value(before).unwrap(), serde_json::to_value(after).unwrap());
+}
+
+// === v6f-d probe (temporary, removed after the fixture is proven) ===
+struct HoldingResolver {
+    release: Arc<tokio::sync::Notify>,
+}
+struct HoldingBackend {
+    release: Arc<tokio::sync::Notify>,
+}
+
+#[async_trait::async_trait]
+impl crate::execution_core::graph::executors::AgentTaskBackend for HoldingBackend {
+    async fn execute(
+        &self,
+        _packet: harness_contract::agent::AgentTaskPacket,
+    ) -> Result<harness_contract::agent::AgentReturnPacket, String> {
+        self.release.notified().await;
+        Err("fixture released the held Agent execution".into())
+    }
+    async fn cancel(
+        &self,
+        _packet: &harness_contract::agent::AgentTaskPacket,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+    fn cancellation_finalized(&self, _packet: &harness_contract::agent::AgentTaskPacket) {}
+}
+
+impl crate::execution_core::graph::executors::AgentTaskBackendResolver for HoldingResolver {
+    fn resolve(
+        &self,
+        _packet: &harness_contract::agent::AgentTaskPacket,
+    ) -> Option<Arc<dyn crate::execution_core::graph::executors::AgentTaskBackend>> {
+        Some(Arc::new(HoldingBackend {
+            release: Arc::clone(&self.release),
+        }))
+    }
+}
+
+/// Provision one real physical Agent execution for an A-family fixture.
+///
+/// The root publishes the Team and Task; Runtime's own supervisor dispatches
+/// it, compiles the AgentTask packet and starts the graph. A holding backend
+/// keeps the node Running while the fixture acts under the real physical
+/// binding: claim, durable artifact, submit. No binding is hand-built.
+async fn provision_agent_execution(
+    services: &Arc<crate::RuntimeServices>,
+    actions: &AgentActionService,
+    store: &Arc<RuntimeEventStore>,
+    tag: &str,
+    acceptance: &str,
+    criterion_source: harness_contract::agent_action::CriterionSource,
+) -> (String, String, String, String) {
+    let request_id = format!("{tag}-request");
+    let execution_id = crate::session_ingress_graph_id("session-1", &request_id, "turn-1");
+    services.publish_session_execution_policy(
+        "session-1",
+        crate::permissions::SessionExecutionPolicyControl::from_policy(
+            harness_contract::policy::SessionExecutionPolicy::from_profile(
+                harness_contract::policy::AutonomyProfileId::Autonomous,
+                1,
+                harness_contract::policy::SessionExecutionPolicyOrigin::ConfigDefault,
+            ),
+        ),
+    );
+    let root_task_id = format!("{tag}-root-task");
+    let root_spec = services
+        .task_runtime_port()
+        .bind_task_spec(
+            "session-1",
+            None,
+            harness_contract::task::TaskSpec::new(format!("{tag} root task")),
+        )
+        .expect("root task spec");
+    services
+        .task_aggregate_service()
+        .create(harness_contract::task::TaskCreateCommand {
+            task_id: root_task_id.clone(),
+            mission_id: services.mission_runtime().default_mission_id().to_string(),
+            kind: harness_contract::task::TaskKind::Root,
+            origin: harness_contract::task::TaskOrigin::User,
+            origin_session_id: "session-1".to_string(),
+            origin_turn_id: "turn-1".to_string(),
+            root_task_id: root_task_id.clone(),
+            parent_task_id: None,
+            predecessor_task_id: None,
+            mission_assignment: harness_contract::task::TaskMissionAssignment::Default,
+            mission_assigned_by: "fixture".to_string(),
+            spec: root_spec,
+            evidence_refs: vec![harness_contract::reality::EvidenceRef::observed(
+                "test_fixture",
+                format!("test://{tag}/root"),
+            )],
+        })
+        .expect("root task aggregate");
+    let release = Arc::new(tokio::sync::Notify::new());
+    services
+        .agent_task_executor()
+        .install_resolver(Arc::new(HoldingResolver {
+            release: Arc::clone(&release),
+        }));
+    let root_action = |id: &str, action: AgentAction| {
+        let mut envelope = root(id, action);
+        envelope.actor.root_execution_id = Some(execution_id.clone());
+        envelope.actor.actor_id = "root:session-1".into();
+        envelope
+    };
+    let team = actions
+        .apply(&root_action(
+            &format!("{tag}-team"),
+            AgentAction::TeamCreate(TeamCreateInput {
+                name: "Delivery".into(),
+                mission: "produce and independently verify evidence".into(),
+                objective: None,
+            }),
+        ))
+        .expect("team")
+        .changed_refs[0]
+        .clone();
+    let mut invited = Vec::new();
+    for (index, role) in ["implementer", "reviewer"].into_iter().enumerate() {
+        let member = actions
+            .apply(&root_action(
+                &format!("{tag}-member-{index}"),
+                AgentAction::AgentInvite(AgentInviteInput {
+                    team_ref: team.clone(),
+                    role: role.into(),
+                    mission: "produce the report".into(),
+                    required_capabilities: vec!["read".into()],
+                    existing_agent_ref: None,
+                    definition_ref: None,
+                    model_profile_ref: None,
+                    expertise_hints: Vec::new(),
+                    execution_requirements: Vec::new(),
+                }),
+            ))
+            .expect("member")
+            .changed_refs[0]
+            .clone();
+        invited.push(member);
+    }
+    let task = actions
+        .apply(&root_action(
+            &format!("{tag}-task"),
+            AgentAction::TaskPublish(TaskPublishInput {
+                team_ref: team.clone(),
+                title: "Research".into(),
+                objective: "Read source".into(),
+                acceptance: acceptance.to_string(),
+                acceptance_checks: Vec::new(),
+                criterion_source,
+                required_capabilities: vec!["read".into()],
+                depends_on: Vec::new(),
+                obligation_refs: Vec::new(),
+                purpose: Default::default(),
+                execution_requirements: Vec::new(),
+                expertise_hints: Vec::new(),
+            }),
+        ))
+        .expect("task")
+        .changed_refs[0]
+        .clone();
+    let (_owner_execution, _owner_lease) = crate::test_support::install_original_dispatch_session(
+        services, "session-1", "turn-1", &request_id, &root_task_id,
+    );
+    let receipts = services
+        .dispatch_ready_agentic_work("program-1")
+        .await
+        .expect("dispatch");
+    let receipt = receipts.first().expect("one dispatch receipt");
+    let mut commits = store.subscribe_commits();
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    let graph = loop {
+        let graph = services
+            .graph_state_store()
+            .load(&receipt.graph_id)
+            .expect("graph");
+        if graph.node_statuses.values().any(|status| {
+            *status == harness_contract::execution_graph::ExecutionNodeStatus::Running
+        }) {
+            break graph;
+        }
+        let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+        tokio::time::timeout(left, commits.changed())
+            .await
+            .expect("node did not start")
+            .expect("commit subscription");
+    };
+    let node_id = format!("{}:agent", receipt.graph_id);
+    let packet: harness_contract::agent::AgentTaskPacket = serde_json::from_str(
+        &graph
+            .nodes
+            .iter()
+            .find(|node| node.id == node_id)
+            .expect("AgentTask node")
+            .payload_ref,
+    )
+    .expect("compiled AgentTask packet");
+    let scope = packet.agentic_binding.clone().expect("compiled scope");
+    let attempt = graph.recovery_cursor.node_attempts[&node_id];
+    let projection = actions.project("program-1").expect("program projection");
+    let mut actor = managed_with_lease(
+        actions,
+        store,
+        &format!("{tag}-artifact-actor"),
+        &team,
+        &receipt.agent_ref,
+        AgentAction::ArtifactCommit(ArtifactCommitInput {
+            content_ref: "artifact://review-fixture-body".into(),
+            kind: "report".into(),
+            title: "Review fixture".into(),
+            relates_to: vec![task.clone()],
+        }),
+    )
+    .actor;
+    actor.original_execution = Some(harness_contract::agent_action::OriginalAgentExecution {
+        graph_id: receipt.graph_id.clone(),
+        node_id: node_id.clone(),
+        attempt,
+    });
+    actor.execution_id = Some(receipt.graph_id.clone());
+    actor.root_execution_id = projection.root_execution_id.clone();
+    actor.actor_id = scope.agent_id.clone();
+    actor.agent_id = Some(scope.agent_id.clone());
+    actor.team_id = Some(scope.team_id.clone());
+    actor.session_id = graph
+        .lineage
+        .as_ref()
+        .expect("graph lineage")
+        .session_id
+        .clone();
+    actor.turn_id = graph
+        .lineage
+        .as_ref()
+        .expect("graph lineage")
+        .turn_id
+        .clone();
+    let claimed = actions.apply(&AgentActionEnvelope {
+        action_id: format!("{tag}-claim"),
+        actor: actor.clone(),
+        expected_revision: None,
+        action: AgentAction::TaskClaim(TaskClaimInput {
+            task_ref: task.clone(),
+            reason: None,
+        }),
+    });
+    assert_eq!(
+        claimed.expect("claim").status,
+        harness_contract::agent_action::AgentActionStatus::Applied,
+        "the real physical owner must be allowed to claim its Task"
+    );
+    let body = format!("{tag} review fixture body");
+    let content = services
+        .artifact_store()
+        .write_bytes(
+            harness_contract::context::ArtifactWriteDescriptor {
+                media_type: "text/plain".into(),
+                visibility_scope: "session:session-1".into(),
+                expected_bytes: None,
+                original_name: None,
+            },
+            body.as_bytes(),
+        )
+        .await
+        .expect("durable artifact content");
+    let committed = actions
+        .apply(&AgentActionEnvelope {
+            action_id: format!("{tag}-artifact"),
+            actor: actor.clone(),
+            expected_revision: None,
+            action: AgentAction::ArtifactCommit(ArtifactCommitInput {
+                content_ref: content.selector.clone(),
+                kind: "report".into(),
+                title: "Review fixture".into(),
+                relates_to: vec![task.clone()],
+            }),
+        })
+        .expect("commit review fixture");
+    assert_eq!(
+        committed.status,
+        harness_contract::agent_action::AgentActionStatus::Applied,
+        "the real physical owner must be allowed to commit its artifact"
+    );
+    let submitted = actions
+        .apply(&AgentActionEnvelope {
+            action_id: format!("{tag}-submit"),
+            actor,
+            expected_revision: None,
+            action: AgentAction::TaskSubmit(TaskSubmitInput {
+                task_ref: task.clone(),
+                deliverable: None,
+                artifact_refs: vec![committed.changed_refs[0].clone()],
+                evidence_refs: vec!["tool://review-fixture".into()],
+                unresolved: Vec::new(),
+            }),
+        })
+        .expect("submit review fixture");
+    assert_eq!(
+        submitted.status,
+        harness_contract::agent_action::AgentActionStatus::Applied,
+        "the real physical owner must be allowed to submit its Task"
+    );
+    release.notify_one();
+    let settle_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let graph = services
+            .graph_state_store()
+            .load(&receipt.graph_id)
+            .expect("graph");
+        if !graph.node_statuses.values().any(|status| {
+            *status == harness_contract::execution_graph::ExecutionNodeStatus::Running
+        }) {
+            break;
+        }
+        let left = settle_deadline.saturating_duration_since(tokio::time::Instant::now());
+        tokio::time::timeout(left, commits.changed())
+            .await
+            .expect("held Agent node did not settle")
+            .expect("commit subscription");
+    }
+    let worker = receipt.agent_ref.clone();
+    let reviewer = invited
+        .into_iter()
+        .find(|member| member != &worker)
+        .expect("a distinct reviewer");
+    (team, worker, reviewer, task)
 }

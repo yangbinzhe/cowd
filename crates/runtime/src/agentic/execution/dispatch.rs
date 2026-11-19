@@ -412,8 +412,30 @@ impl DispatchFlight {
     }
 }
 
-impl Drop for DispatchFlight {
-    fn drop(&mut self) {
+/// Take a dispatch flight, waiting briefly when another pass still owns it.
+///
+/// Returning immediately on a busy flight silently dropped the second caller's
+/// attempt: the pass never reached member selection, so the deferral was never
+/// recorded, and a Task that can never be placed was never recognised as
+/// unreachable. The wait is bounded - real contention still ends in a decline.
+async fn await_dispatch_flight(
+    active: Arc<Mutex<BTreeSet<String>>>,
+    key: String,
+) -> Option<DispatchFlight> {
+    const WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+    let deadline = tokio::time::Instant::now() + WAIT;
+    loop {
+        if let Some(flight) = DispatchFlight::acquire(Arc::clone(&active), key.clone()) {
+            return Some(flight);
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return None;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+}
+
+impl Drop for DispatchFlight {    fn drop(&mut self) {
         self.active
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -1658,6 +1680,7 @@ impl RuntimeServices {
                 attempt_filter.is_none_or(|selected| attempt.execution_id == selected)
             })
             .collect::<Vec<_>>();
+        let mut stranded_attempts = stranded_attempts;
         let mut settled_attempt = false;
         for (task_ref, attempt) in stranded_attempts {
             projection = self
@@ -1797,16 +1820,12 @@ impl RuntimeServices {
         for (task_ref, execution_id, claim_generation) in orphaned_claims {
             // Same namespace translation as the heartbeat: this id is the one
             // the Agent was admitted under, which is an agent-run id.
-            let recovery_reason = match self.graph_state_store().load_async(&execution_id).await {
-                Ok(graph) if !agentic_graph_is_terminal(&graph) => continue,
-                Ok(_) => "startup recovered a terminal graph with an unsettled claim",
-                Err(crate::execution_core::graph::ExecutionStateStoreError::NotFound { .. }) => {
-                    return Err(format!(
-                        "orphan claim {task_ref} for {execution_id} has no graph; physical owner closure is unconfirmed"
-                    ));
-                }
-                Err(error) => return Err(error.to_string()),
-            };
+            // A claim with no attempt record has no admitted physical owner:
+            // dispatch writes the attempt in the same transaction as the
+            // claim, so an empty attempt set means the only remaining owner is
+            // the durable Task projection. Release it instead of consulting a
+            // lease graph that no worker is driving.
+            let recovery_reason = "startup recovered a claim with no admitted physical attempt";
             let release = AgentActionEnvelope {
                 action_id: format!("startup-release-orphan:{task_ref}:{execution_id}"),
                 actor: harness_contract::agent_action::AgentActorBinding {
@@ -2189,7 +2208,7 @@ impl RuntimeServices {
             DispatchMode::Review => task.review_generation,
             DispatchMode::Coordination(revision) => revision,
         };
-        let Some(_flight) = DispatchFlight::acquire(
+        let Some(_flight) = await_dispatch_flight(
             self.agentic_dispatch_flights(),
             format!(
                 "{}|{}|{}|{}",
@@ -2198,7 +2217,9 @@ impl RuntimeServices {
                 mode.as_str(),
                 attempt_generation
             ),
-        ) else {
+        )
+        .await
+        else {
             return self.decline_dispatch(
                 &projection.program_id,
                 task_ref,
@@ -2740,6 +2761,8 @@ impl RuntimeServices {
             {
                 return Err("r393 post-append registration observation unavailable".into());
             }
+            let store = self.graph_state_store();
+            let mut changes = store.subscribe_commits();
             let admission = async {
                 #[cfg(test)]
                 if REGISTRATION_FAULT_393.try_with(|fault| *fault)
@@ -2761,6 +2784,9 @@ impl RuntimeServices {
             .await;
             if let Err(error) = admission {
                 let reason = format!("physical Agent graph admission failed: {error}");
+                eprintln!(
+                    "DISPATCH_SETTLE task={task_ref} mode={mode:?} graph={graph_id} reason={reason}"
+                );
                 if mode == DispatchMode::Review {
                     match self.graph_state_store().load_current_async(&graph_id).await {
                         Err(crate::execution_core::graph::ExecutionStateStoreError::NotFound { .. }) => {
@@ -2787,8 +2813,7 @@ impl RuntimeServices {
                 return Ok(Vec::new());
             }
             let node_id = format!("{graph_id}:agent");
-            let store = self.graph_state_store();
-            let mut changes = store.subscribe_commits();
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
             loop {
                 let current = store
                     .load_async(&graph_id)
@@ -2805,10 +2830,20 @@ impl RuntimeServices {
                 if agentic_graph_is_terminal(&current) {
                     return Err(format!("agentic_started_graph_terminal:{graph_id}"));
                 }
-                tokio::time::timeout(std::time::Duration::from_secs(30), changes.changed())
-                    .await
-                    .map_err(|_| format!("agentic_started_graph_timeout:{graph_id}"))?
-                    .map_err(|_| format!("agentic_started_graph_subscription_closed:{graph_id}"))?;
+                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                if remaining.is_zero() {
+                    return Err(format!("agentic_started_graph_timeout:{graph_id}"));
+                }
+                let wait = std::time::Duration::from_millis(20).min(remaining);
+                match tokio::time::timeout(wait, changes.changed()).await {
+                    Err(_) => {}
+                    Ok(Err(_)) => {
+                        return Err(format!(
+                            "agentic_started_graph_subscription_closed:{graph_id}"
+                        ));
+                    }
+                    Ok(Ok(())) => {}
+                }
             }
             receipts.push(AgenticDispatchReceipt {
                 graph_id,

@@ -17,6 +17,23 @@ fn continued_goal_verifier_requires_current_execution_and_original_business_evid
     .unwrap();
     for include_business_evidence in [false, true] {
         let services = crate::RuntimeServices::in_memory().unwrap();
+        // The criterion cites a typed artifact selector, and the goal store
+        // resolves every cited selector when the contract is created.
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("fixture runtime")
+            .block_on(services.artifact_store().write_bytes_with_identity(
+                harness_contract::context::ArtifactWriteDescriptor {
+                    media_type: "application/json".to_string(),
+                    visibility_scope: "session:continued-session".to_string(),
+                    expected_bytes: None,
+                    original_name: None,
+                },
+                b"{}",
+                "business-evidence",
+            ))
+            .expect("business evidence artifact");
         services.goal_store().create(original.clone()).unwrap();
         let mut current = original.clone();
         current.id = "goal:new-root".into();

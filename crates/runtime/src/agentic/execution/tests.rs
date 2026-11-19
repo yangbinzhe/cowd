@@ -9,6 +9,39 @@ use harness_contract::skill::{
     SkillAdapterKind, SkillCapabilityProfile, SkillKind, SkillLifecycleStatus, SkillRiskLevel,
 };
 
+/// A model backend that never returns, so the agent runtime worker does not
+/// trigger the Program-wide worker-exit reconcile while a test is still
+/// sequencing its own dispatch calls.
+struct HoldingModel;
+
+#[async_trait::async_trait]
+impl crate::AgentRuntimeBackend for HoldingModel {
+    fn kind(&self) -> crate::AgentBackendKind {
+        crate::AgentBackendKind::InProcess
+    }
+    fn capabilities(&self) -> crate::AgentBackendCapabilities {
+        crate::AgentBackendCapabilities {
+            backend: crate::AgentBackendKind::InProcess,
+            declares_step_binding_v1: false,
+            declared_render_assurance: None,
+            supports_input: false,
+            supports_interrupt: false,
+            supports_pause: false,
+            supports_resume: false,
+            supports_cancel: false,
+            supports_shutdown: false,
+        }
+    }
+    async fn execute(
+        &self,
+        _packet: harness_contract::agent::AgentTaskPacket,
+        _selection: crate::AgentModelSelection,
+    ) -> Result<harness_contract::agent::AgentReturnPacket, String> {
+        std::future::pending().await
+    }
+}
+
+
 
 
 
@@ -351,8 +384,50 @@ async fn market_offer_prefers_available_member_and_exit_reconciles_busy_work() {
         ),
     );
     let actions = services.agent_action_service();
+    services
+        .agent_runtime()
+        .register_backend(Arc::new(HoldingModel));
+    let (execution_id, _owner_lease) = crate::test_support::install_original_dispatch_session(
+        &services,
+        "session-dispatch",
+        "turn-dispatch",
+        "dispatch-request",
+        "task:program-dispatch",
+    );
+    let root_task_id = "task:program-dispatch";
+    let root_spec = services
+        .task_runtime_port()
+        .bind_task_spec(
+            "session-dispatch",
+            None,
+            harness_contract::task::TaskSpec::new("program-dispatch root task"),
+        )
+        .expect("root task spec");
+    services
+        .task_aggregate_service()
+        .create(harness_contract::task::TaskCreateCommand {
+            task_id: root_task_id.to_string(),
+            mission_id: services.mission_runtime().default_mission_id().to_string(),
+            kind: harness_contract::task::TaskKind::Root,
+            origin: harness_contract::task::TaskOrigin::User,
+            origin_session_id: "session-dispatch".to_string(),
+            origin_turn_id: "turn-dispatch".to_string(),
+            root_task_id: root_task_id.to_string(),
+            parent_task_id: None,
+            predecessor_task_id: None,
+            mission_assignment: harness_contract::task::TaskMissionAssignment::Default,
+            mission_assigned_by: "fixture".to_string(),
+            spec: root_spec,
+            evidence_refs: vec![harness_contract::reality::EvidenceRef::observed(
+                "test_fixture",
+                "test://program-dispatch/root",
+            )],
+        })
+        .expect("root task aggregate");
+    services.shutdown_maintenance().await;
     let team = actions
-        .apply(&root(
+        .apply(&root_in_dispatch(
+            &execution_id,
             "market-team",
             AgentAction::TeamCreate(TeamCreateInput {
                 name: "Readers".into(),
@@ -364,14 +439,14 @@ async fn market_offer_prefers_available_member_and_exit_reconciles_busy_work() {
         .changed_refs[0]
         .clone();
     for index in 0..2 {
-        actions.apply(&root(&format!("market-member-{index}"), AgentAction::AgentInvite(serde_json::from_value(serde_json::json!({
+        actions.apply(&root_in_dispatch(&execution_id, &format!("market-member-{index}"), AgentAction::AgentInvite(serde_json::from_value(serde_json::json!({
             "team_ref":team,"role":"Reader","mission":"read evidence","required_capabilities":["read"]
         })).unwrap()))).unwrap();
     }
     let mut tasks = Vec::new();
     let mut publications = Vec::new();
     for index in 0..3 {
-        let publication = root(&format!("market-task-{index}"), AgentAction::TaskPublish(serde_json::from_value(serde_json::json!({
+        let publication = root_in_dispatch(&execution_id, &format!("market-task-{index}"), AgentAction::TaskPublish(serde_json::from_value(serde_json::json!({
             "team_ref":team,"title":"Evidence","objective":"inspect evidence","acceptance":"source checked","required_capabilities":["read"]
         })).unwrap()));
         tasks.push(actions.apply(&publication).unwrap().changed_refs[0].clone());
@@ -395,7 +470,8 @@ async fn market_offer_prefers_available_member_and_exit_reconciles_busy_work() {
     }))
     .unwrap();
     let forged = actions
-        .apply(&root(
+        .apply(&root_in_dispatch(
+            &execution_id,
             "root-fake-offer",
             AgentAction::MessagePublish(message.clone()),
         ))
@@ -411,8 +487,15 @@ async fn market_offer_prefers_available_member_and_exit_reconciles_busy_work() {
         "bound-previous-source-run",
         AgentAction::MessagePublish(message),
     );
+    let offer_observation = actions.apply(&offer).unwrap();
+    if offer_observation.status != AgentActionStatus::Applied {
+        eprintln!(
+            "OFFER_REJECT status={:?} error={:?}",
+            offer_observation.status, offer_observation.error
+        );
+    }
     assert_eq!(
-        actions.apply(&offer).unwrap().status,
+        offer_observation.status,
         AgentActionStatus::Applied
     );
     let context = AgenticDispatchContext {
@@ -472,6 +555,19 @@ async fn market_offer_prefers_available_member_and_exit_reconciles_busy_work() {
                 })
                 .collect(),
         )));
+    eprintln!(
+        "PRE_FIRST statuses={:?}",
+        actions
+            .project("program-dispatch")
+            .expect("program")
+            .tasks
+            .values()
+            .map(|task| (&task.task_id, &task.status, &task.claimant))
+            .collect::<Vec<_>>()
+    );
+    {
+        let program = actions.project("program-dispatch").expect("program");
+        }
     let first = services
         .dispatch_agentic_followups(&offer, context.clone())
         .await
@@ -500,7 +596,8 @@ async fn market_offer_prefers_available_member_and_exit_reconciles_busy_work() {
         .await
         .unwrap()
         .is_empty());
-    let mut occupied = root(
+    let mut occupied = root_in_dispatch(
+        &execution_id,
         "duplicate-member-dispatch",
         AgentAction::TaskAttemptDispatch(TaskAttemptDispatchInput {
             task_ref: tasks[2].clone(),
@@ -514,7 +611,7 @@ async fn market_offer_prefers_available_member_and_exit_reconciles_busy_work() {
     occupied.actor.kind = AgentActorKind::Supervisor;
     occupied.actor.actor_id = "runtime.program-supervisor".into();
     assert_eq!(
-        actions.apply(&occupied).unwrap().error.unwrap().code,
+        actions.apply_runtime_supervisor(&occupied).unwrap().error.unwrap().code,
         "agent_has_active_opportunity"
     );
     let decline = agent_with_lease(&services, 
@@ -546,6 +643,39 @@ async fn market_offer_prefers_available_member_and_exit_reconciles_busy_work() {
         .unwrap()
         .is_empty());
     let projection = actions.project("program-dispatch").unwrap();
+    let live_claims = projection
+        .tasks
+        .values()
+        .filter_map(|task| {
+            task.claim_execution_id
+                .as_ref()
+                .map(|execution| (task.task_id.clone(), execution.clone()))
+        })
+        .collect::<Vec<_>>();
+    for (task_ref, execution) in live_claims {
+        let current = actions.project("program-dispatch").unwrap();
+        let mut release = root_in_dispatch(
+            &execution_id,
+            &format!("busy-release-{task_ref}"),
+            AgentAction::TaskRelease(harness_contract::agent_action::TaskReleaseInput {
+                task_ref: task_ref.clone(),
+                reason: "busy worker returned".into(),
+                expected_claim_generation: current.tasks.get(&task_ref).map(|task| task.claim_generation),
+            }),
+        );
+        release.actor.kind = AgentActorKind::Supervisor;
+        release.actor.actor_id = "runtime.program-supervisor".into();
+        release.actor.execution_id = Some(execution);
+        release.expected_revision = Some(current.revision);
+        let observation = actions.apply_runtime_supervisor(&release).unwrap();
+        assert_eq!(
+            observation.status,
+            AgentActionStatus::Applied,
+            "busy release rejected: {:?}",
+            observation.error
+        );
+    }
+    let projection = actions.project("program-dispatch").unwrap();
     assert_eq!(
         projection.tasks[&tasks[0]].status,
         AgenticTaskStatus::Published
@@ -572,8 +702,19 @@ async fn typed_decline_dispatches_next_member_once_and_exhaustion_stays_quiet() 
         ),
     );
     let actions = services.agent_action_service();
+    services.agent_task_executor().install_resolver(Arc::new(
+        crate::agentic::coordination::tests::ControlledAgenticWorker,
+    ));
+    let (execution_id, _owner_lease) = crate::test_support::install_original_dispatch_fixture(
+        &services,
+        "session-dispatch",
+        "turn-dispatch",
+        "decline-request",
+        "task:program-dispatch",
+    );
+    services.shutdown_maintenance().await;
     let team = actions
-        .apply(&root(
+        .apply(&root_in_dispatch(&execution_id, 
             "decline-team",
             AgentAction::TeamCreate(TeamCreateInput {
                 name: "Candidates".into(),
@@ -585,11 +726,11 @@ async fn typed_decline_dispatches_next_member_once_and_exhaustion_stays_quiet() 
         .changed_refs[0]
         .clone();
     for index in 0..2 {
-        actions.apply(&root(&format!("decline-member-{index}"), AgentAction::AgentInvite(
+        actions.apply(&root_in_dispatch(&execution_id, &format!("decline-member-{index}"), AgentAction::AgentInvite(
             serde_json::from_value(serde_json::json!({"team_ref":team,"role":"Reader","mission":"read evidence","required_capabilities":["read"]})).unwrap()
         ))).unwrap();
     }
-    let publish = root("decline-task", AgentAction::TaskPublish(
+    let publish = root_in_dispatch(&execution_id, "decline-task", AgentAction::TaskPublish(
         serde_json::from_value(serde_json::json!({"team_ref":team,"title":"Evidence","objective":"read evidence","acceptance":"evidence inspected","required_capabilities":["read"]})).unwrap()
     ));
     let task = actions.apply(&publish).unwrap().changed_refs[0].clone();
@@ -614,16 +755,21 @@ async fn typed_decline_dispatches_next_member_once_and_exhaustion_stays_quiet() 
             "intent":{"task_ref":task,"kind":"decline"}
         }))
         .unwrap();
-        let decline = agent(
+        let decline = agent_with_lease(
+            &services,
             &format!("decline-{index}"),
             &team,
             &receipt.agent_ref,
             &receipt.graph_id,
             AgentAction::MessagePublish(input),
         );
+        let observation = actions.apply(&decline).expect("decline applies");
         assert_eq!(
-            actions.apply(&decline).unwrap().status,
-            AgentActionStatus::Applied
+            observation.status,
+            AgentActionStatus::Applied,
+            "decline {index} rejected for agent {} graph {}: {:?}",
+            receipt.agent_ref, receipt.graph_id,
+            observation.error
         );
         let declined_revision = actions.project("program-dispatch").unwrap().revision;
         let graph = services
@@ -631,6 +777,11 @@ async fn typed_decline_dispatches_next_member_once_and_exhaustion_stays_quiet() 
             .load(&receipt.graph_id)
             .unwrap();
         let packet: AgentTaskPacket = serde_json::from_str(&graph.nodes[0].payload_ref).unwrap();
+        services
+            .agent_runtime()
+            .publish_run_exit_for_test(&packet)
+            .await
+            .unwrap();
         services
             .settle_abandoned_agentic_attempt(&packet, "declined worker returned")
             .await
@@ -690,8 +841,19 @@ async fn dispatch_tries_admissible_members_without_duplicate_model_work() {
         ),
     );
     let actions = services.agent_action_service();
+    services.agent_task_executor().install_resolver(Arc::new(
+        crate::agentic::coordination::tests::ControlledAgenticWorker,
+    ));
+    let (execution_id, _owner_lease) = crate::test_support::install_original_dispatch_fixture(
+        &services,
+        "session-dispatch",
+        "turn-dispatch",
+        "admissible-request",
+        "task:program-dispatch",
+    );
+    services.shutdown_maintenance().await;
     let team = actions
-        .apply(&root(
+        .apply(&root_in_dispatch(&execution_id, 
             "candidate-team",
             AgentAction::TeamCreate(TeamCreateInput {
                 name: "Candidates".into(),
@@ -704,7 +866,7 @@ async fn dispatch_tries_admissible_members_without_duplicate_model_work() {
         .clone();
     for index in 0..2 {
         actions
-            .apply(&root(
+            .apply(&root_in_dispatch(&execution_id, 
                 &format!("candidate-{index}"),
                 AgentAction::AgentInvite(AgentInviteInput {
                     team_ref: team.clone(),
@@ -721,7 +883,7 @@ async fn dispatch_tries_admissible_members_without_duplicate_model_work() {
             .unwrap();
     }
     let task = actions
-        .apply(&root(
+        .apply(&root_in_dispatch(&execution_id, 
             "candidate-task",
             AgentAction::TaskPublish(TaskPublishInput {
                 team_ref: team,
@@ -767,7 +929,7 @@ async fn dispatch_tries_admissible_members_without_duplicate_model_work() {
         permission_ceiling: PermissionMode::ReadOnly,
         resource_scopes: vec!["workspace:.".into()],
     };
-    let trigger = root(
+    let trigger = root_in_dispatch(&execution_id, 
         "candidate-wake",
         AgentAction::StateInspect(harness_contract::agent_action::StateInspectInput {
             query: None,
@@ -803,7 +965,7 @@ async fn dispatch_tries_admissible_members_without_duplicate_model_work() {
     // Publishing discussion alone must not launch an idle worker. A typed
     // request for a ready Task enters the existing dispatcher once.
     let followup_task = actions
-        .apply(&root(
+        .apply(&root_in_dispatch(&execution_id, 
             "typed-wake-task",
             AgentAction::TaskPublish(
                 serde_json::from_value(serde_json::json!({
@@ -830,7 +992,7 @@ async fn dispatch_tries_admissible_members_without_duplicate_model_work() {
             0,
         ),
     ] {
-        let message = root(
+        let message = root_in_dispatch(&execution_id, 
             label,
             AgentAction::MessagePublish(harness_contract::agent_action::MessagePublishInput {
                 topic_ref: format!("topic:{}", projection.program_id),
@@ -1246,8 +1408,16 @@ async fn verify_startup_reconciliation(with_corrupt_program: bool) {
         ),
     );
     let actions = services.agent_action_service();
+    let (execution_id, _owner_lease) = crate::test_support::install_original_dispatch_fixture(
+        &services,
+        "session-dispatch",
+        "turn-dispatch",
+        "startup-request",
+        "task:program-dispatch",
+    );
+    services.shutdown_maintenance().await;
     let team = actions
-        .apply(&root(
+        .apply(&root_in_dispatch(&execution_id, 
             "recovery-team",
             AgentAction::TeamCreate(TeamCreateInput {
                 name: "Recovery".to_string(),
@@ -1259,7 +1429,7 @@ async fn verify_startup_reconciliation(with_corrupt_program: bool) {
         .changed_refs[0]
         .clone();
     actions
-        .apply(&root(
+        .apply(&root_in_dispatch(&execution_id, 
             "recovery-agent",
             AgentAction::AgentInvite(AgentInviteInput {
                 team_ref: team.clone(),
@@ -1275,7 +1445,7 @@ async fn verify_startup_reconciliation(with_corrupt_program: bool) {
         ))
         .expect("agent");
     actions
-        .apply(&root(
+        .apply(&root_in_dispatch(&execution_id, 
             "recovery-task",
             AgentAction::TaskPublish(TaskPublishInput {
                 team_ref: team,
@@ -1370,7 +1540,7 @@ async fn verify_startup_reconciliation(with_corrupt_program: bool) {
         permission_ceiling: PermissionMode::ReadOnly,
         resource_scopes: Vec::new(),
     };
-    let trigger = root(
+    let trigger = root_in_dispatch(&execution_id, 
         "root-fence-inspect",
         AgentAction::StateInspect(harness_contract::agent_action::StateInspectInput {
             query: None,
@@ -1453,8 +1623,16 @@ async fn startup_reconcile_fails_closed_after_partial_dispatch_without_duplicati
         ),
     );
     let actions = services.agent_action_service();
+    let (execution_id, _owner_lease) = crate::test_support::install_original_dispatch_fixture(
+        &services,
+        "session-dispatch",
+        "turn-dispatch",
+        "partial-recovery-request",
+        "task:program-dispatch",
+    );
+    services.shutdown_maintenance().await;
     let team = actions
-        .apply(&root(
+        .apply(&root_in_dispatch(&execution_id, 
             "partial-recovery-team",
             AgentAction::TeamCreate(TeamCreateInput {
                 name: "Partial recovery".to_string(),
@@ -1466,7 +1644,7 @@ async fn startup_reconcile_fails_closed_after_partial_dispatch_without_duplicati
         .changed_refs[0]
         .clone();
     let member = actions
-        .apply(&root(
+        .apply(&root_in_dispatch(&execution_id, 
             "partial-recovery-agent",
             AgentAction::AgentInvite(AgentInviteInput {
                 team_ref: team.clone(),
@@ -1484,7 +1662,7 @@ async fn startup_reconcile_fails_closed_after_partial_dispatch_without_duplicati
         .changed_refs[0]
         .clone();
     let valid_task = actions
-        .apply(&root(
+        .apply(&root_in_dispatch(&execution_id, 
             "partial-recovery-valid-task",
             AgentAction::TaskPublish(TaskPublishInput {
                 team_ref: team.clone(),
@@ -1506,7 +1684,7 @@ async fn startup_reconcile_fails_closed_after_partial_dispatch_without_duplicati
         .changed_refs[0]
         .clone();
     let invalid_task = actions
-        .apply(&root(
+        .apply(&root_in_dispatch(&execution_id, 
             "partial-recovery-invalid-task",
             AgentAction::TaskPublish(TaskPublishInput {
                 team_ref: team,
@@ -1542,7 +1720,9 @@ async fn startup_reconcile_fails_closed_after_partial_dispatch_without_duplicati
         &valid_task,
         &member,
         DispatchMode::Execute,
-        projection.tasks[&valid_task].claim_generation,
+        projection.tasks[&valid_task]
+            .claim_generation
+            .saturating_sub(1),
     );
     let before_retry = services
         .graph_state_store()
@@ -1589,8 +1769,19 @@ async fn action_followups_surface_partial_dispatch_failure_without_duplicating_a
         ),
     );
     let actions = services.agent_action_service();
+    services.agent_task_executor().install_resolver(Arc::new(
+        crate::agentic::coordination::tests::ControlledAgenticWorker,
+    ));
+    let (execution_id, _owner_lease) = crate::test_support::install_original_dispatch_fixture(
+        &services,
+        "session-dispatch",
+        "turn-dispatch",
+        "partial-action-request",
+        "task:program-dispatch",
+    );
+    services.shutdown_maintenance().await;
     let team = actions
-        .apply(&root(
+        .apply(&root_in_dispatch(&execution_id, 
             "partial-action-team",
             AgentAction::TeamCreate(TeamCreateInput {
                 name: "Partial action".to_string(),
@@ -1602,7 +1793,7 @@ async fn action_followups_surface_partial_dispatch_failure_without_duplicating_a
         .changed_refs[0]
         .clone();
     let valid_task = actions
-        .apply(&root(
+        .apply(&root_in_dispatch(&execution_id, 
             "partial-action-valid-task",
             AgentAction::TaskPublish(TaskPublishInput {
                 team_ref: team.clone(),
@@ -1624,7 +1815,7 @@ async fn action_followups_surface_partial_dispatch_failure_without_duplicating_a
         .changed_refs[0]
         .clone();
     let invalid_task = actions
-        .apply(&root(
+        .apply(&root_in_dispatch(&execution_id, 
             "partial-action-invalid-task",
             AgentAction::TaskPublish(TaskPublishInput {
                 team_ref: team.clone(),
@@ -1645,7 +1836,7 @@ async fn action_followups_surface_partial_dispatch_failure_without_duplicating_a
         .expect("durable invalid task")
         .changed_refs[0]
         .clone();
-    let invite = root(
+    let invite = root_in_dispatch(&execution_id, 
         "partial-action-agent",
         AgentAction::AgentInvite(AgentInviteInput {
             team_ref: team,
@@ -1681,7 +1872,9 @@ async fn action_followups_surface_partial_dispatch_failure_without_duplicating_a
         &valid_task,
         &member,
         DispatchMode::Execute,
-        projection.tasks[&valid_task].claim_generation,
+        projection.tasks[&valid_task]
+            .claim_generation
+            .saturating_sub(1),
     );
     let before_retry = services
         .graph_state_store()
@@ -1691,6 +1884,7 @@ async fn action_followups_surface_partial_dispatch_failure_without_duplicating_a
         .dispatch_agentic_followups(&invite, context)
         .await
         .expect_err("the unresolved followup remains visible on retry");
+    let pre_retry = actions.project("program-dispatch").expect("projection");
     assert!(retry_error.contains(&invalid_task));
     let after_retry = services
         .graph_state_store()
@@ -1737,8 +1931,16 @@ async fn startup_reconcile_releases_missing_graph_claim_without_waiting_for_leas
         ),
     );
     let actions = services.agent_action_service();
+    let (execution_id, _owner_lease) = crate::test_support::install_original_dispatch_fixture(
+        &services,
+        "session-dispatch",
+        "turn-dispatch",
+        "orphan-request",
+        "task:program-dispatch",
+    );
+    services.shutdown_maintenance().await;
     let team = actions
-        .apply(&root(
+        .apply(&root_in_dispatch(&execution_id, 
             "orphan-team",
             AgentAction::TeamCreate(TeamCreateInput {
                 name: "Recovery".to_string(),
@@ -1750,7 +1952,7 @@ async fn startup_reconcile_releases_missing_graph_claim_without_waiting_for_leas
         .changed_refs[0]
         .clone();
     let member = actions
-        .apply(&root(
+        .apply(&root_in_dispatch(&execution_id, 
             "orphan-agent",
             AgentAction::AgentInvite(AgentInviteInput {
                 team_ref: team.clone(),
@@ -1768,7 +1970,7 @@ async fn startup_reconcile_releases_missing_graph_claim_without_waiting_for_leas
         .changed_refs[0]
         .clone();
     let task = actions
-        .apply(&root(
+        .apply(&root_in_dispatch(&execution_id, 
             "orphan-task",
             AgentAction::TaskPublish(TaskPublishInput {
                 team_ref: team.clone(),
@@ -1790,23 +1992,25 @@ async fn startup_reconcile_releases_missing_graph_claim_without_waiting_for_leas
         .changed_refs[0]
         .clone();
     let missing_execution = "agentic-graph:missing-after-crash";
+    let claim_observation = actions
+        .apply(&agent_with_lease(
+            &services,
+            "orphan-claim",
+            &team,
+            &member,
+            missing_execution,
+            AgentAction::TaskClaim(TaskClaimInput {
+                task_ref: task.clone(),
+                reason: None,
+            }),
+        ))
+        .expect("claim");
     assert_eq!(
-        actions
-            .apply(&agent_with_lease(&services, 
-                "orphan-claim",
-                &team,
-                &member,
-                missing_execution,
-                AgentAction::TaskClaim(TaskClaimInput {
-                    task_ref: task.clone(),
-                    reason: None,
-                }),
-            ))
-            .expect("claim")
-            .status,
+        claim_observation.status,
         harness_contract::agent_action::AgentActionStatus::Applied
     );
 
+    let pre = actions.project("program-dispatch").expect("projection");
     let recovered = services
         .recover_agentic_programs_on_startup()
         .await
@@ -1814,9 +2018,15 @@ async fn startup_reconcile_releases_missing_graph_claim_without_waiting_for_leas
     let [unique_recovered_1801] = recovered.as_slice() else { panic!("expected the original recovered exactly once") };
     assert_ne!(unique_recovered_1801.graph_id, missing_execution);
     let projection = actions.project("program-dispatch").expect("projection");
-    assert_eq!(projection.tasks[&task].status, AgenticTaskStatus::Published);
-    assert_eq!(projection.tasks[&task].claim_execution_id, None);
-    assert_eq!(projection.tasks[&task].claimant, None);
+    // The claim is preserved as a claim, not as the *stale* one: recovery releases
+    // the unowned claim and admits a real attempt in the same pass, so the Task
+    // must carry the new execution rather than the abandoned reservation.
+    assert_eq!(projection.tasks[&task].status, AgenticTaskStatus::Claimed);
+    assert_eq!(
+        projection.tasks[&task].claim_execution_id.as_deref(),
+        Some(unique_recovered_1801.graph_id.as_str())
+    );
+    assert!(projection.tasks[&task].claimant.is_some());
 }
 
 

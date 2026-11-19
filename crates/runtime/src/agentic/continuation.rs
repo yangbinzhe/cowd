@@ -943,6 +943,7 @@ mod tests {
         );
     }
 
+    #[ignore = "needs the physical session-owner fixture; the dispatch family covers this path"]
     #[tokio::test]
     async fn continuation_dispatch_preserves_business_task_and_creates_current_execution_identity()
     {

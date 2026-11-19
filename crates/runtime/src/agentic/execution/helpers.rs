@@ -93,6 +93,21 @@ pub(super) fn task_is_ready(projection: &AgenticProgramProjection, task_ref: &st
 pub(super) fn coordination_requests(
     projection: &AgenticProgramProjection,
 ) -> Vec<(String, DispatchMode)> {
+    // A Task with an unsettled coordination attempt already owes that work. A
+    // second request for the same Task would admit a parallel graph for the
+    // same opportunity, which is exactly the duplicate model work this path
+    // exists to prevent.
+    let in_flight = projection
+        .coordination_requests()
+        .into_iter()
+        .filter(|(_, entry)| {
+            entry
+                .coordination
+                .as_ref()
+                .is_some_and(|consumption| !consumption.settled)
+        })
+        .filter_map(|(_, entry)| entry.intent.as_ref().map(|intent| intent.task_ref.clone()))
+        .collect::<std::collections::BTreeSet<_>>();
     projection
         .coordination_requests()
         .into_iter()
@@ -111,6 +126,7 @@ pub(super) fn coordination_requests(
                 )
             })
         })
+        .filter(|(task_ref, _)| !in_flight.contains(task_ref))
         .collect()
 }
 

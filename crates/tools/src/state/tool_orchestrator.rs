@@ -734,19 +734,26 @@ fn data_classification(properties: &EffectProperties, input: &Value) -> DataClas
     {
         return DataClassification::Secret;
     }
+    let sensitive_target = |target: &str| {
+        let target = target.to_ascii_lowercase().replace('\\', "/");
+        target == ".env"
+            || target.ends_with("/.env")
+            || target.contains("/.ssh/")
+            || target.starts_with(".ssh/")
+            || target.contains("id_rsa")
+            || target.contains("credentials")
+            || target.contains("secrets.")
+    };
     if properties
         .scopes
         .iter()
         .filter_map(|scope| scope.target.as_deref())
-        .any(|target| {
-            let target = target.to_ascii_lowercase().replace('\\', "/");
-            target == ".env"
-                || target.ends_with("/.env")
-                || target.contains("/.ssh/")
-                || target.starts_with(".ssh/")
-                || target.contains("credentials")
-                || target.contains("secrets.")
-        })
+        .any(sensitive_target)
+        // The requested target matters as much as a declared one: `read_file`
+        // on `.env` exposes the same material a write to it would change, and
+        // its scope does not have to name the path.
+        || crate::tool_orchestrator::resource_target(input)
+            .is_some_and(|target| sensitive_target(&target))
     {
         return DataClassification::Secret;
     }
