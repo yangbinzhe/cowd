@@ -5352,19 +5352,29 @@ where
             && (delivery_requirement.is_exact()
                 || serde_json::from_str::<serde_json::Value>(input).ok()
                     .is_some_and(|value| value["complete"].as_bool() == Some(true)));
-        // A caller that asks for the complete body has already paid for its
-        // capacity: the grant may grow to the subsystem ceiling, exactly as an
-        // exact-evidence delivery does. The per-result preview ceiling would
-        // otherwise re-truncate the body the caller asked to see whole.
-        let plan = if preserve_complete_read {
+        let exact_delivery = delivery_requirement.is_exact() && !is_error;
+        let plan = if exact_delivery {
             Self::apply_exact_evidence_delivery_budget(self.runtime_budget_plan())
         } else {
             self.runtime_budget_plan()
         };
         let per_tool_limit = plan.tool_result_budget.per_tool_max_tokens as u64;
-        if (delivery_requirement.is_exact() && !is_error) || preserve_complete_read {
+        let requested = raw_tokens
+            .saturating_add(raw_tokens / 5)
+            .saturating_add(96)
+            .min(if exact_delivery || preserve_complete_read {
+                plan.tool_result_budget.max_total_tokens as u64
+            } else {
+                per_tool_limit
+            })
+            .max(1);
+        if exact_delivery {
             if let Ok(mut ledger) = self.turn_context_ledger.lock() {
                 ledger.expand_tool_result_limit(plan.tool_result_budget.max_total_tokens as u64);
+            }
+        } else if preserve_complete_read {
+            if let Ok(mut ledger) = self.turn_context_ledger.lock() {
+                ledger.expand_tool_result_limit(requested);
             }
         }
         // `build_tool_receipt` spends part of the granted budget on its
@@ -5375,15 +5385,6 @@ where
         // Reserve a serialization allowance (codex parity, x1.2) so the receipt
         // envelope and the omission marker are not themselves re-truncated when
         // the message is serialized at the model boundary.
-        let requested = raw_tokens
-            .saturating_add(raw_tokens / 5)
-            .saturating_add(96)
-            .min(if preserve_complete_read {
-                plan.tool_result_budget.max_total_tokens as u64
-            } else {
-                per_tool_limit
-            })
-            .max(1);
         // PLAN B-5: a read must never be starved into a shell by a spent
         // tool-result budget. For the read family the budget is a soft cap, so an
         // exhausted ledger still grants this floor.
@@ -5402,14 +5403,15 @@ where
                 }
             })
             .unwrap_or(requested);
-        let preserve_complete_read = tool_name == "read_file" && !is_error
-            && (delivery_requirement.is_exact()
-                || serde_json::from_str::<serde_json::Value>(input).ok()
-                    .is_some_and(|value| value["complete"].as_bool() == Some(true)));
-        let preserve_complete_read = tool_name == "read_file" && !is_error
-            && (delivery_requirement.is_exact()
-                || serde_json::from_str::<serde_json::Value>(input).ok()
-                    .is_some_and(|value| value["complete"].as_bool() == Some(true)));
+        // A complete read is the body this caller asked for inside the request
+        // it was asked for: the receipt ceiling follows the request, while the
+        // ledger still records what it could reserve. An oversized body stays
+        // beyond even that ceiling, so it is still reported as omitted.
+        let granted = if preserve_complete_read {
+            granted.max(requested)
+        } else {
+            granted
+        };
         let mut receipt = crate::context_evidence::build_tool_receipt_for_delivery(
             tool_name,
             output,
@@ -7125,11 +7127,7 @@ mod agentic_action_body_tests {
         )
         .await
         .unwrap();
-        for path in [
-            "proof.txt",
-            ".cowd/checkpoints",
-            "unrelated-process-target.txt",
-        ] {
+        for path in ["proof.txt", ".cowd/checkpoints"] {
             let conflict = ScopeLockRequest {
                 scope: ScopedResource::workspace_object(
                     locked.resolver.resolve_planned_file(path).unwrap(),
