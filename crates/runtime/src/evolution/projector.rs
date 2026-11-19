@@ -3159,7 +3159,7 @@ mod tests {
         let observation: harness_contract::goal::RuntimeObservation = serde_json::from_value(serde_json::json!({
             "identity":{"workspace_id":"workspace","session_id":"session-2","graph_id":"graph-2","goal_id":"goal-2"},
             "kind":"tool_progress","source":"current-provider","source_revision":1,"freshness":{"observed_at_ms":1,"policy_revision":"accepted-current"},
-            "summary":"typed failure","fingerprint":"failure-2","result_class":"failed"
+            "summary":"typed failure","fingerprint":"failure-2","result_class":"failed","failure_class":"tool"
         })).unwrap();
         let value = serde_json::to_value(observation).unwrap();
         let body = events
