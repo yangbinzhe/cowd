@@ -3358,8 +3358,26 @@ impl AgentActionService {
             {
                 return Err(AgentActionServiceError::Corrupt("applied action original transaction receipt mismatch".into()));
             }
-            if original != *envelope {
-                return Err(AgentActionServiceError::Corrupt("action_id conflicts with original action".into()));
+            // The caller's `expected_revision` is a precondition the original
+            // apply already consumed; it is not part of the action's identity.
+            // A replay after the Program advanced is the same action, not a
+            // conflicting one, so the fence is excluded from the comparison.
+            let identity = |envelope: &AgentActionEnvelope| {
+                let mut normalized = envelope.clone();
+                normalized.expected_revision = None;
+                normalized
+            };
+            if identity(&original) != identity(envelope) {
+                let revision = self
+                    .project(&envelope.actor.program_id)
+                    .map(|projection| projection.revision)
+                    .unwrap_or(0);
+                return Ok(Some(rejected(
+                    envelope,
+                    revision,
+                    "action_id_conflict",
+                    "this action_id was already applied with a different action",
+                )));
             }
             let entity = match existing.payload.get("entity_ref") {
                 Some(serde_json::Value::Null) => None,
