@@ -4315,6 +4315,26 @@ impl ExecutionGraphRunner {
                     return Ok(());
                 }
                 TerminalCommitDisposition::Failed(reason) => {
+                    // A preview-producing outcome that cannot commit must still be
+                    // retired. Without a durable retirement the callback resolves to
+                    // `Pending` forever, so the executor is never told to abort the
+                    // stream it already produced. The cancellation carries no domain
+                    // events, so it is not blocked by whatever refused the terminal
+                    // commit itself.
+                    if let Ok(current) = self.state_store.load_async(graph_id).await {
+                        if current.node_statuses.get(&node_id)
+                            == Some(&ExecutionNodeStatus::Running)
+                        {
+                            let _ = self.commit_service.apply_command(
+                                &current,
+                                &ExecutionGraphCommand::CancelNode {
+                                    expected_revision: current.revision,
+                                    node_id: node_id.clone(),
+                                    reason: "terminal wave commit failed".into(),
+                                },
+                            );
+                        }
+                    }
                     if let Err(cleanup) = self.complete_callback_observed(
                         graph_id,
                         &executor,
