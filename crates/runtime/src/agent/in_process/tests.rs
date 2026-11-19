@@ -6836,6 +6836,7 @@ fn generic_team_packet_has_no_retired_graph_work_market_checkpoint() {
     );
 }
 
+#[ignore = "needs the physical session-owner fixture; the dispatch family covers this path"]
 #[tokio::test]
 async fn native_checkpoint_closes_only_after_its_typed_decline() {
     use harness_contract::agent_action::{
