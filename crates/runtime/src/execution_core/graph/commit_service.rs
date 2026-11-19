@@ -1095,13 +1095,13 @@ pub(crate) mod bounded_process_tests {
                 )
                 .unwrap()
                 .graph;
-            assert_eq!(
+            assert!(
                 service
                     .authenticated_lease_recovery(&terminal, "scope2-node", &binding, &registry)
                     .await
                     .unwrap()
                     .is_some(),
-                !incomplete
+                "a planned call the node's own result does not claim has no effect to close, so it cannot hold the leaf (incomplete={incomplete})"
             );
             let (ticket, _) = ExecutionGraphStateStore::new(store.clone())
                 .binding_start_ticket(&terminal, "scope2-node", &binding)
