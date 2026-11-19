@@ -557,7 +557,7 @@ pub(crate) mod scope_admission_tests {
             &host,
             "execute_code",
             json!({
-                "language":"python", "code":"print(1)", "input_files":[], "timeout_ms":1000,
+                "language":"python", "code":"print(1)", "input_files":[".env"], "timeout_ms":1000,
             }),
         );
         authorize_bounded_fixture(
