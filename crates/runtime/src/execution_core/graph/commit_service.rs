@@ -1601,15 +1601,30 @@ pub(crate) mod bounded_process_tests {
 
     #[tokio::test]
     async fn live_authority_revocation_after_start_reaps_descendants_before_unlock_287() {
-        use crate::execution_core::graph::{ScopeLockMode, ScopeLockRequest, ScopedResource};
+        use crate::execution_core::graph::ScopeLockMode;
         let fixture = owned_fixture();
         let marker = format!("bounded-revoked-287-{}", uuid::Uuid::new_v4());
+        std::fs::write(fixture.workspace.path().join("declared-input.txt"), b"declared")
+            .unwrap();
         let code=format!("import os\nif os.fork()==0:\n os.setsid()\n os.execl('/bin/sleep','{marker}-child','60')\nos.execl('/bin/sleep','{marker}-leader','60')");
         let request = request(
             &fixture.host,
-            json!({"language":"python","code":code,"input_files":[],"timeout_ms":5000}),
+            json!({"language":"python","code":code,"input_files":["declared-input.txt"],"timeout_ms":5000}),
         );
         let effect = request.compiled_invocation.as_ref().unwrap().effect.clone();
+        let resolver =
+            crate::path_identity::WorkspacePathIdentityResolver::discover(fixture.workspace.path())
+                .unwrap();
+        let mut declared = crate::bound_tool_batch::bound_effect_lock_requests(&resolver, &effect)
+            .unwrap()
+            .0;
+        assert!(
+            !declared.is_empty(),
+            "a declared input file must give the bounded process a scope lease"
+        );
+        for request in &mut declared {
+            request.mode = ScopeLockMode::Write;
+        }
         let authority = crate::tool_host::BoundedProcessAuthority::bind(
             fixture.services.clone(),
             request.clone(),
@@ -1643,24 +1658,12 @@ pub(crate) mod bounded_process_tests {
         })
         .await
         .unwrap();
-        let resolver =
-            crate::path_identity::WorkspacePathIdentityResolver::discover(fixture.workspace.path())
-                .unwrap();
         let writer = {
             let locks = fixture.services.scope_locks().clone();
             let marker = marker.clone();
-            let scope = ScopedResource::workspace(resolver.workspace_id()).unwrap();
+            let requests = declared;
             tokio::spawn(async move {
-                let lease = locks
-                    .acquire(
-                        vec![ScopeLockRequest {
-                            scope,
-                            mode: ScopeLockMode::Write,
-                        }],
-                        None,
-                    )
-                    .await
-                    .unwrap();
+                let lease = locks.acquire(requests, None).await.unwrap();
                 assert!(
                     marker_processes(&marker).is_empty(),
                     "canonical lease released before actual descendants disappeared"
