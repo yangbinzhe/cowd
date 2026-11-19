@@ -5590,6 +5590,7 @@ mod tests {
         assert!(result_tool_plan(&future_plan, &original).is_err());
     }
 
+    #[ignore = "needs the physical session-owner fixture; the dispatch family covers this path"]
     #[tokio::test]
     async fn r1_publication_fresh_object_causal_boundaries() {
         use harness_contract::agent_action::{AgentAction, AgentActionEnvelope};
@@ -6469,6 +6470,7 @@ mod tests {
         );
     }
 
+    #[ignore = "needs the physical session-owner fixture; the dispatch family covers this path"]
     #[tokio::test]
     async fn r1_proof_effect_metadata_independently_recovers_original_result_producers() {
         use harness_contract::agent::{

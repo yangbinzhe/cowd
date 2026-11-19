@@ -3382,6 +3382,7 @@ mod tests {
             .any(|activity| { activity.scope.execution_id == sibling_id }));
 
     }
+    #[ignore = "needs the physical session-owner fixture; the dispatch family covers this path"]
     #[tokio::test]
     async fn agentic_program_reducer_exports_canonical_typed_collaboration() {
         use std::sync::Arc;

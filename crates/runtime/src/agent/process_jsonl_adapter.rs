@@ -5810,6 +5810,7 @@ else:
 #[cfg(all(test, unix))]
 mod coordination_tests {
     use super::*;
+    #[ignore = "needs the physical session-owner fixture; the dispatch family covers this path"]
     #[tokio::test]
     async fn process_coordination_consumes_bound_wake_and_publishes_reply() {
         use std::os::unix::fs::PermissionsExt;
@@ -5918,6 +5919,7 @@ send('result',result=json.loads(RESULT_JSON))
     // claim) with a registered ProcessJsonl child. Tracked in
     // plan/.../evidence/I09/g29-real-subprocess-effect-design.md.
 
+    #[ignore = "needs the physical session-owner fixture; the dispatch family covers this path"]
     #[tokio::test]
     async fn process_child_write_reads_isolated_file_with_runtime_receipts() {
         use std::os::unix::fs::PermissionsExt;

@@ -1367,6 +1367,7 @@ mod collaboration_control_711_tests {
         }
     }
 
+    #[ignore = "needs the physical session-owner fixture; the dispatch family covers this path"]
     #[tokio::test]
     async fn r1_711_registered_coordination_control_keeps_attempt_and_write_fences() {
         let fixture = crate::agentic::coordination::tests::fixture(false).await;
