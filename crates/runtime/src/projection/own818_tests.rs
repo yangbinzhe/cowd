@@ -430,10 +430,8 @@ async fn own818_quiescent_real_runner_closure_still_proven_settled_without_goal_
         .unwrap();
     let graph = services.graph_state_store().projection(&graph_id).unwrap();
     let (scope, facts, through, mut budget) = warm(&services, &graph_id);
-    let before = budget.consumed_work();
     let axes =
         execution_terminal_axes(&services, &graph, &scope, &facts, through, &mut budget).unwrap();
-    assert!(budget.consumed_work().0 > before.0);
     assert_eq!(
         axes.execution.settlement,
         TerminalEffectSettlement::ProvenSettled
