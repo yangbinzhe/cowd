@@ -5348,13 +5348,21 @@ where
         input: &str,
     ) -> crate::context_evidence::ModelReceipt {
         let raw_tokens = crate::context_ledger::estimate_text_tokens(output);
-        let plan = if delivery_requirement.is_exact() && !is_error {
+        let preserve_complete_read = tool_name == "read_file" && !is_error
+            && (delivery_requirement.is_exact()
+                || serde_json::from_str::<serde_json::Value>(input).ok()
+                    .is_some_and(|value| value["complete"].as_bool() == Some(true)));
+        // A caller that asks for the complete body has already paid for its
+        // capacity: the grant may grow to the subsystem ceiling, exactly as an
+        // exact-evidence delivery does. The per-result preview ceiling would
+        // otherwise re-truncate the body the caller asked to see whole.
+        let plan = if preserve_complete_read {
             Self::apply_exact_evidence_delivery_budget(self.runtime_budget_plan())
         } else {
             self.runtime_budget_plan()
         };
         let per_tool_limit = plan.tool_result_budget.per_tool_max_tokens as u64;
-        if delivery_requirement.is_exact() && !is_error {
+        if (delivery_requirement.is_exact() && !is_error) || preserve_complete_read {
             if let Ok(mut ledger) = self.turn_context_ledger.lock() {
                 ledger.expand_tool_result_limit(plan.tool_result_budget.max_total_tokens as u64);
             }
@@ -5370,7 +5378,11 @@ where
         let requested = raw_tokens
             .saturating_add(raw_tokens / 5)
             .saturating_add(96)
-            .min(per_tool_limit)
+            .min(if preserve_complete_read {
+                plan.tool_result_budget.max_total_tokens as u64
+            } else {
+                per_tool_limit
+            })
             .max(1);
         // PLAN B-5: a read must never be starved into a shell by a spent
         // tool-result budget. For the read family the budget is a soft cap, so an
@@ -5390,6 +5402,10 @@ where
                 }
             })
             .unwrap_or(requested);
+        let preserve_complete_read = tool_name == "read_file" && !is_error
+            && (delivery_requirement.is_exact()
+                || serde_json::from_str::<serde_json::Value>(input).ok()
+                    .is_some_and(|value| value["complete"].as_bool() == Some(true)));
         let preserve_complete_read = tool_name == "read_file" && !is_error
             && (delivery_requirement.is_exact()
                 || serde_json::from_str::<serde_json::Value>(input).ok()
