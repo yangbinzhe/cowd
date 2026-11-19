@@ -5537,13 +5537,49 @@ mod tests {
                 }]
             }),
         );
-        let original = append(
-            "tool.invocation.completed",
-            serde_json::json!({
-                "governed_plan_id":"original-plan", "tool_call_id":"original-call",
-                "tool_name":"read_file"
-            }),
-        );
+        // A business lifecycle event is only accepted with the activity it
+        // belongs to, so the completed call carries its binding.
+        let original = store
+            .append(
+                crate::RuntimeEventInput {
+                    stream_id: "session:claimed-plan".into(),
+                    scope: crate::RuntimeEventScope::Tool,
+                    kind: "tool.invocation.completed".into(),
+                    status: None,
+                    actor: Some("conversation_runtime".into()),
+                    refs: Vec::new(),
+                    payload: serde_json::json!({
+                        "governed_plan_id":"original-plan", "tool_call_id":"original-call",
+                        "tool_name":"read_file"
+                    }),
+                }
+                .with_activity_binding(harness_contract::projection::RuntimeActivityBinding {
+                    root_execution_id: "execution:claimed-plan".to_string(),
+                    session_id: "session:claimed-plan".to_string(),
+                    turn_id: "turn:claimed-plan".to_string(),
+                    root_task_id: "task:claimed-plan".to_string(),
+                    task_id: "task:claimed-plan".to_string(),
+                    activity_id: "activity:claimed-plan".to_string(),
+                    node_id: None,
+                    parent_activity_id: Some("activity:claimed-plan:parent".to_string()),
+                    initiator_activity_id: None,
+                    team_run_id: None,
+                    agent_instance_id: None,
+                    agent_run_id: None,
+                    skill_id: None,
+                    skill_revision: None,
+                    skill_activation_id: None,
+                    tool_contract_id: Some("contract:read_file".to_string()),
+                    tool_call_id: Some("original-call".to_string()),
+                    approval_id: None,
+                    parallel_group_id: None,
+                    revision: 1,
+                    fence: 1,
+                    generation: 1,
+                })
+                .expect("activity binding"),
+            )
+            .unwrap();
         let events = store.list_stream("session:claimed-plan").unwrap();
         assert_eq!(
             result_tool_plan(&events, &original).unwrap().unwrap()["tool_call_id"],
