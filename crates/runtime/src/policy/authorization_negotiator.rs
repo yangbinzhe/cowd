@@ -3721,7 +3721,8 @@ mod tests {
                 )
                 .descriptor
                 .required_permission,
-                PermissionMode::DangerFullAccess
+                PermissionMode::DangerFullAccess,
+                "a sensitive or unknown read target must keep the danger floor: {value}"
             );
         }
     }

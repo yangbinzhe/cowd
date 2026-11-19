@@ -862,7 +862,18 @@ impl ToolHostLease {
                 unresolved,
             );
         }
-        resolve_registered_tool_effect_resolution(&resolver, &canonical_id, input, permission)
+        let mut resolution =
+            resolve_registered_tool_effect_resolution(&resolver, &canonical_id, input, permission);
+        // A path-reading tool described from an invocation that names no target
+        // cannot prove what it would read, so it cannot claim the bounded floor.
+        // Read-only tools that legitimately take no target (a workspace snapshot)
+        // are unaffected.
+        let path_reading = matches!(canonical_id.as_str(), "read_file" | "read_ref");
+        if path_reading && crate::tool_orchestrator::resource_target(input).is_none() {
+            resolution.descriptor.assessment.data_sensitivity =
+                harness_contract::policy::DataClassification::Secret;
+        }
+        resolution
     }
 
     pub(crate) fn orchestration_child_effects(
