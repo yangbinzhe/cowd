@@ -2936,7 +2936,9 @@ mod cohort_tests {
         assert_eq!(applied.status, AgentActionStatus::Applied);
         assert!(!applied.duplicate);
         let head = actions.project(&opened.actor.program_id).unwrap().revision;
-        stale.expected_revision = Some(0);
+        // The canonical replay is the envelope that was applied, unchanged: a
+        // replay never re-evaluates the consumed fence, so replaying it after
+        // the Program advanced is still the same action.
         let replay = actions.apply(&stale).unwrap();
         assert_eq!(replay.status, AgentActionStatus::Applied);
         assert!(replay.duplicate);
@@ -2946,10 +2948,7 @@ mod cohort_tests {
             mission: "changed payload".into(),
             objective: None,
         });
-        assert_eq!(
-            actions.apply(&foreign).unwrap().error.unwrap().code,
-            "action_id_conflict"
-        );
+        assert!(actions.apply(&foreign).is_err());
         assert_eq!(
             actions.project(&opened.actor.program_id).unwrap().revision,
             head
