@@ -2187,6 +2187,12 @@ mod bounded {
             }
             if done {
                 kill_descendants();
+                // SIGKILL is delivered asynchronously, and the runtime releases the
+                // canonical lease as soon as this sandbox reports its terminal. A
+                // process that left the wrapper's process group (setsid) would then
+                // outlive the lease that admitted it, so the namespace must be empty
+                // before init exits.
+                await_namespace_empty();
             }
             match rustix::process::wait(rustix::process::WaitOptions::NOHANG) {
                 Ok(Some((pid, result))) => {
@@ -2719,6 +2725,27 @@ mod bounded {
             }
         }
     }
+    fn await_namespace_empty() {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            let others = fs::read_dir("/proc")
+                .map(|entries| {
+                    entries
+                        .filter_map(Result::ok)
+                        .filter_map(|entry| {
+                            entry.file_name().to_str()?.parse::<i32>().ok()
+                        })
+                        .filter(|pid| *pid > 1)
+                        .count()
+                })
+                .unwrap_or(0);
+            if others == 0 {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
     fn kill_descendants() {
         if let Ok(entries) = fs::read_dir("/proc") {
             for entry in entries.filter_map(Result::ok) {
