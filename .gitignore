@@ -60,3 +60,7 @@ plan/
 # python bytecode caches are not part of the candidate
 __pycache__/
 *.pyc
+
+# AOCI agent host integration (machine-bound; do not commit)
+opencode.json
+opencode.json.backup.*
