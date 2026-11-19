@@ -7423,6 +7423,31 @@ fn validate_evolution_scenario_isolation(
             shared_write_scopes.join(", ")
         )));
     }
+    if scenario.resource_scopes.is_empty() {
+        return Err(RuntimeServicesError::Invariant(
+            "paired evolution scenario must declare the workspace-relative scopes it reads".into(),
+        ));
+    }
+    for scope in &scenario.resource_scopes {
+        let Some((mode, target)) = scope.split_once(':') else {
+            return Err(RuntimeServicesError::Invariant(format!(
+                "paired evolution scenario scope has no mode: {scope}"
+            )));
+        };
+        if mode != "read" {
+            // The isolation contract is a read-only copy: any other resource
+            // (network, a shared workspace, a process capability) leaves the
+            // isolated enclosure the pair is supposed to prove.
+            return Err(RuntimeServicesError::Invariant(format!(
+                "paired evolution scenario scope leaves the isolated enclosure: {scope}"
+            )));
+        }
+        if crate::governed_tool_plan::validate_relative_scope_path(target).is_err() {
+            return Err(RuntimeServicesError::Invariant(format!(
+                "paired evolution scenario scope escapes the workspace: {scope}"
+            )));
+        }
+    }
     let installed_skills = skill_catalog
         .profiles()
         .map_err(RuntimeServicesError::Invariant)?
