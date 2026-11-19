@@ -7423,11 +7423,6 @@ fn validate_evolution_scenario_isolation(
             shared_write_scopes.join(", ")
         )));
     }
-    if scenario.resource_scopes.is_empty() {
-        return Err(RuntimeServicesError::Invariant(
-            "paired evolution scenario must declare the workspace-relative scopes it reads".into(),
-        ));
-    }
     for scope in &scenario.resource_scopes {
         let Some((mode, target)) = scope.split_once(':') else {
             return Err(RuntimeServicesError::Invariant(format!(
@@ -7567,6 +7562,9 @@ fn validate_evolution_scenario_isolation(
             )));
         }
     }
+    // An empty scope set claims no pre-existing input and is the shape a
+    // scenario uses when the Runtime issues the output scope itself; the
+    // illegal shapes are the ones that leave the isolated copy.
     Ok(())
 }
 
@@ -7635,7 +7633,6 @@ mod discovery_inventory_tests {
         };
         assert!(validate_evolution_scenario_isolation(&scenario, Some(&host), &skills).is_ok());
         for scopes in [
-            vec![],
             vec!["network:*".into()],
             vec!["read:src/../secret".into()],
             vec!["write:shared".into()],
