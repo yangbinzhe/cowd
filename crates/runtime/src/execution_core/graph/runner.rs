@@ -6350,15 +6350,37 @@ async fn drain_original_unknown(
     }
 }
 
+fn executor_panic_message(payload: &Box<dyn std::any::Any + Send>) -> String {
+    payload
+        .downcast_ref::<&str>()
+        .map(|message| (*message).to_string())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "executor panicked".to_string())
+}
+
 async fn poll_with_original_custody(
     runner: &ExecutionGraphRunner, expected_binding: Option<&ExecutionNodeBinding>,
     executor: &Arc<dyn NodeExecutor>, ticket: &NodeExecutionTicket,
     commits: &mut tokio::sync::watch::Receiver<u64>, resources: &ExecutionResourceManager,
     original_unknown: &mut Option<NodeExecutorError>,
 ) -> Result<NodeExecutionOutcome, NodeExecutorError> {
-    match executor.poll_or_await(ticket).await {
-        Err(error @ NodeExecutorError::OriginalCustodyUnknown { .. }) => *original_unknown = Some(error),
-        result => return result,
+    // An executor is foreign code: a panic in it must become that node's failed
+    // result, not an unwind through the pump that strands the wave, its
+    // resources and every other graph sharing the capacity.
+    let polled = std::panic::AssertUnwindSafe(executor.poll_or_await(ticket))
+        .catch_unwind()
+        .await;
+    match polled {
+        Err(payload) => {
+            return Err(NodeExecutorError::Poll {
+                node_id: ticket.node_id.clone(),
+                reason: format!("executor panicked: {}", executor_panic_message(&payload)),
+            })
+        }
+        Ok(Err(error @ NodeExecutorError::OriginalCustodyUnknown { .. })) => {
+            *original_unknown = Some(error)
+        }
+        Ok(result) => return result,
     }
     loop {
         if runner.command_intent_waiter(&ticket.graph_id).is_some()
