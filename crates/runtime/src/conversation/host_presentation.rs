@@ -7134,25 +7134,25 @@ fn continuation_resource_limit_is_explicit_and_supports_long_tasks() {
 /// between a completion gap and an outstanding closure rung.
 #[test]
 fn both_rollback_paths_share_one_bound() {
-    // Only the production half of the file: this test's own source would
-    // otherwise count itself. The boundary is the first test module, not any
-    // test-only import near the top of the file.
+    // The file interleaves production code with test modules, so a prefix cut is
+    // not a production window. Both needles are assembled from pieces so this
+    // test's own source cannot count itself.
     let source = include_str!("host_presentation.rs");
-    let production = source
-        .split("\n#[cfg(test)]\nmod ")
-        .next()
-        .expect("production code precedes the test module");
+    let gap = concat!("claim_continuation_", "budget(&mut state, \"completion_gap\")");
+    let rung = concat!("claim_continuation_", "budget(&mut state, \"closure_rung\")");
     assert_eq!(
-        production
-            .matches("claim_continuation_budget(&mut state,")
-            .count(),
-        2,
-        "both the completion-gap and the closure-rung rollback must claim the shared budget"
+        source.matches(gap).count(),
+        1,
+        "the completion-gap rollback must claim the shared budget exactly once"
     );
     assert_eq!(
-        production
-            .matches("state.completion_gap_continuations =")
-            .count(),
+        source.matches(rung).count(),
+        1,
+        "the closure-rung rollback must claim the shared budget exactly once"
+    );
+    let counter = concat!("state.", "completion_gap_continuations =");
+    assert_eq!(
+        source.matches(counter).count(),
         1,
         "the continuation counter must be advanced in exactly one place"
     );
