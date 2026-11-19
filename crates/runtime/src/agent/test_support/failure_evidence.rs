@@ -20,7 +20,26 @@ pub fn collect_failure_evidence(
         return json!({"status":"Unavailable", "reason":"COWD_FIXTURE_EVIDENCE_DIR_unset",
             "first_predicate":"Unknown", "source_count":sources.len(), "reads_started":0});
     };
-    let (path, file) = match prepare_archive(std::path::Path::new(&directory)) {
+    collect_failure_evidence_into(
+        std::path::Path::new(&directory),
+        store,
+        sources,
+        original_failure,
+        deadline,
+    )
+}
+
+/// Archive to a directory the caller already owns. The environment form exists
+/// for the operator-supplied fixture directory; the direct form lets a test
+/// prove the archive without racing a process-wide variable.
+pub fn collect_failure_evidence_into(
+    directory: &std::path::Path,
+    store: &RuntimeEventStore,
+    sources: &[FailureEvidenceSource<'_>],
+    original_failure: &str,
+    deadline: Instant,
+) -> Value {
+    let (path, file) = match prepare_archive(directory) {
         Ok(prepared) => prepared,
         Err(_) => return json!({"status":"Unavailable", "reason":"restricted_directory_preflight_failed",
             "first_predicate":"Unknown", "source_count":sources.len(), "reads_started":0}),
@@ -234,10 +253,28 @@ mod tests {
             kind:"agent.local_exit".into(), status:Some("completed".into()), actor:Some("fixture".into()), refs:vec![],
             payload:json!({"phase":"local_returned", "private_body":"private_archive_only"}),
         }).unwrap();
-        let receipt = super::collect_failure_evidence(&store, &[FailureEvidenceSource {
-            stream_id:"agent:archive", after_sequence:0, through_sequence:u64::MAX,
-        }], "controlled failure");
-        assert_eq!(receipt["status"], "ArchivedDiagnostic");
+        let archive = tempfile::tempdir().unwrap();
+        let archive_directory = archive.path().canonicalize().unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(
+                &archive_directory,
+                std::fs::Permissions::from_mode(0o700),
+            )
+            .unwrap();
+        }
+        let receipt = super::collect_failure_evidence_into(
+            &archive_directory,
+            &store,
+            &[FailureEvidenceSource {
+                stream_id: "agent:archive",
+                after_sequence: 0,
+                through_sequence: u64::MAX,
+            }],
+            "controlled failure",
+            Instant::now() + Duration::from_secs(5),
+        );
+        assert_eq!(receipt["status"], "ArchivedDiagnostic", "{receipt}");
         assert!(receipt.get("sources").is_none());
         assert!(!receipt.to_string().contains("private_archive_only"));
         drop(store);
