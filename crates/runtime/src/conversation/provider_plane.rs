@@ -934,9 +934,11 @@ where
             step_id: uuid::Uuid::new_v4().to_string(),
             session_id: self.session_id().to_string(),
             turn_id,
-            execution_id: execution
+            execution_id: self
+                .execution_identity
                 .as_ref()
-                .map(|context| context.execution_id.clone()),
+                .and_then(|identity| identity.graph_id().map(str::to_string))
+                .or_else(|| execution.as_ref().map(|context| context.execution_id.clone())),
             actor_ref: self
                 .execution_identity
                 .as_ref()

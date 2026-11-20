@@ -390,11 +390,29 @@ fn register_protocol_graph_with_purpose(
         .node_statuses
         .insert(node_id.clone(), ExecutionNodeStatus::Planned);
     parent_graph.nodes.push(parent_node);
-    fixture
-        .services
-        .commit_service()
-        .register_graph(parent_graph)
-        .expect("register AgentTask parent graph");
+    let parent_attempt = {
+        let registered = fixture
+            .services
+            .commit_service()
+            .register_graph(parent_graph)
+            .expect("register AgentTask parent graph");
+        // The parent AgentTask node is the physical owner a delegated child is
+        // driven under. A `Planned` node has no start fact, so the child's drive
+        // cannot resolve `agent/1` and every delegated turn fails as a corrupt
+        // parent stream. Production starts that node before the child runs.
+        let started = crate::test_support::bind_running_graph_node(
+            fixture.services.commit_service(),
+            &registered.graph,
+            &node_id,
+        );
+        assert_eq!(
+            started.0.node_statuses.get(&node_id),
+            Some(&ExecutionNodeStatus::Running),
+            "the AgentTask parent must hold its running attempt"
+        );
+        started.1.attempt
+    };
+    assert_eq!(parent_attempt, attempt);
 
     let current_node_id = format!("{conversation_graph_id}:model");
     let mut current_node = ExecutionNodeSpec::new(
@@ -1242,6 +1260,8 @@ struct TopicSafePointClient {
     services: Arc<crate::RuntimeServices>,
     publication: AgentActionEnvelope,
     fail_first: bool,
+    turn_cancellation: Option<Arc<crate::execution_core::services::TurnCancellationControl>>,
+    reader: TopicSafePointReader,
 }
 
 #[derive(Clone)]
@@ -1324,7 +1344,7 @@ impl ToolExecutor for WorkerClosureSurfaceTools {
         name: &str,
         input: &str,
     ) -> Result<harness_contract::context::ToolOutputDraft, ToolError> {
-        TopicSafePointReader.execute_output(name, input).await
+        TopicSafePointReader { host: None }.execute_output(name, input).await
     }
 
     fn available_tool_names(&self) -> Vec<String> {
@@ -1571,43 +1591,103 @@ async fn exercise_worker_closure_surface(required_write: bool) {
     assert!(program.objective_verdict.is_none());
 }
 impl ApiClient for TopicSafePointClient {
+    fn step_tool_definitions(&self) -> Option<Vec<crate::ProviderToolDefinition>> {
+        // A real provider advertises the very contracts its step pins. The
+        // runtime refuses any step whose advertised definition disagrees with
+        // the pinned catalog, so these come from the same pinned snapshot the
+        // executor offers instead of being described a second time here.
+        let lease = self.reader.host.as_ref()?.pin_snapshot();
+        let wanted = std::collections::BTreeSet::from(["read_file".to_string()]);
+        Some(
+            lease
+                .snapshot()
+                .catalog
+                .definitions(Some(&wanted))
+                .into_iter()
+                .map(|definition| crate::ProviderToolDefinition {
+                    name: definition.name,
+                    description: definition.description,
+                    input_schema: definition.input_schema,
+                })
+                .collect(),
+        )
+    }
+
+    fn configure_turn_cancellation(
+        &mut self,
+        control: Option<Arc<crate::execution_core::services::TurnCancellationControl>>,
+    ) -> Result<(), RuntimeError> {
+        // This fixture is the physical provider of the delegated leaf: it owns
+        // the transport the turn would have to stop, so it accepts the turn's
+        // cancellation home exactly as the real provider client does.
+        self.turn_cancellation = control;
+        Ok(())
+    }
+
     fn stream(
         &mut self,
         request: ApiRequest,
     ) -> Pin<Box<dyn Stream<Item = Result<AssistantEvent, RuntimeError>> + Send + '_>> {
+        // `stream` is lazy: the runtime admits the request and only then polls
+        // the returned stream, so the request is recorded here (at admission)
+        // while everything that requires the runtime to be inside the provider
+        // step - the peer publication and the step decision - happens on the
+        // first poll, exactly as a real transport would.
         let step = {
             let mut requests = self.requests.lock().unwrap();
             requests.push(request);
             requests.len()
         };
-        if self.fail_first || step >= 3 {
-            return Box::pin(stream::iter(vec![Err(RuntimeError::new(
-                "HTTP 402 Payment Required: safe-point test",
-            ))]));
-        }
-        if step == 1 {
-            assert_eq!(
-                self.services
-                    .agent_action_service()
-                    .apply(&self.publication)
-                    .unwrap()
-                    .status,
-                harness_contract::agent_action::AgentActionStatus::Applied
-            );
-        }
-        Box::pin(stream::iter(vec![
-            Ok(AssistantEvent::ToolUse {
-                id: format!("topic-read-{step}"),
-                name: "read_file".into(),
-                input: format!("{{\"path\":\"part-{step}.txt\"}}"),
-            }),
-            Ok(AssistantEvent::MessageStop),
-        ]))
+        let publication = self.publication.clone();
+        let services = Arc::clone(&self.services);
+        let fail_first = self.fail_first;
+        let events = async move {
+            if fail_first || step >= 3 {
+                return vec![Err(RuntimeError::new(
+                    "HTTP 402 Payment Required: safe-point test",
+                ))];
+            }
+            if step == 1 {
+                assert_eq!(
+                    services
+                        .agent_action_service()
+                        .apply(&publication)
+                        .unwrap()
+                        .status,
+                    harness_contract::agent_action::AgentActionStatus::Applied
+                );
+            }
+            vec![
+                Ok(AssistantEvent::ToolUse {
+                    id: format!("topic-read-{step}"),
+                    name: "read_file".into(),
+                    input: format!("{{\"path\":\"part-{step}.txt\"}}"),
+                }),
+                Ok(AssistantEvent::MessageStop),
+            ]
+        };
+        Box::pin(stream::once(events).flat_map(stream::iter))
     }
 }
-struct TopicSafePointReader;
+#[derive(Clone)]
+struct TopicSafePointReader {
+    host: Option<std::sync::Arc<tools::ToolHost>>,
+}
+impl TopicSafePointReader {
+    fn with_catalog(workspace: &std::path::Path) -> Self {
+        Self {
+            host: Some(std::sync::Arc::new(tools::ToolHost::builtin(
+                "protocol-state-workspace",
+                workspace,
+            ))),
+        }
+    }
+}
 #[async_trait::async_trait]
 impl ToolExecutor for TopicSafePointReader {
+    fn pin_step_catalog(&self) -> Option<tools::ToolHostLease> {
+        self.host.as_ref().map(|host| host.pin_snapshot())
+    }
     fn tool_discovery_receipt(&self) -> harness_contract::tool::ToolDiscoveryReceipt {
         declared_host_fixture_catalog(&[("read_file", PermissionMode::ReadOnly)])
     }
@@ -1720,6 +1800,9 @@ async fn actual_delegated_model_safe_point_receives_delta_and_only_success_ackno
             );
         }
         let captured = Arc::new(Mutex::new(vec![]));
+        let reader = TopicSafePointReader::with_catalog(
+            &std::env::current_dir().expect("workspace"),
+        );
         let mut session = Session::new();
         session.session_id = fixture.root.session_id.clone();
         let mut runtime = crate::ConversationRuntime::new(
@@ -1729,12 +1812,34 @@ async fn actual_delegated_model_safe_point_receives_delta_and_only_success_ackno
                 services: Arc::clone(&services),
                 publication,
                 fail_first,
+                turn_cancellation: None,
+                reader: TopicSafePointReader { host: reader.host.clone() },
             },
-            TopicSafePointReader,
+            reader,
             PermissionPolicy::new(crate::PermissionMode::ReadOnly),
             canonical_host_system_prompt(vec![]),
         )
         .without_memory();
+        // A real delegated leaf runs under the packet's own execution identity;
+        // the provider step it binds carries that run/actor/attempt, which is
+        // what the delegated Host Step fence authenticates each call against.
+        runtime = runtime.with_checkpoint_identity(
+            "protocol-state-workspace",
+            Some(
+                services
+                    .graph_state_store()
+                    .load(parent_id)
+                    .unwrap()
+                    .nodes
+                    .first()
+                    .map(|node| {
+                        let packet: harness_contract::agent::AgentTaskPacket =
+                            serde_json::from_str(&node.payload_ref).unwrap();
+                        packet.assignment.execution_identity
+                    })
+                    .unwrap(),
+            ),
+        );
         runtime.set_active_model("test-model");
         runtime.set_context_profile(ContextProfile::SubAgent);
         let parent = services.graph_state_store().load(parent_id).unwrap();
@@ -1853,18 +1958,18 @@ struct RootPresentationRecoveryReader;
 #[async_trait::async_trait]
 impl ToolExecutor for RootPresentationRecoveryReader {
     fn tool_discovery_receipt(&self) -> harness_contract::tool::ToolDiscoveryReceipt {
-        TopicSafePointReader.tool_discovery_receipt()
+        TopicSafePointReader { host: None }.tool_discovery_receipt()
     }
     async fn execute_output(
         &self,
         name: &str,
         input: &str,
     ) -> Result<harness_contract::context::ToolOutputDraft, ToolError> {
-        TopicSafePointReader.execute_output(name, input).await
+        TopicSafePointReader { host: None }.execute_output(name, input).await
     }
 
     fn available_tool_names(&self) -> Vec<String> {
-        TopicSafePointReader.available_tool_names()
+        TopicSafePointReader { host: None }.available_tool_names()
     }
 
     fn collaboration_runtime_available(&self) -> bool {

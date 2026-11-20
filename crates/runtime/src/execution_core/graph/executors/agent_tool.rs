@@ -756,6 +756,14 @@ impl NoDispatchObservation {
         if state.refused.is_empty() {
             return Ok(());
         }
+        // One ticket has exactly one sealed fact. A second finish for the same
+        // observation re-seals from whatever `refused` holds at that moment,
+        // which replaces a fact the runtime already committed against - and a
+        // reader of the earlier ticket then compares the new digest with the
+        // old result and reports custody unknown for a call that never ran.
+        if state.completed.is_some() {
+            return Ok(());
+        }
         let witness = NoDispatchWitness {
             fact: NoDispatchFact {
                 ticket: self.ticket.clone(),
@@ -798,7 +806,12 @@ impl NoDispatchObservation {
                 .max(actual_duration_ms.max(1));
             return Ok(());
         };
-        original.authenticate(ticket, Some(&outcome.result))?;
+        original.fact.validate_identity(ticket)?;
+        if original.fact.result_sha256.as_ref()
+            != Some(&no_dispatch_digest(&outcome.result).map_err(|error| error.to_string())?)
+        {
+            return Err("NoDispatch sealed result mismatch".into());
+        }
         if state.completed.as_ref() != Some(original)
             || original
                 .fact
