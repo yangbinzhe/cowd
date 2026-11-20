@@ -1163,7 +1163,7 @@ context_plane.rs[DW9L]: F:上下文平面：组装、激活、记忆投影与预
 conversation.rs[DW9L]: F:会话主体：轮次输入控制、审批等待、工具平面与取消站点，承载一次对话的完整执行 | R:code:crates/runtime/src/conversation/tool_plane.rs | A:OriginalTurnInputControl 提供审批等待唤醒 | S:输入控制与审批等待必须在原始轮次内闭环
 evidence_terminal_plane.rs[DW9L]: F:终态证据平面：策略账本、运行时事件、结果终结与会话读写入口 | R:code:crates/runtime/src/conversation/conversation.rs | A:record_turn_started 与 compact_session_with_checkpoint | S:终态写入与策略账本同事务
 frame_refusal.rs[DW8S]: F:帧拒绝：把未执行的工具调用统一成一种形状（工具结果、事件载荷与整帧理由） | R:code:crates/runtime/src/conversation/conversation.rs | A:FrameRefusal::new 与 wholly_refused_frame_reason | S:拒绝必须有可持久的事件与明确形状，不能只返回裸错误
-host.rs[DW9L]: F:标准运行时宿主：回合执行角色、入口引用、宿主构造与提交，含闭环动作工具集与测试入口 | R:code:crates/runtime/src/conversation/host_route.rs | A:submit_owned_conversation_turn 为入口 | S:宿主不拥有 provider 客户端或具体会话运行时类型；未绑定执行的程序报 not_applicable（不是 unknown），无交付物时不得请求完成；回合取消控制只装给无入口的根回合，委派叶的取消归父级
+host.rs[DW9L]: F:标准运行时宿主：回合执行角色、入口引用、宿主构造与提交，含闭环动作工具集与测试入口 | R:code:crates/runtime/src/conversation/host_route.rs | A:submit_owned_conversation_turn 为入口 | S:宿主不拥有 provider 客户端或具体会话运行时类型；未绑定执行的程序报 not_applicable（不是 unknown），无交付物时不得请求完成；回合取消控制原本只装给无入口根回合，委派叶现由自己的 operational 控制承载取消，绑定既有物理 run owner，无 ingress 不能授权 Requested 取消
 host_backend.rs[DW9L]: F:图拥有的 provider 与受治理工具执行后端：动作通道要求、循环守卫、调用重复记录与结果桩 | R:code:crates/runtime/src/conversation/host.rs | A:evaluate_loop_guard 与 loop_block_after | S:循环硬停必须显式开启，计数本身不证明结果或来源变化
 host_presentation.rs[DW9L]: F:宿主呈现：受治理工具上下文、合成、终态证据与呈现策略，含终态所有权判定 | R:code:crates/runtime/src/conversation/host.rs | A:terminal_commit_owned_by 防止呈现与权威竞争；两条回滚共用同一预算领取函数 | S:呈现不得与任务或目标终态权威竞争
 host_presentation_recovery_tests.rs[TQ7L]: F:宿主呈现恢复测试 | R:code:crates/runtime/src/conversation/host_presentation.rs | A:测试模块 | S:覆盖呈现恢复路径
@@ -1172,13 +1172,13 @@ liveness.rs[DW8L]: F:回合活性观察与推进动作：无进展不等于失�
 own834_host_control_tests.rs[TQ6S]: F:宿主控制 own834 测试 | R:code:crates/runtime/src/conversation/host_route.rs | A:测试模块 | S:覆盖控制装配
 prompt.rs[DW8L]: F:提示：系统提示与消息构造 | R:code:crates/runtime/src/conversation/prompt_assembly.rs | A:提示构造入口 | S:提示分稳定与动态两段
 prompt_assembly.rs[DW8L]: F:提示装配：按上下文项与画像装配请求提示 | R:code:crates/runtime/src/conversation/context_plane.rs | A:装配入口 | S:稳定段在前，动态段在后
-provider_plane.rs[DW9L]: F:provider 平面：模型请求构造、发送与流式事件处理 | R:code:crates/provider/src/client.rs | A:prepare_wire 与流式入口 | S:请求体有上限，流式按事件推进
+provider_plane.rs[DW9L]: F:provider 平面：模型请求构造、发送与流式事件处理 | R:code:crates/provider/src/client.rs | A:prepare_wire 与流式入口 | S:请求体有上限，流式按事件推进；步骤身份的 execution_id 与 wire 证据上下文必须同源推导，否则绑定步骤会以 requires matching durable wire evidence 拒绝
 request_compiler.rs[DW7M]: F:请求编译器：把上下文与工具暴露编译成 provider 请求并给出统计 | R:code:crates/runtime/src/conversation/provider_plane.rs | A:request_compiler_stats 暴露统计 | S:编译结果可复现，统计用于诊断
 sse.rs[DW6S]: F:会话侧 SSE 处理：把 provider 流事件转成会话事件 | R:code:crates/runtime/src/conversation/provider_plane.rs | A:SSE 解析入口 | S:半帧保留缓冲
 static_tool_executor.rs[DW6S]: F:静态工具执行器：无图场景下的直接工具执行 | R:code:crates/runtime/src/conversation/conversation.rs | A:静态执行入口 | S:仅用于无图场景，受治理路径仍走图
 step_snapshot.rs[DW8L]: F:步骤快照：记录模型步骤与工具批次的准备态成员与原样输入，并解析调用的绑定 | R:code:crates/runtime/src/conversation/host_backend.rs | A:PreparedAgentBatchMember 为快照成员；StepCallBinding::resolve 解析活绑定 | S:快照保留原样输入，供事后复核；活绑定只能由它当初被授权的那一个宿主租约服务，宿主换掉快照而契约未变时必须报 step_binding_stale 而不是继续服务，契约真变了才继续
 summary_compression.rs[DM7L]: F:摘要压缩：把长对话压缩成摘要并保留续接点 | R:code:crates/memory/src/compression/deep.rs | A:压缩与摘要入口 | S:摘要必须保留可续接的语义锚点
-tool_plane.rs[DW9L]: F:受治理工具波次执行：计划事件持久化、根节点活动运行时、原始动作所有者与单次已校验输入 | R:code:crates/runtime/src/conversation/turn_engine.rs | A:VerifiedRootActionOwner 携带原始票据与生产者事件 | S:原始动作所有者只能由真实 tick 与生产者构造；根节点未真正启动时不得声称已有绑定；批次准入要求原票据、回合作用域、服务与提交所有者四者齐备，缺一即拒绝
+tool_plane.rs[DW9L]: F:受治理工具波次执行：计划事件持久化、根节点活动运行时、原始动作所有者与单次已校验输入 | R:code:crates/runtime/src/conversation/turn_engine.rs | A:VerifiedRootActionOwner 携带原始票据与生产者事件 | S:原始动作所有者只能由真实 tick 与生产者构造；根节点未真正启动时不得声称已有绑定；批次准入要求原票据、回合作用域、服务与提交所有者四者齐备，缺一即拒绝；回合策略重定向对每个受治理批次执行，不只 owner-less 批次
 turn_engine.rs[DW9L]: F:回合引擎：回合构造、策略、会话与压缩控制，单次生产者捕获与已校验输入 | R:code:crates/runtime/src/conversation/tool_plane.rs | A:OriginalSingleProducerCapture 绑定决定与权限上下文 | S:生产者与提交所有者必须逐字段认证后才能提交；缺少回合取消控制时取消查询必须报错而不是默认未取消
 turn_inbox.rs[DW7M]: F:回合收件箱：检查点引导与上下文项、已认证的目标输入 | R:code:crates/runtime/src/conversation/turn_engine.rs | A:authenticated_goal_inputs 校验来源键 | S:目标输入必须与原始查询端口返回的会话记录一致
 workspace_scopes.rs[DS7L]: F:工作区资源作用域：按目标中的显式文件目标推导精确作用域 | R:code:crates/runtime/src/conversation/tool_plane.rs | A:explicit_workspace_resource_scopes 为入口 | S:作用域只防止工具越出工作区或悄悄放宽租约，不决定工作分解
@@ -1248,14 +1248,14 @@ mod.rs[DW9T]: F:执行图模块根：提交服务、编译、执行器、恢复�
 override_custody.rs[DW8L]: F:覆盖终态托管：把干预造成的短路节点封成覆盖终态，含封条、静默与释放 | R:code:crates/runtime/src/execution_core/graph/executors/synthesize.rs | A:OVERRIDE_TERMINAL_NODE_SUFFIXES 十项；静默释放 15 分钟 | S:封条必须基于真实终态事实，不得掩盖未运行的节点
 recovery.rs[DR8M]: F:图恢复：在物理闭合预算内重试并恢复节点状态 | R:code:crates/runtime/src/execution_core/graph/commit_service.rs | A:PHYSICAL_CLOSURE_RETRY_PAUSE=25ms | S:恢复有预算，busy-wait 不得超过；可重试的闭合错误（源在证明下移动等）在预算内重试，已关闭绑定分支与开放绑定分支必须同构，不能提前把重试错误抛给调用方
 registry.rs[DW8L]: F:执行器注册表：按节点种类解析执行器与后端 | R:code:crates/runtime/src/execution_core/graph/executors/mod.rs | A:注册与解析入口 | S:注册表只解析，不执行
-runner.rs[DW9L]: F:图运行器：泵循环、取消所有者与任务驱动 | R:code:crates/runtime/src/execution_core/graph/commit_service.rs | A:ExecutionGraphRunner 与 OriginalPumpTask | S:运行器只推进，不代写终态；终态提交失败时必须先发持久取消产生退役记录，否则回调永远停在 Pending、after_abort 不会执行
+runner.rs[DW9L]: F:图运行器：泵循环、取消所有者与任务驱动 | R:code:crates/runtime/src/execution_core/graph/commit_service.rs | A:ExecutionGraphRunner 与 OriginalPumpTask | S:运行器只推进，不代写终态；终态提交失败时必须先发持久取消产生退役记录，否则回调永远停在 Pending、after_abort 不会执行；隔离失败的提交沿用该节点已密封的 no_dispatch 事实，不另造失败结果
 state_store.rs[DP8L]: F:图状态存储：节点状态与尝试的持久读写 | R:code:crates/runtime/src/execution_core/graph/commit_pipeline.rs | A:状态存储入口 | S:状态写入必须经提交管线
 tests.rs[TQ8L]: F:执行图测试 | R:code:crates/runtime/src/execution_core/graph/runner.rs | A:测试模块 | S:覆盖提交与恢复；单靠置状态为 Running 造不出托管，需真正启动过的尝试，这类用例按事实停用
 tool_receipt_query.rs[DP7L]: F:工具回执查询：按票据与调用查已持久回执 | R:code:crates/runtime/src/execution_core/graph/commit_service.rs | A:查询入口 | S:回执查询只读；查询必须返回与提交时同一份回执，不得把已提交证据的归属改写成重放标记，重放标记只属于执行路径上的现场重放
 
 ===/<repository>/crates/runtime/src/execution_core/graph/executors/===
 agent.rs[DW8L]: F:Agent 节点执行器：驱动 Agent 后端并产出节点结果 | R:code:crates/runtime/src/execution_core/graph/executors/agent_tool.rs | A:实现 NodeExecutor | S:执行器只驱动后端，不拥有图状态
-agent_tool.rs[DW7L]: F:Agent 工具执行器：受治理工具批次的节点执行 | R:code:crates/runtime/src/execution_core/graph/executors/agent.rs | A:实现 NodeExecutor | S:工具批次受治理与授权约束
+agent_tool.rs[DW7L]: F:Agent 工具执行器：受治理工具批次的节点执行 | R:code:crates/runtime/src/execution_core/graph/executors/agent.rs | A:实现 NodeExecutor | S:工具批次受治理与授权约束；一个票据只保留一个 NoDispatch 密封事实，重复 finish 不得按当时拒绝集合重新密封
 agentic_program_wait.rs[DW9L]: F:程序等待执行器：以外部等待等待程序屏障，检查冻结子集与持久事实后解除 | R:code:crates/runtime/src/execution_core/graph/executors/agent_tool.rs | A:WaitingExternal 只能由匹配外部分辨离开 | S:只有拥有真实持久外部依赖的执行器才可等待外部；解除条件以处置记录里的 reason 为准（all_tasks_accepted、task_stranded、worker_quiescent）；搁浅判定只认“无空闲可用成员”的延迟记账，而成员占用只来自真实 retained run，仅装租约不算占用
 approval.rs[DW7L]: F:审批节点执行器：等待审批决定并产出结果 | R:code:crates/runtime/src/execution_core/graph/executors/agent.rs | A:实现 NodeExecutor | S:审批等待必须由决定唤醒
 materialize.rs[DW7L]: F:物化节点执行器：消费同图已提交前驱结果，写入工作区并产出物化回执 | R:code:crates/runtime/src/execution_core/graph/executors/verify.rs | A:KIND=materialize；new(state_store, workspace_root) | S:只消费同图已提交结果，不重算上游
