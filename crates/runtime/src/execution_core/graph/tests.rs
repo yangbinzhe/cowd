@@ -4992,7 +4992,6 @@ async fn process_side_effect_hook_runs_only_after_graph_commit() {
 }
 
 #[tokio::test]
-#[ignore = "unresolved: a pending post-commit callback outlasts the 100ms command bound in this fixture"]
 async fn post_commit_callback_never_holds_graph_coordination_lock() {
     let (registry, state, commits) = harness();
     let entered = Arc::new(Notify::new());
