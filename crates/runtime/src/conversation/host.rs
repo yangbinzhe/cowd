@@ -5886,7 +5886,7 @@ struct PersistedToolBatch {
     continue_with_tool_batch: bool,
 }
 
-fn encode_tool_calls_with_continuation(
+pub(crate) fn encode_tool_calls_with_continuation(
     session_id: &str,
     calls: &[ModelToolCall],
     continue_with_tool_batch: bool,

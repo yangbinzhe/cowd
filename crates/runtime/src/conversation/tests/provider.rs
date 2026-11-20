@@ -4462,6 +4462,9 @@ fn explicit_team_obligation_survives_a_non_collaboration_setup_batch() {
 
 #[tokio::test]
 async fn parallel_network_tool_batch_is_admitted_by_the_retargeted_strategy_lease() {
+    if crate::test_support::skip_if_env_absent("COWD_TEST_POSTGRES_URL") {
+        return;
+    }
     let executions = Arc::new(AtomicUsize::new(0));
     let observed = Arc::clone(&executions);
     let event_store = Arc::new(RuntimeEventStore::for_test());
@@ -4475,13 +4478,127 @@ async fn parallel_network_tool_batch_is_admitted_by_the_retargeted_strategy_leas
             turn_id: "parallel-network-turn".into(),
         },
     );
-    let bus = CowdEventBus::new();
-    let _scope = bus.enter_execution(crate::CowdExecutionContext {
-        execution_id: "parallel-network-execution".to_string(),
-        session_id: "parallel-network-session".to_string(),
-        turn_id: "parallel-network-turn".to_string(),
+    // A governed tool batch is admitted only under the graph owner that holds
+    // its original ticket, turn scope and commit owner. Calling the batch step
+    // directly leaves all four absent, so nothing is ever executed and the
+    // turn strategy retarget is never even consulted. Run the batch the way
+    // production does: a registered graph node, started, with the batch
+    // executed under that exact activity binding.
+    let services = crate::RuntimeServices::test_builder(
+        std::env::temp_dir().join("parallel-network-home"),
+        std::env::current_dir().expect("workspace"),
+    )
+    .build()
+    .expect("parallel network runtime services");
+    let store = services.event_store().clone();
+    let commits = services.commit_service().clone();
+    let execution_id = "parallel-network-execution";
+    let mut graph = harness_contract::execution_graph::ExecutionGraph::new(
+        "gather external standards evidence",
+    );
+    graph.id = execution_id.to_string();
+    graph.lineage = Some(harness_contract::execution_graph::ExecutionGraphLineage {
+        session_id: "parallel-network-session".into(),
+        turn_id: "parallel-network-turn".into(),
+        root_task_id: "parallel-network-task".into(),
+        task_id: "parallel-network-task".into(),
+        generation: 1,
     });
+    let batch_calls = [
+        "technical standard official",
+        "technical standard maintainers",
+    ]
+    .into_iter()
+    .enumerate()
+    .map(|(index, query)| ModelToolCall {
+        binding: None,
+        id: format!("search-{index}"),
+        name: "web_search".to_string(),
+        input: serde_json::json!({ "query": query }).to_string(),
+        depends_on: Vec::new(),
+    })
+    .collect::<Vec<_>>();
+    let mut batch_node = harness_contract::execution_graph::ExecutionNodeSpec::new(
+        harness_contract::execution_graph::ExecutionNodeKind::ToolBatch,
+        "tool_batch",
+        crate::host::encode_tool_calls_with_continuation(
+            "parallel-network-session",
+            &batch_calls,
+            false,
+        )
+            .expect("encode network batch"),
+    );
+    batch_node.id = "parallel-network-batch".to_string();
+    graph.nodes.push(batch_node.clone());
+    let runner = crate::execution_core::graph::ExecutionGraphRunner::new(
+        services.executor_registry().clone(),
+        services.graph_state_store().clone(),
+        commits.clone(),
+        services.resource_manager().clone(),
+        services.scope_locks().clone(),
+        services.worktree_leases().clone(),
+        services.workspace_key(),
+        services.workspace_root(),
+    );
+    let mut graph = runner.register(graph).await.expect("register network graph");
+    for status in [
+        harness_contract::execution_graph::ExecutionNodeStatus::Ready,
+        harness_contract::execution_graph::ExecutionNodeStatus::Running,
+    ] {
+        graph = commits
+            .transition_node(&graph, &batch_node.id, status, None, Vec::new())
+            .expect("network batch node transition")
+            .graph;
+    }
+    let attempt = graph.recovery_cursor.node_attempts[&batch_node.id];
+    let ticket = crate::execution_core::NodeExecutionTicket {
+        graph_id: graph.id.clone(),
+        node_id: batch_node.id.clone(),
+        executor_kind: batch_node.executor_kind.clone(),
+        service_class: graph.service_class,
+        attempt,
+        idempotency_key: batch_node.idempotency_key.clone(),
+        payload_ref: batch_node.payload_ref.clone(),
+    };
+    let binding = store
+        .latest_for_stream(&format!("{}:node:{}", graph.id, batch_node.id))
+        .expect("network node activity stream")
+        .and_then(|event| event.activity_binding())
+        .expect("network node activity binding");
+    let bus = CowdEventBus::new();
+    let _scope = bus.enter_execution_with_activity(
+        crate::CowdExecutionContext {
+            execution_id: execution_id.to_string(),
+            session_id: "parallel-network-session".to_string(),
+            turn_id: "parallel-network-turn".to_string(),
+        },
+        Some(binding.clone()),
+    );
     let mut receiver = bus.subscribe();
+    let sessions = Arc::new(crate::test_support::session_store());
+    sessions
+        .create_session(&session::SessionRecord {
+            session_id: "parallel-network-session".into(),
+            platform: "test".into(),
+            chat_id: "parallel-network".into(),
+            user_id: None,
+            model: None,
+            created_at: "2026-11-20T00:00:00Z".into(),
+            last_activity: "2026-11-20T00:00:00Z".into(),
+            message_count: 0,
+            reset_policy: "manual".into(),
+            metadata_json: None,
+            input_tokens: 0,
+            output_tokens: 0,
+            status: "active".into(),
+        })
+        .await
+        .expect("parallel network session record");
+    let mut session = session;
+    session.session_id = "parallel-network-session".into();
+    let artifacts = std::sync::Arc::new(crate::ArtifactStore::for_test_default(
+        std::env::temp_dir().join("parallel-network-artifacts"),
+    ));
     let runtime = ConversationRuntime::new(
         session,
         MockApi,
@@ -4494,6 +4611,10 @@ async fn parallel_network_tool_batch_is_admitted_by_the_retargeted_strategy_leas
     )
     .without_memory()
     .with_cowd_event_bus(bus)
+    .with_artifact_store(artifacts)
+    .with_session_journal_port(crate::session_runtime_port::TestSessionPortAdapter::new(
+        sessions,
+    ))
     .with_runtime_event_store(event_store);
     runtime
         .begin_turn_strategy("turn-network-batch", "继续")
@@ -4513,8 +4634,23 @@ async fn parallel_network_tool_batch_is_admitted_by_the_retargeted_strategy_leas
     })
     .collect::<Vec<_>>();
 
-    let result = runtime
-        .execute_tool_batch_step(&calls, &crate::SharedPrompter::none(), 1)
+    let turn_state = Arc::new(tokio::sync::Mutex::new(crate::host::tests::r1_branch_state(
+        "parallel-network-session",
+        "parallel-network-goal",
+    )));
+    let (result, _) = runtime
+        .execute_tool_batch_step_with_owner(
+            &calls,
+            &crate::SharedPrompter::none(),
+            1,
+            &std::collections::BTreeMap::new(),
+            &std::collections::BTreeMap::new(),
+            Some(&(binding.clone(), attempt)),
+            Some(&ticket),
+            Some(&turn_state),
+            Some(&services),
+            Some(&commits),
+        )
         .await
         .expect("network batch execution");
     let strategy = runtime

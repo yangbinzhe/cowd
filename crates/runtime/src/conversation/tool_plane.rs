@@ -2685,19 +2685,14 @@ where
         admission_plan
             .tasks
             .retain(|task| !replays.contains_key(&task.tool_call_id) && !original_replays.contains_key(&task.tool_call_id));
-        // An owner-less batch is a direct call: no provider turn produced it, so
-        // no earlier provider step retargeted the turn strategy for the
-        // concrete effects about to execute. The lease still validates the
-        // batch against the turn's current decision, and the current decision
-        // is the one the strategy engine produces from this batch's own
-        // requirements - network access, mutation and parallelism are the same
-        // properties the provider path retargets on. Binding the decision in
-        // the provider turn only would leave every direct batch judged by a
-        // guess the turn could not have known, and refuse them as if the turn
-        // strategy were narrower than its own effects.
-        if owner.is_none() && ticket.is_none() {
-            self.retarget_active_turn_strategy_for_governed_plan(&admission_plan, calls)?;
-        }
+        // The decision that validates this batch is derived from the batch
+        // itself: network access, mutation and parallelism are exactly the
+        // properties the strategy engine retargets on, and the provider path
+        // does the same for the turn it produces. A batch judged by a guess
+        // taken before its own effects were known is refused as if the turn
+        // strategy were narrower than the work it is already doing - for an
+        // owner-less direct call and for a graph-owned batch alike.
+        self.retarget_active_turn_strategy_for_governed_plan(&admission_plan, calls)?;
         let decision = self
             .active_turn_strategy()
             .map(|state| state.decision)

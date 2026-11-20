@@ -1258,13 +1258,16 @@ where
                     .cowd_bus
                     .as_ref()
                     .and_then(|bus| bus.current_execution_context());
+                let evidence_execution_id = self
+                    .execution_identity
+                    .as_ref()
+                    .and_then(|identity| identity.graph_id().map(str::to_string))
+                    .or_else(|| execution_epoch.as_ref().map(|context| context.execution_id.clone()))
+                    .unwrap_or_default();
                 request.provider_evidence_context = Some(crate::ProviderRequestEvidenceContext {
             graph_owner: self.root_effect_owner().ok().map(|(activity, attempt)| Box::new(crate::provider_runtime_client::ProviderGraphOwner { activity, attempt })),
                     session_id: self.session_id().to_string(),
-                    execution_id: execution_epoch
-                        .as_ref()
-                        .map(|context| context.execution_id.clone())
-                        .unwrap_or_default(),
+                    execution_id: evidence_execution_id,
                     turn_id: execution_epoch
                         .as_ref()
                         .map(|context| context.turn_id.clone())
