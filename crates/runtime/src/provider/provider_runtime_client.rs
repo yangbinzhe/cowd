@@ -2403,6 +2403,13 @@ fn compile_provider_input_messages(
 /// switch. Comparing those two numbering spaces rejects every attempt after
 /// the first: the bound step keeps its own attempt while the counter moves on,
 /// so the recovery chain stops at the first replan instead of resuming.
+///
+/// The execution reference is compared in one normalized form on both sides.
+/// A run-scoped reference (`run:<graph id>`) and the graph id itself name the
+/// same execution, and the runtime carries both spellings: the step identity
+/// keeps the graph id while the conversation runtime rebuilds its execution
+/// identity from the run-scoped reference. Comparing the raw strings rejects
+/// every delegated agent, so both sides are reduced to the graph id first.
 fn bound_step_evidence_mismatch(
     context: Option<&ProviderRequestEvidenceContext>,
     snapshot: &harness_contract::step::StepSnapshot,
@@ -2410,9 +2417,23 @@ fn bound_step_evidence_mismatch(
     let Some(context) = context else {
         return true;
     };
-    context.session_id != snapshot.identity.session_id
+    let step_execution = snapshot.identity.execution_id.as_deref().unwrap_or_default();
+    let mismatched = context.session_id != snapshot.identity.session_id
         || context.turn_id != snapshot.identity.turn_id
-        || context.execution_id != snapshot.identity.execution_id.as_deref().unwrap_or_default()
+        || crate::execution_core::graph::graph_id_for_lookup(&context.execution_id)
+            != crate::execution_core::graph::graph_id_for_lookup(step_execution);
+    if mismatched {
+        eprintln!(
+            "bound provider step evidence mismatch: session {:?}/{:?} turn {:?}/{:?} execution {:?}/{:?}",
+            context.session_id,
+            snapshot.identity.session_id,
+            context.turn_id,
+            snapshot.identity.turn_id,
+            context.execution_id,
+            step_execution,
+        );
+    }
+    mismatched
 }
 
 async fn forward_provider_attempt(
@@ -4554,6 +4575,38 @@ mod tests {
             super::ProviderStreamError::unbound(error)
                 .protocol_diagnostic
                 .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn bound_step_accepts_a_run_prefixed_execution_reference() {
+        let root = tempfile::tempdir().unwrap();
+        let (_, request) = step_wire_fixture("http://127.0.0.1:1/v1".into(), root.path());
+        let bound = request.bound_step.as_ref().expect("fixture binds a step");
+        let snapshot = bound.snapshot();
+        let mut context = request
+            .provider_evidence_context
+            .clone()
+            .expect("fixture carries evidence context");
+        let step_execution = snapshot
+            .identity
+            .execution_id
+            .clone()
+            .expect("the bound step carries an execution id");
+        context.execution_id = format!("run:{step_execution}");
+        assert!(
+            !super::bound_step_evidence_mismatch(Some(&context), &snapshot),
+            "a run-scoped reference to the bound step's execution must stay admissible"
+        );
+        context.execution_id = format!("run:{}", "agentic-graph:someone-else");
+        assert!(
+            super::bound_step_evidence_mismatch(Some(&context), &snapshot),
+            "a run-scoped reference to a different execution must still be refused"
+        );
+        context.execution_id = "agentic-graph:someone-else".to_string();
+        assert!(
+            super::bound_step_evidence_mismatch(Some(&context), &snapshot),
+            "a foreign execution must still be refused"
         );
     }
 

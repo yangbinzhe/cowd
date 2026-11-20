@@ -2006,7 +2006,12 @@ where
                         &owner.task_id,
                         &owner.session_id,
                         &owner.turn_id,
-                        &ticket.graph_id,
+                        // The canonical graph id, never the run-scoped
+                        // reference. The task graph identity carries the graph
+                        // id; a run reference in this field makes every
+                        // delegated agent's execution identity differ from the
+                        // bound provider step that names the same execution.
+                        crate::execution_core::graph::graph_id_for_lookup(&ticket.graph_id),
                     )
                     .map_err(|error| RuntimeError::new(error.to_string()))?,
                 );
