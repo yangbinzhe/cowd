@@ -4788,6 +4788,11 @@ async fn review_rejects_a_goal_from_another_program_even_with_matching_wording()
         &reviewer,
         AgentAction::StateInspect(StateInspectInput::default()),
     );
+    // The rejection is asserted to leave the durable commit cursor untouched.
+    // Background runtime maintenance also commits, so it must be shut down
+    // before the cursor is sampled; otherwise the assertion races a task that
+    // lands inside the window whenever this test runs after heavier siblings.
+    services.shutdown_maintenance().await;
     let before = service.project("program-1").unwrap();
     let cursor = store.durable_commit_cursor().unwrap();
     let receipt = service
@@ -4839,6 +4844,9 @@ async fn rework_without_operator_wording_is_refused() {
         &reviewer,
         AgentAction::StateInspect(StateInspectInput::default()),
     );
+    // Background runtime maintenance also commits; stop it before sampling the
+    // cursor so the refusal assertion cannot race a maintenance write.
+    services.shutdown_maintenance().await;
     let before = service.project("program-1").unwrap();
     let cursor = store.durable_commit_cursor().unwrap();
     let refused = service
