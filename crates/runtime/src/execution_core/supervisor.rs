@@ -3479,7 +3479,7 @@ mod completion_pump_tests {
     }
 
     #[tokio::test]
-    #[ignore = "unresolved: 58 concurrent ready nodes reach `original owner coordination deadline expired` under this capacity"]
+    #[ignore = "unresolved: 58 concurrent ready nodes exhaust the 60s physical-closure budget (62.9-63.4s); measured that shutdown_impl is never entered, coordinate_original_gate records only 2 GATE_OK, and the pump loop count is 0 — the lead is load/closure accounting under a current_thread runtime, not a lock or a lost wakeup"]
     async fn completion_pump_keeps_mixed_ready_utilization_above_ninety_percent() {
         const READY: usize = 58;
         const CAPACITY: usize = 64;
@@ -3648,7 +3648,7 @@ mod completion_pump_tests {
     }
 
     #[tokio::test]
-    #[ignore = "unresolved: an executor panic propagates out of the runner instead of becoming a failed node result"]
+    #[ignore = "unresolved: this oracle contradicts node_panic_does_not_terminate_unrelated_ready_nodes, which pins panic as custody-unknown (node stays Running, error exposes `original pump task panicked`); making a panic a failed node result would break that pinned product stance"]
     async fn node_panic_returns_materialize_quota_before_another_graph_needs_it() {
         let workspace = tempfile::tempdir().unwrap();
         let executor = Arc::new(PumpTestExecutor::new([]).with_panic_node("panic-node"));

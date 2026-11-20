@@ -2395,6 +2395,48 @@ fn compile_provider_input_messages(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Refuse a bound step whose durable wire evidence names a different owner.
+///
+/// A bound step pins its own Runtime-owned attempt identity. The request-side
+/// `ProviderRequestEvidenceContext::attempt` is a provider counter scoped to
+/// one model-step operation, and it advances on every retry, replan and model
+/// switch. Comparing those two numbering spaces rejects every attempt after
+/// the first: the bound step keeps its own attempt while the counter moves on,
+/// so the recovery chain stops at the first replan instead of resuming.
+///
+/// The execution reference is compared in one normalized form on both sides.
+/// A run-scoped reference (`run:<graph id>`) and the graph id itself name the
+/// same execution, and the runtime carries both spellings: the step identity
+/// keeps the graph id while the conversation runtime rebuilds its execution
+/// identity from the run-scoped reference. Comparing the raw strings rejects
+/// every delegated agent, so both sides are reduced to the graph id first.
+fn bound_step_evidence_mismatch(
+    context: Option<&ProviderRequestEvidenceContext>,
+    snapshot: &harness_contract::step::StepSnapshot,
+) -> bool {
+    let Some(context) = context else {
+        return true;
+    };
+    let step_execution = snapshot.identity.execution_id.as_deref().unwrap_or_default();
+    let mismatched = context.session_id != snapshot.identity.session_id
+        || context.turn_id != snapshot.identity.turn_id
+        || crate::execution_core::graph::graph_id_for_lookup(&context.execution_id)
+            != crate::execution_core::graph::graph_id_for_lookup(step_execution);
+    if mismatched {
+        tracing::warn!(
+            target: "cowd::provider_wire",
+            context_session = %context.session_id,
+            step_session = %snapshot.identity.session_id,
+            context_turn = %context.turn_id,
+            step_turn = %snapshot.identity.turn_id,
+            context_execution = %context.execution_id,
+            step_execution = %step_execution,
+            "bound provider step evidence mismatch"
+        );
+    }
+    mismatched
+}
+
 async fn forward_provider_attempt(
     entry: ProviderEntry,
     prompt_composition: Option<crate::PromptComposition>,
@@ -2434,20 +2476,8 @@ async fn forward_provider_attempt(
     // the definitions, so it is comparable with `model_visible_prompt_bytes`.
     let step_render = if let Some(step) = &bound_step {
         let snapshot = step.snapshot();
-        if evidence_context.as_ref().is_none_or(|context| {
-            context.session_id != snapshot.identity.session_id
-                || context.turn_id != snapshot.identity.turn_id
-                || context.execution_id
-                    != snapshot
-                        .identity
-                        .execution_id
-                        .as_deref()
-                        .unwrap_or_default()
-                || snapshot
-                    .identity
-                    .attempt
-                    .is_some_and(|attempt| context.attempt != attempt)
-        }) || evidence_writer.is_none()
+        if bound_step_evidence_mismatch(evidence_context.as_ref(), &snapshot)
+            || evidence_writer.is_none()
         {
             return Err(RuntimeError::new(
                 "bound provider step requires matching durable wire evidence",
@@ -4550,6 +4580,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn bound_step_accepts_a_run_prefixed_execution_reference() {
+        let root = tempfile::tempdir().unwrap();
+        let (_, request) = step_wire_fixture("http://127.0.0.1:1/v1".into(), root.path());
+        let bound = request.bound_step.as_ref().expect("fixture binds a step");
+        let snapshot = bound.snapshot();
+        let mut context = request
+            .provider_evidence_context
+            .clone()
+            .expect("fixture carries evidence context");
+        let step_execution = snapshot
+            .identity
+            .execution_id
+            .clone()
+            .expect("the bound step carries an execution id");
+        context.execution_id = format!("run:{step_execution}");
+        assert!(
+            !super::bound_step_evidence_mismatch(Some(&context), &snapshot),
+            "a run-scoped reference to the bound step's execution must stay admissible"
+        );
+        context.execution_id = format!("run:{}", "agentic-graph:someone-else");
+        assert!(
+            super::bound_step_evidence_mismatch(Some(&context), &snapshot),
+            "a run-scoped reference to a different execution must still be refused"
+        );
+        context.execution_id = "agentic-graph:someone-else".to_string();
+        assert!(
+            super::bound_step_evidence_mismatch(Some(&context), &snapshot),
+            "a foreign execution must still be refused"
+        );
+    }
+
+    #[tokio::test]
+    async fn bound_step_accepts_a_provider_attempt_that_advances_past_its_own_attempt() {
+        let root = tempfile::tempdir().unwrap();
+        let (_, request) = step_wire_fixture("http://127.0.0.1:1/v1".into(), root.path());
+        let bound = request.bound_step.as_ref().expect("fixture binds a step");
+        let snapshot = bound.snapshot();
+        let mut context = request
+            .provider_evidence_context
+            .clone()
+            .expect("fixture carries evidence context");
+        context.attempt = 1;
+        assert!(
+            !super::bound_step_evidence_mismatch(Some(&context), &snapshot),
+            "the bound step's own attempt must be admitted"
+        );
+        context.attempt = 2;
+        assert!(
+            !super::bound_step_evidence_mismatch(Some(&context), &snapshot),
+            "a replan or model switch advances the provider counter, not the bound step; it must stay admissible"
+        );
+        let mut foreign = context.clone();
+        foreign.turn_id = "turn:someone-else".into();
+        assert!(
+            super::bound_step_evidence_mismatch(Some(&foreign), &snapshot),
+            "a foreign turn must still be refused"
+        );
+        assert!(
+            super::bound_step_evidence_mismatch(None, &snapshot),
+            "a missing evidence context must still be refused"
+        );
+    }
+
     async fn r189_physical_wire_rejects_wrong_attempt_old_open_and_missing_requested() {
         let root = tempfile::tempdir().unwrap();
         let (_, request) = step_wire_fixture("http://127.0.0.1:1/v1".into(), root.path());

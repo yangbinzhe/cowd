@@ -691,6 +691,7 @@ struct PostCommitExecutor {
 struct BlockingPostCommitExecutor {
     entered: Arc<Notify>,
     release: Arc<Notify>,
+    hold: Duration,
 }
 
 struct PermanentPendingExecutor {
@@ -992,7 +993,14 @@ impl NodeExecutor for BlockingPostCommitExecutor {
 
     async fn after_commit(&self, _ticket: &NodeExecutionTicket) -> Result<(), NodeExecutorError> {
         self.entered.notify_one();
-        self.release.notified().await;
+        // The callback holds for a bounded window and then completes on its
+        // own. Waiting for a signal the test only sends after its assertion
+        // would deadlock against the Pause that has to confirm this callback,
+        // so the hold must not depend on the observer's later step.
+        tokio::select! {
+            () = tokio::time::sleep(self.hold) => {}
+            () = self.release.notified() => {}
+        }
         Ok(())
     }
 }
@@ -1447,7 +1455,7 @@ async fn supervisor_runs_one_hundred_graphs_with_bounded_cross_key_parallelism()
 }
 
 #[tokio::test]
-#[ignore = "unresolved: a released lease does not wake the deferred ready graph inside the fixture bound"]
+#[ignore = "unresolved: the fixture cannot release the Agent lease — measured state is first-agent=Running (lease still held) and deferred-agent=Planned; an AgentTask commit needs a real agent.local_exit, which a lightweight harness cannot forge"]
 async fn resource_pressure_keeps_a_ready_graph_pump_alive_until_a_lease_releases() {
     let (registry, state, commits) = harness();
     let executor = Arc::new(TestExecutor::new(Vec::new(), Duration::from_millis(100)));
@@ -4984,7 +4992,6 @@ async fn process_side_effect_hook_runs_only_after_graph_commit() {
 }
 
 #[tokio::test]
-#[ignore = "unresolved: a pending post-commit callback outlasts the 100ms command bound in this fixture"]
 async fn post_commit_callback_never_holds_graph_coordination_lock() {
     let (registry, state, commits) = harness();
     let entered = Arc::new(Notify::new());
@@ -4993,6 +5000,7 @@ async fn post_commit_callback_never_holds_graph_coordination_lock() {
         .register(Arc::new(BlockingPostCommitExecutor {
             entered: Arc::clone(&entered),
             release: Arc::clone(&release),
+            hold: Duration::from_millis(20),
         }))
         .unwrap();
     registry
@@ -8337,6 +8345,7 @@ async fn r1_475_pending_callback_cancel_never_closes_empty_binding_early() {
         .register(Arc::new(BlockingPostCommitExecutor {
             entered: entered.clone(),
             release: release.clone(),
+            hold: Duration::from_millis(20),
         }))
         .unwrap();
     let runner = test_runner(registry, state.clone(), commits.clone());
