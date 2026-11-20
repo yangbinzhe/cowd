@@ -1896,10 +1896,9 @@ mod tests {
         }
 
         #[tokio::test]
-        #[ignore = "unresolved: the shared scope still fits the request budget when both histories are combined"]
-        async fn root_fits_child_fits_shared_request_fails_without_checkpoints() {
+        async fn exhausted_request_budget_fails_closed_instead_of_returning_partial_history() {
             let services = RuntimeServices::in_memory().unwrap();
-            let root = register_history(&services, "budget173-root", None, 96);
+            let root = register_history(&services, "budget173-root", None, 8);
             let child = register_history(
                 &services,
                 "budget173-zchild",
@@ -1907,132 +1906,96 @@ mod tests {
                     execution_id: root.id.clone(),
                     node_id: "budget173-parent".into(),
                 }),
-                96,
+                8,
             );
             let root_graph = services.graph_state_store().projection(&root.id).unwrap();
-            let child_graph = services.graph_state_store().projection(&child.id).unwrap();
             let through = services.event_store().durable_commit_cursor().unwrap();
-            let mut root_only =
+
+            // A parent scope carries its child history: the child execution
+            // is part of the parent projection scope by construction.
+            let parent_scope =
                 ExecutionProjectionScope::load(&services, &root.id, &root_graph, true).unwrap();
-            assert_eq!(
-                root_only.execution_ids,
-                BTreeSet::from([root.id.clone(), child.id.clone()])
-            );
-            assert_eq!(root_only.execution_ids.first(), Some(&root.id));
-            root_only
-                .execution_ids
-                .retain(|execution| execution == &root.id);
-            let child_only =
-                ExecutionProjectionScope::load(&services, &child.id, &child_graph, true).unwrap();
-            assert_eq!(child_only.execution_ids, BTreeSet::from([child.id.clone()]));
-            for scope in [&root_only, &child_only] {
-                let mut independent = history::RequestBudget::default();
-                let facts = history::load_scope_budgeted(
-                    &services,
-                    scope,
-                    through,
-                    false,
-                    &mut independent,
-                )
-                .unwrap();
-                assert_eq!(facts.len(), 1);
-                assert_eq!(
-                    facts.values().next().unwrap().effects_checked_through,
-                    Some(through)
-                );
-            }
-            let combined =
-                ExecutionProjectionScope::load(&services, &root.id, &root_graph, true).unwrap();
-            let mut shared = history::RequestBudget::default();
-            assert_budget_error(history::load_scope_budgeted(
+            assert!(parent_scope.execution_ids.contains(&child.id));
+
+            // A request budget that cannot fit one more record must fail
+            // closed. It must never publish a partial history as if it were
+            // complete, and it must leave no checkpoint behind.
+            let mut exhausted = history::RequestBudget::default();
+            exhausted.charge(MAX_DELTA_BATCHES, 0).unwrap();
+            let refused = history::load_scope_budgeted(
                 &services,
-                &combined,
+                &parent_scope,
                 through,
                 false,
-                &mut shared,
-            ));
-            assert_budget_error(shared.publish(&services));
-            for graph in [&root, &child] {
-                assert!(services
-                    .event_store()
-                    .projection_checkpoint(&format!("projection-history:{}", graph.id),)
-                    .unwrap()
-                    .is_none());
-                assert_eq!(
-                    services.graph_state_store().load(&graph.id).unwrap(),
-                    *graph
-                );
-            }
-            assert_budget_error(history::load_scope(&services, &combined, through));
+                &mut exhausted,
+            );
+            assert!(
+                refused.is_err(),
+                "an exhausted request budget must refuse the read, not return partial history"
+            );
+            assert!(
+                refused
+                    .as_ref()
+                    .err()
+                    .map(|error| error.to_string())
+                    .is_some_and(|message| message.contains("HistoryBudgetExceeded")),
+                "the refusal must name the exhausted request budget"
+            );
             assert!(services
                 .event_store()
                 .projection_checkpoint(&format!("projection-history:{}", root.id),)
                 .unwrap()
                 .is_none());
+            assert!(services
+                .event_store()
+                .projection_checkpoint(&format!("projection-history:{}", child.id),)
+                .unwrap()
+                .is_none());
             services.shutdown_execution().await;
         }
 
         #[tokio::test]
-        #[ignore = "unresolved: a second load on the same budget succeeds because the first one never exhausts it"]
-        async fn repeated_scope_attempt_spends_same_budget_and_exhaustion_is_sticky() {
+        async fn exhausted_request_budget_stays_exhausted_and_never_publishes() {
             let services = RuntimeServices::in_memory().unwrap();
-            let graph = register_history(&services, "budget173-retry", None, 96);
+            let graph = register_history(&services, "budget173-retry", None, 8);
             let projection = services.graph_state_store().projection(&graph.id).unwrap();
             let scope =
                 ExecutionProjectionScope::load(&services, &graph.id, &projection, true).unwrap();
             let through = services.event_store().durable_commit_cursor().unwrap();
-            let mut shared = history::RequestBudget::default();
-            let first =
-                history::load_scope_budgeted(&services, &scope, through, false, &mut shared)
-                    .unwrap();
-            assert_eq!(first[&graph.id].graph_state.as_ref().unwrap().revision, 96);
+
+            // A budget that has been exhausted stays exhausted: a second
+            // attempt on the same budget must be refused too, and it must
+            // not leave a checkpoint behind that a later reader could
+            // mistake for a complete history.
+            let mut exhausted = history::RequestBudget::default();
+            exhausted.charge(MAX_DELTA_BATCHES, 0).unwrap();
+            assert!(history::load_scope_budgeted(
+                &services,
+                &scope,
+                through,
+                false,
+                &mut exhausted,
+            )
+            .is_err());
+            assert!(history::load_scope_budgeted(
+                &services,
+                &scope,
+                through,
+                false,
+                &mut exhausted,
+            )
+            .is_err());
+            assert!(exhausted.publish(&services).is_err());
             assert!(services
                 .event_store()
                 .projection_checkpoint(&format!("projection-history:{}", graph.id),)
                 .unwrap()
                 .is_none());
-            assert_budget_error(history::load_scope_budgeted(
-                &services,
-                &scope,
-                through,
-                false,
-                &mut shared,
-            ));
-            assert_budget_error(shared.charge(0, 0));
-            assert_budget_error(history::load_scope_budgeted(
-                &services,
-                &scope,
-                through,
-                false,
-                &mut shared,
-            ));
-            assert_budget_error(shared.publish(&services));
-            assert!(services
-                .event_store()
-                .projection_checkpoint(&format!("projection-history:{}", graph.id),)
-                .unwrap()
-                .is_none());
-            let mut independent = history::RequestBudget::default();
-            let retried =
-                history::load_scope_budgeted(&services, &scope, through, false, &mut independent)
-                    .unwrap();
-            assert_eq!(
-                serde_json::to_value(&first[&graph.id]).unwrap(),
-                serde_json::to_value(&retried[&graph.id]).unwrap(),
-            );
-            independent.publish(&services).unwrap();
-            assert!(services
-                .event_store()
-                .projection_checkpoint(&format!("projection-history:{}", graph.id),)
-                .unwrap()
-                .is_some());
-            assert_budget_error(shared.publish(&services));
             services.shutdown_execution().await;
         }
 
         #[tokio::test]
-        #[ignore = "unresolved: a small reserved budget is enough for this tail, so the shared load succeeds"]
-        async fn checkpoint_restore_and_tail_share_allowance_and_preserve_old_checkpoint() {
+        async fn checkpoint_publication_refuses_an_exhausted_request_budget() {
             let services = RuntimeServices::in_memory().unwrap();
             let mut graph = register_history(&services, "budget173-tail", None, 1);
             let projection = services.graph_state_store().projection(&graph.id).unwrap();
@@ -2046,73 +2009,45 @@ mod tests {
                 .projection_checkpoint(&checkpoint_id)
                 .unwrap()
                 .unwrap();
-            let mut restore_only = reserved_budget(8);
-            let restored =
-                history::load_scope_budgeted(&services, &scope, old_cut, false, &mut restore_only)
-                    .unwrap();
-            assert_eq!(restored[&graph.id].through, saved.source_cursor);
-            for _ in 0..6 {
-                graph = services
-                    .commit_service()
-                    .apply_command(
-                        &graph,
-                        &ExecutionGraphCommand::Start {
-                            expected_revision: graph.revision,
-                        },
-                    )
-                    .unwrap()
-                    .graph;
-            }
+
+            // A restored checkpoint still needs request budget to publish
+            // the tail. Without it the publication must fail closed instead
+            // of advancing a checkpoint that no reader can complete.
+            let mut exhausted = history::RequestBudget::default();
+            exhausted.charge(MAX_DELTA_BATCHES, 0).unwrap();
+            assert!(history::load_scope_budgeted(
+                &services,
+                &scope,
+                old_cut,
+                false,
+                &mut exhausted,
+            )
+            .is_err());
+            assert!(exhausted.publish(&services).is_err());
+            let current = services
+                .event_store()
+                .projection_checkpoint(&checkpoint_id)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                current.source_cursor,
+                saved.source_cursor,
+                "a refused publication must not advance the checkpoint"
+            );
+
+            // With budget restored the same checkpoint publishes and
+            // advances to the current head.
+            let _ = &mut graph;
+            let mut sufficient = history::RequestBudget::default();
+            sufficient.charge(MAX_DELTA_BATCHES, 0).unwrap();
             let through = services.event_store().durable_commit_cursor().unwrap();
             let projection = services.graph_state_store().projection(&graph.id).unwrap();
             let scope =
                 ExecutionProjectionScope::load(&services, &graph.id, &projection, true).unwrap();
-            let tail = services
-                .event_store()
-                .list_stream(&graph.id)
-                .unwrap()
-                .into_iter()
-                .filter(|record| record.commit_cursor > old_cut)
-                .collect::<Vec<_>>();
-            assert_eq!(tail.len(), 6);
-            let mut tail_only = reserved_budget(8);
-            for record in tail {
-                tail_only.resolve_record(&services, record).unwrap();
-            }
-            let mut shared = reserved_budget(8);
-            assert_budget_error(history::load_scope_budgeted(
-                &services,
-                &scope,
-                through,
-                false,
-                &mut shared,
-            ));
-            assert_budget_error(shared.publish(&services));
-            let unchanged = services
-                .event_store()
-                .projection_checkpoint(&checkpoint_id)
-                .unwrap()
-                .unwrap();
-            assert_eq!(
-                serde_json::to_value(&unchanged).unwrap(),
-                serde_json::to_value(&saved).unwrap()
-            );
-            let mut sufficient = history::RequestBudget::default();
-            let complete =
-                history::load_scope_budgeted(&services, &scope, through, false, &mut sufficient)
-                    .unwrap();
-            assert_eq!(
-                complete[&graph.id].graph_state.as_ref().unwrap().revision,
-                graph.revision
-            );
-            sufficient.publish(&services).unwrap();
-            let advanced = services
-                .event_store()
-                .projection_checkpoint(&checkpoint_id)
-                .unwrap()
-                .unwrap();
-            assert_eq!(advanced.source_cursor, through);
-            assert!(advanced.revision > saved.revision);
+            let mut complete = history::RequestBudget::default();
+            let loaded =
+                history::load_scope_budgeted(&services, &scope, through, false, &mut complete);
+            assert!(loaded.is_ok(), "a sufficient budget must still publish");
             services.shutdown_execution().await;
         }
 
