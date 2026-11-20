@@ -42,8 +42,18 @@ pub(super) fn execution_terminal_axes(
     let start = through;
     let mut axes = ExecutionTerminalAxes::default();
     if facts.values().any(|state| state.incomplete) {
+        // A graph this request could not finish reading leaves the verdict
+        // incomplete, but it does not erase a debt another graph already
+        // proved: an effect whose receipt is missing is unsettled whether or
+        // not some sibling history is still unread. Only when nothing read so
+        // far names a debt does the unread source make the answer unknown.
+        let known_debt = facts.values().any(|state| state.effect_missing_receipt);
         axes.execution.phase = TerminalExecutionPhase::Unknown;
-        axes.execution.settlement = TerminalEffectSettlement::Unknown;
+        axes.execution.settlement = if known_debt {
+            TerminalEffectSettlement::Unsettled
+        } else {
+            TerminalEffectSettlement::Unknown
+        };
         axes.execution.coverage_complete = false;
         axes.source_cursor = services.event_store().durable_commit_cursor()?;
         axes.source_race = axes.source_cursor != through;
