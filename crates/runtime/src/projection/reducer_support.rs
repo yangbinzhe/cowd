@@ -1306,6 +1306,31 @@ fn agentic_programs_for_executions(
         }
         programs.push(projection);
     }
+    if programs.is_empty() {
+        // A registered graph whose Program cannot be read must not surface as empty
+        // collaboration, and neither may a store that holds Program streams carrying
+        // no opening record. Both are corruption, not an absent Program: fail closed
+        // with `program_not_found` instead of presenting an empty collaboration.
+        let streams = services
+            .event_store()
+            .stream_ids_for_scope(RuntimeEventScope::Program)
+            .map_err(|error| RuntimeServicesError::Invariant(error.to_string()))?;
+        for stream in streams {
+            let total = services
+                .event_store()
+                .stream_event_count(&stream)
+                .map_err(|error| RuntimeServicesError::Invariant(error.to_string()))?;
+            let opened = services
+                .event_store()
+                .count_stream_kinds(&stream, &["agentic.program_opened"], through)
+                .map_err(RuntimeServicesError::Invariant)?;
+            if total > 0 && opened == 0 {
+                return Err(RuntimeServicesError::Invariant(format!(
+                    "program_not_found: Program stream `{stream}` carries no opening record"
+                )));
+            }
+        }
+    }
     Ok(programs)
 }
 

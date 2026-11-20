@@ -1147,7 +1147,7 @@ working_set.rs[DR7L]: F:工作集：模型工作偏好与私有笔记，源字�
 
 ===/<repository>/crates/runtime/src/context/evidence/===
 grep.rs[DR7L]: F:grep 读取窗口：复用原始获取与嵌套投递所有者，校验父效果范围与原始文件域 | R:code:crates/runtime/src/context/evidence/mod.rs | A:grep_read_target_for_parent 与 original_read_file_domain | S:同调用内的 grep 读取只复用既有获取，不新开范围
-mod.rs[DR9L]: F:证据读取域根：读取获取封条、读取块、投递等级与收件人、根读取所有者与投递材料 | R:code:crates/runtime/src/context/evidence/raw.rs | A:READ_CHUNK_SEAL_CAPACITY=256；原生与进程两种投递 kind | S:读取证据必须封条化，投递等级区分原生与进程
+mod.rs[DR9L]: F:证据读取域根：读取获取封条、读取块、投递等级与收件人、根读取所有者与投递材料 | R:code:crates/runtime/src/context/evidence/raw.rs | A:READ_CHUNK_SEAL_CAPACITY=256；child_read_acquisitions 产出子读获取记录，read_file 与 grep 窗口两类 | S:读取证据必须封条化，投递等级区分原生与进程；子读记录需自带 relative_path（read_file 分支从子调用自身 input.path 取），否则消费方只能又去 input 里掏路径；记录缺任何一项前置校验（父票据、描述符哈希、步骤绑定来源）时整个获取返回 None 而非部分记录
 projection.rs[DR6T]: F:证据审计投影：把运行时回执转成稳定审计视图 | R:code:crates/runtime/src/context/evidence/mod.rs | A:audit_projection 为唯一转换 | S:投影只读，不改变回执
 raw.rs[DR8L]: F:规范原始证据持久边界：原始字节与其摘要、读取与保留 | R:code:crates/runtime/src/context/evidence/mod.rs | A:未经持久化的原始内容不可裁剪 | S:原始证据必须可独立检索，才允许从上下文移除
 
@@ -1256,7 +1256,7 @@ tool_receipt_query.rs[DP7L]: F:工具回执查询：按票据与调用查已持�
 ===/<repository>/crates/runtime/src/execution_core/graph/executors/===
 agent.rs[DW8L]: F:Agent 节点执行器：驱动 Agent 后端并产出节点结果 | R:code:crates/runtime/src/execution_core/graph/executors/agent_tool.rs | A:实现 NodeExecutor | S:执行器只驱动后端，不拥有图状态
 agent_tool.rs[DW7L]: F:Agent 工具执行器：受治理工具批次的节点执行 | R:code:crates/runtime/src/execution_core/graph/executors/agent.rs | A:实现 NodeExecutor | S:工具批次受治理与授权约束
-agentic_program_wait.rs[DW9L]: F:程序等待执行器：以外部等待等待程序屏障，检查冻结子集与持久事实后解除 | R:code:crates/runtime/src/execution_core/graph/executors/agent_tool.rs | A:WaitingExternal 只能由匹配外部分辨离开 | S:只有拥有真实持久外部依赖的执行器才可等待外部；解除条件以处置记录里的 reason 为准（all_tasks_accepted、task_stranded、worker_quiescent）
+agentic_program_wait.rs[DW9L]: F:程序等待执行器：以外部等待等待程序屏障，检查冻结子集与持久事实后解除 | R:code:crates/runtime/src/execution_core/graph/executors/agent_tool.rs | A:WaitingExternal 只能由匹配外部分辨离开 | S:只有拥有真实持久外部依赖的执行器才可等待外部；解除条件以处置记录里的 reason 为准（all_tasks_accepted、task_stranded、worker_quiescent）；搁浅判定只认“无空闲可用成员”的延迟记账，而成员占用只来自真实 retained run，仅装租约不算占用
 approval.rs[DW7L]: F:审批节点执行器：等待审批决定并产出结果 | R:code:crates/runtime/src/execution_core/graph/executors/agent.rs | A:实现 NodeExecutor | S:审批等待必须由决定唤醒
 materialize.rs[DW7L]: F:物化节点执行器：消费同图已提交前驱结果，写入工作区并产出物化回执 | R:code:crates/runtime/src/execution_core/graph/executors/verify.rs | A:KIND=materialize；new(state_store, workspace_root) | S:只消费同图已提交结果，不重算上游
 mod.rs[DW8T]: F:执行器模块根：汇总 agent/agent_tool/approval/materialize/scoped/synthesize/target_guard/verify 与程序等待 | R:code:crates/runtime/src/execution_core/graph/executors/agent.rs | A:多模块 re-export | S:模块只做汇总
@@ -1360,7 +1360,7 @@ history_prefix_tests.rs[TQ7L]: F:历史前缀测试 | R:code:crates/runtime/src/
 mod.rs[EN9T]: F:投影模块根：把图/目标/Agent/团队/关系/审批/上下文与事件存储翻译成统一公开投影，含缓存键与授权范围 | R:code:crates/runtime/src/projection/read_evidence.rs | A:模块不拥有持久状态 | S:投影只读既有存储，不写事实；历史请求预算是 256 条记录、预留 16 条提交检查点，夹具规模必须落在此预算内
 own818_tests.rs[TQ7M]: F:投影 own818 测试 | R:code:crates/runtime/src/projection/mod.rs | A:测试模块 | S:覆盖投影与终态结算；夹具分页加载，单次请求超预算会以 Invariant 报错
 read_evidence.rs[EN9L]: F:证据读取：按需鉴权交付分页，不写投影缓存或检查点 | R:code:crates/runtime/src/projection/snapshot.rs | A:ReadAuthSource 提供读取鉴权 | S:分页交付必须鉴权，且不落缓存
-reducer_support.rs[EN8L]: F:投影归约支撑：执行活动与终态轴、历史效果校验、健康实体、范围与谱系判定 | R:code:crates/runtime/src/projection/activity.rs | A:ExecutionProjectionScope 限定范围 | S:作用域不得退化为执行全域；运行成员集合只看真实 retained run，空集不等于无成员
+reducer_support.rs[EN8L]: F:投影归约支撑：执行活动与终态轴、历史效果校验、健康实体、范围与谱系判定 | R:code:crates/runtime/src/projection/activity.rs | A:ExecutionProjectionScope 限定范围 | S:作用域不得退化为执行全域；运行成员集合只看真实 retained run，空集不等于无成员；Program 发现是图作用域且按 kind 过滤的，本作用域读不到开立时额外校验 Program 流完整性——有记录却无 agentic.program_opened 即报 program_not_found，不得以空协作呈现
 settlement.rs[EN9L]: F:终态结算读取：闭包读取与绑定校验、物理闭包复核与绑定刷新 | R:code:crates/runtime/src/projection/reducer_support.rs | A:recheck_work 复核物理闭包 | S:未确认物理闭包不得宣称终态
 snapshot.rs[EN9L]: F:投影快照：物化快照、摘要图投影、策略与成本原因、并发度与团队拓扑；对外只暴露安全引用与安全文本 | R:code:crates/runtime/src/projection/delta.rs | A:safe_public_ref/safe_public_text 过滤 | S:快照只暴露安全字段
 

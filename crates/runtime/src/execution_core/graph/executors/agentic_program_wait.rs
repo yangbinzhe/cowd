@@ -2029,6 +2029,64 @@ mod tests {
             "a Task with no live child graph still parks the root (PLAN C5-6)"
         );
 
+        // Only now must the member look occupied: the parking decision above needs
+        // no live child graph, while the "no free eligible member" record the barrier
+        // consumes needs a real retained run. The public recovery entry installs one.
+        {
+            let task_identity = harness_contract::execution::ExecutionIdentity::for_task_graph(
+                "stranded-principal",
+                services.workspace_key(),
+                "stranded-mission",
+                busy.clone(),
+                format!("session:{program_id}"),
+                format!("turn:{program_id}"),
+                "stranded-graph",
+            )
+            .expect("stranded task-graph identity");
+            let identity = harness_contract::execution::ExecutionIdentity::for_agent_node(
+                &task_identity,
+                "stranded-run",
+                "stranded-node",
+            )
+            .expect("stranded agent-node identity");
+            services
+                .agent_runtime()
+                .restore_verified_run(crate::AgentRunSnapshot {
+                    agentic_binding: Some(harness_contract::agent::AgenticExecutionBinding {
+                        program_id: program_id.to_string(),
+                        agent_id: worker.clone(),
+                        membership_id: worker.clone(),
+                        team_id: team_ref.clone(),
+                        task_team_id: team_ref.clone(),
+                        source_spec_revision: 1,
+                        task_purpose: None,
+                        focus: harness_contract::agent::AgenticExecutionFocus::TaskExecute {
+                            task_ref: busy.clone(),
+                        },
+                    }),
+                    execution_identity: identity,
+                    run_id: "stranded-run".to_string(),
+                    agent_id: worker.clone(),
+                    task_id: busy.clone(),
+                    root_task_id: busy.clone(),
+                    session_id: format!("session:{program_id}"),
+                    graph_id: "stranded-graph".to_string(),
+                    node_id: "stranded-node".to_string(),
+                    attempt: 1,
+                    expected_graph_revision: 0,
+                    backend: crate::AgentBackendKind::InProcess,
+                    status: harness_contract::agent::AgentStatus::Running,
+                    revision: 0,
+                    model: Some("fast".to_string()),
+                    provider: Some("test".to_string()),
+                    binding: None,
+                    started_at_ms: 1,
+                    updated_at_ms: 1,
+                    failure: None,
+                })
+                .expect("install the retained member run");
+        }
+
         // Re-dispatch the unreachable Task: Runtime tried and could not place it.
         for attempt in 0..4 {
             let observed = services.agent_action_service().project(program_id).expect("observed Program");
