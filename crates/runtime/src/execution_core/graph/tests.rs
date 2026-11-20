@@ -691,6 +691,7 @@ struct PostCommitExecutor {
 struct BlockingPostCommitExecutor {
     entered: Arc<Notify>,
     release: Arc<Notify>,
+    hold: Duration,
 }
 
 struct PermanentPendingExecutor {
@@ -992,7 +993,14 @@ impl NodeExecutor for BlockingPostCommitExecutor {
 
     async fn after_commit(&self, _ticket: &NodeExecutionTicket) -> Result<(), NodeExecutorError> {
         self.entered.notify_one();
-        self.release.notified().await;
+        // The callback holds for a bounded window and then completes on its
+        // own. Waiting for a signal the test only sends after its assertion
+        // would deadlock against the Pause that has to confirm this callback,
+        // so the hold must not depend on the observer's later step.
+        tokio::select! {
+            () = tokio::time::sleep(self.hold) => {}
+            () = self.release.notified() => {}
+        }
         Ok(())
     }
 }
@@ -4993,6 +5001,7 @@ async fn post_commit_callback_never_holds_graph_coordination_lock() {
         .register(Arc::new(BlockingPostCommitExecutor {
             entered: Arc::clone(&entered),
             release: Arc::clone(&release),
+            hold: Duration::from_millis(20),
         }))
         .unwrap();
     registry
@@ -8337,6 +8346,7 @@ async fn r1_475_pending_callback_cancel_never_closes_empty_binding_early() {
         .register(Arc::new(BlockingPostCommitExecutor {
             entered: entered.clone(),
             release: release.clone(),
+            hold: Duration::from_millis(20),
         }))
         .unwrap();
     let runner = test_runner(registry, state.clone(), commits.clone());
