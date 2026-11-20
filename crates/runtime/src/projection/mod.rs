@@ -4051,7 +4051,7 @@ mod tests {
                     "decision_revision": revision,
                     "execution_graph_ref": execution_id,
                     "session_ref": "strategy-projection",
-                    "turn_ref": format!("turn-{decision_id}"),
+                    "turn_ref": "turn-strategy-projection",
                     "policy_version": "strategy-decision-v4",
                     "decision_source": "deterministic",
                     "confidence": 90,
@@ -4086,10 +4086,14 @@ mod tests {
             }
             .with_activity_binding(harness_contract::projection::RuntimeActivityBinding {
                 root_execution_id: execution_id.to_string(),
-                session_id: "session-activity".to_string(),
-                turn_id: "turn-activity".to_string(),
-                root_task_id: "task-activity".to_string(),
-                task_id: "task-activity".to_string(),
+                // The binding is what attaches the strategy fact to the
+                // projection, so it has to name the graph's own lineage - the
+                // fixture used to write a different Session and turn, and the
+                // projection could never see its strategy events.
+                session_id: "strategy-projection".to_string(),
+                turn_id: "turn-strategy-projection".to_string(),
+                root_task_id: "task-strategy-projection".to_string(),
+                task_id: "task-strategy-projection".to_string(),
                 activity_id: format!("activity:execution:{execution_id}"),
                 node_id: None,
                 parent_activity_id: None,
@@ -4119,11 +4123,16 @@ mod tests {
                 1,
             ))
             .expect("selected event");
-        let selected_projection = snapshot(&services, &graph_id, &context(&services))
+        let selected_snapshot = snapshot(&services, &graph_id, &context(&services))
             .await
-            .expect("selected-only projection")
+            .expect("selected-only projection");
+        let appended = services
+            .event_store()
+            .list_stream("session:strategy-projection")
+            .map(|events| events.iter().map(|event| event.kind.clone()).collect::<Vec<_>>());
+        let selected_projection = selected_snapshot
             .strategy
-            .expect("selected-only strategy");
+            .unwrap_or_else(|| panic!("selected-only strategy missing; appended={appended:?}"));
         assert_eq!(selected_projection.status.as_deref(), Some("running"));
         assert_eq!(
             selected_projection.actual_status,
