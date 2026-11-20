@@ -333,17 +333,26 @@ pub(super) fn load(
     };
     let mut first_goal_attached = false;
     budget.checkpoint_base_bytes = 0;
-    if let Some(saved) = checkpoint.as_ref() {
+    // A checkpoint is a cache, not the authority: the durable events are. One
+    // this request cannot read - an older schema, another projection's id, a
+    // cut beyond the one asked for, or another Session scope - is stale cache,
+    // so the request recomputes from the events and republishes it. Treating
+    // those four as an invariant violation made a fixable staleness a hard
+    // failure and left the cache stuck at the old shape forever. A checkpoint
+    // that does claim this request still has to decode and match exactly
+    // below, which is where real corruption is caught.
+    let saved = checkpoint.as_ref().filter(|saved| {
+        saved.payload["schema"]
+            .as_u64()
+            .is_some_and(|schema| matches!(schema, 3 | 4 | 5 | 6))
+            && saved.projection_id == projection_id
+            && saved.source_cursor <= through
+            && saved.payload["scope"].as_str() == Some(content_scope.as_str())
+    });
+    if let Some(saved) = saved {
         let schema = saved.payload["schema"]
             .as_u64()
             .ok_or_else(|| invalid("checkpoint schema missing"))?;
-        if !matches!(schema, 3 | 4 | 5 | 6)
-            || saved.projection_id != projection_id
-            || saved.source_cursor > through
-            || saved.payload["scope"] != content_scope
-        {
-            return Err(invalid("checkpoint owner/source mismatch"));
-        }
         let metadata = budget.charge_value(saved)?;
         if budget.scope_progress {
             let declared = saved.payload["body"]["bytes"].as_u64()
