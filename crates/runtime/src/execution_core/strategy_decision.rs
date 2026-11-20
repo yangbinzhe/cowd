@@ -402,7 +402,6 @@ impl TurnStrategyDecisionState {
         Ok(())
     }
 
-    #[cfg(any(test, feature = "test-fixtures"))]
     pub fn revise_for_tool_requirements(
         &mut self,
         selected_candidate: ExecutionCandidateKind,
