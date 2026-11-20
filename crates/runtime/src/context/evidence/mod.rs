@@ -601,7 +601,9 @@ pub(crate) fn child_read_acquisitions(
             "parent_idempotency_key": request.idempotency_key,
             "parent_descriptor_hash": auth.descriptor_hash,
             "step_index": child.step_index(), "step_id": child.step_id(), "position": child.position(),
-            "tool_name": "read_file", "input": child.input(), "input_sha256": read_sha256(&input),
+            "tool_name": "read_file",
+            "relative_path": child.input().get("path").cloned().unwrap_or(serde_json::Value::Null),
+            "input": child.input(), "input_sha256": read_sha256(&input),
             "effect": effect, "body": body, "prefixes": prefixes,
         }));
     }
