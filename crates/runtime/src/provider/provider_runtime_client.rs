@@ -2423,14 +2423,15 @@ fn bound_step_evidence_mismatch(
         || crate::execution_core::graph::graph_id_for_lookup(&context.execution_id)
             != crate::execution_core::graph::graph_id_for_lookup(step_execution);
     if mismatched {
-        eprintln!(
-            "bound provider step evidence mismatch: session {:?}/{:?} turn {:?}/{:?} execution {:?}/{:?}",
-            context.session_id,
-            snapshot.identity.session_id,
-            context.turn_id,
-            snapshot.identity.turn_id,
-            context.execution_id,
-            step_execution,
+        tracing::warn!(
+            target: "cowd::provider_wire",
+            context_session = %context.session_id,
+            step_session = %snapshot.identity.session_id,
+            context_turn = %context.turn_id,
+            step_turn = %snapshot.identity.turn_id,
+            context_execution = %context.execution_id,
+            step_execution = %step_execution,
+            "bound provider step evidence mismatch"
         );
     }
     mismatched
