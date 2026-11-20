@@ -1,7 +1,7 @@
 {
   "version": 1,
   "created_at": "2026-11-18T15:37:27Z",
-  "updated_at": "2026-11-20T06:24:45Z",
+  "updated_at": "2026-11-20T06:36:20Z",
   "files": {
     ".cargo/config.toml": {
       "role": "index",
@@ -71,9 +71,9 @@
     },
     "aoci.code.txt": {
       "role": "index",
-      "sha256": "513de47f07a4c3360655cd77ec9ceb285d442ad89468c8249b7a855bd9267a8e",
-      "size": 417846,
-      "normalized_sha256": "513de47f07a4c3360655cd77ec9ceb285d442ad89468c8249b7a855bd9267a8e"
+      "sha256": "3ed5c7e58f9307ccf3bd78a9efe8dd44ce5a7442fae291b9e14c2cf10fd769e7",
+      "size": 418061,
+      "normalized_sha256": "3ed5c7e58f9307ccf3bd78a9efe8dd44ce5a7442fae291b9e14c2cf10fd769e7"
     },
     "aoci.meta.txt": {
       "role": "index",
@@ -6675,9 +6675,9 @@
     },
     "crates/runtime/src/projection/reducer_support.rs": {
       "role": "index",
-      "sha256": "d7ccb0e471b7bb9720f1eb0b7e6d0dd6a86df914f6e98f4c9ba04d0206282bd0",
-      "size": 96522,
-      "normalized_sha256": "d7ccb0e471b7bb9720f1eb0b7e6d0dd6a86df914f6e98f4c9ba04d0206282bd0"
+      "sha256": "0ba18c03d9f77173ffd84ff09c8073be5157a72c41e88942932925ef9c39d9ce",
+      "size": 97783,
+      "normalized_sha256": "0ba18c03d9f77173ffd84ff09c8073be5157a72c41e88942932925ef9c39d9ce"
     },
     "crates/runtime/src/projection/settlement.rs": {
       "role": "index",

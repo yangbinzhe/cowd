@@ -1360,7 +1360,7 @@ history_prefix_tests.rs[TQ7L]: F:历史前缀测试 | R:code:crates/runtime/src/
 mod.rs[EN9T]: F:投影模块根：把图/目标/Agent/团队/关系/审批/上下文与事件存储翻译成统一公开投影，含缓存键与授权范围 | R:code:crates/runtime/src/projection/read_evidence.rs | A:模块不拥有持久状态 | S:投影只读既有存储，不写事实；历史请求预算是 256 条记录、预留 16 条提交检查点，夹具规模必须落在此预算内
 own818_tests.rs[TQ7M]: F:投影 own818 测试 | R:code:crates/runtime/src/projection/mod.rs | A:测试模块 | S:覆盖投影与终态结算；夹具分页加载，单次请求超预算会以 Invariant 报错
 read_evidence.rs[EN9L]: F:证据读取：按需鉴权交付分页，不写投影缓存或检查点 | R:code:crates/runtime/src/projection/snapshot.rs | A:ReadAuthSource 提供读取鉴权 | S:分页交付必须鉴权，且不落缓存
-reducer_support.rs[EN8L]: F:投影归约支撑：执行活动与终态轴、历史效果校验、健康实体、范围与谱系判定 | R:code:crates/runtime/src/projection/activity.rs | A:ExecutionProjectionScope 限定范围 | S:作用域不得退化为执行全域；运行成员集合只看真实 retained run，空集不等于无成员
+reducer_support.rs[EN8L]: F:投影归约支撑：执行活动与终态轴、历史效果校验、健康实体、范围与谱系判定 | R:code:crates/runtime/src/projection/activity.rs | A:ExecutionProjectionScope 限定范围 | S:作用域不得退化为执行全域；运行成员集合只看真实 retained run，空集不等于无成员；Program 发现是图作用域且按 kind 过滤的，本作用域读不到开立时额外校验 Program 流完整性——有记录却无 agentic.program_opened 即报 program_not_found，不得以空协作呈现
 settlement.rs[EN9L]: F:终态结算读取：闭包读取与绑定校验、物理闭包复核与绑定刷新 | R:code:crates/runtime/src/projection/reducer_support.rs | A:recheck_work 复核物理闭包 | S:未确认物理闭包不得宣称终态
 snapshot.rs[EN9L]: F:投影快照：物化快照、摘要图投影、策略与成本原因、并发度与团队拓扑；对外只暴露安全引用与安全文本 | R:code:crates/runtime/src/projection/delta.rs | A:safe_public_ref/safe_public_text 过滤 | S:快照只暴露安全字段
 
