@@ -6501,11 +6501,24 @@ mod tests {
         request
             .preparation
             .retain_dispatch_lease(Some(Arc::new(lease)));
-        let stream = client.stream(request);
-        tokio::time::timeout(std::time::Duration::from_secs(2), entered_rx)
-            .await
-            .unwrap()
-            .unwrap();
+        // A Provider stream is lazy: preparation (including the ContextBytes
+        // admission) and the transport write only happen when something polls
+        // it. Awaiting the server's "entered" signal without driving the
+        // stream waits for a request that was never sent, so the test drives
+        // the stream while it waits for the wire.
+        let mut wire_stream = Some(client.stream(request));
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            let stream = wire_stream.as_mut().unwrap();
+            tokio::select! {
+                entered = entered_rx => entered.expect("wire entered signal"),
+                _ = async {
+                    use futures::StreamExt;
+                    while stream.next().await.is_some() {}
+                } => panic!("the Provider stream ended before the request reached the wire"),
+            }
+        })
+        .await
+        .unwrap();
         assert_eq!(
             manager
                 .snapshot(&ExecutionResourceKind::Provider)
@@ -6520,7 +6533,7 @@ mod tests {
                 .active_leases
         ));
         assert!(!server.is_finished(), "remote completion is still unknown");
-        drop(stream);
+        drop(wire_stream.take());
         let ResourceAdmissionDecision::Granted { lease: next, .. } = tokio::time::timeout(
             std::time::Duration::from_secs(2),
             manager.admit(admission()),
