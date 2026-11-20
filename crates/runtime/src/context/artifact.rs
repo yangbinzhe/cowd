@@ -1911,7 +1911,11 @@ impl ArtifactStore {
             ) {
                 Ok(object) => object,
                 Err(error) => {
-                    let primary = ArtifactError::Metadata(error);
+                    let primary = if error == "artifact quota exhausted" {
+                        ArtifactError::QuotaExceeded
+                    } else {
+                        ArtifactError::Metadata(error)
+                    };
                     let compensation =
                         self.inner
                             .repository

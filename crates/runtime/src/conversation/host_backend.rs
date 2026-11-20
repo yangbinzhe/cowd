@@ -6541,21 +6541,23 @@ mod safety_fuse_streak_tests {
     }
 
     #[test]
-    fn collaboration_convergence_bound_scales_with_complexity() {
+    fn collaboration_convergence_bound_is_a_fixed_no_progress_lease() {
         use super::collaboration_convergence_replan_bound;
         use harness_contract::core::TaskComplexity;
-        assert_eq!(
-            collaboration_convergence_replan_bound(TaskComplexity::Simple),
-            2
-        );
-        assert_eq!(
-            collaboration_convergence_replan_bound(TaskComplexity::Strategic),
-            6
-        );
-        assert!(
-            collaboration_convergence_replan_bound(TaskComplexity::Strategic)
-                > collaboration_convergence_replan_bound(TaskComplexity::Moderate)
-        );
+        // Predicted complexity is telemetry, never a work permit: the retained
+        // convergence budget is one fixed bound so that removing a prediction
+        // cannot shorten a previously admitted task.
+        for complexity in [
+            TaskComplexity::Simple,
+            TaskComplexity::Moderate,
+            TaskComplexity::Strategic,
+        ] {
+            assert_eq!(
+                collaboration_convergence_replan_bound(complexity),
+                6,
+                "{complexity:?}"
+            );
+        }
     }
 
     #[test]
@@ -9048,7 +9050,7 @@ pub(super) fn original_early_deferral_sources(
             || event.kind != "authorization.lease_transition"
             || event.scope != crate::RuntimeEventScope::Tool || event.schema_version != 1
             || event.actor.as_deref() != Some("conversation_runtime.early_tool")
-            || event.transaction_id != format!("authorization-transition:{key}")
+            || event.transaction_id != format!("authorization-transition:{}:{key}", event.stream_id)
             || !event.stream_id.starts_with("authorization-lease:") {
             return Ok(None);
         }

@@ -2309,14 +2309,17 @@ mod tests {
             evidence_refs: vec!["tool://tool-raw-chatcmpl-tool-aa0d514a557763e5-6".to_string()],
             unresolved: vec![],
         });
-        // The content suffix was truncated: the receipt it names is recorded, so
-        // the server resolves the citation to that receipt instead of refusing
-        // a citation that was only mistyped. The content is still verified
-        // against the receipt, so nothing invented is accepted.
-        services
+        // The content suffix was truncated: the receipt it names is recorded,
+        // so the refusal names that canonical receipt instead of guessing which
+        // content the model meant.
+        let error = services
             .validate_agent_action_evidence(&actor, &action)
             .await
-            .unwrap_or_else(|error| panic!("a truncated suffix is repaired: {error}"));
+            .expect_err("a mistyped citation must be refused with the receipt named");
+        assert!(
+            error.contains(canonical),
+            "the refusal must name the canonical receipt: {error}"
+        );
         let attempt_form = AgentAction::TaskSubmit(TaskSubmitInput {
             task_ref: "task:1".to_string(),
             deliverable: None,

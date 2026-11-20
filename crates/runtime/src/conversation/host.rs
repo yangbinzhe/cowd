@@ -6301,7 +6301,7 @@ impl<T: ToolExecutor> crate::conversation::EarlyToolDispatcher for HostEarlyTool
                 if assessment.lease.as_ref().is_some_and(|lease| lease.lease_id == transition.lease.lease_id) {
                     let key = (Arc::as_ptr(services.event_store()) as usize, session_id.clone(), candidate.call.id.clone());
                     if let Some(witness) = early_transition_faults().lock().unwrap().remove(&key) {
-                        let transaction_id = format!("authorization-transition:{}", transition.transition_id);
+                        let transaction_id = format!("authorization-transition:{}:{}", authorization_stream_id, transition.transition_id);
                         *witness.lock().unwrap() = Some((transaction_id.clone(), transition.lease.lease_id.clone()));
                         services.event_store().inject_append_fault_once(transaction_id, false);
                     }
@@ -7583,7 +7583,7 @@ impl OriginalBatchPolicyOwner {
             || transition.lease.capability != lease.capability || transition.lease.policy_revision != lease.policy_revision
             || transition.lease.effect_descriptor_hash != lease.effect_descriptor_hash
             || transition_event.idempotency_key.as_deref() != Some(transition.transition_id.as_str())
-            || transition_event.transaction_id != format!("authorization-transition:{}", transition.transition_id)
+            || transition_event.transaction_id != format!("authorization-transition:{}:{}", transition_event.stream_id, transition.transition_id)
             || transition_event.refs != vec![crate::RuntimeEventRef { kind: "authorization_lease".into(), id: lease.lease_id.clone() }]
         { return Err("original member consume transition mismatch".into()); }
         Ok(OriginalMemberReplayWitness { store: Arc::clone(&self.event_store), ticket, outer: original.clone(), index, prepared,

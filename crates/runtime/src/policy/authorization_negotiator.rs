@@ -1990,7 +1990,7 @@ pub(crate) fn persist_authorization_transition_event(
                 .stream_revision(stream_id)
                 .map_err(|error| error.to_string())?;
             let request = crate::AppendTransactionRequest {
-                transaction_id: format!("authorization-transition:{}", transition.transition_id),
+                transaction_id: format!("authorization-transition:{}:{}", stream_id, transition.transition_id),
                 expected_streams: vec![crate::ExpectedStreamRevision {
                     stream_id: stream_id.to_string(),
                     expected_revision,
@@ -4554,7 +4554,7 @@ pub(crate) fn validate_historical_authorization_issuer(
         || !matches!(issuer.actor.as_deref(), Some("conversation_runtime" | "conversation_runtime.early_tool" | "runtime.process_jsonl"))
         || transition.kind != AuthorizationLeaseTransitionKind::Issued
         || issuer.idempotency_key.as_deref() != Some(transition.transition_id.as_str())
-        || issuer.transaction_id != format!("authorization-transition:{}", transition.transition_id)
+        || issuer.transaction_id != format!("authorization-transition:{}:{}", issuer.stream_id, transition.transition_id)
         || issuer.transaction_index != 0 || issuer.commit_cursor == 0 || issuer.commit_cursor >= receipt_cursor
         || issuer.refs.len() != 1 || issuer.refs[0].kind != "authorization_lease"
         || issuer.refs[0].id != grant.authorization_lease.lease_id
@@ -4670,7 +4670,7 @@ pub(crate) fn capture_member_proof_lease_control(
             } else {
                 // Other member transactions require their own original owner
                 // witness; a receipt or event kind alone is not sufficient.
-                if event.transaction_id == format!("authorization-transition:{}", transition.transition_id) {
+                if event.transaction_id == format!("authorization-transition:{}:{}", event.stream_id, transition.transition_id) {
                 let original = store.original_transaction_receipt(&event.transaction_id).map_err(|e| e.to_string())?
                     .ok_or("lease transition original receipt missing")?;
                 if event.transaction_index != 0 || original.transaction_id != event.transaction_id
@@ -4792,7 +4792,7 @@ pub(crate) fn capture_proof_lease_control(
                 .map_err(|error| format!("proof lease transition malformed: {error}"))?;
             if event.actor.as_deref().is_none_or(|actor| !matches!(actor, "conversation_runtime" | "conversation_runtime.early_tool" | "runtime.process_jsonl"))
                 || event.idempotency_key.as_deref() != Some(transition.transition_id.as_str())
-                || event.transaction_id != format!("authorization-transition:{}", transition.transition_id)
+                || event.transaction_id != format!("authorization-transition:{}:{}", event.stream_id, transition.transition_id)
                 || event.refs != vec![crate::RuntimeEventRef { kind: "authorization_lease".into(), id: lease.lease_id.clone() }]
                 || transition.lease.signature != lease.signature
                 || authorization_lease_signed_payload(&transition.lease) != signed

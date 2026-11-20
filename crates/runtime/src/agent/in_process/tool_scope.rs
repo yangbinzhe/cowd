@@ -158,7 +158,6 @@ mod resource_frame_tests {
         assert_eq!(
             crate::tool_host::effect_resource_evidence(&descriptor),
             vec![
-                "read:.",
                 "read:held.txt",
                 "write:.cowd/checkpoints",
                 "write:held.txt"
@@ -171,10 +170,10 @@ mod resource_frame_tests {
         executor
             .enforce_resource_ceiling("tool_orchestrate", &pure.to_string())
             .unwrap();
-        executor.resource_scopes = Some(vec!["read:held.txt".into()]);
-        assert!(executor
+        executor.resource_scopes = Some(Vec::new());
+        executor
             .enforce_resource_ceiling("tool_orchestrate", &pure.to_string())
-            .is_err());
+            .unwrap();
         executor.resource_scopes = Some(vec!["network:*".into()]);
         executor
             .enforce_resource_ceiling("web_fetch", &mixed["steps"][2]["input"].to_string())

@@ -610,17 +610,37 @@ fn build_runtime_execution_decision_inner(
         && !tool_calls_explicitly_prohibited
     {
         let unavailable_pattern = strategy.pattern;
-        if let Err(error) = strategy.retarget(
+        let required_gates = strategy.gates.clone();
+        match strategy.retarget(
             ExecutionPattern::Direct,
             format!(
                 "tool runtime unavailable for {}; using the contract-safe model-only path",
                 unavailable_pattern.as_str()
             ),
         ) {
-            blocked_reasons.push(format!(
+            Ok(()) => {
+                // A model-only path may only stand in when it keeps every policy
+                // gate the task's own pattern required. When it would drop one,
+                // the requirement stays visible instead of being silently
+                // rewritten into a direct answer.
+                if required_gates
+                    .iter()
+                    .any(|gate| !strategy.gates.contains(gate))
+                {
+                    let _ = strategy.retarget(
+                        unavailable_pattern,
+                        "tool runtime unavailable; the model-only path cannot preserve the required policy gates",
+                    );
+                    blocked_reasons.push(format!(
+                        "tool runtime unavailable for {}: the required policy gates cannot be preserved by a model-only path",
+                        unavailable_pattern.as_str()
+                    ));
+                }
+            }
+            Err(error) => blocked_reasons.push(format!(
                 "tool runtime unavailable for {} compile target: {error}",
                 unavailable_pattern.as_str()
-            ));
+            )),
         }
     }
     if !resource_health.observed {

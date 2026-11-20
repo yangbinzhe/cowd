@@ -1873,7 +1873,7 @@ mod tests {
         assert!(scope.network);
         let sandbox = lease.describe_effect(
             "execute_code",
-            &serde_json::json!({"language":"python","code":"print(1)"}),
+            &serde_json::json!({"language":"python","code":"print(1)","input_files":[]}),
         );
         let scope = resource_scope_from_effect(&sandbox);
         assert_eq!(scope.kind, "workspace");

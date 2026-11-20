@@ -747,6 +747,22 @@ impl RequestBudget {
             }
             let resolved = std::sync::Arc::clone(resolved);
             self.charge(0, 0)?;
+            if !self.charged_records.contains_key(&record.event_id) {
+                // The checkpoint memo prepared this body in an earlier request
+                // and already paid for it, so this request bills only the
+                // record identity and its metadata - the same units the
+                // canonical walk pays before it resolves. Defer before
+                // charging when the shared budget cannot hold them, so a
+                // restore can never overdraw the request.
+                let metadata = serde_json::to_vec(&record)
+                    .map_err(|_| checkpoint_error())?
+                    .len();
+                self.terminal_preflight(0, metadata.saturating_add(512))?;
+                self.charge(1, 0)?;
+                self.charge_value(&record)?;
+                self.charged_records
+                    .insert(record.event_id.clone(), (record.clone(), metadata));
+            }
             let resolved = resolved.as_ref().clone();
             self.terminal_resolved(services, &record, &resolved)?;
             return Ok(resolved);

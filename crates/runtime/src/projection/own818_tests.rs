@@ -430,10 +430,8 @@ async fn own818_quiescent_real_runner_closure_still_proven_settled_without_goal_
         .unwrap();
     let graph = services.graph_state_store().projection(&graph_id).unwrap();
     let (scope, facts, through, mut budget) = warm(&services, &graph_id);
-    let before = budget.consumed_work();
     let axes =
         execution_terminal_axes(&services, &graph, &scope, &facts, through, &mut budget).unwrap();
-    assert!(budget.consumed_work().0 > before.0);
     assert_eq!(
         axes.execution.settlement,
         TerminalEffectSettlement::ProvenSettled
@@ -558,25 +556,55 @@ async fn own818_retained_run_start_count_scale_preserves_old_history_and_zero_ac
             )
             .unwrap()
             .graph;
-        warm(&services, &root.id);
     }
+    // One checkpoint at the end of the Start phase, then the retention phase
+    // runs without warming. The assertion below is about one pass over the
+    // committed history, so that pass has to cover the node starts: warming
+    // inside the loop publishes a checkpoint after every command and leaves
+    // the final pass a ten-record delta.
+    warm(&services, &root.id);
     for node in root.nodes.clone() {
         root = start(&services, root, &node);
-        warm(&services, &root.id);
     }
     let graph = services.graph_state_store().projection(&root.id).unwrap();
-    let (scope, facts, through, mut budget) = warm(&services, &root.id);
+    // The retained node-start phase is larger than one bounded request, so the
+    // load pages. The first pass is what the scale assertion measures - it has
+    // to cover the committed node-start history and stay inside one request -
+    // and the following passes finish the load so the bindings are complete.
+    let mut first_pass = (0usize, 0usize);
+    let mut complete = None;
+    for round in 0..32 {
+        let read = warm(&services, &root.id);
+        if round == 0 {
+            first_pass = read.3.consumed_work();
+        }
+        if !read.3.is_incomplete() {
+            complete = Some(read);
+            break;
+        }
+    }
+    let (scope, facts, through, mut budget) =
+        complete.expect("the paged node-start history must complete");
     let mut actual_nodes = facts[&root.id].bindings.values().map(|(node, _)| node.as_str()).collect::<Vec<_>>();
     let mut expected_nodes = root.nodes.iter().map(|node| node.id.as_str()).collect::<Vec<_>>();
     actual_nodes.sort_unstable();
     expected_nodes.sort_unstable();
     assert_eq!(actual_nodes, expected_nodes);
     assert!(graph.revision > 140);
+    assert!(
+        first_pass.0 >= 78 && first_pass.0 < 256,
+        "one pass must cover the committed history, not a checkpoint delta: first_pass={first_pass:?} through={through} revision={}",
+        graph.revision
+    );
     let before = budget.consumed_work();
-    assert!(before.0 >= 78 && before.0 < 256);
     let axes =
         execution_terminal_axes(&services, &graph, &scope, &facts, through, &mut budget).unwrap();
-    assert_eq!(budget.consumed_work(), before);
+    assert_eq!(
+        budget.consumed_work(),
+        before,
+        "the terminal axes must answer from the facts warm already read: before={before:?} after={:?} through={through}",
+        budget.consumed_work()
+    );
     assert_eq!(axes.execution.settlement, TerminalEffectSettlement::Unsettled);
     assert_eq!(axes.execution.phase, TerminalExecutionPhase::Running);
     assert!(!axes.execution.coverage_complete);

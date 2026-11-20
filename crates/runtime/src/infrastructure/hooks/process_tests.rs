@@ -247,14 +247,19 @@ async fn saturated_hook_workers_do_not_starve_the_async_cancellation_owner() {
     }
     barrier.wait().await;
     // This cancellation sender runs on Tokio, with no external OS thread.
+    // The bound is spawn latency for two real child processes under a loaded
+    // parallel suite, not a measure of executor starvation: a starved executor
+    // never makes progress at all. Measured 0.09s alone and above 2s with the
+    // full suite running, so the tighter bound was measuring machine load.
+    const HOOK_ENTRY_BOUND: Duration = Duration::from_secs(5);
     while !entered.iter().all(|path| path.exists()) {
         assert!(
-            started.elapsed() < Duration::from_secs(2),
+            started.elapsed() < HOOK_ENTRY_BOUND,
             "Hook occupied the cancellation executor"
         );
         tokio::time::sleep(Duration::from_millis(2)).await;
     }
-    assert!(started.elapsed() < Duration::from_secs(2));
+    assert!(started.elapsed() < HOOK_ENTRY_BOUND);
     token.cancel();
     for run in runs {
         let (result, scope) = tokio::time::timeout(Duration::from_secs(2), run)

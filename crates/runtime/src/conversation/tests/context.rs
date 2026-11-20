@@ -839,6 +839,23 @@ impl ApiClient for ExposureRecordingApi {
     fn configure_tool_choice_required(&mut self, required: bool) {
         self.required_tool_choices.lock().unwrap().push(required);
     }
+
+    fn step_tool_definitions(&self) -> Option<Vec<crate::ProviderToolDefinition>> {
+        let projections = self.projections.lock().ok()?;
+        let projection = projections.last()?;
+        Some(
+            projection
+                .bootstrap_ids
+                .iter()
+                .chain(projection.active_ids.iter())
+                .map(|name| crate::ProviderToolDefinition {
+                    name: name.clone(),
+                    description: None,
+                    input_schema: serde_json::json!({"type": "object"}),
+                })
+                .collect(),
+        )
+    }
 }
 
 const EXPOSURE_FIXTURE_REVISION: u64 = 7;

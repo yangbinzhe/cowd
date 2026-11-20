@@ -3817,6 +3817,44 @@ mod readiness_tests {
         persist_ready_synthesize_for_session(services, None)
     }
 
+    /// The same two nodes, dispatched by the supervisor instead of completed by
+    /// hand. A predecessor that is transitioned to `Completed` without going
+    /// through dispatch never releases its binding, so no lease-closure record
+    /// is ever written for it - and a completed attempt without one holds every
+    /// successor closed forever.
+    fn persist_dispatched_synthesize(services: &RuntimeServices) -> ExecutionGraph {
+        let mut graph = ExecutionGraph::new("terminal predecessor and recovered synthesize");
+        crate::test_support::attach_execution_graph_lineage(&mut graph);
+        graph.nodes = vec![
+            node("tool_batch", "predecessor"),
+            node("synthesize", "answer"),
+        ];
+        let session = graph
+            .lineage
+            .as_ref()
+            .map(|lineage| lineage.session_id.clone())
+            .unwrap_or_default();
+        graph.nodes[0].payload_ref = crate::step_snapshot::encode_persisted_tool_batch(
+            &serde_json::json!({
+                "session_id": session,
+                "calls": [],
+                "step_snapshots": {},
+                "continue_with_tool_batch": false,
+            }),
+        )
+        .unwrap();
+        graph.edges.push(ExecutionEdge {
+            from: "predecessor".into(),
+            to: "answer".into(),
+            kind: ExecutionEdgeKind::DependsOn,
+        });
+        services
+            .commit_service()
+            .register_graph(graph)
+            .unwrap()
+            .graph
+    }
+
     fn persist_ready_synthesize_for_session(
         services: &RuntimeServices,
         session: Option<&str>,
@@ -4389,9 +4427,11 @@ mod readiness_tests {
     #[tokio::test]
     async fn r1_in_memory_original_graph_uses_persistent_binding_owner() {
         let services = RuntimeServices::in_memory().unwrap();
-        let before = persist_ready_synthesize(&services);
+        let before = persist_dispatched_synthesize(&services);
         let backend = ReadinessBackend::new();
+        let predecessor_backend = ReadinessBackend::new();
         let queries = Arc::new(Mutex::new(Vec::new()));
+        bind(&services, ticket_for(&before, 0), &predecessor_backend, &queries);
         bind(&services, ticket_for(&before, 1), &backend, &queries);
         services
             .execution_supervisor()

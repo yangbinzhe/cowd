@@ -2873,7 +2873,7 @@ impl AgentActionService {
             if transition.kind != harness_contract::policy::AuthorizationLeaseTransitionKind::Consumed
                 || transition.idempotency_key.as_deref() != Some(authorization.request_id.as_str())
                 || consumption.idempotency_key.as_deref() != Some(transition.transition_id.as_str())
-                || consumption.transaction_id != format!("authorization-transition:{}", transition.transition_id)
+                || consumption.transaction_id != format!("authorization-transition:{}:{}", consumption.stream_id, transition.transition_id)
                 || !crate::authorization_negotiator::consumed_transition_matches_original_execution(&transition, authorization) {
                 return Err(missing());
             }
