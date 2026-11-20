@@ -697,12 +697,8 @@ impl ExecutionCommitService {
             invocation.intent.normalized_input =
                 harness_contract::step::parse_strict_json(query.input)
                     .map_err(|error| ExecutionCommitError::InvalidCommand(error.to_string()))?;
-            let mut outcome: crate::RuntimeToolExecutionOutcome =
+            let outcome: crate::RuntimeToolExecutionOutcome =
                 serde_json::from_value(receipt.payload["outcome"].clone())?;
-            for evidence in &mut outcome.observed_evidence {
-                evidence.provenance =
-                    harness_contract::context::ObservedEvidenceProvenance::RetainedReplay;
-            }
             let lifecycle = if let Some(value) = receipt.payload.get("lifecycle_anchor").filter(|value| !value.is_null()) {
                 use sha2::{Digest, Sha256};
                 let anchor: crate::tool_host::ToolLifecycleAnchor = serde_json::from_value(value.clone())?;
