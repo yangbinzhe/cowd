@@ -1583,7 +1583,7 @@ impl OwnedRootActionIssuer {
                     && transition.idempotency_key.as_deref() == Some(authorization.request_id.as_str())
                     && evidence.stream_id == format!("authorization-lease:{}", authorization.authorization_lease.lease_id)
                     && evidence.idempotency_key.as_deref() == Some(transition.transition_id.as_str())
-                    && evidence.transaction_id == format!("authorization-transition:{}", transition.transition_id)
+                    && evidence.transaction_id == format!("authorization-transition:{}:{}", evidence.stream_id, transition.transition_id)
                     && evidence.transaction_index == 0 && source_receipt.event_ids.len() == 1
                     && crate::authorization_negotiator::AuthorizationNegotiator::verify_lease_signature(&transition.lease)
                     && crate::authorization_negotiator::AuthorizationNegotiator::verify_lease_signature(&authorization.authorization_lease)

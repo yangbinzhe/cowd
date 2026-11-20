@@ -3278,7 +3278,7 @@ where
             || consume.status.as_deref() != Some("consumed") || consume.actor.as_deref() != Some("conversation_runtime")
             || consume.stream_id != stream || consume.transaction_index != 0 || consume.schema_version != 1
             || consume.idempotency_key.as_deref() != Some(transition.transition_id.as_str())
-            || consume.transaction_id != format!("authorization-transition:{}", transition.transition_id)
+            || consume.transaction_id != format!("authorization-transition:{}:{}", stream, transition.transition_id)
             || consume.refs != vec![RuntimeEventRef { kind: "authorization_lease".into(), id: lease.lease_id.clone() }]
             || receipt.transaction_id != consume.transaction_id || receipt.commit_cursor != consume.commit_cursor
             || receipt.event_ids.as_slice() != [consume.event_id.clone()] || receipt.stream_revisions.len() != 1

@@ -9050,7 +9050,7 @@ pub(super) fn original_early_deferral_sources(
             || event.kind != "authorization.lease_transition"
             || event.scope != crate::RuntimeEventScope::Tool || event.schema_version != 1
             || event.actor.as_deref() != Some("conversation_runtime.early_tool")
-            || event.transaction_id != format!("authorization-transition:{key}")
+            || event.transaction_id != format!("authorization-transition:{}:{key}", event.stream_id)
             || !event.stream_id.starts_with("authorization-lease:") {
             return Ok(None);
         }
