@@ -1161,7 +1161,7 @@ mod.rs[DR7L]: F:资源层：资源种类与投影、提示、证据、迁移与�
 compact.rs[DM7L]: F:会话压缩：估算、是否压缩、摘要格式化、压缩执行与计划应用 | R:code:crates/memory/src/compression/session.rs | A:compact_session 与 plan_session_compaction | S:压缩保留最近窗口与续接消息
 context_plane.rs[DW9L]: F:上下文平面：组装、激活、记忆投影与预算治理，含易变时钟哨兵与目标状态包前缀 | R:code:crates/runtime/src/conversation/conversation.rs | A:VOLATILE_CLOCK_SENTINEL 在渲染期替换 | S:渲染期替换易变段，避免破坏提示缓存
 conversation.rs[DW9L]: F:会话主体：轮次输入控制、审批等待、工具平面与取消站点，承载一次对话的完整执行 | R:code:crates/runtime/src/conversation/tool_plane.rs | A:OriginalTurnInputControl 提供审批等待唤醒 | S:输入控制与审批等待必须在原始轮次内闭环
-evidence_terminal_plane.rs[DW9L]: F:终态证据平面：策略账本、运行时事件、结果终结与会话读写入口 | R:code:crates/runtime/src/conversation/conversation.rs | A:record_turn_started 与 compact_session_with_checkpoint | S:终态写入与策略账本同事务
+evidence_terminal_plane.rs[DW9L]: F:终态证据平面：策略账本、运行时事件、结果终结与会话读写入口 | R:code:crates/runtime/src/conversation/conversation.rs | A:record_turn_started 与 compact_session_with_checkpoint | S:终态写入与策略账本同事务；策略重定向方法属生产路径，不得加 test-only 门控，否则 cargo build --features full 会因 E0599 编不过而 --all-targets 编 test target 察觉不到
 frame_refusal.rs[DW8S]: F:帧拒绝：把未执行的工具调用统一成一种形状（工具结果、事件载荷与整帧理由） | R:code:crates/runtime/src/conversation/conversation.rs | A:FrameRefusal::new 与 wholly_refused_frame_reason | S:拒绝必须有可持久的事件与明确形状，不能只返回裸错误
 host.rs[DW9L]: F:标准运行时宿主：回合执行角色、入口引用、宿主构造与提交，含闭环动作工具集与测试入口 | R:code:crates/runtime/src/conversation/host_route.rs | A:submit_owned_conversation_turn 为入口 | S:宿主不拥有 provider 客户端或具体会话运行时类型；未绑定执行的程序报 not_applicable（不是 unknown），无交付物时不得请求完成；回合取消控制原本只装给无入口根回合，委派叶现由自己的 operational 控制承载取消，绑定既有物理 run owner，无 ingress 不能授权 Requested 取消
 host_backend.rs[DW9L]: F:图拥有的 provider 与受治理工具执行后端：动作通道要求、循环守卫、调用重复记录与结果桩 | R:code:crates/runtime/src/conversation/host.rs | A:evaluate_loop_guard 与 loop_block_after | S:循环硬停必须显式开启，计数本身不证明结果或来源变化
@@ -1178,7 +1178,7 @@ sse.rs[DW6S]: F:会话侧 SSE 处理：把 provider 流事件转成会话事件 
 static_tool_executor.rs[DW6S]: F:静态工具执行器：无图场景下的直接工具执行 | R:code:crates/runtime/src/conversation/conversation.rs | A:静态执行入口 | S:仅用于无图场景，受治理路径仍走图
 step_snapshot.rs[DW8L]: F:步骤快照：记录模型步骤与工具批次的准备态成员与原样输入，并解析调用的绑定 | R:code:crates/runtime/src/conversation/host_backend.rs | A:PreparedAgentBatchMember 为快照成员；StepCallBinding::resolve 解析活绑定 | S:快照保留原样输入，供事后复核；活绑定只能由它当初被授权的那一个宿主租约服务，宿主换掉快照而契约未变时必须报 step_binding_stale 而不是继续服务，契约真变了才继续
 summary_compression.rs[DM7L]: F:摘要压缩：把长对话压缩成摘要并保留续接点 | R:code:crates/memory/src/compression/deep.rs | A:压缩与摘要入口 | S:摘要必须保留可续接的语义锚点
-tool_plane.rs[DW9L]: F:受治理工具波次执行：计划事件持久化、根节点活动运行时、原始动作所有者与单次已校验输入 | R:code:crates/runtime/src/conversation/turn_engine.rs | A:VerifiedRootActionOwner 携带原始票据与生产者事件 | S:原始动作所有者只能由真实 tick 与生产者构造；根节点未真正启动时不得声称已有绑定；批次准入要求原票据、回合作用域、服务与提交所有者四者齐备，缺一即拒绝；回合策略重定向对每个受治理批次执行，不只 owner-less 批次
+tool_plane.rs[DW9L]: F:受治理工具波次执行：计划事件持久化、根节点活动运行时、原始动作所有者与单次已校验输入 | R:code:crates/runtime/src/conversation/turn_engine.rs | A:VerifiedRootActionOwner 携带原始票据与生产者事件 | S:原始动作所有者只能由真实 tick 与生产者构造；根节点未真正启动时不得声称已有绑定；批次准入要求原票据、回合作用域、服务与提交所有者四者齐备，缺一即拒绝；回合策略重定向对每个受治理批次执行，不只 owner-less 批次；重建执行身份时图 id 必须经 graph_id_for_lookup 规范，run: 前缀不得写入 graph_id 字段
 turn_engine.rs[DW9L]: F:回合引擎：回合构造、策略、会话与压缩控制，单次生产者捕获与已校验输入 | R:code:crates/runtime/src/conversation/tool_plane.rs | A:OriginalSingleProducerCapture 绑定决定与权限上下文 | S:生产者与提交所有者必须逐字段认证后才能提交；缺少回合取消控制时取消查询必须报错而不是默认未取消
 turn_inbox.rs[DW7M]: F:回合收件箱：检查点引导与上下文项、已认证的目标输入 | R:code:crates/runtime/src/conversation/turn_engine.rs | A:authenticated_goal_inputs 校验来源键 | S:目标输入必须与原始查询端口返回的会话记录一致
 workspace_scopes.rs[DS7L]: F:工作区资源作用域：按目标中的显式文件目标推导精确作用域 | R:code:crates/runtime/src/conversation/tool_plane.rs | A:explicit_workspace_resource_scopes 为入口 | S:作用域只防止工具越出工作区或悄悄放宽租约，不决定工作分解
@@ -1222,8 +1222,8 @@ report.rs[DO6T]: F:执行报告：执行摘要结构 | R:code:crates/runtime/src
 safety_fuse.rs[DR7S]: F:安全熔断：仅在无进展且异常时熔断，不作为常规期限 | R:code:crates/runtime/src/execution_core/mod.rs | A:熔断条件基于无进展 | S:健康推进不设死期限
 semantic_progress.rs[DR6T]: F:语义进展：判定回合是否取得语义进展 | R:code:crates/runtime/src/execution_core/safety_fuse.rs | A:进展判定入口 | S:无进展不等于失败
 services.rs[DW9L]: F:执行核心服务：对图的提交、恢复与查询服务聚合 | R:code:crates/runtime/src/execution_core/graph/mod.rs | A:RuntimeServices 扩展实现 | S:服务层是唯一写入口；后台维护监督者会自行派发就绪工作，测试要固定顺序须显式关停它
-strategy_decision.rs[DW8L]: F:运行时执行决定：由策略与资源推导执行决定 | R:code:crates/harness-contract/src/strategy/mod.rs | A:build_runtime_execution_decision | S:决定由运行时推导，模型不直接设定
-supervisor.rs[DW9L]: F:执行监督：监督执行推进与终态 | R:code:crates/runtime/src/execution_core/services.rs | A:监督入口 | S:监督器读事实，不代写结论；泵夹具必须给事件存储绑定产物存储，否则内容外置会报 MissingContentStore
+strategy_decision.rs[DW8L]: F:运行时执行决定：由策略与资源推导执行决定 | R:code:crates/harness-contract/src/strategy/mod.rs | A:build_runtime_execution_decision | S:决定由运行时推导，模型不直接设定；对工具需求的重定向方法属生产路径，不得加 test-only 门控
+supervisor.rs[DW9L]: F:执行监督：监督执行推进与终态 | R:code:crates/runtime/src/execution_core/services.rs | A:监督入口 | S:监督器读事实，不代写结论；泵夹具必须给事件存储绑定产物存储，否则内容外置会报 MissingContentStore；执行器 panic 按 custody unknown 处理，节点留 Running 且错误暴露 original pump task panicked，不得改写成 failed 节点结果
 
 ===/<repository>/crates/runtime/src/execution_core/cross_plane/===
 mod.rs[DW6T]: F:跨平面执行模块根 | R:code:crates/runtime/src/execution_core/cross_plane/service.rs | A:模块声明 | S:-
@@ -1250,7 +1250,7 @@ recovery.rs[DR8M]: F:图恢复：在物理闭合预算内重试并恢复节点�
 registry.rs[DW8L]: F:执行器注册表：按节点种类解析执行器与后端 | R:code:crates/runtime/src/execution_core/graph/executors/mod.rs | A:注册与解析入口 | S:注册表只解析，不执行
 runner.rs[DW9L]: F:图运行器：泵循环、取消所有者与任务驱动 | R:code:crates/runtime/src/execution_core/graph/commit_service.rs | A:ExecutionGraphRunner 与 OriginalPumpTask | S:运行器只推进，不代写终态；终态提交失败时必须先发持久取消产生退役记录，否则回调永远停在 Pending、after_abort 不会执行；隔离失败的提交沿用该节点已密封的 no_dispatch 事实，不另造失败结果
 state_store.rs[DP8L]: F:图状态存储：节点状态与尝试的持久读写 | R:code:crates/runtime/src/execution_core/graph/commit_pipeline.rs | A:状态存储入口 | S:状态写入必须经提交管线
-tests.rs[TQ8L]: F:执行图测试 | R:code:crates/runtime/src/execution_core/graph/runner.rs | A:测试模块 | S:覆盖提交与恢复；单靠置状态为 Running 造不出托管，需真正启动过的尝试，这类用例按事实停用
+tests.rs[TQ8L]: F:执行图测试 | R:code:crates/runtime/src/execution_core/graph/runner.rs | A:测试模块 | S:覆盖提交与恢复；单靠置状态为 Running 造不出托管，需真正启动过的尝试，这类用例按事实停用；AgentTask 节点的提交要真实的 agent.local_exit 事实，轻量 harness 夹具无法伪造，相关用例按停用处理
 tool_receipt_query.rs[DP7L]: F:工具回执查询：按票据与调用查已持久回执 | R:code:crates/runtime/src/execution_core/graph/commit_service.rs | A:查询入口 | S:回执查询只读；查询必须返回与提交时同一份回执，不得把已提交证据的归属改写成重放标记，重放标记只属于执行路径上的现场重放
 
 ===/<repository>/crates/runtime/src/execution_core/graph/executors/===
@@ -1357,7 +1357,7 @@ delta.rs[EN7M]: F:投影增量：按事件窗口产出增量投影 | R:code:crat
 history.rs[EN9L]: F:投影历史：请求预算、终态预检与围栏、分页与检查点、流头与规范记录 | R:code:crates/runtime/src/projection/history_prefix.rs | A:INCOMPLETE 表示需快照续读 | S:历史不完整必须显式标记，不得充当完整历史；fresh 预算不得自动获得增量续读权，否则会借用别人发布的检查点绕过完整性判定
 history_prefix.rs[EN8M]: F:历史前缀：机器进展证明与前缀校验 | R:code:crates/runtime/src/projection/history.rs | A:machine_progress 产出校验证明 | S:前缀只在已校验范围内可信；从不完整读取发布出来的检查点不能充当完整答案的基座，未显式声明增量续读的请求续读它时必须报 canonical history incomplete at target
 history_prefix_tests.rs[TQ7L]: F:历史前缀测试 | R:code:crates/runtime/src/projection/history_prefix.rs | A:测试模块 | S:覆盖前缀与进展证明
-mod.rs[EN9T]: F:投影模块根：把图/目标/Agent/团队/关系/审批/上下文与事件存储翻译成统一公开投影，含缓存键与授权范围 | R:code:crates/runtime/src/projection/read_evidence.rs | A:模块不拥有持久状态 | S:投影只读既有存储，不写事实；历史请求预算是 256 条记录、预留 16 条提交检查点，夹具规模必须落在此预算内
+mod.rs[EN9T]: F:投影模块根：把图/目标/Agent/团队/关系/审批/上下文与事件存储翻译成统一公开投影，含缓存键与授权范围 | R:code:crates/runtime/src/projection/read_evidence.rs | A:模块不拥有持久状态 | S:投影只读既有存储，不写事实；历史请求预算是 256 条记录、预留 16 条提交检查点，夹具规模必须落在此预算内；预算耗尽时 load_scope_budgeted 返回 Ok 并标 incomplete 而非 Err，只有 charge 自身报错，断言不得期望 HistoryBudgetExceeded
 own818_tests.rs[TQ7M]: F:投影 own818 测试 | R:code:crates/runtime/src/projection/mod.rs | A:测试模块 | S:覆盖投影与终态结算；夹具分页加载，单次请求超预算会以 Invariant 报错；分页循环必须显式声明增量续读权
 read_evidence.rs[EN9L]: F:证据读取：按需鉴权交付分页，不写投影缓存或检查点 | R:code:crates/runtime/src/projection/snapshot.rs | A:ReadAuthSource 提供读取鉴权 | S:分页交付必须鉴权，且不落缓存
 reducer_support.rs[EN8L]: F:投影归约支撑：执行活动与终态轴、历史效果校验、健康实体、范围与谱系判定 | R:code:crates/runtime/src/projection/activity.rs | A:ExecutionProjectionScope 限定范围 | S:作用域不得退化为执行全域；运行成员集合只看真实 retained run，空集不等于无成员；Program 发现是图作用域且按 kind 过滤的，本作用域读不到开立时额外校验 Program 流完整性——有记录却无 agentic.program_opened 即报 program_not_found，不得以空协作呈现
@@ -1370,7 +1370,7 @@ outcome_selector.rs[DP7M]: F:Provider 选择：由不可变 Outcome 证据按候
 prefix_attribution.rs[DO7L]: F:前缀归因：把 Provider 前缀分叉归因到具体提示段，产出复用比与解释 | R:code:crates/runtime/src/provider/transport_pool.rs | A:PromptSegment 固定 6 段 | S:归因只解释分叉，不改变请求
 provider_registry.rs[FC8L]: F:Provider 注册表：运行时宿主私有配置快照，请求钉住不可变快照，非法替换不改变上次有效快照 | R:code:crates/runtime/src/provider/provider_resources.rs | A:revision 标识快照代 | S:成功重载只影响其后新请求
 provider_resources.rs[FC8M]: F:Provider 资源策略：配额、账户与模型策略、资源代与叶子准入 | R:code:crates/runtime/src/provider/provider_registry.rs | A:provider_leaf_admission 产出占用租约 | S:真正调用方持有租约，策略只计算需求
-provider_runtime_client.rs[FI9L]: F:Provider 运行时客户端：请求准备、能力与并行工具策略、流式传输与用量记录 | R:code:crates/runtime/src/provider/transport_policy.rs | A:bind_preparation_scope 绑定准备作用域 | S:准备失败显式归类，不静默降级；stream 是惰性流，准备、容量准入与传输写入都发生在首次 poll
+provider_runtime_client.rs[FI9L]: F:Provider 运行时客户端：请求准备、能力与并行工具策略、流式传输与用量记录 | R:code:crates/runtime/src/provider/transport_policy.rs | A:bind_preparation_scope 绑定准备作用域 | S:准备失败显式归类，不静默降级；stream 是惰性流，准备、容量准入与传输写入都发生在首次 poll；绑定 step 的证据比对不得比较 attempt 编号，请求侧是模型步内 provider 计数、replan 后必不相等；execution 引用两侧都须经 graph_id_for_lookup 规范化
 transcript_seal.rs[FZ7M]: F:转录封存：推理签名与私有推理在落库前用 AES-256-GCM 封存，仅在再激活时启封 | R:code:crates/runtime/src/provider/provider_runtime_client.rs | A:is_sealed_provider_transcript 识别封存值 | S:封存值不得当作普通会话历史
 transport_policy.rs[FR6S]: F:传输策略：由上下文窗口与消息长度推导单请求空闲容忍 | R:code:crates/runtime/src/provider/transport_pool.rs | A:derive 为唯一入口 | S:只调空闲容忍，不判定目标完成，也不把断线当失败
 transport_pool.rs[FI8L]: F:传输池：连接与提示前缀缓存、预热领导者、缓存字节预算与复用观测 | R:code:crates/runtime/src/provider/transport_policy.rs | A:low_structural_reuse 标记低复用 | S:前缀缓存有字节预算，超出必须等待
