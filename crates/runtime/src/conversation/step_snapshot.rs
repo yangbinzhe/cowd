@@ -156,6 +156,21 @@ impl StepCallBinding {
         current: Option<tools::ToolHostLease>,
     ) -> Result<Arc<BoundStep>, RuntimeError> {
         if let Some(step) = &self.bound_step {
+            let Some(lease) = current else {
+                return Ok(Arc::clone(step));
+            };
+            // A live binding is authorized against one specific host lease. When the
+            // host replaced its snapshot without changing the tool contract, the
+            // lease that authorized this binding is gone: refuse it instead of
+            // serving a binding the host no longer stands behind. A replacement
+            // that did change the contract re-issues the pinned tools, so the
+            // cached binding still describes the contract the host now serves.
+            let bound = step.lease().snapshot();
+            if step.lease().implementation_revision() != lease.implementation_revision()
+                && bound.descriptor_set_hash == lease.snapshot().descriptor_set_hash
+            {
+                return Err(RuntimeError::new("step_binding_stale"));
+            }
             return Ok(Arc::clone(step));
         }
         let lease = current.ok_or_else(|| RuntimeError::new("step_tool_host_unavailable"))?;
