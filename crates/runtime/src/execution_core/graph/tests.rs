@@ -1455,7 +1455,7 @@ async fn supervisor_runs_one_hundred_graphs_with_bounded_cross_key_parallelism()
 }
 
 #[tokio::test]
-#[ignore = "unresolved: a released lease does not wake the deferred ready graph inside the fixture bound"]
+#[ignore = "unresolved: the fixture cannot release the Agent lease — measured state is first-agent=Running (lease still held) and deferred-agent=Planned; an AgentTask commit needs a real agent.local_exit, which a lightweight harness cannot forge"]
 async fn resource_pressure_keeps_a_ready_graph_pump_alive_until_a_lease_releases() {
     let (registry, state, commits) = harness();
     let executor = Arc::new(TestExecutor::new(Vec::new(), Duration::from_millis(100)));
