@@ -18187,7 +18187,12 @@ mod physical_closure_ring_tests {
     }
 
     fn planned_call(id: &str) -> serde_json::Value {
-        json!({"id": id, "name": "state_inspect", "input": "{}", "origin": null})
+        // A hand-built planned call has to satisfy the persisted batch
+        // schema: `depends_on` carries no serde default, so omitting it makes
+        // the whole batch undecodable and the closure is left with the raw
+        // JSON alone - it then reads no effect key for any call and skips
+        // them all. This call is bindless on purpose; it is not malformed.
+        json!({"id": id, "name": "state_inspect", "input": "{}", "origin": null, "depends_on": []})
     }
 
     /// A dispatched call whose terminal receipt has not landed yet is still in
