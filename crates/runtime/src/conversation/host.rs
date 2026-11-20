@@ -1502,6 +1502,26 @@ where
                 direct_turn_control = Some(control);
             }
         }
+        // A delegated leaf owns no root ingress, but the model step still has to
+        // answer the turn-level cancellation predicate. Without a home that
+        // predicate errors, the leaf's model node fails and the graph ends with
+        // no turn result at all - a leaf could never reach a terminal outcome.
+        // The home is the leaf's own operational control, bound to the physical
+        // run owner it already holds: it may observe cancellation, and it cannot
+        // authorize a Requested cancellation without ingress.
+        if execution_role == TurnExecutionRole::DelegatedLeaf {
+            let mut runtime = runtime.lock().await;
+            if runtime.original_turn_control().is_err() {
+                let control = crate::execution_core::services::TurnCancellationControl::operational_with_token(
+                    &session_id,
+                    &turn_ref,
+                    &graph.id,
+                    runtime.cancellation_token(),
+                );
+                runtime.install_provider_cancellation_control(Some(Arc::clone(&control)))?;
+                direct_turn_control = Some(control);
+            }
+        }
         if execution_role == TurnExecutionRole::RootTurn && ingress.is_some() {
             let bus = runtime.lock().await.cowd_bus().cloned().ok_or_else(|| {
                 RuntimeError::new("owned root requires its event bus")
@@ -5866,7 +5886,7 @@ struct PersistedToolBatch {
     continue_with_tool_batch: bool,
 }
 
-fn encode_tool_calls_with_continuation(
+pub(crate) fn encode_tool_calls_with_continuation(
     session_id: &str,
     calls: &[ModelToolCall],
     continue_with_tool_batch: bool,

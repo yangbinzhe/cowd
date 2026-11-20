@@ -349,6 +349,9 @@ pub(super) fn load(
             && saved.source_cursor <= through
             && saved.payload["scope"].as_str() == Some(content_scope.as_str())
     });
+    let base_incomplete = saved
+        .as_ref()
+        .is_some_and(|saved| saved.payload["incomplete"] == true);
     if let Some(saved) = saved {
         let schema = saved.payload["schema"]
             .as_u64()
@@ -591,7 +594,8 @@ pub(super) fn load(
             let Some(record) = page.into_iter().next() else {
                 if state.graph_state.as_ref().is_none_or(|current| {
                     current.id != graph.graph_id || current.revision != prefix.target_revision
-                }) {
+                }) || (base_incomplete && !budget.incremental)
+                {
                     return Err(invalid("canonical history incomplete at target"));
                 }
                 prefix.history_complete = true;

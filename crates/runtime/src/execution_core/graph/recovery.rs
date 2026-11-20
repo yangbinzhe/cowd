@@ -105,15 +105,31 @@ impl<'a> ExecutionGraphRecovery<'a> {
                         .state_store
                         .binding_lease_closure(&graph, &node_id, &binding, position)?;
                     if already_closed {
-                        self.commit_service
+                        match self
+                            .commit_service
                             .recover_closed_binding_publication(
                                 &graph,
                                 &node_id,
                                 &binding,
                                 self.registry,
                             )
-                            .await?;
-                        break;
+                            .await
+                        {
+                            Ok(_) => break,
+                            Err(error) if error.keeps_the_closure_waiting() => {
+                                // The publication raced a concurrent writer or a
+                                // source moved under its proof: that is the same
+                                // wait the open branch below serves, so it re-reads
+                                // inside the closure budget instead of reporting
+                                // the retryable error early.
+                                if std::time::Instant::now() >= closure_deadline {
+                                    return Err(error.into());
+                                }
+                                wait_inside_the_closure_budget(&mut commits, closure_deadline).await;
+                                continue;
+                            }
+                            Err(error) => return Err(error.into()),
+                        }
                     }
                     let mut owner = if !already_closed {
                         let key = super::events::ExecutionBindingLeaseClosure::fence_key(

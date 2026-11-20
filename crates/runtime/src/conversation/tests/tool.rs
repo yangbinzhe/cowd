@@ -10,7 +10,7 @@ use futures::{
 
 use super::*;
 
-fn r1_branch_state(session_id: &str, goal_id: &str) -> TurnGraphState {
+pub(crate) fn r1_branch_state(session_id: &str, goal_id: &str) -> TurnGraphState {
     TurnGraphState {
         content: "answer directly".into(),
         task_understanding: Some(harness_contract::strategy::understand(

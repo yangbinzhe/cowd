@@ -2685,6 +2685,14 @@ where
         admission_plan
             .tasks
             .retain(|task| !replays.contains_key(&task.tool_call_id) && !original_replays.contains_key(&task.tool_call_id));
+        // The decision that validates this batch is derived from the batch
+        // itself: network access, mutation and parallelism are exactly the
+        // properties the strategy engine retargets on, and the provider path
+        // does the same for the turn it produces. A batch judged by a guess
+        // taken before its own effects were known is refused as if the turn
+        // strategy were narrower than the work it is already doing - for an
+        // owner-less direct call and for a graph-owned batch alike.
+        self.retarget_active_turn_strategy_for_governed_plan(&admission_plan, calls)?;
         let decision = self
             .active_turn_strategy()
             .map(|state| state.decision)

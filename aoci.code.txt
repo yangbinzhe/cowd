@@ -2,7 +2,7 @@
 
 ===/<repository>/===
 .gitignore[FV5T]: F:忽略构建产物、IDE/OS 文件、本地 .cowd 数据、node_modules、运行时数据库、plan/ 与 .omo/ 本地资产、旧目录名、live-eval 产物与机器绑定的 opencode.json | R:- | A:plan/ 与 .omo/ 整体忽略；opencode.json 与备份文件按前缀忽略 | S:plan/ 被整体忽略但工作计划就放在 plan/ 下，交付核对要按显式路径；opencode.json 含机器绝对路径，必须保持忽略
-Cargo.toml[FV9S]: F:workspace 根：33 个成员 crate 与 default-members 清单、统一版本号、共享依赖版本、dev/release profile 与 workspace 级 lint 级别 | R:- | A:edition 2021；license MIT；publish=false；unsafe_code=forbid，unwrap_used/expect_used=warn | S:unsafe_code=forbid 是全 workspace 硬门禁，任何 unsafe 只能走已获准的独立 crate 或构建脚本路径；default-members 同时决定裸 cargo build/test 的默认范围，成员与 default-members 必须同步增删
+Cargo.toml[FV9S]: F:workspace 根：33 个成员 crate 与 default-members 清单、统一版本号、共享依赖版本、dev/release profile 与 workspace 级 lint 级别 | R:- | A:edition 2021；license MIT；publish=false；unsafe_code=forbid，unwrap_used/expect_used=warn | S:unsafe_code=forbid 是全 workspace 硬门禁，任何 unsafe 只能走已获准的独立 crate 或构建脚本路径；default-members 同时决定裸 cargo build/test 的默认范围，成员与 default-members 必须同步增删；[workspace.package] version 是唯一版本源，发布只改它并由 cargo 同步 Cargo.lock
 LICENSE[SZ3T]: F:MIT 许可证全文，附商业使用通知的说明与联系方式 | R:- | A:MIT License，Copyright (c) 2026 Cowd Project Authors；商业使用需主动通知作者 | S:-
 Makefile[OV6T]: F:本地构建入口：按 /proc/meminfo 动态计算安全并行度，提供 check/test/test-all/build/tui-smoke/release-gate 目标，并对 cargo clean 做交互确认 | R:code:scripts/validate.sh,code:scripts/scenarios/tui-smoke.sh | A:SAFE_BUILD_JOBS = 可用内存/3GB，SAFE_TEST_THREADS = 可用内存/2GB 且上限 8，CC_NUM_JOBS=2 | S:cargo clean 会销毁 SQLite 等原生编译缓存并引发数十 GB 级重编译，因此只保留交互确认入口；并行度只在本文件按内存探测，其他脚本不得另设一套
 PRODUCT.md[SU5T]: F:产品登记：目标用户、产品目的、品牌气质、反例清单、七条设计原则与无障碍要求 | R:- | A:单一事实源原则：Runtime 产生执行事实，Gateway 传输，Surface 只做投影与短暂传输态 | S:反例清单对实现有约束力（如不把 TUI 做成常驻仪表盘、不用不受控并发冒充加速），新增界面与交互先对照它再定方案
@@ -1176,7 +1176,7 @@ provider_plane.rs[DW9L]: F:provider 平面：模型请求构造、发送与流�
 request_compiler.rs[DW7M]: F:请求编译器：把上下文与工具暴露编译成 provider 请求并给出统计 | R:code:crates/runtime/src/conversation/provider_plane.rs | A:request_compiler_stats 暴露统计 | S:编译结果可复现，统计用于诊断
 sse.rs[DW6S]: F:会话侧 SSE 处理：把 provider 流事件转成会话事件 | R:code:crates/runtime/src/conversation/provider_plane.rs | A:SSE 解析入口 | S:半帧保留缓冲
 static_tool_executor.rs[DW6S]: F:静态工具执行器：无图场景下的直接工具执行 | R:code:crates/runtime/src/conversation/conversation.rs | A:静态执行入口 | S:仅用于无图场景，受治理路径仍走图
-step_snapshot.rs[DW8L]: F:步骤快照：记录模型步骤与工具批次的准备态成员与原样输入 | R:code:crates/runtime/src/conversation/host_backend.rs | A:PreparedAgentBatchMember 为快照成员 | S:快照保留原样输入，供事后复核
+step_snapshot.rs[DW8L]: F:步骤快照：记录模型步骤与工具批次的准备态成员与原样输入，并解析调用的绑定 | R:code:crates/runtime/src/conversation/host_backend.rs | A:PreparedAgentBatchMember 为快照成员；StepCallBinding::resolve 解析活绑定 | S:快照保留原样输入，供事后复核；活绑定只能由它当初被授权的那一个宿主租约服务，宿主换掉快照而契约未变时必须报 step_binding_stale 而不是继续服务，契约真变了才继续
 summary_compression.rs[DM7L]: F:摘要压缩：把长对话压缩成摘要并保留续接点 | R:code:crates/memory/src/compression/deep.rs | A:压缩与摘要入口 | S:摘要必须保留可续接的语义锚点
 tool_plane.rs[DW9L]: F:受治理工具波次执行：计划事件持久化、根节点活动运行时、原始动作所有者与单次已校验输入 | R:code:crates/runtime/src/conversation/turn_engine.rs | A:VerifiedRootActionOwner 携带原始票据与生产者事件 | S:原始动作所有者只能由真实 tick 与生产者构造；根节点未真正启动时不得声称已有绑定；批次准入要求原票据、回合作用域、服务与提交所有者四者齐备，缺一即拒绝
 turn_engine.rs[DW9L]: F:回合引擎：回合构造、策略、会话与压缩控制，单次生产者捕获与已校验输入 | R:code:crates/runtime/src/conversation/tool_plane.rs | A:OriginalSingleProducerCapture 绑定决定与权限上下文 | S:生产者与提交所有者必须逐字段认证后才能提交；缺少回合取消控制时取消查询必须报错而不是默认未取消
@@ -1246,12 +1246,12 @@ local_network.rs[DS8L]: F:本地网络效果：授权载荷、回执载荷与结
 local_network_tests.rs[TQ7L]: F:本地网络效果测试 | R:code:crates/runtime/src/execution_core/graph/local_network.rs | A:夹具票据读取实现 | S:覆盖授权与回执校验
 mod.rs[DW9T]: F:执行图模块根：提交服务、编译、执行器、恢复、注册表、资源与运行的统一导出 | R:code:crates/runtime/src/execution_core/graph/commit_pipeline.rs | A:PHYSICAL_CLOSURE_BUDGET=60s | S:物理闭合有预算，超时不得无限等待
 override_custody.rs[DW8L]: F:覆盖终态托管：把干预造成的短路节点封成覆盖终态，含封条、静默与释放 | R:code:crates/runtime/src/execution_core/graph/executors/synthesize.rs | A:OVERRIDE_TERMINAL_NODE_SUFFIXES 十项；静默释放 15 分钟 | S:封条必须基于真实终态事实，不得掩盖未运行的节点
-recovery.rs[DR8M]: F:图恢复：在物理闭合预算内重试并恢复节点状态 | R:code:crates/runtime/src/execution_core/graph/commit_service.rs | A:PHYSICAL_CLOSURE_RETRY_PAUSE=25ms | S:恢复有预算，busy-wait 不得超过
+recovery.rs[DR8M]: F:图恢复：在物理闭合预算内重试并恢复节点状态 | R:code:crates/runtime/src/execution_core/graph/commit_service.rs | A:PHYSICAL_CLOSURE_RETRY_PAUSE=25ms | S:恢复有预算，busy-wait 不得超过；可重试的闭合错误（源在证明下移动等）在预算内重试，已关闭绑定分支与开放绑定分支必须同构，不能提前把重试错误抛给调用方
 registry.rs[DW8L]: F:执行器注册表：按节点种类解析执行器与后端 | R:code:crates/runtime/src/execution_core/graph/executors/mod.rs | A:注册与解析入口 | S:注册表只解析，不执行
 runner.rs[DW9L]: F:图运行器：泵循环、取消所有者与任务驱动 | R:code:crates/runtime/src/execution_core/graph/commit_service.rs | A:ExecutionGraphRunner 与 OriginalPumpTask | S:运行器只推进，不代写终态；终态提交失败时必须先发持久取消产生退役记录，否则回调永远停在 Pending、after_abort 不会执行
 state_store.rs[DP8L]: F:图状态存储：节点状态与尝试的持久读写 | R:code:crates/runtime/src/execution_core/graph/commit_pipeline.rs | A:状态存储入口 | S:状态写入必须经提交管线
 tests.rs[TQ8L]: F:执行图测试 | R:code:crates/runtime/src/execution_core/graph/runner.rs | A:测试模块 | S:覆盖提交与恢复；单靠置状态为 Running 造不出托管，需真正启动过的尝试，这类用例按事实停用
-tool_receipt_query.rs[DP7L]: F:工具回执查询：按票据与调用查已持久回执 | R:code:crates/runtime/src/execution_core/graph/commit_service.rs | A:查询入口 | S:回执查询只读
+tool_receipt_query.rs[DP7L]: F:工具回执查询：按票据与调用查已持久回执 | R:code:crates/runtime/src/execution_core/graph/commit_service.rs | A:查询入口 | S:回执查询只读；查询必须返回与提交时同一份回执，不得把已提交证据的归属改写成重放标记，重放标记只属于执行路径上的现场重放
 
 ===/<repository>/crates/runtime/src/execution_core/graph/executors/===
 agent.rs[DW8L]: F:Agent 节点执行器：驱动 Agent 后端并产出节点结果 | R:code:crates/runtime/src/execution_core/graph/executors/agent_tool.rs | A:实现 NodeExecutor | S:执行器只驱动后端，不拥有图状态
@@ -1354,11 +1354,11 @@ trust_resolver.rs[DS7M]: F:信任解析：信任策略/事件/配置与信任提
 ===/<repository>/crates/runtime/src/projection/===
 activity.rs[EN9L]: F:执行活动投影：从事件与历史投影活动、判定事件所属执行与节点、合并活动 | R:code:crates/runtime/src/projection/snapshot.rs | A:requires_activity_binding 要求绑定 | S:未知归属的事件不得并入执行
 delta.rs[EN7M]: F:投影增量：按事件窗口产出增量投影 | R:code:crates/runtime/src/projection/mod.rs | A:delta 为唯一入口 | S:增量只描述变化，不重写全量
-history.rs[EN9L]: F:投影历史：请求预算、终态预检与围栏、分页与检查点、流头与规范记录 | R:code:crates/runtime/src/projection/history_prefix.rs | A:INCOMPLETE 表示需快照续读 | S:历史不完整必须显式标记，不得充当完整历史；非增量预算下未完成一次请求会直接报 Invariant，而快照续读预期走增量
-history_prefix.rs[EN8M]: F:历史前缀：机器进展证明与前缀校验 | R:code:crates/runtime/src/projection/history.rs | A:machine_progress 产出校验证明 | S:前缀只在已校验范围内可信
+history.rs[EN9L]: F:投影历史：请求预算、终态预检与围栏、分页与检查点、流头与规范记录 | R:code:crates/runtime/src/projection/history_prefix.rs | A:INCOMPLETE 表示需快照续读 | S:历史不完整必须显式标记，不得充当完整历史；fresh 预算不得自动获得增量续读权，否则会借用别人发布的检查点绕过完整性判定
+history_prefix.rs[EN8M]: F:历史前缀：机器进展证明与前缀校验 | R:code:crates/runtime/src/projection/history.rs | A:machine_progress 产出校验证明 | S:前缀只在已校验范围内可信；从不完整读取发布出来的检查点不能充当完整答案的基座，未显式声明增量续读的请求续读它时必须报 canonical history incomplete at target
 history_prefix_tests.rs[TQ7L]: F:历史前缀测试 | R:code:crates/runtime/src/projection/history_prefix.rs | A:测试模块 | S:覆盖前缀与进展证明
 mod.rs[EN9T]: F:投影模块根：把图/目标/Agent/团队/关系/审批/上下文与事件存储翻译成统一公开投影，含缓存键与授权范围 | R:code:crates/runtime/src/projection/read_evidence.rs | A:模块不拥有持久状态 | S:投影只读既有存储，不写事实；历史请求预算是 256 条记录、预留 16 条提交检查点，夹具规模必须落在此预算内
-own818_tests.rs[TQ7M]: F:投影 own818 测试 | R:code:crates/runtime/src/projection/mod.rs | A:测试模块 | S:覆盖投影与终态结算；夹具分页加载，单次请求超预算会以 Invariant 报错
+own818_tests.rs[TQ7M]: F:投影 own818 测试 | R:code:crates/runtime/src/projection/mod.rs | A:测试模块 | S:覆盖投影与终态结算；夹具分页加载，单次请求超预算会以 Invariant 报错；分页循环必须显式声明增量续读权
 read_evidence.rs[EN9L]: F:证据读取：按需鉴权交付分页，不写投影缓存或检查点 | R:code:crates/runtime/src/projection/snapshot.rs | A:ReadAuthSource 提供读取鉴权 | S:分页交付必须鉴权，且不落缓存
 reducer_support.rs[EN8L]: F:投影归约支撑：执行活动与终态轴、历史效果校验、健康实体、范围与谱系判定 | R:code:crates/runtime/src/projection/activity.rs | A:ExecutionProjectionScope 限定范围 | S:作用域不得退化为执行全域；运行成员集合只看真实 retained run，空集不等于无成员；Program 发现是图作用域且按 kind 过滤的，本作用域读不到开立时额外校验 Program 流完整性——有记录却无 agentic.program_opened 即报 program_not_found，不得以空协作呈现
 settlement.rs[EN9L]: F:终态结算读取：闭包读取与绑定校验、物理闭包复核与绑定刷新 | R:code:crates/runtime/src/projection/reducer_support.rs | A:recheck_work 复核物理闭包 | S:未确认物理闭包不得宣称终态

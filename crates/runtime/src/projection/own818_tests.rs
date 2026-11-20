@@ -18,6 +18,7 @@ fn warm(
     let through = services.event_store().durable_commit_cursor().unwrap();
     let graph = services.graph_state_store().projection(root).unwrap();
     let mut budget = history::RequestBudget::default();
+    budget.enable_incremental();
     let scope =
         ExecutionProjectionScope::load_budgeted(services, root, &graph, true, through, &mut budget)
             .unwrap();

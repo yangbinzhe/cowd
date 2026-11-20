@@ -1941,9 +1941,6 @@ fn load_budgeted(
     budget: &mut RequestBudget,
 ) -> Result<HistoryState, RuntimeServicesError> {
     if !historical {
-        if !budget.incremental {
-            budget.enable_incremental();
-        }
         return prefix::load(services, scope, graph, through, budget);
     }
     let source_fence = budget.capture_source_fence(services)?;

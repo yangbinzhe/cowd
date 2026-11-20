@@ -5568,14 +5568,15 @@ impl ExecutionGraphRunner {
                 Arc::clone(&active.executor),
                 active.ticket.clone(),
                 active.binding.clone(),
+                active.no_dispatch.clone(),
             )
         });
-        if running.as_ref().map(|(_, _, binding)| binding) != expected_binding {
+        if running.as_ref().map(|(_, _, binding, _)| binding) != expected_binding {
             return Err(ExecutionRunnerError::CommandSuperseded {
                 node_id: node_id.to_owned(),
             });
         }
-        if let Some((executor, ticket, _)) = running.as_ref() {
+        if let Some((executor, ticket, _, _)) = running.as_ref() {
             self.active_cancel_observed(graph_id, &executor, ticket)
                 .await?;
             self.complete_callback_observed(
@@ -5639,17 +5640,27 @@ impl ExecutionGraphRunner {
         if status == Some(ExecutionNodeStatus::Running) {
             let ticket = running
                 .as_ref()
-                .map(|(_, ticket, _)| ticket.clone())
+                .map(|(_, ticket, _, _)| ticket.clone())
                 .ok_or_else(|| {
                     ExecutionRunnerError::Driver(
                         "isolated Running node lost original ticket".into(),
                     )
                 })?;
+            // A node that sealed a NoDispatch fact keeps that fact: the
+            // failure this isolation produces is about the custody question,
+            // not about what the batch did, and re-committing a fresh result
+            // would contradict the digest the seal was authenticated with.
+            let sealed = running
+                .as_ref()
+                .and_then(|(_, _, _, observation)| observation.as_ref())
+                .and_then(|observation| observation.witness());
+            let mut outcome = NodeExecutionOutcome::new(result);
+            outcome.no_dispatch = sealed;
             self.commit_service
                 .transition_execution_outcome_async(
                     current,
                     ticket,
-                    NodeExecutionOutcome::new(result),
+                    outcome,
                     BTreeMap::new(),
                 )
                 .await?;
