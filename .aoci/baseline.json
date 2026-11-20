@@ -1,7 +1,7 @@
 {
   "version": 1,
   "created_at": "2026-11-18T15:37:27Z",
-  "updated_at": "2026-11-20T17:03:10Z",
+  "updated_at": "2026-11-20T17:37:53Z",
   "files": {
     ".cargo/config.toml": {
       "role": "index",
@@ -35,15 +35,15 @@
     },
     "Cargo.lock": {
       "role": "observe",
-      "sha256": "aa5c9a7c46a3902aa5908a5ac63d548764a07fe4c0fbb9b8630ce9f24a6ec85e",
+      "sha256": "ea0b9de312cfac042d711d443bdd9595b8103dc1ed3c2e1d29494812e92a3538",
       "size": 104981,
-      "normalized_sha256": "aa5c9a7c46a3902aa5908a5ac63d548764a07fe4c0fbb9b8630ce9f24a6ec85e"
+      "normalized_sha256": "ea0b9de312cfac042d711d443bdd9595b8103dc1ed3c2e1d29494812e92a3538"
     },
     "Cargo.toml": {
       "role": "index",
-      "sha256": "d87228442b3c895c950e55ba1718eb297cca10b0e6be59354d9291f32e3982e2",
+      "sha256": "08cbe52aeb2e53507419ce753d465ab12a5a6d246690dcf2f3fbcfce6b79be52",
       "size": 2840,
-      "normalized_sha256": "d87228442b3c895c950e55ba1718eb297cca10b0e6be59354d9291f32e3982e2"
+      "normalized_sha256": "08cbe52aeb2e53507419ce753d465ab12a5a6d246690dcf2f3fbcfce6b79be52"
     },
     "LICENSE": {
       "role": "index",
@@ -71,9 +71,9 @@
     },
     "aoci.code.txt": {
       "role": "index",
-      "sha256": "95c531a8f890f137ca0fb32615085549f0467a4ecc2a2341ff5f815f2aab3eaf",
-      "size": 420505,
-      "normalized_sha256": "95c531a8f890f137ca0fb32615085549f0467a4ecc2a2341ff5f815f2aab3eaf"
+      "sha256": "6a7886e0bcda1be9ab46a8e1e5733bee17a1a4e0e9d06874995d87ce8243a1d7",
+      "size": 420718,
+      "normalized_sha256": "6a7886e0bcda1be9ab46a8e1e5733bee17a1a4e0e9d06874995d87ce8243a1d7"
     },
     "aoci.meta.txt": {
       "role": "index",
@@ -5127,9 +5127,9 @@
     },
     "crates/runtime/src/agentic/action_service/tests.rs": {
       "role": "index",
-      "sha256": "600fc15be50121f5ca5c1243462eebc4f7a763648575a5c594c6786177626c6f",
-      "size": 236891,
-      "normalized_sha256": "600fc15be50121f5ca5c1243462eebc4f7a763648575a5c594c6786177626c6f"
+      "sha256": "ae8617d31a8826e3162754134536bceeab415443c8b59824b544d27d601a1f12",
+      "size": 237442,
+      "normalized_sha256": "ae8617d31a8826e3162754134536bceeab415443c8b59824b544d27d601a1f12"
     },
     "crates/runtime/src/agentic/continuation.rs": {
       "role": "index",

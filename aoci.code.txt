@@ -2,7 +2,7 @@
 
 ===/<repository>/===
 .gitignore[FV5T]: F:忽略构建产物、IDE/OS 文件、本地 .cowd 数据、node_modules、运行时数据库、plan/ 与 .omo/ 本地资产、旧目录名、live-eval 产物与机器绑定的 opencode.json | R:- | A:plan/ 与 .omo/ 整体忽略；opencode.json 与备份文件按前缀忽略 | S:plan/ 被整体忽略但工作计划就放在 plan/ 下，交付核对要按显式路径；opencode.json 含机器绝对路径，必须保持忽略
-Cargo.toml[FV9S]: F:workspace 根：33 个成员 crate 与 default-members 清单、统一版本号、共享依赖版本、dev/release profile 与 workspace 级 lint 级别 | R:- | A:edition 2021；license MIT；publish=false；unsafe_code=forbid，unwrap_used/expect_used=warn | S:unsafe_code=forbid 是全 workspace 硬门禁，任何 unsafe 只能走已获准的独立 crate 或构建脚本路径；default-members 同时决定裸 cargo build/test 的默认范围，成员与 default-members 必须同步增删；[workspace.package] version 是唯一版本源，发布只改它并由 cargo 同步 Cargo.lock
+Cargo.toml[FV9S]: F:workspace 根：33 个成员 crate 与 default-members 清单、统一版本号、共享依赖版本、dev/release profile 与 workspace 级 lint 级别 | R:- | A:edition 2021；license MIT；publish=false；unsafe_code=forbid，unwrap_used/expect_used=warn | S:unsafe_code=forbid 是全 workspace 硬门禁，任何 unsafe 只能走已获准的独立 crate 或构建脚本路径；default-members 同时决定裸 cargo build/test 的默认范围，成员与 default-members 必须同步增删；[workspace.package] version 是唯一版本源，发布只改它并由 cargo metadata 同步 Cargo.lock
 LICENSE[SZ3T]: F:MIT 许可证全文，附商业使用通知的说明与联系方式 | R:- | A:MIT License，Copyright (c) 2026 Cowd Project Authors；商业使用需主动通知作者 | S:-
 Makefile[OV6T]: F:本地构建入口：按 /proc/meminfo 动态计算安全并行度，提供 check/test/test-all/build/tui-smoke/release-gate 目标，并对 cargo clean 做交互确认 | R:code:scripts/validate.sh,code:scripts/scenarios/tui-smoke.sh | A:SAFE_BUILD_JOBS = 可用内存/3GB，SAFE_TEST_THREADS = 可用内存/2GB 且上限 8，CC_NUM_JOBS=2 | S:cargo clean 会销毁 SQLite 等原生编译缓存并引发数十 GB 级重编译，因此只保留交互确认入口；并行度只在本文件按内存探测，其他脚本不得另设一套
 PRODUCT.md[SU5T]: F:产品登记：目标用户、产品目的、品牌气质、反例清单、七条设计原则与无障碍要求 | R:- | A:单一事实源原则：Runtime 产生执行事实，Gateway 传输，Surface 只做投影与短暂传输态 | S:反例清单对实现有约束力（如不把 TUI 做成常驻仪表盘、不用不受控并发冒充加速），新增界面与交互先对照它再定方案
@@ -1075,7 +1075,7 @@ authorization.rs[DW8L]: F:动作授权与状态迁移校验：普通、带完成
 delegation.rs[DW7S]: F:组织授权判定：建队、绑定动作调用与团队组织三类判定 | R:code:crates/runtime/src/agentic/program.rs | A:三个 can_* 判定函数 | S:组织权限来自不可变的物理执行授权，不来自业务载荷
 native_effect_history_tests.rs[TQ7L]: F:原生效果历史测试：事件历史执行器与保持态执行器 | R:code:crates/runtime/src/agentic/action_service.rs | A:NodeExecutor 两个测试实现 | S:测试覆盖历史读取与保持语义
 receipt_index_791_tests.rs[TQ5T]: F:回执索引 791 的测试入口 | R:code:crates/runtime/src/agentic/action_service.rs | A:单行 use super::* | S:-
-tests.rs[TQ8L]: F:Agent 动作服务测试：动作应用、团队与成员、评审与目标、保持态后端与持有解析器 | R:code:crates/runtime/src/agentic/action_service.rs | A:Harness fixtures 使用 HoldingBackend 与 HoldingResolver | S:测试覆盖动作协议端到端路径
+tests.rs[TQ8L]: F:Agent 动作服务测试：动作应用、团队与成员、评审与目标、保持态后端与持有解析器 | R:code:crates/runtime/src/agentic/action_service.rs | A:Harness fixtures 使用 HoldingBackend 与 HoldingResolver | S:测试覆盖动作协议端到端路径；断言「拒绝路径不推进 durable commit cursor」的用例必须先 shutdown_maintenance，否则同一 RuntimeServices 的后台维护会提交事件，使游标多 1 而隔离跑时看不出来
 
 ===/<repository>/crates/runtime/src/agentic/execution/===
 admission.rs[DW8L]: F:执行准入：能力与工具交集、技能工具贡献、能力缺口约束、目录项选择与权限下界 | R:code:crates/runtime/src/agentic/execution/dispatch.rs | A:effective_capabilities_after_intersection 为交集入口 | S:能力→工具→宿主三层交集决定可用工具，缺口必须显式报告；工具发现只验证已注册接口，作用域在调用时按租约判定，不得把发现当作授权
