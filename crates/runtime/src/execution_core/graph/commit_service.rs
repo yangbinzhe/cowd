@@ -20525,15 +20525,6 @@ mod failure_shape_tests {
         while fixture.events.stream_revision(&effect_stream).expect("head") == settled_head {
             tokio::task::yield_now().await;
         }
-        // The source must be *already* moved when the budget starts spending. Left
-        // running, the writer commits for the whole 400ms window and how many events
-        // land depends on the machine: on an idle host it outran the budget and the
-        // recovery reported the raw `stream revision mismatch` instead of the typed
-        // source-moved error, while the rule under test - a never-settling source
-        // fails closed inside a bounded budget - held the whole time. Stopping it here
-        // makes the moved source a fact the budget cannot outrun.
-        stop.store(true, std::sync::atomic::Ordering::SeqCst);
-        writer.await.unwrap();
         let started = std::time::Instant::now();
         let recovery = ExecutionGraphRecovery::new(&fixture.state, &fixture.commits, &fixture.registry);
         let error = recovery
@@ -20547,6 +20538,8 @@ mod failure_shape_tests {
             .await
             .expect_err("a source that never settles fails closed");
         let elapsed = started.elapsed();
+        stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        writer.await.unwrap();
         assert!(
             elapsed >= std::time::Duration::from_millis(300),
             "the physical-closure budget was spent before failing: {elapsed:?}"
