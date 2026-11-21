@@ -2,7 +2,7 @@
 
 ===/<repository>/===
 .gitignore[FV5T]: F:忽略构建产物、IDE/OS 文件、本地 .cowd 数据、node_modules、运行时数据库、plan/ 与 .omo/ 本地资产、旧目录名、live-eval 产物与机器绑定的 opencode.json | R:- | A:plan/ 与 .omo/ 整体忽略；opencode.json 与备份文件按前缀忽略 | S:plan/ 被整体忽略但工作计划就放在 plan/ 下，交付核对要按显式路径；opencode.json 含机器绝对路径，必须保持忽略
-Cargo.toml[FV9S]: F:workspace 根：33 个成员 crate 与 default-members 清单、统一版本号、共享依赖版本、dev/release profile 与 workspace 级 lint 级别 | R:- | A:edition 2021；license MIT；publish=false；unsafe_code=forbid，unwrap_used/expect_used=warn | S:当前 workspace 版本 0.10.44。[workspace.package] version 是唯一版本源，发布只改它并由 cargo update --workspace --offline 同步 Cargo.lock；unsafe_code=forbid 是全 workspace 硬门禁；default-members 与成员清单必须同步增删；改本文件会让 AOCI 的 Cargo.toml 条目变 stale
+Cargo.toml[FV9S]: F:workspace 根：33 个成员 crate 与 default-members 清单、统一版本号、共享依赖版本、dev/release profile 与 workspace 级 lint 级别 | R:- | A:edition 2021；license MIT；publish=false；unsafe_code=forbid，unwrap_used/expect_used=warn | S:当前 workspace 版本 0.10.45。[workspace.package] version 是唯一版本源，发布只改它并由 cargo update --workspace --offline 同步 Cargo.lock；该文件在只读挂载上，sed -i 会因权限改不了属主而失败，必须用 python 重写；unsafe_code=forbid 是全 workspace 硬门禁；default-members 与成员清单必须同步增删
 LICENSE[SZ3T]: F:MIT 许可证全文，附商业使用通知的说明与联系方式 | R:- | A:MIT License，Copyright (c) 2026 Cowd Project Authors；商业使用需主动通知作者 | S:-
 Makefile[OV6T]: F:本地构建入口：按 /proc/meminfo 动态计算安全并行度，提供 check/test/test-all/build/tui-smoke/release-gate 目标，并对 cargo clean 做交互确认 | R:code:scripts/validate.sh,code:scripts/scenarios/tui-smoke.sh | A:SAFE_BUILD_JOBS = 可用内存/3GB，SAFE_TEST_THREADS = 可用内存/2GB 且上限 8，CC_NUM_JOBS=2 | S:cargo clean 会销毁 SQLite 等原生编译缓存并引发数十 GB 级重编译，因此只保留交互确认入口；并行度只在本文件按内存探测，其他脚本不得另设一套
 PRODUCT.md[SU5T]: F:产品登记：目标用户、产品目的、品牌气质、反例清单、七条设计原则与无障碍要求 | R:- | A:单一事实源原则：Runtime 产生执行事实，Gateway 传输，Surface 只做投影与短暂传输态 | S:反例清单对实现有约束力（如不把 TUI 做成常驻仪表盘、不用不受控并发冒充加速），新增界面与交互先对照它再定方案
@@ -1050,7 +1050,7 @@ tool_turn.rs[DW8L]: F:工具回合执行器：作用域回执、效果恢复、A
 failure_evidence.rs[TQ7M]: F:失败证据收集：从事件存储取证据页并打包归档，含摘要写入 | R:code:crates/runtime/src/agent/test_support.rs | A:collect_failure_evidence 为入口；ArchiveWriter 与 DigestWriter | S:归档保留原始字节与摘要，便于事后复核
 
 ===/<repository>/crates/runtime/src/agentic/===
-action_invocation.rs[DW8L]: F:调用作用域能力：委托原始会话所有者、单次已校验输入、所有者准入见证与已验证动作调用 | R:code:crates/runtime/src/agentic/action_service.rs | A:VerifiedActionInvocation 携带私有见证 | S:见证不可由调用方坐标构造；委托签发只限原始 ToolBatch 宿主适配器
+action_invocation.rs[DW8L]: F:调用作用域能力与委派准入：委托原始会话所有者、Step 归属校验、已验证动作调用见证 | R:code:crates/runtime/src/agentic/action_service.rs,code:crates/runtime/src/agentic/review_evidence/results.rs | A:VerifiedActionInvocation 携带私有见证；execution_ids_agree 两侧走 graph_id_for_lookup | S:见证不可由调用方坐标构造；一个执行有两种拼写（裸 graph id 与 run: 前缀），比较 Step 归属必须用 execution_ids_agree 而非裸字符串等值，graph_id_for_lookup 只剥 run:，runner:/runs: 是独立命名空间不可误剥；委托签发只限原始 ToolBatch 宿主适配器
 action_service.rs[DW9L]: F:Agent 动作服务主体：动作应用与拒绝、原始成员提交与回执、重放、等待与恢复处置、事务 id 与幂等 | R:code:crates/harness-contract/src/agent_action.rs | A:RefusedCall 与 RefusalOutcome 表达拒绝；事务 id 含处置类型与修订 | S:拒绝必须写在会被读取的键上；同一 program 修订上的不同处置必须有不同事务 id，否则会被幂等去重吞掉；行动提示只可追加，不得覆盖同一响应里已写入的提示
 continuation.rs[DW8L]: F:程序延续：读取延续目标并准备延续谱系，与新的根一起提交 | R:code:crates/runtime/src/agentic/program.rs | A:prepare 为唯一准备入口 | S:延续由运行时准备并随新根提交，业务数量不替代冻结的 actor 授权
 coordination.rs[DW8L]: F:协调查询：对原始程序日志的纯查询，无第二队列或写入者 | R:code:crates/runtime/src/agentic/program.rs | A:coordination_requests 与 coordination_wake 为查询 | S:协调只读 Program 日志
@@ -1094,16 +1094,16 @@ own823c_tests.rs[TQ5T]: F:order_contract 的 own823c 测试入口 | R:code:crate
 
 ===/<repository>/crates/runtime/src/agentic/review_evidence/===
 coverage.rs[DW8L]: F:评审覆盖校验：证据包含、结果引用覆盖与必需写入失败条目 | R:code:crates/runtime/src/agentic/review_evidence.rs | A:validate_review_coverage 为入口 | S:覆盖缺口必须逐项报出，不能只给总数
-current_review.rs[DW9L]: F:当前评审控制调用的精确身份：评审动作身份、当前评审应用判定、程序切面吸收自身评审与效果键解析 | R:code:crates/runtime/src/agentic/review_evidence/policy.rs | A:resolve_current_review_effect_key 拒绝两调用同声索豁免 | S:豁免只能针对唯一的当前调用，存储值不能自授豁免
+current_review.rs[DW9L]: F:当前评审控制调用的精确身份：评审动作身份、当前评审应用判定、程序切面吸收自身评审与效果键解析 | R:code:crates/runtime/src/agentic/review_evidence/policy.rs | A:resolve_current_review_effect_key 拒绝两调用同声索豁免 | S:豁免只能针对唯一的当前调用，存储值不能自授豁免；评审人身份比对里 execution 一侧用 execution_ids_agree（run: 前缀与裸 id 等价），session/turn 仍是精确 UUID 比较
 current_review_applied_tests.rs[TQ6S]: F:当前评审已应用路径的测试 | R:code:crates/runtime/src/agentic/review_evidence/current_review.rs | A:测试模块 | S:覆盖已应用评审无存活调用的分支
 current_review_retirement.rs[DW8L]: F:评审退役：图尾部保留业务证据或判定为自身评审退役 | R:code:crates/runtime/src/agentic/review_evidence/current_review.rs | A:graph_tail_preserves_work 与 graph_tail_is_own_review_retirement | S:退役只对原始单评审节点保留证据，源修订 CAS 仍推进到实际头
 identity.rs[DW7T]: F:评审证据身份：材料身份与辅助引用、评审结果身份 | R:code:crates/runtime/src/agentic/review_evidence.rs | A:review_result_identity 为唯一身份构造 | S:身份按材料引用派生，不按文本
-policy.rs[DW9L]: F:评审策略快照：读既有运行时策略与工具日志，推导根评审策略、证明输入快照与历史会话切面 | R:code:crates/runtime/src/agentic/review_evidence/current_review.rs | A:禁止自造策略；历史切面只接受真实窗口 | S:伪造窗口或截断流必须拒绝
+policy.rs[DW9L]: F:评审策略快照：读既有运行时策略与工具日志，推导根评审策略、证明输入快照与历史会话切面 | R:code:crates/runtime/src/agentic/review_evidence/current_review.rs | A:禁止自造策略；历史切面只接受真实窗口 | S:伪造窗口或截断流必须拒绝；source 归属与 unsealed acquisition 两处的 execution 比较都走 execution_ids_agree，Provider 分支比 packet.run_id()、Process 分支比 packet.graph_id()，两条分支不得用不同拼写口径
 policy_control_identity_tests.rs[TQ6S]: F:策略控制身份测试 | R:code:crates/runtime/src/agentic/review_evidence/policy.rs | A:测试模块 | S:覆盖控制身份解析
 read_source.rs[DW7S]: F:读认证来源端口：原始存储边界与测试用键覆盖源 | R:code:crates/runtime/src/agentic/review_evidence.rs | A:ReadAuthSource trait | S:事件发现留给调用方，端口不承诺预算或切面
 reason_code.rs[DR7S]: F:评审拒绝码：六类稳定拒绝码与句子前缀映射 | R:code:crates/runtime/src/agentic/review_evidence.rs | A:REVIEW_REFUSAL_CODES 固定六项 | S:拒绝必须按码计数，不能按句子形状
 receipt_index_791_tests.rs[TQ6S]: F:评审证据回执索引测试 | R:code:crates/runtime/src/agentic/review_evidence.rs | A:测试模块 | S:覆盖回执索引路径
-results.rs[DW9L]: F:结果解析：经既有 Artifact/Program/Tool 所有者解析不透明结果，含结果来源强度与进程执行认证 | R:code:crates/runtime/src/agentic/review_evidence.rs | A:require_strong 强制强来源 | S:结果必须经真实所有者解析，弱来源不得充当结论；业务生命周期事件必须携带完整 RuntimeActivityBinding（含 parent_activity_id 与 tool_contract_id）
+results.rs[DW9L]: F:结果解析：经既有 Artifact/Program/Tool 所有者解析不透明结果，含结果来源强度与进程执行认证 | R:code:crates/runtime/src/agentic/review_evidence.rs | A:require_strong 强制强来源 | S:结果必须经真实所有者解析，弱来源不得充当结论；业务生命周期事件必须携带完整 RuntimeActivityBinding（含 parent_activity_id、tool_contract_id 与 generation>0）；result_tool_plan 的 plan.refs 是事件字段（Vec<RuntimeEventRef>）而非 payload 字段，其中 execution 一侧用 execution_ids_agree 比较，session/turn 保持精确
 work_contract_tests.rs[TQ6S]: F:工作契约测试 | R:code:crates/runtime/src/agentic/review_evidence/policy.rs | A:测试模块 | S:覆盖工作契约校验
 
 ===/<repository>/crates/runtime/src/agentic/review_evidence/policy/===
