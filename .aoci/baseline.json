@@ -1,7 +1,7 @@
 {
   "version": 1,
   "created_at": "2026-11-18T15:37:27Z",
-  "updated_at": "2026-11-21T04:15:58Z",
+  "updated_at": "2026-11-21T05:13:48Z",
   "files": {
     ".cargo/config.toml": {
       "role": "index",
@@ -35,15 +35,15 @@
     },
     "Cargo.lock": {
       "role": "observe",
-      "sha256": "9d8717a7ea2382c49a6c34860c7e59c5945313bef91049c0bb8e53abfa1667af",
+      "sha256": "b32714f0167064701c677ee5e2507caceefb980587412ae36f7d75c66666d3e2",
       "size": 104981,
-      "normalized_sha256": "9d8717a7ea2382c49a6c34860c7e59c5945313bef91049c0bb8e53abfa1667af"
+      "normalized_sha256": "b32714f0167064701c677ee5e2507caceefb980587412ae36f7d75c66666d3e2"
     },
     "Cargo.toml": {
       "role": "index",
-      "sha256": "d12bde7e1beb264813f7e14cdb4b6bd87a0451a1c8a927aceb9884976f339fc3",
+      "sha256": "9229bfd69bd72a3ebd75673c9f30df2a2124d2d43bc28ef26fe6f5da07922a4e",
       "size": 2840,
-      "normalized_sha256": "d12bde7e1beb264813f7e14cdb4b6bd87a0451a1c8a927aceb9884976f339fc3"
+      "normalized_sha256": "9229bfd69bd72a3ebd75673c9f30df2a2124d2d43bc28ef26fe6f5da07922a4e"
     },
     "LICENSE": {
       "role": "index",
@@ -71,9 +71,9 @@
     },
     "aoci.code.txt": {
       "role": "index",
-      "sha256": "81813dda7ad38dc46c102a655d53d34c0ce65e7dd2354ac67de1b20be12f1a15",
-      "size": 421376,
-      "normalized_sha256": "81813dda7ad38dc46c102a655d53d34c0ce65e7dd2354ac67de1b20be12f1a15"
+      "sha256": "02955cc31cd0126c7b61d294e73b8d08db766a6451e88f5abcd8b8be34a1d778",
+      "size": 421619,
+      "normalized_sha256": "02955cc31cd0126c7b61d294e73b8d08db766a6451e88f5abcd8b8be34a1d778"
     },
     "aoci.meta.txt": {
       "role": "index",
@@ -5559,9 +5559,9 @@
     },
     "crates/runtime/src/conversation/context_plane.rs": {
       "role": "index",
-      "sha256": "74afa121506a08cd7435d6a2bca0eac378b18b2469ff9b1e8398460a7ef8a227",
-      "size": 196069,
-      "normalized_sha256": "74afa121506a08cd7435d6a2bca0eac378b18b2469ff9b1e8398460a7ef8a227"
+      "sha256": "d8b143c767e69212fe0b202a124d2f6f01df2330fcf4f3ef31a431c0d1254b30",
+      "size": 199794,
+      "normalized_sha256": "d8b143c767e69212fe0b202a124d2f6f01df2330fcf4f3ef31a431c0d1254b30"
     },
     "crates/runtime/src/conversation/conversation.rs": {
       "role": "index",

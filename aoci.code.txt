@@ -1159,7 +1159,7 @@ mod.rs[DR7L]: F:资源层：资源种类与投影、提示、证据、迁移与�
 
 ===/<repository>/crates/runtime/src/conversation/===
 compact.rs[DM7L]: F:会话压缩：估算、是否压缩、摘要格式化、压缩执行与计划应用 | R:code:crates/memory/src/compression/session.rs | A:compact_session 与 plan_session_compaction | S:压缩保留最近窗口与续接消息
-context_plane.rs[DW9L]: F:上下文平面：组装、激活、记忆投影与预算治理，含易变时钟哨兵与目标状态包前缀 | R:code:crates/runtime/src/conversation/conversation.rs | A:VOLATILE_CLOCK_SENTINEL 在渲染期替换 | S:渲染期替换易变段，避免破坏提示缓存
+context_plane.rs[DW9L]: F:上下文平面：组装、激活、记忆投影与预算治理，含易变时钟哨兵与目标状态包前缀 | R:code:crates/runtime/src/conversation/conversation.rs | A:VOLATILE_CLOCK_SENTINEL 在渲染期替换 | S:渲染期替换易变段，避免破坏提示缓存；native tool source 的身份比对必须用该 runtime 自己的 execution_identity，不得用 bus.current_execution_context()（那是 root 作用域，会拒掉委派 agent 的调用），图 id 两侧须经 graph_id_for_lookup 规范化
 conversation.rs[DW9L]: F:会话主体：轮次输入控制、审批等待、工具平面与取消站点，承载一次对话的完整执行 | R:code:crates/runtime/src/conversation/tool_plane.rs | A:OriginalTurnInputControl 提供审批等待唤醒 | S:输入控制与审批等待必须在原始轮次内闭环
 evidence_terminal_plane.rs[DW9L]: F:终态证据平面：策略账本、运行时事件、结果终结与会话读写入口 | R:code:crates/runtime/src/conversation/conversation.rs | A:record_turn_started 与 compact_session_with_checkpoint | S:终态写入与策略账本同事务；策略重定向方法属生产路径，不得加 test-only 门控，否则 cargo build --features full 会因 E0599 编不过而 --all-targets 编 test target 察觉不到
 frame_refusal.rs[DW8S]: F:帧拒绝：把未执行的工具调用统一成一种形状（工具结果、事件载荷与整帧理由） | R:code:crates/runtime/src/conversation/conversation.rs | A:FrameRefusal::new 与 wholly_refused_frame_reason | S:拒绝必须有可持久的事件与明确形状，不能只返回裸错误
