@@ -5207,7 +5207,17 @@ where
                 &reason,
             ));
         };
-        tracing::warn!(%tool_name, %turn_id, "dispatch refused for a repeatedly failing call");
+        // The refusal is the last thing the operator sees before a turn can end
+        // without a result, so it has to name what failed and how the model was
+        // told to get out — a bare turn id cannot be actioned after the fact.
+        tracing::warn!(
+            %tool_name,
+            %turn_id,
+            failed_count = refusal.count,
+            cause = %refusal.cause_signature,
+            way_out = crate::repetition_guard::SCOPED_RECOVERY_GUIDANCE,
+            "dispatch refused for a repeatedly failing call"
+        );
         let reason = format!(
             "Runtime refused to dispatch this call again: it has already failed \
              deterministically {} times in this turn, so retrying it cannot produce a \
