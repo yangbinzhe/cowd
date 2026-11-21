@@ -2383,7 +2383,10 @@ fn step_belongs_to_packet(
         });
     identity.session_id == packet.session_id()
         && turn.is_some_and(|turn| identity.turn_id == turn)
-        && identity.execution_id.as_deref() == Some(packet.run_id())
+        && crate::agentic::action_invocation::execution_ids_agree(
+            identity.execution_id.as_deref(),
+            packet.run_id(),
+        )
         && identity.run_ref.as_deref() == Some(packet.run_id())
         // The native provider path does not carry the attempt in the Step
         // identity; when it does, it has to be the reviewer's attempt. The
