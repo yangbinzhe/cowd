@@ -1263,6 +1263,14 @@ where
                     .as_ref()
                     .and_then(|identity| identity.graph_id().map(str::to_string))
                     .or_else(|| execution_epoch.as_ref().map(|context| context.execution_id.clone()))
+                    .map(|execution_id| {
+                        // The canonical graph id, never the run-scoped
+                        // reference. The physical Provider identity copies this
+                        // value and compares it with the bound step identity,
+                        // so a run reference here makes every delegated agent
+                        // look like a different execution.
+                        crate::execution_core::graph::graph_id_for_lookup(&execution_id).to_string()
+                    })
                     .unwrap_or_default();
                 request.provider_evidence_context = Some(crate::ProviderRequestEvidenceContext {
             graph_owner: self.root_effect_owner().ok().map(|(activity, attempt)| Box::new(crate::provider_runtime_client::ProviderGraphOwner { activity, attempt })),
@@ -1340,6 +1348,7 @@ where
                     attempt_id
                 });
                 let bound_step = self.bind_provider_step(&mut request)?;
+                align_evidence_attempt_to_bound_step(&mut request, bound_step.as_ref());
                 let mut reducer = ModelStreamReducer::new(
                     self.cowd_bus.clone(),
                     self.runtime_event_store.clone(),
@@ -2681,6 +2690,7 @@ where
             let provider_started = Instant::now();
             let stream_started = Instant::now();
             let bound_step = self.bind_provider_step(&mut request)?;
+            align_evidence_attempt_to_bound_step(&mut request, bound_step.as_ref());
             let native_context = request.provider_evidence_context.clone();
             let native_step = bound_step.as_ref().map(|step| step.snapshot().clone());
             self.native_wire_receipts
@@ -3564,6 +3574,31 @@ where
             }
         }
         Err(last_error.unwrap_or_else(|| RuntimeError::new("all provider fallbacks exhausted")))
+    }
+}
+
+
+/// Make the request's evidence attempt the bound step's own attempt.
+///
+/// The request-side counter is a provider counter scoped to one model-step
+/// operation, and it advances on every retry, replan and model switch. The
+/// bound step pins the Runtime-owned attempt of that same operation. The
+/// physical Provider identity compares the two, so once the provider counter
+/// moves past the first attempt the comparison can never hold again and the
+/// recovery chain stops. When a bound step exists its attempt is the one the
+/// evidence must name.
+fn align_evidence_attempt_to_bound_step(
+    request: &mut ApiRequest,
+    bound_step: Option<&Arc<crate::step_snapshot::BoundStep>>,
+) {
+    let Some(step) = bound_step else {
+        return;
+    };
+    let Some(attempt) = step.snapshot().identity.attempt else {
+        return;
+    };
+    if let Some(context) = request.provider_evidence_context.as_mut() {
+        context.attempt = attempt;
     }
 }
 
