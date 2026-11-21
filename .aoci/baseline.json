@@ -1,7 +1,7 @@
 {
   "version": 1,
   "created_at": "2026-11-18T15:37:27Z",
-  "updated_at": "2026-11-21T02:38:27Z",
+  "updated_at": "2026-11-21T04:15:58Z",
   "files": {
     ".cargo/config.toml": {
       "role": "index",
@@ -35,15 +35,15 @@
     },
     "Cargo.lock": {
       "role": "observe",
-      "sha256": "efba5aa239faa3f7402d6298fe4982a4300eca91e4d7a4f5c3c0f0a32273f9e1",
+      "sha256": "9d8717a7ea2382c49a6c34860c7e59c5945313bef91049c0bb8e53abfa1667af",
       "size": 104981,
-      "normalized_sha256": "efba5aa239faa3f7402d6298fe4982a4300eca91e4d7a4f5c3c0f0a32273f9e1"
+      "normalized_sha256": "9d8717a7ea2382c49a6c34860c7e59c5945313bef91049c0bb8e53abfa1667af"
     },
     "Cargo.toml": {
       "role": "index",
-      "sha256": "6869b5fdee9fb6f6b87573ef0ff95dd5dd86d1941a82b6c992a90b64e2f0497c",
+      "sha256": "d12bde7e1beb264813f7e14cdb4b6bd87a0451a1c8a927aceb9884976f339fc3",
       "size": 2840,
-      "normalized_sha256": "6869b5fdee9fb6f6b87573ef0ff95dd5dd86d1941a82b6c992a90b64e2f0497c"
+      "normalized_sha256": "d12bde7e1beb264813f7e14cdb4b6bd87a0451a1c8a927aceb9884976f339fc3"
     },
     "LICENSE": {
       "role": "index",
@@ -71,9 +71,9 @@
     },
     "aoci.code.txt": {
       "role": "index",
-      "sha256": "6e1404756d0943192db3fce1b3fa25291008fe7bafea07b6ac51c00f50bb52f6",
-      "size": 420936,
-      "normalized_sha256": "6e1404756d0943192db3fce1b3fa25291008fe7bafea07b6ac51c00f50bb52f6"
+      "sha256": "81813dda7ad38dc46c102a655d53d34c0ce65e7dd2354ac67de1b20be12f1a15",
+      "size": 421376,
+      "normalized_sha256": "81813dda7ad38dc46c102a655d53d34c0ce65e7dd2354ac67de1b20be12f1a15"
     },
     "aoci.meta.txt": {
       "role": "index",
@@ -5607,9 +5607,9 @@
     },
     "crates/runtime/src/conversation/host_route.rs": {
       "role": "index",
-      "sha256": "d99a53a682176369a058c86af4dd325884604dbbf01469e298c55167976368fb",
-      "size": 33550,
-      "normalized_sha256": "d99a53a682176369a058c86af4dd325884604dbbf01469e298c55167976368fb"
+      "sha256": "b32161b065a7850f3b61c4760c5b53039fa0dade1d8c240be523d928c687f60e",
+      "size": 36155,
+      "normalized_sha256": "b32161b065a7850f3b61c4760c5b53039fa0dade1d8c240be523d928c687f60e"
     },
     "crates/runtime/src/conversation/liveness.rs": {
       "role": "index",
@@ -5619,9 +5619,9 @@
     },
     "crates/runtime/src/conversation/own834_host_control_tests.rs": {
       "role": "index",
-      "sha256": "48ac9c4b362dd656a07a73b8701a55787866588326af451b2be5d746bdf25516",
-      "size": 5473,
-      "normalized_sha256": "48ac9c4b362dd656a07a73b8701a55787866588326af451b2be5d746bdf25516"
+      "sha256": "89fdc83db9a45e09e207b7bf7e53ecff6e4e5d0505f60e3d047ec746c39dc16d",
+      "size": 7089,
+      "normalized_sha256": "89fdc83db9a45e09e207b7bf7e53ecff6e4e5d0505f60e3d047ec746c39dc16d"
     },
     "crates/runtime/src/conversation/prompt.rs": {
       "role": "index",
@@ -5733,9 +5733,9 @@
     },
     "crates/runtime/src/conversation/tool_plane.rs": {
       "role": "index",
-      "sha256": "5fa7ad2de917b60ddc79e20c0e4c4f6b560500feb4f735f29e2166a383a783ac",
-      "size": 398277,
-      "normalized_sha256": "5fa7ad2de917b60ddc79e20c0e4c4f6b560500feb4f735f29e2166a383a783ac"
+      "sha256": "d089f6ef039420ca4c5f783f0c090550898b7e140f8ceb1b6ee111f437ee67eb",
+      "size": 398727,
+      "normalized_sha256": "d089f6ef039420ca4c5f783f0c090550898b7e140f8ceb1b6ee111f437ee67eb"
     },
     "crates/runtime/src/conversation/turn_engine.rs": {
       "role": "index",
