@@ -663,7 +663,9 @@ impl ProviderPhysicalObservation {
             || id.resource_lease.is_empty()
             || id.step.session_id != id.session_id
             || id.step.turn_id != id.turn_id
-            || id.step.execution_id.as_deref() != Some(id.execution_id.as_str())
+            || crate::execution_core::graph::graph_id_for_lookup(
+                id.step.execution_id.as_deref().unwrap_or_default(),
+            ) != crate::execution_core::graph::graph_id_for_lookup(&id.execution_id)
             || id
                 .step
                 .attempt
@@ -4641,6 +4643,100 @@ mod tests {
             super::bound_step_evidence_mismatch(None, &snapshot),
             "a missing evidence context must still be refused"
         );
+    }
+
+    #[tokio::test]
+    async fn physical_identity_accepts_the_bound_step_own_attempt_after_a_replan() {
+        let root = tempfile::tempdir().unwrap();
+        let (_, request) = step_wire_fixture("http://127.0.0.1:1/v1".into(), root.path());
+        let context = request.provider_evidence_context.as_ref().unwrap();
+        let step = request.bound_step.as_ref().unwrap().snapshot();
+        let step_attempt = step
+            .identity
+            .attempt
+            .expect("the fixture's bound step carries its own attempt");
+
+        // The failure live saw: the evidence context still named the provider
+        // counter from the model-step operation while the bound step pinned its
+        // own Runtime attempt, so an attempt after a replan never matched.
+        let mut stale = context.clone();
+        stale.attempt = step_attempt.saturating_add(1);
+        let stale_identity = super::ProviderPhysicalIdentity {
+            graph_owner: None,
+            session_id: stale.session_id.clone(),
+            execution_id: stale.execution_id.clone(),
+            turn_id: stale.turn_id.clone(),
+            request_sequence: stale.request_sequence,
+            request_id: "original-request".into(),
+            response_id: "actual-response-A".into(),
+            opened_at_ms: 1,
+            logical_attempt: stale.attempt,
+            step: step.identity.clone(),
+            provider_attempt: step.provider_attempt.clone(),
+            resource_lease: "resource-lease:fixture:original".into(),
+        };
+        assert!(
+            super::ProviderPhysicalObservation::ResponseOpened {
+                identity: stale_identity,
+            }
+            .validate(&stale)
+            .is_err(),
+            "an evidence attempt that is not the bound step's own must be refused"
+        );
+
+        // Aligned to the bound step's attempt, the same observation is admitted.
+        let mut aligned = context.clone();
+        aligned.attempt = step_attempt;
+        let aligned_identity = super::ProviderPhysicalIdentity {
+            graph_owner: None,
+            session_id: aligned.session_id.clone(),
+            execution_id: aligned.execution_id.clone(),
+            turn_id: aligned.turn_id.clone(),
+            request_sequence: aligned.request_sequence,
+            request_id: "original-request".into(),
+            response_id: "actual-response-A".into(),
+            opened_at_ms: 1,
+            logical_attempt: aligned.attempt,
+            step: step.identity.clone(),
+            provider_attempt: step.provider_attempt.clone(),
+            resource_lease: "resource-lease:fixture:original".into(),
+        };
+        super::ProviderPhysicalObservation::ResponseOpened {
+            identity: aligned_identity,
+        }
+        .validate(&aligned)
+        .expect("the bound step's own attempt must be admitted");
+
+        // The run-scoped spelling of the same execution is the same execution.
+        let mut run_scoped = context.clone();
+        run_scoped.attempt = step_attempt;
+        let run_scoped_execution = format!(
+            "run:{}",
+            step.identity
+                .execution_id
+                .clone()
+                .expect("the fixture's step carries an execution id")
+        );
+        run_scoped.execution_id = run_scoped_execution.clone();
+        let run_scoped_identity = super::ProviderPhysicalIdentity {
+            graph_owner: None,
+            session_id: run_scoped.session_id.clone(),
+            execution_id: run_scoped_execution,
+            turn_id: run_scoped.turn_id.clone(),
+            request_sequence: run_scoped.request_sequence,
+            request_id: "original-request".into(),
+            response_id: "actual-response-A".into(),
+            opened_at_ms: 1,
+            logical_attempt: run_scoped.attempt,
+            step: step.identity.clone(),
+            provider_attempt: step.provider_attempt.clone(),
+            resource_lease: "resource-lease:fixture:original".into(),
+        };
+        super::ProviderPhysicalObservation::ResponseOpened {
+            identity: run_scoped_identity,
+        }
+        .validate(&run_scoped)
+        .expect("a run-scoped reference to the bound step's execution must be admitted");
     }
 
     async fn r189_physical_wire_rejects_wrong_attempt_old_open_and_missing_requested() {
