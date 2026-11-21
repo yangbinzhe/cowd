@@ -2973,6 +2973,67 @@ mod gate_tests {
     }
 
     #[test]
+    fn a_observer_produced_integrity_block_satisfies_the_canonical_usage_reader() {
+        // The reader refuses to sum a scenario whose timeline bodies were not
+        // observed. The producer is the only place that can say so, so the
+        // contract is checked across the boundary instead of against a
+        // hand-written fixture.
+        let mut observer = crate::live_scenario_observer::LiveScenarioObserver::default();
+        let events = (0..2)
+            .map(|sequence| {
+                json!({
+                    "source": "runtime_lifecycle",
+                    "stream_id": "session:test",
+                    "sequence": sequence,
+                    "kind": "runtime.progress",
+                    "commit_cursor": sequence + 1,
+                    "transaction_index": 0,
+                    "status": "running",
+                    "payload": {"status": "observed"},
+                })
+            })
+            .collect::<Vec<_>>();
+        let page = json!({
+            "events": events,
+            "has_more": false,
+            "next_cursor": "v2:0:0:0",
+        });
+        observer
+            .observe_timeline_page("/timeline", &Ok(page), 10)
+            .expect("timeline page");
+        let integrity = observer.integrity_report();
+        assert!(
+            super::timeline_coverage_complete(&integrity),
+            "the observer's own integrity block must satisfy the reader: {integrity}"
+        );
+        let report = json!({
+            "level": "deep", "authorized_real_model": true,
+            "execution_trace": {
+                "provider_rounds": 1, "rounds": [],
+                "total_usage": {"total_tokens": 17, "usage_source": "live_gateway_canonical_usage"},
+                "provider_cache": {"physical_provider_attempts": 1, "usage_unknown_attempts": 0}
+            },
+            "live_gateway_scenarios": {"scenarios": [{"observation_integrity": integrity, "metrics": {
+                "provider_attempt_count": 1, "provider_usage_records": 1,
+                "usage_unknown_attempts": 0, "model_rounds": 1,
+                "provider_attempt_cache_dimensions_unknown_count": 0,
+                "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0,
+                "input_tokens": 17, "output_tokens": 0, "total_tokens": 17
+            }}]}
+        });
+        assert_eq!(
+            crate::HarnessEvalReportSummary::from_report_json(
+                "report".to_string(),
+                "report.json".to_string(),
+                None,
+                &report,
+            )
+            .total_tokens,
+            Some(17)
+        );
+    }
+
+    #[test]
     fn canonical_read_total_distinguishes_known_zero_missing_partial_and_overflow() {
         let summary = |report: &Value| {
             HarnessEvalReportSummary::from_report_json(

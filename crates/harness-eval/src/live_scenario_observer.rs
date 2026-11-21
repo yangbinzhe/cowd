@@ -134,6 +134,7 @@ pub(crate) struct LiveScenarioObserver {
     timeline_pages_drained: bool,
     timeline_pages: u64,
     timeline_cursor_advances: u64,
+    timeline_unobserved_bodies: u64,
     last_root_fingerprint: Option<String>,
     last_history_progress: Option<HistoryProgress>,
     last_live_fingerprint: Option<String>,
@@ -167,6 +168,7 @@ impl Default for LiveScenarioObserver {
             timeline_pages_drained: false,
             timeline_pages: 0,
             timeline_cursor_advances: 0,
+            timeline_unobserved_bodies: 0,
             last_root_fingerprint: None,
             last_history_progress: None,
             last_live_fingerprint: None,
@@ -424,6 +426,9 @@ impl LiveScenarioObserver {
                     );
                 }
             } else {
+                if !timeline_body_observed(&event) {
+                    self.timeline_unobserved_bodies = self.timeline_unobserved_bodies.saturating_add(1);
+                }
                 self.timeline_event_payloads.insert(identity, event.clone());
                 self.timeline_events.push(event.clone());
                 new_items.push(event);
@@ -762,6 +767,12 @@ impl LiveScenarioObserver {
             "timeline_drained": self.timeline_pages_drained,
             "message_pages_drained": self.message_pages_drained,
             "omitted_changes": 0,
+            "timeline_unobserved_bodies": self.timeline_unobserved_bodies,
+            "timeline_body_observation": if self.timeline_unobserved_bodies == 0 {
+                "observed"
+            } else {
+                "unobserved"
+            },
             "stall_detected": self.stall_detected,
             "phase": self.phase.as_str(),
             "last_active_phase": self.last_active_phase.as_str(),
@@ -1009,6 +1020,18 @@ fn response_bytes(response: &Result<Value, String>) -> u64 {
     }
 }
 
+/// Whether a timeline event carried a readable body.
+///
+/// The canonical usage reader refuses to sum a scenario whose timeline bodies
+/// were not observed, so the observer has to say which events it could read.
+fn timeline_body_observed(event: &Value) -> bool {
+    match event.get("payload") {
+        Some(Value::Null) | None => false,
+        Some(Value::Object(map)) => !map.is_empty(),
+        Some(_) => true,
+    }
+}
+
 fn timeline_event_identity(event: &Value) -> Result<String, String> {
     let source = event
         .get("source")
@@ -1151,6 +1174,46 @@ mod tests {
             "next_cursor": cursor,
             "degraded": false,
         })
+    }
+
+    fn event_with_body(sequence: u64) -> Value {
+        let mut value = event(sequence);
+        value["payload"] = json!({"status": "observed"});
+        value
+    }
+
+    #[test]
+    fn observed_timeline_bodies_are_reported_as_observed() {
+        let mut observer = LiveScenarioObserver::default();
+        let page = json!({
+            "events": (0..3).map(event_with_body).collect::<Vec<_>>(),
+            "has_more": false,
+            "next_cursor": "v2:0:0:0",
+        });
+        observer
+            .observe_timeline_page("/timeline", &Ok(page), 10)
+            .expect("timeline page");
+        let report = observer.integrity_report();
+        assert_eq!(report["timeline_unobserved_bodies"], 0);
+        assert_eq!(report["timeline_body_observation"], "observed");
+    }
+
+    #[test]
+    fn a_timeline_event_without_a_readable_body_is_counted_as_unobserved() {
+        let mut observer = LiveScenarioObserver::default();
+        let mut bare = event(0);
+        bare["payload"] = json!({});
+        let page = json!({
+            "events": [bare, event_with_body(1)],
+            "has_more": false,
+            "next_cursor": "v2:0:0:0",
+        });
+        observer
+            .observe_timeline_page("/timeline", &Ok(page), 10)
+            .expect("timeline page");
+        let report = observer.integrity_report();
+        assert_eq!(report["timeline_unobserved_bodies"], 1);
+        assert_eq!(report["timeline_body_observation"], "unobserved");
     }
 
     #[test]

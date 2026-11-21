@@ -9037,6 +9037,10 @@ fn failed_scenario_with_session_execution_and_program(
     json!({
         "scenario_id": spec.id,
         "status": "failed",
+        "observation_integrity": diagnostics
+            .pointer("/observation_integrity")
+            .cloned()
+            .unwrap_or(Value::Null),
         "session_id": if session_id.is_empty() { Value::Null } else { Value::String(session_id) },
         "execution_id": execution_id,
         "turn_id": turn_id,
