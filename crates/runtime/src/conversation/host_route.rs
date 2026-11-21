@@ -2,6 +2,69 @@
 
 use super::*;
 
+/// Publishes the conversation turn's outcome exactly once.
+///
+/// The awaiting host reads `completion_receiver`: if the sender is dropped
+/// without a value, all it can report is `channel closed`, which discards the
+/// reason the turn ended. Every exit path — including a panic while the turn
+/// body is polled — therefore goes through this guard, so the host always sees
+/// the real cause. `Drop` is the last resort: it publishes an explicit error
+/// instead of closing the channel silently.
+struct CompletionSenderGuard<T: ToolExecutor> {
+    sender: Option<
+        tokio::sync::oneshot::Sender<(
+            Option<Box<crate::ConversationRuntime<ProviderRuntimeClient, T>>>,
+            Result<TurnSummary, RuntimeError>,
+        )>,
+    >,
+    settled: bool,
+}
+
+impl<T: ToolExecutor> CompletionSenderGuard<T> {
+    fn new(
+        sender: tokio::sync::oneshot::Sender<(
+            Option<Box<crate::ConversationRuntime<ProviderRuntimeClient, T>>>,
+            Result<TurnSummary, RuntimeError>,
+        )>,
+    ) -> Self {
+        Self {
+            sender: Some(sender),
+            settled: false,
+        }
+    }
+
+    fn complete(
+        &mut self,
+        runtime: Option<Box<crate::ConversationRuntime<ProviderRuntimeClient, T>>>,
+        result: Result<TurnSummary, RuntimeError>,
+    ) {
+        self.settled = true;
+        if let Some(sender) = self.sender.take() {
+            let _ = sender.send((runtime, result));
+        }
+    }
+
+    fn fail(&mut self, error: RuntimeError) {
+        self.complete(None, Err(error));
+    }
+}
+
+impl<T: ToolExecutor> Drop for CompletionSenderGuard<T> {
+    fn drop(&mut self) {
+        if self.settled {
+            return;
+        }
+        if let Some(sender) = self.sender.take() {
+            let _ = sender.send((
+                None,
+                Err(RuntimeError::new(
+                    "submitted Runtime turn ended without reporting a result: the turn body returned early or panicked",
+                )),
+            ));
+        }
+    }
+}
+
 fn unreclaimed_turn_error<Summary>(
     result: Result<Summary, RuntimeError>,
     owner: &str,
@@ -571,7 +634,16 @@ where
         let execution_supervisor = Arc::clone(services.execution_supervisor());
         if let Err(error) = execution_supervisor
             .spawn_owned("conversation_turn", Box::pin(async move {
+                // A turn body that returns without sending leaves the awaiting
+                // host with a bare `channel closed` and no cause. Every exit
+                // path here must publish the real reason on `completion_sender`
+                // (the sender is moved into `completion_guard` below so a panic
+                // cannot drop it silently either).
+                let mut completion_guard = CompletionSenderGuard::new(completion_sender);
                 let Ok(runtime) = runtime_receiver.await else {
+                    completion_guard.fail(RuntimeError::new(
+                        "the conversation turn never received its Runtime: the submitting host dropped the runtime handoff before the turn started",
+                    ));
                     return;
                 };
                 // S-03/A2: surface completed background bash jobs to the next
@@ -600,8 +672,7 @@ where
                             {
                                 Ok(lease) => Some(lease),
                                 Err(error) => {
-                                    let _ = completion_sender
-                                        .send((Some(runtime), Err(RuntimeError::new(error))));
+                                    completion_guard.fail(RuntimeError::new(error));
                                     return;
                                 }
                             },
@@ -647,7 +718,7 @@ where
                                     if let Some(lease) = execution_bus_lease.as_ref() {
                                         let owner = Arc::new(runtime.shared_policy_owner());
                                         if let Err(error) = lease.install_session_policy_owner(owner) {
-                                            let _ = completion_sender.send((Some(runtime), Err(RuntimeError::new(error))));
+                                            completion_guard.fail(RuntimeError::new(error));
                                             return;
                                         }
                                     }
@@ -674,7 +745,7 @@ where
                 };
                 drop(execution_scope);
                 drop(execution_bus_lease);
-                let _ = completion_sender.send((runtime, result));
+                completion_guard.complete(runtime, result);
             }))
             .await
         {

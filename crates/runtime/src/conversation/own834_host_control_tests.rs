@@ -140,3 +140,42 @@ async fn own834_returned_runtime_preserves_interrupted_recovery_semantics() {
     assert!(!host.poisoned);
     host.require_next_model_tool_action(["read_file".into()]).unwrap();
 }
+
+#[tokio::test]
+async fn own834_turn_exit_publishes_its_reason_instead_of_closing_the_channel() {
+    let (sender, receiver) =
+        tokio::sync::oneshot::channel::<(Option<Box<crate::ConversationRuntime<ProviderRuntimeClient, NoTools>>>, Result<TurnSummary, RuntimeError>)>();
+    {
+        let mut guard = CompletionSenderGuard::new(sender);
+        guard.fail(RuntimeError::new("original turn failure must survive"));
+    }
+    let (runtime, result) = receiver
+        .await
+        .expect("the failing exit must publish a value, not drop the sender");
+    assert!(runtime.is_none());
+    assert_eq!(
+        result.unwrap_err().to_string(),
+        "original turn failure must survive"
+    );
+}
+
+#[tokio::test]
+async fn own834_turn_panic_still_publishes_a_reason_instead_of_closing_the_channel() {
+    let (sender, receiver) =
+        tokio::sync::oneshot::channel::<(Option<Box<crate::ConversationRuntime<ProviderRuntimeClient, NoTools>>>, Result<TurnSummary, RuntimeError>)>();
+    let unwound = std::panic::AssertUnwindSafe(async move {
+        let _guard = CompletionSenderGuard::new(sender);
+        panic!("turn body panicked before reporting a result");
+    });
+    use futures::FutureExt;
+    assert!(unwound.catch_unwind().await.is_err());
+    let (runtime, result) = receiver
+        .await
+        .expect("a panicking exit must publish a value, not drop the sender");
+    assert!(runtime.is_none());
+    let message = result.unwrap_err().to_string();
+    assert!(
+        message.contains("without reporting a result"),
+        "the host must receive an explicit reason, got: {message}"
+    );
+}
