@@ -1172,7 +1172,7 @@ liveness.rs[DW8L]: F:回合活性观察与推进动作：无进展不等于失�
 own834_host_control_tests.rs[TQ6S]: F:宿主控制 own834 测试 | R:code:crates/runtime/src/conversation/host_route.rs | A:测试模块 | S:覆盖控制装配
 prompt.rs[DW8L]: F:提示：系统提示与消息构造 | R:code:crates/runtime/src/conversation/prompt_assembly.rs | A:提示构造入口 | S:提示分稳定与动态两段
 prompt_assembly.rs[DW8L]: F:提示装配：按上下文项与画像装配请求提示 | R:code:crates/runtime/src/conversation/context_plane.rs | A:装配入口 | S:稳定段在前，动态段在后
-provider_plane.rs[DW9L]: F:provider 平面：模型请求构造、发送与流式事件处理 | R:code:crates/provider/src/client.rs | A:prepare_wire 与流式入口 | S:请求体有上限，流式按事件推进；步骤身份的 execution_id 与 wire 证据上下文必须同源推导，否则绑定步骤会以 requires matching durable wire evidence 拒绝
+provider_plane.rs[DW9L]: F:provider 平面：模型请求构造、发送与流式事件处理 | R:code:crates/provider/src/client.rs | A:prepare_wire 与流式入口 | S:请求体有上限，流式按事件推进；证据上下文的 execution_id 写入时即经 graph_id_for_lookup 规范为图 id，与 step 身份同源；绑定 step 存在时 context.attempt 必须取 step 自己的 attempt，不得用模型步内 provider 计数
 request_compiler.rs[DW7M]: F:请求编译器：把上下文与工具暴露编译成 provider 请求并给出统计 | R:code:crates/runtime/src/conversation/provider_plane.rs | A:request_compiler_stats 暴露统计 | S:编译结果可复现，统计用于诊断
 sse.rs[DW6S]: F:会话侧 SSE 处理：把 provider 流事件转成会话事件 | R:code:crates/runtime/src/conversation/provider_plane.rs | A:SSE 解析入口 | S:半帧保留缓冲
 static_tool_executor.rs[DW6S]: F:静态工具执行器：无图场景下的直接工具执行 | R:code:crates/runtime/src/conversation/conversation.rs | A:静态执行入口 | S:仅用于无图场景，受治理路径仍走图
@@ -1370,7 +1370,7 @@ outcome_selector.rs[DP7M]: F:Provider 选择：由不可变 Outcome 证据按候
 prefix_attribution.rs[DO7L]: F:前缀归因：把 Provider 前缀分叉归因到具体提示段，产出复用比与解释 | R:code:crates/runtime/src/provider/transport_pool.rs | A:PromptSegment 固定 6 段 | S:归因只解释分叉，不改变请求
 provider_registry.rs[FC8L]: F:Provider 注册表：运行时宿主私有配置快照，请求钉住不可变快照，非法替换不改变上次有效快照 | R:code:crates/runtime/src/provider/provider_resources.rs | A:revision 标识快照代 | S:成功重载只影响其后新请求
 provider_resources.rs[FC8M]: F:Provider 资源策略：配额、账户与模型策略、资源代与叶子准入 | R:code:crates/runtime/src/provider/provider_registry.rs | A:provider_leaf_admission 产出占用租约 | S:真正调用方持有租约，策略只计算需求
-provider_runtime_client.rs[FI9L]: F:Provider 运行时客户端：请求准备、能力与并行工具策略、流式传输与用量记录 | R:code:crates/runtime/src/provider/transport_policy.rs | A:bind_preparation_scope 绑定准备作用域 | S:准备失败显式归类，不静默降级；stream 是惰性流，准备、容量准入与传输写入都发生在首次 poll；绑定 step 的证据比对不得比较 attempt 编号，请求侧是模型步内 provider 计数、replan 后必不相等；execution 引用两侧都须经 graph_id_for_lookup 规范化
+provider_runtime_client.rs[FI9L]: F:Provider 运行时客户端：请求准备、能力与并行工具策略、流式传输与用量记录 | R:code:crates/runtime/src/provider/transport_policy.rs | A:bind_preparation_scope 绑定准备作用域 | S:准备失败显式归类，不静默降级；stream 是惰性流，准备、容量准入与传输写入都发生在首次 poll；绑定 step 的证据比对不得比较 attempt 编号，请求侧是模型步内 provider 计数、replan 后必不相等；execution 引用在 validate 与证据守卫两侧均须经 graph_id_for_lookup 规范化，run 前缀与图 id 视为同一 execution
 transcript_seal.rs[FZ7M]: F:转录封存：推理签名与私有推理在落库前用 AES-256-GCM 封存，仅在再激活时启封 | R:code:crates/runtime/src/provider/provider_runtime_client.rs | A:is_sealed_provider_transcript 识别封存值 | S:封存值不得当作普通会话历史
 transport_policy.rs[FR6S]: F:传输策略：由上下文窗口与消息长度推导单请求空闲容忍 | R:code:crates/runtime/src/provider/transport_pool.rs | A:derive 为唯一入口 | S:只调空闲容忍，不判定目标完成，也不把断线当失败
 transport_pool.rs[FI8L]: F:传输池：连接与提示前缀缓存、预热领导者、缓存字节预算与复用观测 | R:code:crates/runtime/src/provider/transport_policy.rs | A:low_structural_reuse 标记低复用 | S:前缀缓存有字节预算，超出必须等待
