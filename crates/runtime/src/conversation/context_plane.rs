@@ -849,8 +849,26 @@ where
         let Some(bus) = self.cowd_bus.as_ref() else {
             return Ok(());
         };
-        let Some(execution) = bus.current_execution_context() else {
+        // A delegated agent shares the bus with the root it was spawned from, so
+        // `bus.current_execution_context()` is the ROOT's execution while the
+        // admitted step below belongs to this agent. Comparing them rejects every
+        // delegated native call. The identity that describes this runtime is
+        // `self.execution_identity`; that is what the step has to match.
+        let Some(identity) = self.execution_identity.as_ref() else {
             return Ok(());
+        };
+        let Some(expected_graph_id) = identity.graph_id().map(str::to_string) else {
+            return Ok(());
+        };
+        let expected_execution_id =
+            crate::execution_core::graph::graph_id_for_lookup(&expected_graph_id);
+        let own_execution = crate::CowdExecutionContext {
+            execution_id: expected_graph_id.clone(),
+            session_id: identity
+                .session_id()
+                .map(str::to_string)
+                .unwrap_or_else(|| self.session_id().to_string()),
+            turn_id: identity.turn_id().unwrap_or_default().to_string(),
         };
         let mut sources = self
             .turn_native_tool_sources
@@ -863,10 +881,16 @@ where
             let Some(binding) = call.binding.as_ref() else {
                 continue;
             };
+            let admitted_execution_id = binding
+                .snapshot
+                .identity
+                .execution_id
+                .as_deref()
+                .map(crate::execution_core::graph::graph_id_for_lookup);
             if binding.snapshot.identity.session_id != self.session_id()
-                || binding.snapshot.identity.turn_id != execution.turn_id
-                || binding.snapshot.identity.execution_id.as_deref()
-                    != Some(execution.execution_id.as_str())
+                || Some(binding.snapshot.identity.turn_id.as_str())
+                    != identity.turn_id()
+                || admitted_execution_id.as_deref() != Some(expected_execution_id.as_ref())
                 || binding.origin.origin_step_id != binding.snapshot.identity.step_id
                 || binding.origin.call_id != call.id
                 || binding.origin.catalog_digest != binding.snapshot.catalog_digest
@@ -881,7 +905,7 @@ where
                 if existing.call.binding != call.binding
                     || existing.call.name != call.name
                     || existing.call.input != call.input
-                    || existing.execution != execution
+                    || existing.execution.execution_id != own_execution.execution_id
                 {
                     return Err(RuntimeError::new(
                         "Native tool invocation has conflicting source Step or input",
@@ -893,7 +917,7 @@ where
                 call.id.clone(),
                 NativeToolSource {
                     call: call.clone(),
-                    execution: execution.clone(),
+                    execution: own_execution.clone(),
                     activity_owner: bus.current_activity_binding(),
                     tool_owner: bus.current_tool_activity_binding(&call.id, &call.name),
                 },
@@ -4176,7 +4200,22 @@ mod immutable_native_acquisition_tests {
             )
             .without_memory()
             .with_cowd_event_bus(bus.clone())
-            .with_runtime_event_store(store.clone());
+            .with_runtime_event_store(store.clone())
+            .with_checkpoint_identity(
+                "scope2-workspace",
+                Some(
+                    harness_contract::execution::ExecutionIdentity::for_task_graph(
+                        "scope2-principal",
+                        "scope2-workspace",
+                        "scope2-mission",
+                        "scope2-task",
+                        "scope2-session",
+                        "scope2-turn",
+                        "scope2-graph",
+                    )
+                    .unwrap(),
+                ),
+            );
             let _execution = bus.enter_execution(crate::CowdExecutionContext {
                 execution_id: "scope2-graph".into(),
                 session_id: "scope2-session".into(),
@@ -4201,6 +4240,50 @@ mod immutable_native_acquisition_tests {
             let mut foreign_call = original.clone();
             foreign_call.binding.as_mut().unwrap().origin.call_id = "foreign-call".into();
             assert!(runtime.remember_native_tool_calls(&[foreign_call]).is_err());
+
+            let delegated_bus = crate::CowdEventBus::new();
+            let task_graph = harness_contract::execution::ExecutionIdentity::for_task_graph(
+                "scope2-principal",
+                "scope2-workspace",
+                "scope2-mission",
+                "scope2-task",
+                "scope2-session",
+                "scope2-turn",
+                "scope2-graph",
+            )
+            .unwrap();
+            let agent_identity = harness_contract::execution::ExecutionIdentity::for_agent_node(
+                &task_graph,
+                "scope2-agent-run",
+                "scope2-node",
+            )
+            .unwrap();
+            let delegated = ConversationRuntime::new(
+                {
+                    let mut session = Session::new();
+                    session.session_id = "scope2-session".into();
+                    session
+                },
+                AcquisitionApi,
+                crate::StaticToolExecutor::new(),
+                PermissionPolicy::new(crate::PermissionMode::DangerFullAccess),
+                vec![],
+            )
+            .without_memory()
+            .with_cowd_event_bus(delegated_bus.clone())
+            .with_runtime_event_store(store.clone())
+            .with_checkpoint_identity("scope2-workspace", Some(agent_identity));
+            let _root_execution = delegated_bus.enter_execution(crate::CowdExecutionContext {
+                execution_id: "session-ingress-graph:root".into(),
+                session_id: "scope2-session".into(),
+                turn_id: "scope2-turn".into(),
+            });
+            delegated
+                .remember_native_tool_calls(std::slice::from_ref(&original))
+                .expect(
+                    "a delegated agent must be judged against its own execution identity, not the \
+                     root execution the shared bus currently exposes",
+                );
             assert_eq!(runtime.turn_native_tool_sources.lock().unwrap()[&original.id].call, original);
             let source = NativeToolSource {
                 call: ModelToolCall {
