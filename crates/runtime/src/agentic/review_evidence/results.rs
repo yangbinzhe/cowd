@@ -2808,19 +2808,31 @@ pub(super) fn result_tool_plan<'events>(
                 if step.snapshot.identity.session_id != binding.session_id
                     || step.snapshot.identity.turn_id != binding.turn_id
                     || match binding.agent_run_id.as_deref() {
-                        Some(run) => step.snapshot.identity.run_ref.as_deref() != Some(run),
-                        None => expected != binding.root_execution_id,
+                        Some(run) => !crate::agentic::action_invocation::execution_ids_agree(
+                            step.snapshot.identity.run_ref.as_deref(),
+                            run,
+                        ),
+                        None => !crate::agentic::action_invocation::execution_ids_agree(
+                            Some(expected),
+                            &binding.root_execution_id,
+                        ),
                     }
                     || ![
                         ("session", binding.session_id.as_str()),
                         ("turn", binding.turn_id.as_str()),
-                        ("execution", expected),
                     ]
                     .into_iter()
                     .all(|(kind, id)| {
                         plan.refs
                             .iter()
                             .any(|reference| reference.kind == kind && reference.id == id)
+                    })
+                    || !plan.refs.iter().any(|reference| {
+                        reference.kind == "execution"
+                            && crate::agentic::action_invocation::execution_ids_agree(
+                                Some(expected),
+                                &reference.id,
+                            )
                     })
                 {
                     return Err(
@@ -8200,6 +8212,217 @@ mod tests {
             super::merge_actual_input_cuts(&mut judged_cuts, &judged_actual)
                 .expect_err("the object under review moving still refuses"),
             "actual result input source moved during enumeration"
+        );
+    }
+
+    /// One execution has two spellings: the canonical graph id and the run-scoped
+    /// reference (`run:<graph_id>`). A plan records the ref as `run:<graph>` while the
+    /// Step identity records the bare graph id, and comparing the raw strings refused
+    /// every review of a delegated task in the sixth live round: five `task_review`
+    /// attempts all answered `result original plan crosses its exact Session/Turn/Step
+    /// owner` with one refs entry mismatched and nothing else wrong.
+    fn execution_prefix_plan(
+        plan_execution: &str,
+        step_execution: Option<&str>,
+        run_ref: Option<&str>,
+    ) -> (Vec<crate::DurableRuntimeEvent>, crate::DurableRuntimeEvent) {
+        let store = crate::RuntimeEventStore::for_test();
+        let append = |kind: &str, payload: serde_json::Value| {
+            store
+                .append(crate::RuntimeEventInput {
+                    stream_id: "session:prefix-plan".into(),
+                    scope: crate::RuntimeEventScope::Tool,
+                    kind: kind.into(),
+                    status: None,
+                    actor: Some("conversation_runtime".into()),
+                    refs: Vec::new(),
+                    payload,
+                })
+                .unwrap()
+        };
+        let plan = serde_json::json!({
+            "plan_id": "prefix-plan",
+            "tasks": [{
+                "tool_call_id": "prefix-call",
+                "tool_name": "read_file",
+                "step_binding": {
+                    "origin": {
+                        "origin_step_id": "step:prefix",
+                        "call_id": "prefix-call",
+                        "catalog_digest": "catalog",
+                        "source": {"kind": "offline_test"}
+                    },
+                    "snapshot": {
+                        "contract_version": harness_contract::step::STEP_CONTRACT_VERSION,
+                        "identity": {
+                            "step_id": "step:prefix",
+                            "session_id": "session:prefix-plan",
+                            "turn_id": "turn:prefix-plan",
+                            "execution_id": step_execution,
+                            "run_ref": run_ref,
+                            "attempt": null,
+                            "epoch": null,
+                            "goal_ref": null,
+                            "program_ref": null,
+                            "task_ref": null,
+                            "build_ref": "build"
+                        },
+                        "provider_attempt": {
+                            "attempt_id": "attempt:prefix",
+                            "origin_step_id": "step:prefix",
+                            "model_profile_digest": "profile",
+                            "request_digest": "request"
+                        },
+                        "catalog_digest": "catalog",
+                        "tools": [],
+                        "related_revisions": {},
+                        "context_refs": [],
+                        "expires_at_ms": 0
+                    }
+                }
+            }]
+        });
+        let _plan_event = store
+            .append(crate::RuntimeEventInput {
+                stream_id: "session:prefix-plan".into(),
+                scope: crate::RuntimeEventScope::Tool,
+                kind: "tool.execution_plan.created".into(),
+                status: None,
+                actor: Some("conversation_runtime".into()),
+                refs: plan_refs(plan_execution),
+                payload: plan,
+            })
+            .unwrap();
+        let owner = store
+            .append(
+                crate::RuntimeEventInput {
+                    stream_id: "session:prefix-plan".into(),
+                    scope: crate::RuntimeEventScope::Tool,
+                    kind: "tool.invocation.completed".into(),
+                    status: None,
+                    actor: Some("conversation_runtime".into()),
+                    refs: Vec::new(),
+                    payload: serde_json::json!({
+                        "governed_plan_id": "prefix-plan",
+                        "tool_call_id": "prefix-call",
+                        "tool_name": "read_file"
+                    }),
+                }
+                .with_activity_binding(harness_contract::projection::RuntimeActivityBinding {
+                    root_execution_id: "agentic-graph:964e8be4".to_string(),
+                    session_id: "session:prefix-plan".to_string(),
+                    turn_id: "turn:prefix-plan".to_string(),
+                    root_task_id: "task:prefix".to_string(),
+                    task_id: "task:prefix".to_string(),
+                    activity_id: "activity:prefix".to_string(),
+                    node_id: None,
+                    parent_activity_id: Some("activity:prefix:parent".to_string()),
+                    initiator_activity_id: None,
+                    team_run_id: None,
+                    agent_instance_id: None,
+                    agent_run_id: None,
+                    skill_id: None,
+                    skill_revision: None,
+                    skill_activation_id: None,
+                    tool_contract_id: Some("contract:read_file".to_string()),
+                    tool_call_id: Some("prefix-call".to_string()),
+                    approval_id: None,
+                    parallel_group_id: None,
+                    revision: 1,
+                    fence: 1,
+                    generation: 1,
+                })
+                .expect("binding"),
+            )
+            .unwrap();
+        let events = store
+            .list_stream("session:prefix-plan")
+            .expect("session events");
+        (events, owner)
+    }
+
+    fn plan_refs(plan_execution: &str) -> Vec<crate::RuntimeEventRef> {
+        let reference = |kind: &str, id: &str| crate::RuntimeEventRef {
+            kind: kind.to_string(),
+            id: id.to_string(),
+        };
+        vec![
+            reference("governed_tool_plan", "prefix-plan"),
+            reference("execution", plan_execution),
+            reference("session", "session:prefix-plan"),
+            reference("turn", "turn:prefix-plan"),
+        ]
+    }
+
+    #[test]
+    fn result_tool_plan_matches_a_run_prefixed_ref_to_a_bare_step_execution() {
+        // The sixth live round's exact shape: ref carries `run:`, Step identity is bare.
+        let (events, owner) = execution_prefix_plan(
+            "run:agentic-graph:964e8be4",
+            Some("agentic-graph:964e8be4"),
+            Some("run:agentic-graph:964e8be4"),
+        );
+        let task = super::result_tool_plan(&events, &owner).expect("prefix is one execution");
+        assert!(task.is_some(), "the delegated review must find its plan task");
+    }
+
+    #[test]
+    fn result_tool_plan_still_refuses_a_different_execution_behind_the_prefix() {
+        let (events, owner) = execution_prefix_plan(
+            "run:agentic-graph:964e8be4",
+            Some("agentic-graph:different"),
+            Some("run:agentic-graph:964e8be4"),
+        );
+        assert_eq!(
+            super::result_tool_plan(&events, &owner).expect_err("a foreign graph stays refused"),
+            "result original plan crosses its exact Session/Turn/Step owner"
+        );
+    }
+
+    #[test]
+    fn result_tool_plan_keeps_session_and_turn_exact() {
+        let (mut events, owner) = execution_prefix_plan(
+            "run:agentic-graph:964e8be4",
+            Some("agentic-graph:964e8be4"),
+            Some("run:agentic-graph:964e8be4"),
+        );
+        // A prefix must never be normalized away for session or turn: they are UUIDs.
+        for event in &mut events {
+            for reference in &mut event.refs {
+                if reference.kind == "session" {
+                    reference.id = "run:session:prefix-plan".to_string();
+                }
+            }
+        }
+        assert_eq!(
+            super::result_tool_plan(&events, &owner).expect_err("session stays exact"),
+            "result original plan crosses its exact Session/Turn/Step owner"
+        );
+    }
+
+    #[test]
+    fn result_tool_plan_refuses_a_step_without_an_execution() {
+        let (events, owner) = execution_prefix_plan(
+            "run:agentic-graph:964e8be4",
+            None,
+            Some("run:agentic-graph:964e8be4"),
+        );
+        assert_eq!(
+            super::result_tool_plan(&events, &owner).expect_err("no execution is no owner"),
+            "result original Step has no execution"
+        );
+    }
+
+    #[test]
+    fn runner_and_runs_namespaces_are_not_run_ids() {
+        let (events, owner) = execution_prefix_plan(
+            "runner:agentic-graph:964e8be4",
+            Some("agentic-graph:964e8be4"),
+            Some("run:agentic-graph:964e8be4"),
+        );
+        assert_eq!(
+            super::result_tool_plan(&events, &owner).expect_err("runner: is its own namespace"),
+            "result original plan crosses its exact Session/Turn/Step owner"
         );
     }
 }
