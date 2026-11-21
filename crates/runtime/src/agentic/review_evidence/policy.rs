@@ -2821,11 +2821,17 @@ impl ActualImmutableInput {
             let source_matches = match acquisition.origin["source"]["kind"].as_str() {
                 Some("process") => acquisition.origin["source"]["worker_id"] == packet.run_id()
                     && acquisition.origin["source"]["sequence"].as_u64().is_some_and(|sequence| sequence > 0)
-                    && acquisition.step.execution_id.as_deref() == Some(packet.graph_id())
+                    && crate::agentic::action_invocation::execution_ids_agree(
+                        acquisition.step.execution_id.as_deref(),
+                        packet.graph_id(),
+                    )
                     && acquisition.step.actor_ref.as_deref() == Some(packet.agent_id())
                     && acquisition.step.attempt == Some(packet.attempt),
                 Some("provider") => acquisition.origin["source"]["attempt_id"].as_str().is_some_and(|attempt| !attempt.is_empty())
-                    && acquisition.step.execution_id.as_deref() == Some(packet.run_id())
+                    && crate::agentic::action_invocation::execution_ids_agree(
+                        acquisition.step.execution_id.as_deref(),
+                        packet.run_id(),
+                    )
                     && acquisition.step.actor_ref.as_deref() == Some(packet.assignment.execution_identity.principal_id()),
                 _ => false,
             };
@@ -3872,7 +3878,10 @@ pub(super) fn authenticate_unsealed_delegated_input(
         stored_invocation.intent.normalized_input = serde_json::Value::Null;
         let source_matches = match &step.origin.source {
             CallSource::Provider { attempt_id } => {
-                identity.execution_id.as_deref() == Some(packet.run_id())
+                crate::agentic::action_invocation::execution_ids_agree(
+                    identity.execution_id.as_deref(),
+                    packet.run_id(),
+                )
                     && identity
                         .attempt
                         .is_none_or(|attempt| attempt == packet.attempt)
@@ -3881,7 +3890,10 @@ pub(super) fn authenticate_unsealed_delegated_input(
                     && attempt_id == &step.snapshot.provider_attempt.attempt_id
             }
             CallSource::Process { worker_id, .. } => {
-                identity.execution_id.as_deref() == Some(packet.graph_id())
+                crate::agentic::action_invocation::execution_ids_agree(
+                    identity.execution_id.as_deref(),
+                    packet.graph_id(),
+                )
                     && identity.attempt == Some(packet.attempt)
                     && worker_id == packet.run_id()
                     && identity.actor_ref.as_deref() == Some(packet.agent_id())

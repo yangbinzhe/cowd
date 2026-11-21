@@ -517,6 +517,19 @@ where F: FnOnce(VerifiedActionInvocation) -> Fut, Fut: std::future::Future<Outpu
 
 // Evidence/artifact scopes are the scopes actually granted to this call, not
 // the packet's entire resource ceiling. They never grant tool-effect authority.
+/// One execution has two spellings: the canonical graph id, and the
+/// run-scoped reference the Agent was admitted under (`run:<graph_id>`). The
+/// Step identity records whichever spelling its producer wrote, while a packet
+/// names the other, so comparing the raw strings refuses a delegated call that
+/// owns its owner in full. Normalize both sides with the store's own rule
+/// instead of teaching each call site to remember the prefix.
+pub(crate) fn execution_ids_agree(candidate: Option<&str>, packet_execution: &str) -> bool {
+    candidate.is_some_and(|id| {
+        crate::execution_core::graph::graph_id_for_lookup(id)
+            == crate::execution_core::graph::graph_id_for_lookup(packet_execution)
+    })
+}
+
 fn delegated_evidence_scopes_allowed(scopes: &[String], session_id: &str, bounded: bool, packet_scopes: &[String]) -> bool {
     let session_scope = format!("session:{session_id}");
     scopes.iter().any(|scope| scope == &session_scope)
@@ -555,9 +568,11 @@ where F: FnOnce(VerifiedActionInvocation) -> Fut, Fut: std::future::Future<Outpu
     let identity = &step.snapshot().identity;
     let source_matches = match &binding.origin.source {
         harness_contract::step::CallSource::Provider { .. } =>
-            identity.execution_id.as_deref() == Some(packet.run_id()) && identity.attempt.is_none_or(|a| a == attempt),
+            execution_ids_agree(identity.execution_id.as_deref(), packet.run_id())
+                && identity.attempt.is_none_or(|a| a == attempt),
         harness_contract::step::CallSource::Process { worker_id, .. } =>
-            identity.execution_id.as_deref() == Some(packet.graph_id()) && identity.attempt == Some(attempt)
+            execution_ids_agree(identity.execution_id.as_deref(), packet.graph_id())
+                && identity.attempt == Some(attempt)
                 && worker_id == packet.run_id(),
         _ => false,
     };
@@ -703,6 +718,31 @@ where F: FnOnce(VerifiedActionInvocation) -> Fut, Fut: std::future::Future<Outpu
 mod tests {
     use super::*;
     use harness_contract::agent_action::{AgentActorBinding, AgentActorKind};
+
+    #[test]
+    fn a_run_scoped_packet_execution_matches_the_bare_graph_id() {
+        assert!(execution_ids_agree(
+            Some("agentic-graph:0f1e"),
+            "run:agentic-graph:0f1e"
+        ));
+        assert!(execution_ids_agree(
+            Some("run:agentic-graph:0f1e"),
+            "agentic-graph:0f1e"
+        ));
+        assert!(execution_ids_agree(Some("run:agentic-graph:0f1e"), "run:agentic-graph:0f1e"));
+        assert!(!execution_ids_agree(
+            Some("agentic-graph:0f1e"),
+            "run:agentic-graph:9c8d"
+        ));
+        assert!(!execution_ids_agree(None, "agentic-graph:0f1e"));
+    }
+
+    #[test]
+    fn other_namespaces_are_not_unwrapped_as_run_ids() {
+        assert!(!execution_ids_agree(Some("runner:graph:0f1e"), "graph:0f1e"));
+        assert!(!execution_ids_agree(Some("runs:graph:0f1e"), "graph:0f1e"));
+        assert!(execution_ids_agree(Some("runner:graph:0f1e"), "runner:graph:0f1e"));
+    }
 
     #[test]
     fn delegated_evidence_scopes_are_a_subset_of_the_original_packet() {
