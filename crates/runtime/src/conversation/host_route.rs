@@ -47,6 +47,19 @@ impl<T: ToolExecutor> CompletionSenderGuard<T> {
     fn fail(&mut self, error: RuntimeError) {
         self.complete(None, Err(error));
     }
+
+    /// Fail while handing the runtime back to the host.
+    ///
+    /// A turn that failed after it took ownership of the runtime must still
+    /// return that runtime; dropping it would poison the host and refuse every
+    /// later turn of the same session.
+    fn fail_with(
+        &mut self,
+        runtime: Option<Box<crate::ConversationRuntime<ProviderRuntimeClient, T>>>,
+        error: RuntimeError,
+    ) {
+        self.complete(runtime, Err(error));
+    }
 }
 
 impl<T: ToolExecutor> Drop for CompletionSenderGuard<T> {
@@ -58,11 +71,27 @@ impl<T: ToolExecutor> Drop for CompletionSenderGuard<T> {
             let _ = sender.send((
                 None,
                 Err(RuntimeError::new(
-                    "submitted Runtime turn ended without reporting a result: the turn body returned early or panicked",
+                    "submitted Runtime turn ended without reporting a result: the turn body returned early",
                 )),
             ));
         }
     }
+}
+
+/// Turns a caught panic payload into the error the host receives.
+///
+/// The payload is what `spawn_owned`'s `JoinError` already carried, but the
+/// guard's `Drop` published a generic message first and the oneshot accepted
+/// only that one, so the payload never reached the host.
+fn panic_runtime_error(payload: Box<dyn std::any::Any + Send>) -> RuntimeError {
+    let message = if let Some(message) = payload.downcast_ref::<&str>() {
+        (*message).to_string()
+    } else if let Some(message) = payload.downcast_ref::<String>() {
+        message.clone()
+    } else {
+        "unknown panic payload".to_string()
+    };
+    RuntimeError::new(format!("submitted Runtime turn panicked: {message}"))
 }
 
 fn unreclaimed_turn_error<Summary>(
@@ -640,12 +669,17 @@ where
                 // (the sender is moved into `completion_guard` below so a panic
                 // cannot drop it silently either).
                 let mut completion_guard = CompletionSenderGuard::new(completion_sender);
-                let Ok(runtime) = runtime_receiver.await else {
-                    completion_guard.fail(RuntimeError::new(
-                        "the conversation turn never received its Runtime: the submitting host dropped the runtime handoff before the turn started",
-                    ));
-                    return;
-                };
+                // A panic inside the turn body unwound straight through the
+                // guard, so `Drop` published a generic message and the payload
+                // that `spawn_owned` carries in its `JoinError` was dropped on
+                // the floor. Catching it here lets the payload reach the host
+                // as the real cause.
+                let turn_body = async move {
+                    let Ok(runtime) = runtime_receiver.await else {
+                        return Err((None, RuntimeError::new(
+                            "the conversation turn never received its Runtime: the submitting host dropped the runtime handoff before the turn started",
+                        )));
+                    };
                 // S-03/A2: surface completed background bash jobs to the next
                 // model turn as runtime-owned, tool-authority context.
                 for completion in
@@ -672,8 +706,7 @@ where
                             {
                                 Ok(lease) => Some(lease),
                                 Err(error) => {
-                                    completion_guard.fail(RuntimeError::new(error));
-                                    return;
+                                    return Err((Some(runtime), RuntimeError::new(error)));
                                 }
                             },
                             None => None,
@@ -718,8 +751,7 @@ where
                                     if let Some(lease) = execution_bus_lease.as_ref() {
                                         let owner = Arc::new(runtime.shared_policy_owner());
                                         if let Err(error) = lease.install_session_policy_owner(owner) {
-                                            completion_guard.fail(RuntimeError::new(error));
-                                            return;
+                                            return Err((Some(runtime), RuntimeError::new(error)));
                                         }
                                     }
                                     runtime.set_session_execution_fence(fence);
@@ -745,7 +777,16 @@ where
                 };
                 drop(execution_scope);
                 drop(execution_bus_lease);
-                completion_guard.complete(runtime, result);
+                Ok((runtime, result))
+                };
+                use futures::FutureExt;
+                match std::panic::AssertUnwindSafe(turn_body).catch_unwind().await {
+                    Ok(Ok((runtime, result))) => completion_guard.complete(runtime, result),
+                    Ok(Err((runtime, error))) => completion_guard.fail_with(runtime, error),
+                    Err(payload) => {
+                        completion_guard.fail(panic_runtime_error(payload));
+                    }
+                }
             }))
             .await
         {

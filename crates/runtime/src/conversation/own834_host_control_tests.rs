@@ -159,6 +159,40 @@ async fn own834_turn_exit_publishes_its_reason_instead_of_closing_the_channel() 
     );
 }
 
+#[test]
+fn own834_turn_panic_payload_reaches_the_host_instead_of_a_generic_message() {
+    let payload = std::panic::catch_unwind(|| panic!("turn body panicked with its own payload"))
+        .expect_err("the panic must produce a payload");
+    let message = super::panic_runtime_error(payload).to_string();
+    assert!(
+        message.contains("turn body panicked with its own payload"),
+        "the host must receive the panic payload, got: {message}"
+    );
+    assert!(
+        !message.contains("without reporting a result"),
+        "the generic drop message must not displace the payload, got: {message}"
+    );
+}
+
+#[tokio::test]
+async fn own834_turn_panic_guard_publishes_the_panic_reason_to_the_host() {
+    let (sender, receiver) =
+        tokio::sync::oneshot::channel::<(Option<Box<crate::ConversationRuntime<ProviderRuntimeClient, NoTools>>>, Result<TurnSummary, RuntimeError>)>();
+    let mut guard = CompletionSenderGuard::new(sender);
+    let payload = std::panic::catch_unwind(|| panic!("guarded turn body panicked"))
+        .expect_err("the panic must produce a payload");
+    guard.fail(super::panic_runtime_error(payload));
+    let (runtime, result) = receiver
+        .await
+        .expect("a panicking turn must publish a value, not drop the sender");
+    assert!(runtime.is_none());
+    let message = result.unwrap_err().to_string();
+    assert!(
+        message.contains("guarded turn body panicked"),
+        "the host must receive the panic payload, got: {message}"
+    );
+}
+
 #[tokio::test]
 async fn own834_turn_panic_still_publishes_a_reason_instead_of_closing_the_channel() {
     let (sender, receiver) =
