@@ -3088,7 +3088,10 @@ pub(super) fn original_tool_primary_and_index(
             || binding.agent_instance_id.as_deref() != Some(packet.agent_id())
             || packet.session_id() != binding.session_id
             || packet.assignment.execution_identity.turn_id() != Some(binding.turn_id.as_str())
-            || identity.execution_id.as_deref() != Some(expected_execution)
+            || !crate::agentic::action_invocation::execution_ids_agree(
+                identity.execution_id.as_deref(),
+                expected_execution,
+            )
             || identity.actor_ref.as_deref() != Some(expected_actor)
             || identity.run_ref.as_deref() != Some(packet.run_id())
             || identity
@@ -8352,6 +8355,35 @@ mod tests {
             reference("session", "session:prefix-plan"),
             reference("turn", "turn:prefix-plan"),
         ]
+    }
+
+    /// The seventh live round's shape, from the Provider branch: the Step identity
+    /// carries the bare graph id while the packet's `run_id()` is the run-scoped
+    /// spelling, so comparing `identity.execution_id` against `Some(packet.run_id())`
+    /// refused every delegated review with `Agent tool output Step does not match its
+    /// original packet`. Only the execution comparison may be normalized - the run
+    /// spelling itself stays exact, because a genuine run mismatch is a real defect.
+    #[test]
+    fn provider_step_execution_matches_a_run_prefixed_packet_id() {
+        use crate::agentic::action_invocation::execution_ids_agree;
+        let graph = "agentic-graph:f3d902f0";
+        let run = "run:agentic-graph:f3d902f0";
+        assert!(execution_ids_agree(Some(graph), run));
+        assert!(execution_ids_agree(Some(run), graph));
+        assert!(!execution_ids_agree(Some("agentic-graph:other"), run));
+        assert!(!execution_ids_agree(None, run));
+        // The run spelling is compared exactly, so a different run still fails even
+        // though both sides are run-scoped.
+        assert_ne!(Some(run), Some("run:agentic-graph:other"));
+        // `runner:` and `runs:` are separate namespaces and are not run ids.
+        assert!(!execution_ids_agree(
+            Some("runner:agentic-graph:f3d902f0"),
+            graph
+        ));
+        assert!(!execution_ids_agree(
+            Some("runs:agentic-graph:f3d902f0"),
+            graph
+        ));
     }
 
     #[test]

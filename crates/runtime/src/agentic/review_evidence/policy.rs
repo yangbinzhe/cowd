@@ -7747,7 +7747,10 @@ fn authenticated_delegated_plan_settled(
             || binding.tool_call_id.as_deref() != task["tool_call_id"].as_str()
             || binding.tool_contract_id.as_deref() != task["tool_name"].as_str()
             || step.snapshot.identity.run_ref.as_deref() != Some(packet.run_id())
-            || step.snapshot.identity.execution_id.as_deref() != Some(packet.run_id())
+            || !crate::agentic::action_invocation::execution_ids_agree(
+                step.snapshot.identity.execution_id.as_deref(),
+                packet.run_id(),
+            )
             || step
                 .snapshot
                 .identity
