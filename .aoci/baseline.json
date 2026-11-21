@@ -1,7 +1,7 @@
 {
   "version": 1,
   "created_at": "2026-11-18T15:37:27Z",
-  "updated_at": "2026-11-21T09:00:42Z",
+  "updated_at": "2026-11-21T15:56:21Z",
   "files": {
     ".cargo/config.toml": {
       "role": "index",
@@ -35,15 +35,15 @@
     },
     "Cargo.lock": {
       "role": "observe",
-      "sha256": "8ec5411938cddf2903c8c6eea57d3c743e9df609785c268f47df60766f6d70a6",
+      "sha256": "90cf6ed012851bc7ecc9c7065bd0f63c08643ca4e040721b117266c3e73fefcf",
       "size": 104981,
-      "normalized_sha256": "8ec5411938cddf2903c8c6eea57d3c743e9df609785c268f47df60766f6d70a6"
+      "normalized_sha256": "90cf6ed012851bc7ecc9c7065bd0f63c08643ca4e040721b117266c3e73fefcf"
     },
     "Cargo.toml": {
       "role": "index",
-      "sha256": "1d1231a199e34c0c17409188c3315f2e77133a920194639da2b0fddd9f743afa",
+      "sha256": "c1884cbabe3f36e42b914bf338b508daf286ee7982a28b6cd37a0595e3c7c437",
       "size": 2840,
-      "normalized_sha256": "1d1231a199e34c0c17409188c3315f2e77133a920194639da2b0fddd9f743afa"
+      "normalized_sha256": "c1884cbabe3f36e42b914bf338b508daf286ee7982a28b6cd37a0595e3c7c437"
     },
     "LICENSE": {
       "role": "index",
@@ -71,9 +71,9 @@
     },
     "aoci.code.txt": {
       "role": "index",
-      "sha256": "6312424ab56d0e942682b71614b29c582794a068673f806ce5f260e0fbd5ae17",
-      "size": 422309,
-      "normalized_sha256": "6312424ab56d0e942682b71614b29c582794a068673f806ce5f260e0fbd5ae17"
+      "sha256": "0cf1dc38e2ed5b9447171b438f23271c7e20fc85cfa9964065f88898a0c36838",
+      "size": 423226,
+      "normalized_sha256": "0cf1dc38e2ed5b9447171b438f23271c7e20fc85cfa9964065f88898a0c36838"
     },
     "aoci.meta.txt": {
       "role": "index",
@@ -5091,9 +5091,9 @@
     },
     "crates/runtime/src/agentic/action_invocation.rs": {
       "role": "index",
-      "sha256": "b43f096cba0d1489cfc48e3f552044ffda1239a7882531abaf9241f7ac4049e3",
-      "size": 52429,
-      "normalized_sha256": "b43f096cba0d1489cfc48e3f552044ffda1239a7882531abaf9241f7ac4049e3"
+      "sha256": "8860370a62a45a950461cfea586b399a5b946da3f0801268e431b35b33505741",
+      "size": 54161,
+      "normalized_sha256": "8860370a62a45a950461cfea586b399a5b946da3f0801268e431b35b33505741"
     },
     "crates/runtime/src/agentic/action_service.rs": {
       "role": "index",
@@ -5265,9 +5265,9 @@
     },
     "crates/runtime/src/agentic/review_evidence/current_review.rs": {
       "role": "index",
-      "sha256": "911a2907458faeff102876a3dccd217a21ec0c8e6a0ad5d2334d11e28187f225",
-      "size": 208016,
-      "normalized_sha256": "911a2907458faeff102876a3dccd217a21ec0c8e6a0ad5d2334d11e28187f225"
+      "sha256": "9f22d6faecf13e4b7ad8329149883d484635a1af85427a4ddebeb12609771c4a",
+      "size": 208099,
+      "normalized_sha256": "9f22d6faecf13e4b7ad8329149883d484635a1af85427a4ddebeb12609771c4a"
     },
     "crates/runtime/src/agentic/review_evidence/current_review_applied_tests.rs": {
       "role": "index",
@@ -5289,9 +5289,9 @@
     },
     "crates/runtime/src/agentic/review_evidence/policy.rs": {
       "role": "index",
-      "sha256": "3761d7bdcb1a73ebf70ef1d6b3163e7014eb871086b6e82f9a3f77fff04ccacb",
-      "size": 552867,
-      "normalized_sha256": "3761d7bdcb1a73ebf70ef1d6b3163e7014eb871086b6e82f9a3f77fff04ccacb"
+      "sha256": "248cfd4e26164ee705ecee8ae503df655cd1297b5f50f6b165ca4ae1d688ff0f",
+      "size": 553319,
+      "normalized_sha256": "248cfd4e26164ee705ecee8ae503df655cd1297b5f50f6b165ca4ae1d688ff0f"
     },
     "crates/runtime/src/agentic/review_evidence/policy/s1_fixture.rs": {
       "role": "index",
@@ -5325,9 +5325,9 @@
     },
     "crates/runtime/src/agentic/review_evidence/results.rs": {
       "role": "index",
-      "sha256": "8e48f85ac24b56aea11933079bbab585d0adee067e57623264e3b7897b0e38ed",
-      "size": 363176,
-      "normalized_sha256": "8e48f85ac24b56aea11933079bbab585d0adee067e57623264e3b7897b0e38ed"
+      "sha256": "abf8635f88bbf95ba19afdf7331537e89e0ea13695613823c23fa11644773ab0",
+      "size": 372727,
+      "normalized_sha256": "abf8635f88bbf95ba19afdf7331537e89e0ea13695613823c23fa11644773ab0"
     },
     "crates/runtime/src/agentic/review_evidence/work_contract_tests.rs": {
       "role": "index",
