@@ -1084,7 +1084,7 @@ heartbeat.rs[DW8M]: F:领取心跳：领取者、图终态判定、驱动状态�
 helpers.rs[DW7L]: F:派发辅助：显示信息附着、派发模式、就绪与依赖判定、成员排序、实体引用与时间戳 | R:code:crates/runtime/src/agentic/execution/dispatch.rs | A:task_is_ready 与 dependencies_accepted 为判定 | S:就绪与依赖判定集中在此，派发与恢复共用
 plan736_tests.rs[TQ6S]: F:plan 736 的测试入口 | R:code:crates/runtime/src/agentic/execution/tests.rs | A:use super::* | S:-
 reviewed_goal_fixture.rs[TQ7M]: F:评审目标夹具：诊断帧与边界记录、根与委托动作信封、租约图注册与物理子 Agent 注册 | R:code:crates/runtime/src/agentic/execution/tests.rs | A:root_in_dispatch 与 agent_with_lease 为夹具入口 | S:夹具走真实派发与租约链，不伪造物理执行
-tests.rs[TQ8L]: F:Agent 执行测试：持有模型、市场待处理 worker、动作协议与派发路径 | R:code:crates/runtime/src/agentic/execution/dispatch.rs | A:HoldingModel 实现 AgentRuntimeBackend 以保持运行 | S:测试覆盖派发与恢复的并发路径
+tests.rs[TQ8L]: F:Agent 执行测试：持有模型、市场待处理 worker、动作协议与派发路径 | R:code:crates/runtime/src/agentic/execution/dispatch.rs | A:HoldingModel 实现 AgentRuntimeBackend 以保持运行 | S:测试覆盖派发与恢复的并发路径；startup_reconcile 用例断言恢复回执（恰好一条、task_ref 为本任务、graph_id 是真 agentic-graph: 执行）而非瞬时投影状态，因为 recover_agentic_programs_on_startup 会 await 自己那次派发、attempt 可能在其中失败并把任务转为 Rework
 
 ===/<repository>/crates/runtime/src/agentic/execution/reviewed_goal_fixture/===
 own832_diagnostics.rs[TQ7L]: F:own832 诊断快照：在图状态、任务尝试与投影上采集快照 | R:code:crates/runtime/src/agentic/execution/reviewed_goal_fixture.rs | A:Snapshot::capture 为入口 | S:诊断只读快照，不改变运行状态

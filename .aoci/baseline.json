@@ -1,7 +1,7 @@
 {
   "version": 1,
   "created_at": "2026-11-18T15:37:27Z",
-  "updated_at": "2026-11-21T17:40:52Z",
+  "updated_at": "2026-11-21T22:09:01Z",
   "files": {
     ".cargo/config.toml": {
       "role": "index",
@@ -71,9 +71,9 @@
     },
     "aoci.code.txt": {
       "role": "index",
-      "sha256": "cf7066a9309e7990e600d879b307a098bd7878a44556ef3ed3e2023699197c9a",
-      "size": 423446,
-      "normalized_sha256": "cf7066a9309e7990e600d879b307a098bd7878a44556ef3ed3e2023699197c9a"
+      "sha256": "aa519441bbfd16f640145a3c9b0ef2367d2ab4683fd75adf8df79bef98c7741d",
+      "size": 423728,
+      "normalized_sha256": "aa519441bbfd16f640145a3c9b0ef2367d2ab4683fd75adf8df79bef98c7741d"
     },
     "aoci.meta.txt": {
       "role": "index",
@@ -5199,9 +5199,9 @@
     },
     "crates/runtime/src/agentic/execution/tests.rs": {
       "role": "index",
-      "sha256": "d45ff4dc252a11f8c74e83157004f23fa3d1941eff285e58386792f8a8b185d2",
-      "size": 81332,
-      "normalized_sha256": "d45ff4dc252a11f8c74e83157004f23fa3d1941eff285e58386792f8a8b185d2"
+      "sha256": "7c7987a5006a5301eb1793472f726af3390572d72add0243752e9b8e294b9aca",
+      "size": 82742,
+      "normalized_sha256": "7c7987a5006a5301eb1793472f726af3390572d72add0243752e9b8e294b9aca"
     },
     "crates/runtime/src/agentic/fact_admission.rs": {
       "role": "index",
