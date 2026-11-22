@@ -579,6 +579,9 @@ async fn resolve_wait_once(
     let mut barrier_rejections = serde_json::Value::Null;
     let mut observed_revision = 0u64;
     let mut barrier_rejections = serde_json::Value::Null;
+    // The barrier this pass set out to release, so a conflict that lands after
+    // another pass resolved it can still be counted.
+    let mut releasing_node: Option<String> = None;
     const MAX_GRAPH_CAS_ATTEMPTS: usize = 8;
     if strand_exhausted {
         record(
@@ -633,6 +636,20 @@ async fn resolve_wait_once(
                 )
         });
         let Some(node) = candidate else {
+            // A barrier this pass set out to release can leave `WaitingExternal`
+            // while the command is in flight: a concurrent resolve pass, or the
+            // commit this pass's own command raced, resolves it first, and the
+            // command then reports a stale revision. The barrier IS released
+            // then. A count of zero here leaves the root parked with nothing
+            // left to wake it, so the release is counted once, from the durable
+            // checkpoint a resolved barrier carries.
+            if resolved == 0
+                && releasing_node.as_deref().is_some_and(|node_id| {
+                    barrier_released_by_checkpoint(&graph, node_id, program_id)
+                })
+            {
+                resolved = 1;
+            }
             // Name which condition rejected the barrier, instead of leaving a zero
             // count to be inferred. In one live run this count was zero in every pass
             // of every run while the durable stream showed the node reaching
@@ -674,6 +691,7 @@ async fn resolve_wait_once(
             });
             break;
         };
+        releasing_node = Some(node.id.clone());
         barrier_candidates = barrier_candidates.saturating_add(1);
         observed_revision = graph
             .node_results
@@ -1093,6 +1111,34 @@ fn child_graph_task_is_live(
             )
         })
     })
+}
+
+/// Whether the barrier node this pass was releasing has already been resolved.
+///
+/// A parked barrier carries `agentic-program-wait:<program>:revision:<n>` as its
+/// durable result, and a released one carries `agentic-program-checkpoint:<program>:...`.
+/// Those are the same Program's barrier in two states, so the checkpoint prefix is
+/// what says the barrier is released rather than still parked.
+fn barrier_released_by_checkpoint(
+    graph: &ExecutionGraph,
+    node_id: &str,
+    program_id: &str,
+) -> bool {
+    let Some(node) = graph.nodes.iter().find(|node| node.id == node_id) else {
+        return false;
+    };
+    if node.kind != ExecutionNodeKind::Verify
+        || node.executor_kind != AgenticProgramWaitExecutor::KIND
+    {
+        return false;
+    }
+    graph
+        .node_results
+        .get(node_id)
+        .and_then(|result| result.result_ref.as_deref())
+        .is_some_and(|result_ref| {
+            result_ref.starts_with(&format!("agentic-program-checkpoint:{program_id}:"))
+        })
 }
 
 pub(crate) fn graph_belongs_to_program(graph: &ExecutionGraph, program_id: &str) -> bool {
