@@ -29,6 +29,26 @@ async fn wait_inside_the_closure_budget(
     let _ = tokio::time::timeout(cap, commits.changed()).await;
 }
 
+/// The failure the recovery reports when the physical-closure budget is
+/// spent while a closure proof was still waiting on its owner.
+///
+/// A source that moved under the proof and a stream whose revision moved
+/// under that same proof are one condition: the owner is still writing.
+/// The commit service already classifies both as "keeps the closure
+/// waiting", so both re-prove inside the budget. The budget boundary
+/// reports the typed source-moved error for that condition, so the two
+/// surfaces name it the same way instead of letting the raw store
+/// variant leak out as a different failure shape.
+fn budget_exhausted_closure_error(error: ExecutionCommitError) -> ExecutionCommitError {
+    match error {
+        ExecutionCommitError::EventStore(crate::RuntimeEventStoreError::StaleRevision {
+            stream_id,
+            ..
+        }) => ExecutionCommitError::PhysicalClosureSourceMoved { stream_id },
+        other => other,
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum ExecutionRecoveryError {
     #[error(transparent)]
@@ -123,7 +143,7 @@ impl<'a> ExecutionGraphRecovery<'a> {
                                 // inside the closure budget instead of reporting
                                 // the retryable error early.
                                 if std::time::Instant::now() >= closure_deadline {
-                                    return Err(error.into());
+                                    return Err(budget_exhausted_closure_error(error).into());
                                 }
                                 wait_inside_the_closure_budget(&mut commits, closure_deadline).await;
                                 continue;
@@ -197,7 +217,7 @@ impl<'a> ExecutionGraphRecovery<'a> {
                             // re-proves inside the budget instead of naming
                             // an unproven quiescence.
                             if std::time::Instant::now() >= closure_deadline {
-                                return Err(error.into());
+                                return Err(budget_exhausted_closure_error(error).into());
                             }
                             wait_inside_the_closure_budget(&mut commits, closure_deadline).await;
                             continue;
@@ -225,7 +245,7 @@ impl<'a> ExecutionGraphRecovery<'a> {
                             // a source moved under the proof: read again on
                             // the fresh view while the budget holds.
                             if std::time::Instant::now() >= closure_deadline {
-                                return Err(error.into());
+                                return Err(budget_exhausted_closure_error(error).into());
                             }
                             wait_inside_the_closure_budget(&mut commits, closure_deadline).await;
                         }
