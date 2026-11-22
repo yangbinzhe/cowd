@@ -155,10 +155,31 @@ impl<'a> ExecutionGraphRecovery<'a> {
                         let key = super::events::ExecutionBindingLeaseClosure::fence_key(
                             &graph, &node_id, &binding,
                         );
-                        Some(scopes.try_recover_binding_owner(&key)
-                            .map_err(|error| ExecutionRecoveryError::LeaseReconciliation(error.to_string()))?
-                            .ok_or_else(|| ExecutionRecoveryError::LeaseReconciliation(format!(
-                                "{graph_id}/{node_id}/{}: original owner alive or unsupported missing fence",binding.attempt)))?)
+                        match scopes
+                            .binding_owner_state(&key)
+                            .map_err(|error| {
+                                ExecutionRecoveryError::LeaseReconciliation(error.to_string())
+                            })?
+                        {
+                            super::resources::BindingOwnerState::Available(fence) => Some(fence),
+                            super::resources::BindingOwnerState::Held => {
+                                // The original owner still holds the binding fence,
+                                // so it is still working: the recovery waits for it
+                                // inside the physical-closure budget and re-proves,
+                                // instead of failing the node closed while its owner
+                                // is still writing.
+                                if std::time::Instant::now() >= closure_deadline {
+                                    return Err(ExecutionRecoveryError::LeaseReconciliation(format!(
+                                        "{graph_id}/{node_id}/{}: original owner alive",binding.attempt)).into());
+                                }
+                                wait_inside_the_closure_budget(&mut commits, closure_deadline).await;
+                                continue;
+                            }
+                            super::resources::BindingOwnerState::Missing => {
+                                return Err(ExecutionRecoveryError::LeaseReconciliation(format!(
+                                    "{graph_id}/{node_id}/{}: unsupported missing fence",binding.attempt)).into());
+                            }
+                        }
                     } else {
                         None
                     };
