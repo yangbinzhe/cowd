@@ -2,7 +2,7 @@
 
 ===/<repository>/===
 .gitignore[FV5T]: F:忽略构建产物、IDE/OS 文件、本地 .cowd 数据、node_modules、运行时数据库、plan/ 与 .omo/ 本地资产、旧目录名、live-eval 产物与机器绑定的 opencode.json | R:- | A:plan/ 与 .omo/ 整体忽略；opencode.json 与备份文件按前缀忽略 | S:plan/ 被整体忽略但工作计划就放在 plan/ 下，交付核对要按显式路径；opencode.json 含机器绝对路径，必须保持忽略
-Cargo.toml[FV9S]: F:workspace 根：33 个成员 crate 与 default-members 清单、统一版本号、共享依赖版本、dev/release profile 与 workspace 级 lint 级别 | R:- | A:edition 2021；license MIT；publish=false；unsafe_code=forbid，unwrap_used/expect_used=warn | S:当前 workspace 版本 0.10.46。[workspace.package] version 是唯一版本源，发布只改它并由 cargo update --workspace --offline 同步 Cargo.lock；该文件在只读挂载上，sed -i 会因权限改不了属主而失败，必须用 python 重写；unsafe_code=forbid 是全 workspace 硬门禁；default-members 与成员清单必须同步增删
+Cargo.toml[FV9S]: F:workspace 根：33 个成员 crate 与 default-members 清单、统一版本号、共享依赖版本、dev/release profile 与 workspace 级 lint 级别 | R:- | A:edition 2021；license MIT；publish=false；unsafe_code=forbid，unwrap_used/expect_used=warn | S:当前 workspace 版本 0.10.47。[workspace.package] version 是唯一版本源，发布只改它并由 cargo update --workspace --offline 同步 Cargo.lock；该文件在只读挂载上，sed -i 会因权限改不了属主而失败，必须用 python 重写；unsafe_code=forbid 是全 workspace 硬门禁；default-members 与成员清单必须同步增删
 LICENSE[SZ3T]: F:MIT 许可证全文，附商业使用通知的说明与联系方式 | R:- | A:MIT License，Copyright (c) 2026 Cowd Project Authors；商业使用需主动通知作者 | S:-
 Makefile[OV6T]: F:本地构建入口：按 /proc/meminfo 动态计算安全并行度，提供 check/test/test-all/build/tui-smoke/release-gate 目标，并对 cargo clean 做交互确认 | R:code:scripts/validate.sh,code:scripts/scenarios/tui-smoke.sh | A:SAFE_BUILD_JOBS = 可用内存/3GB，SAFE_TEST_THREADS = 可用内存/2GB 且上限 8，CC_NUM_JOBS=2 | S:cargo clean 会销毁 SQLite 等原生编译缓存并引发数十 GB 级重编译，因此只保留交互确认入口；并行度只在本文件按内存探测，其他脚本不得另设一套
 PRODUCT.md[SU5T]: F:产品登记：目标用户、产品目的、品牌气质、反例清单、七条设计原则与无障碍要求 | R:- | A:单一事实源原则：Runtime 产生执行事实，Gateway 传输，Surface 只做投影与短暂传输态 | S:反例清单对实现有约束力（如不把 TUI 做成常驻仪表盘、不用不受控并发冒充加速），新增界面与交互先对照它再定方案
@@ -1246,7 +1246,7 @@ local_network.rs[DS8L]: F:本地网络效果：授权载荷、回执载荷与结
 local_network_tests.rs[TQ7L]: F:本地网络效果测试 | R:code:crates/runtime/src/execution_core/graph/local_network.rs | A:夹具票据读取实现 | S:覆盖授权与回执校验
 mod.rs[DW9T]: F:执行图模块根：提交服务、编译、执行器、恢复、注册表、资源与运行的统一导出 | R:code:crates/runtime/src/execution_core/graph/commit_pipeline.rs | A:PHYSICAL_CLOSURE_BUDGET=60s | S:物理闭合有预算，超时不得无限等待
 override_custody.rs[DW8L]: F:覆盖终态托管：把干预造成的短路节点封成覆盖终态，含封条、静默与释放 | R:code:crates/runtime/src/execution_core/graph/executors/synthesize.rs | A:OVERRIDE_TERMINAL_NODE_SUFFIXES 十项；静默释放 15 分钟 | S:封条必须基于真实终态事实，不得掩盖未运行的节点
-recovery.rs[DR8M]: F:图恢复：在物理闭合预算内重试并恢复节点状态 | R:code:crates/runtime/src/execution_core/graph/commit_service.rs | A:PHYSICAL_CLOSURE_RETRY_PAUSE=25ms | S:恢复有预算，busy-wait 不得超过；可重试的闭合错误（源在证明下移动等）在预算内重试，已关闭绑定分支与开放绑定分支必须同构，不能提前把重试错误抛给调用方
+recovery.rs[DR8M]: F:图恢复：在物理闭合预算内重试并恢复节点状态 | R:code:crates/runtime/src/execution_core/graph/commit_service.rs | A:PHYSICAL_CLOSURE_RETRY_PAUSE=25ms | S:恢复有预算，busy-wait 不得超过；可重试的闭合错误（源在证明下移动等）在预算内重试，已关闭绑定分支与开放绑定分支必须同构，不能提前把重试错误抛给调用方；预算耗尽时统一报类型化的 source-moved 错误，原始存储变体不在预算边界漏出
 registry.rs[DW8L]: F:执行器注册表：按节点种类解析执行器与后端 | R:code:crates/runtime/src/execution_core/graph/executors/mod.rs | A:注册与解析入口 | S:注册表只解析，不执行
 runner.rs[DW9L]: F:图运行器：泵循环、取消所有者与任务驱动 | R:code:crates/runtime/src/execution_core/graph/commit_service.rs | A:ExecutionGraphRunner 与 OriginalPumpTask | S:运行器只推进，不代写终态；终态提交失败时必须先发持久取消产生退役记录，否则回调永远停在 Pending、after_abort 不会执行；隔离失败的提交沿用该节点已密封的 no_dispatch 事实，不另造失败结果
 state_store.rs[DP8L]: F:图状态存储：节点状态与尝试的持久读写 | R:code:crates/runtime/src/execution_core/graph/commit_pipeline.rs | A:状态存储入口 | S:状态写入必须经提交管线
@@ -1256,7 +1256,7 @@ tool_receipt_query.rs[DP7L]: F:工具回执查询：按票据与调用查已持�
 ===/<repository>/crates/runtime/src/execution_core/graph/executors/===
 agent.rs[DW8L]: F:Agent 节点执行器：驱动 Agent 后端并产出节点结果 | R:code:crates/runtime/src/execution_core/graph/executors/agent_tool.rs | A:实现 NodeExecutor | S:执行器只驱动后端，不拥有图状态
 agent_tool.rs[DW7L]: F:Agent 工具执行器：受治理工具批次的节点执行 | R:code:crates/runtime/src/execution_core/graph/executors/agent.rs | A:实现 NodeExecutor | S:工具批次受治理与授权约束；一个票据只保留一个 NoDispatch 密封事实，重复 finish 不得按当时拒绝集合重新密封
-agentic_program_wait.rs[DW9L]: F:程序等待执行器：以外部等待等待程序屏障，检查冻结子集与持久事实后解除 | R:code:crates/runtime/src/execution_core/graph/executors/agent_tool.rs | A:WaitingExternal 只能由匹配外部分辨离开 | S:只有拥有真实持久外部依赖的执行器才可等待外部；解除条件以处置记录里的 reason 为准（all_tasks_accepted、task_stranded、worker_quiescent）；搁浅判定只认“无空闲可用成员”的延迟记账，而成员占用只来自真实 retained run，仅装租约不算占用
+agentic_program_wait.rs[DW9L]: F:程序等待执行器：以外部等待等待程序屏障，检查冻结子集与持久事实后解除 | R:code:crates/runtime/src/execution_core/graph/executors/agent_tool.rs | A:WaitingExternal 只能由匹配外部分辨离开 | S:只有拥有真实持久外部依赖的执行器才可等待外部；解除条件以处置记录里的 reason 为准（all_tasks_accepted、task_stranded、worker_quiescent）；搁浅判定只认“无空闲可用成员”的延迟记账，而成员占用只来自真实 retained run，仅装租约不算占用；CAS 冲突后重试发现屏障已被并发解除时，按持久检查点 agentic-program-checkpoint 计数一次，根不留在停放态
 approval.rs[DW7L]: F:审批节点执行器：等待审批决定并产出结果 | R:code:crates/runtime/src/execution_core/graph/executors/agent.rs | A:实现 NodeExecutor | S:审批等待必须由决定唤醒
 materialize.rs[DW7L]: F:物化节点执行器：消费同图已提交前驱结果，写入工作区并产出物化回执 | R:code:crates/runtime/src/execution_core/graph/executors/verify.rs | A:KIND=materialize；new(state_store, workspace_root) | S:只消费同图已提交结果，不重算上游
 mod.rs[DW8T]: F:执行器模块根：汇总 agent/agent_tool/approval/materialize/scoped/synthesize/target_guard/verify 与程序等待 | R:code:crates/runtime/src/execution_core/graph/executors/agent.rs | A:多模块 re-export | S:模块只做汇总
