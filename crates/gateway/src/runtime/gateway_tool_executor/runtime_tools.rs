@@ -1578,6 +1578,10 @@ impl GatewayToolExecutor {
         // The bound is still there: the duplicate is answered once per scope, so a
         // model polling an unchanged reference is still told, and a model that
         // genuinely needs the content gets it on the next ask.
+        // The repeat is answered with the same persistent envelope as the first
+        // read. Nothing is withheld: the receipt names how to get the content
+        // again, and the bytes come with it so the answer stays sealable.
+        let mut already_served_notice: Option<String> = None;
         if runtime::repetition_guard::served_read_count(&read_scope, &read_key) == 2 {
             // Name only tools this request actually exposes.
             //
@@ -1623,17 +1627,12 @@ impl GatewayToolExecutor {
                         .join(" or ")
                 )
             };
-            return Ok(serde_json::to_string(&serde_json::json!({
-                "reference": input.reference,
-                "already_served": true,
-                "notice": format!(
-                    "Runtime already returned this exact read (same reference, same \
-                     cursor, same limit) in this session, and durable content does not \
-                     change, so the bytes you already hold are current. {way_back} To \
-                     read something else, name a different `reference`."
-                )
-            }))
-            .map_err(|error| ToolError::new(error.to_string()))?);
+            already_served_notice = Some(format!(
+                "Runtime already returned this exact read (same reference, same \
+                 cursor, same limit) in this session. The durable bytes are repeated \
+                 here, so this answer stays readable and sealable. {way_back} To read \
+                 something else, name a different `reference`."
+            ));
         }
         let (delegate, mut delegated) = match input.program_directory_inspect_input().map_err(|error| ToolError::new(error.to_string()))? {
             Some(derived) => ("state_inspect", derived),
@@ -1666,7 +1665,12 @@ impl GatewayToolExecutor {
                 _ => delegated["cursor"] = serde_json::json!(cursor),
             }
         }
-        Box::pin(self.execute_runtime_tool_with_binding(delegate, delegated, binding)).await
+        let output =
+            Box::pin(self.execute_runtime_tool_with_binding(delegate, delegated, binding)).await?;
+        match already_served_notice {
+            Some(notice) => Ok(merge_already_served_notice(&output, notice)?),
+            None => Ok(output),
+        }
     }
 
     async fn execute_context_retrieve(
@@ -2300,6 +2304,23 @@ pub(crate) fn single_call_capability_refusal(tool_name: &str) -> ToolError {
          capability: replay the action under the original owner, have that owner authorize it, \
          or use a non-delegated path"
     ))
+}
+
+/// Merge the already-served notice into the envelope the read really produced.
+///
+/// The repeat carries the same persistent envelope as the first read - kind,
+/// available, chunks, bytes and chunk_bytes are left exactly as the read
+/// produced them - so the answer can still yield a body seal. Only two fields
+/// are added.
+fn merge_already_served_notice(output: &str, notice: String) -> Result<String, ToolError> {
+    let mut value: serde_json::Value = serde_json::from_str(output)
+        .map_err(|error| ToolError::new(format!("read answer is not JSON: {error}")))?;
+    let Some(object) = value.as_object_mut() else {
+        return Ok(output.to_string());
+    };
+    object.insert("already_served".to_string(), serde_json::Value::Bool(true));
+    object.insert("notice".to_string(), serde_json::Value::String(notice));
+    serde_json::to_string_pretty(&value).map_err(|error| ToolError::new(error.to_string()))
 }
 
 fn is_unified_read_tool(tool_name: &str) -> bool {

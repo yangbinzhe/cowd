@@ -2398,3 +2398,77 @@ fn gb2_membership_reason_refusal_preserves_the_original_field() {
     let corrected = json!({"agent_ref":"agent:test", "team_ref":"team:test", "operation":"join"});
     assert!(executor.validate_tool_input("membership_update", &corrected.to_string()).is_ok());
 }
+
+/// A repeated read must still carry the persistent envelope.
+///
+/// The second ask of the same immutable reference was answered with a receipt
+/// that carried no bytes at all: kind, available, chunks, bytes and chunk_bytes
+/// were all missing. read_body_seal cannot derive a seal from such an answer,
+/// so every review that needed that evidence was refused - and a refusal with
+/// no readable source is not a verdict on the work.
+///
+/// Nothing is withheld by design: the receipt names how to get the content
+/// again. So the repeat has to carry the same persistent envelope fields the
+/// first answer carried.
+#[tokio::test]
+async fn a_repeated_read_still_carries_the_persistent_envelope() {
+    let services = runtime::RuntimeServices::in_memory().unwrap();
+    let session_id = format!(
+        "repeat-read-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    let artifact = services
+        .artifact_store()
+        .write_bytes(
+            harness_contract::context::ArtifactWriteDescriptor {
+                media_type: "text/plain".into(),
+                visibility_scope: format!("session:{session_id}"),
+                expected_bytes: None,
+                original_name: None,
+            },
+            b"durable bytes that a repeated read must still carry",
+        )
+        .await
+        .unwrap();
+    let executor = GatewayToolExecutor::new(None, false, GatewayToolRegistry::builtin())
+        .with_runtime_session_id(session_id.clone());
+    executor.bind_runtime_services(&services).unwrap();
+    let input = UnifiedReadRequest {
+        reference: artifact.selector.clone(),
+        cursor: None,
+        limit: Some(64),
+    };
+    let binding = || RuntimeToolExecutionBinding {
+        action_invocation: None,
+        tool_lease: None,
+        action_id: None,
+        session_id: Some(session_id.as_str()),
+        authorized_scopes: &[],
+        memory_context: None,
+        reality_context: None,
+        model_lease: None,
+        parent_execution: None,
+        parent_execution_attempt: None,
+        execution_decision: None,
+        permission_ceiling: harness_contract::policy::PermissionMode::WorkspaceWrite,
+    };
+    let first: serde_json::Value = serde_json::from_str(
+        &executor
+            .execute_unified_read(input.clone(), binding())
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    let second: serde_json::Value = serde_json::from_str(
+        &executor.execute_unified_read(input.clone(), binding()).await.unwrap(),
+    )
+    .unwrap();
+    assert_eq!(second["kind"], "evidence_retrieve", "second answer: {second}");
+    assert_eq!(second["available"], true, "second answer: {second}");
+    assert_eq!(second["chunks"], first["chunks"], "second answer: {second}");
+    assert_eq!(second["bytes"], first["bytes"], "second answer: {second}");
+    assert_eq!(second["chunk_bytes"], first["chunk_bytes"], "second answer: {second}");
+}
