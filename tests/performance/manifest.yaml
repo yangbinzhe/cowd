@@ -1,5 +1,4 @@
 schema_version: 1
-baseline_established: 0.9.711  # 基线建立时的工作区版本，仅供参考；阈值与负载与版本无关
 runs: 20
 warmup_runs: 3
 environment:
