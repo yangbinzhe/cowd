@@ -660,6 +660,7 @@ impl AgentActionService {
             "barrier_candidates": record.barrier_candidates,
             "released": record.released,
             "observed_revision": record.observed_revision,
+            "barrier_rejections": record.barrier_rejections,
         });
         let request = AppendTransactionRequest {
             transaction_id: format!(

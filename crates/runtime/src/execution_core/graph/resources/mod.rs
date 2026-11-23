@@ -17,7 +17,7 @@ pub use manager::{
     ResourceLimitAdjustment, ResourceObservation, ResourceObservationFreshness, ResourceQuota,
     ResourceResultClass, ResourceWaitReason,
 };
-pub(crate) use scope_lock::{BindingOwnerFence, ReleasedBindingLeases};
+pub(crate) use scope_lock::{BindingOwnerFence, BindingOwnerState, ReleasedBindingLeases};
 pub use scope_lock::{
     ScopeLockError, ScopeLockLease, ScopeLockManager, ScopeLockMode, ScopeLockRequest,
     ScopedResource,

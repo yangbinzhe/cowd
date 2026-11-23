@@ -5021,18 +5021,38 @@ async fn post_commit_callback_never_holds_graph_coordination_lock() {
     };
 
     entered.notified().await;
-    let revision = state.load(&graph_id).unwrap().revision;
-    let command = runner.command(
-        &graph_id,
-        ExecutionGraphCommand::Pause {
-            expected_revision: revision,
-            reason: "exercise coordination while callback is pending".to_string(),
-        },
-    );
-    let paused = tokio::time::timeout(Duration::from_millis(100), command)
-        .await
-        .expect("post-commit callback must not block graph command coordination")
-        .expect("pause should commit while callback remains pending");
+    // The pending commit callback advances the graph itself, so a revision read
+    // outside the coordination lock can be superseded before the command
+    // validates it. A stale revision is the graph moving, not the callback
+    // holding the lock, so it is re-issued against the fresh revision inside
+    // the same bounded budget: the "must not block" expectation below still
+    // measures the whole thing, and a callback that really held the lock would
+    // still time out on the first attempt.
+    let mut revision = state.load(&graph_id).unwrap().revision;
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(100);
+    let paused = loop {
+        let command = runner.command(
+            &graph_id,
+            ExecutionGraphCommand::Pause {
+                expected_revision: revision,
+                reason: "exercise coordination while callback is pending".to_string(),
+            },
+        );
+        let outcome = tokio::time::timeout_at(deadline, command)
+            .await
+            .expect("post-commit callback must not block graph command coordination");
+        match outcome {
+            Ok(graph) => break graph,
+            Err(
+                crate::execution_core::graph::ExecutionRunnerError::Commit(
+                    crate::execution_core::graph::ExecutionCommitError::StaleRevision { .. },
+                ),
+            ) => revision = state.load(&graph_id).unwrap().revision,
+            Err(error) => {
+                panic!("pause should commit while callback remains pending: {error:?}")
+            }
+        }
+    };
     assert!(paused.revision > revision);
 
     release.notify_one();

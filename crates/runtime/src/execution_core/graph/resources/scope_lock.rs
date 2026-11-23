@@ -166,6 +166,18 @@ pub struct ScopeLockManager {
     shared: Arc<Shared>,
 }
 
+/// The state of a binding-owner fence.
+///
+/// `Held` means a live owner still holds the fence lock: that owner is still
+/// working, which is not the same condition as `Missing` (no fence was ever
+/// registered). A caller needs the difference, because a live owner is waited
+/// for while a missing fence is not recoverable at all.
+pub(crate) enum BindingOwnerState {
+    Missing,
+    Held,
+    Available(BindingOwnerFence),
+}
+
 pub(crate) struct BindingOwnerFence {
     file: File,
     key: String,
@@ -607,10 +619,10 @@ impl ScopeLockManager {
         })
     }
 
-    pub(crate) fn try_recover_binding_owner(
+    pub(crate) fn binding_owner_state(
         &self,
         key: &str,
-    ) -> Result<Option<BindingOwnerFence>, ScopeLockError> {
+    ) -> Result<BindingOwnerState, ScopeLockError> {
         use std::io::Read;
         use std::os::unix::fs::OpenOptionsExt;
         let path = self.binding_owner_path(key)?;
@@ -621,12 +633,16 @@ impl ScopeLockManager {
             .open(&path)
         {
             Ok(file) => file,
-            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+            Err(error) if error.kind() == ErrorKind::NotFound => {
+                return Ok(BindingOwnerState::Missing);
+            }
             Err(error) => return Err(scope_io(&path, error)),
         };
         match FileExt::try_lock_exclusive(&file) {
             Ok(()) => {}
-            Err(error) if error.kind() == ErrorKind::WouldBlock => return Ok(None),
+            Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                return Ok(BindingOwnerState::Held);
+            }
             Err(error) => return Err(scope_io(&path, error)),
         }
         let mut marker = String::new();
@@ -639,13 +655,23 @@ impl ScopeLockManager {
                 "unsupported or incomplete binding owner marker".into(),
             ));
         }
-        Ok(Some(BindingOwnerFence {
+        Ok(BindingOwnerState::Available(BindingOwnerFence {
             file,
             key: key.into(),
             recovery: true,
             released: false,
             failed: false,
         }))
+    }
+
+    pub(crate) fn try_recover_binding_owner(
+        &self,
+        key: &str,
+    ) -> Result<Option<BindingOwnerFence>, ScopeLockError> {
+        match self.binding_owner_state(key)? {
+            BindingOwnerState::Available(fence) => Ok(Some(fence)),
+            BindingOwnerState::Missing | BindingOwnerState::Held => Ok(None),
+        }
     }
 
     pub fn active_lease_count(&self) -> Result<usize, ScopeLockError> {

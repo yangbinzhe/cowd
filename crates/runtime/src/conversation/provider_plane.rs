@@ -355,6 +355,65 @@ const fn provider_admission_timeout_ms(
     }
 }
 
+/// How many times a provider admission may expire before the turn gives up.
+const MAX_PROVIDER_ADMISSION_EXPIRY_RETRIES: usize = 16;
+
+/// Wait for one Provider slot, re-queuing an expired wait instead of failing
+/// the turn.
+///
+/// The admission timeout is how long one request may sit in the queue, not how
+/// long the work behind it may live. A shared Provider quota makes queuing the
+/// normal case, so an expired wait re-queues the request: work that never
+/// started is not abandoned, and the queue wait is not charged to the turn's
+/// own budget. The retry bound keeps a Provider that can never admit anything
+/// from parking a turn forever.
+async fn admit_provider_capacity_until_granted<F>(
+    manager: &crate::execution_core::graph::ExecutionResourceManager,
+    cancellation: &crate::CancellationToken,
+    mut build_request: F,
+) -> Result<crate::execution_core::graph::ExecutionResourceLease, RuntimeError>
+where
+    F: FnMut() -> crate::execution_core::graph::ResourceAdmissionRequest,
+{
+    let mut expired_waits = 0usize;
+    loop {
+        let acquire = manager.admit(build_request());
+        let decision = tokio::select! {
+            () = cancellation.cancelled() => {
+                return Err(RuntimeError::new(
+                    "turn cancelled while waiting for provider capacity",
+                ));
+            }
+            decision = acquire => decision.map_err(|error| RuntimeError::new(format!(
+                "provider capacity admission failed: {error}"
+            )))?,
+        };
+        match decision {
+            crate::execution_core::graph::ResourceAdmissionDecision::Granted { lease, .. } => {
+                return Ok(lease);
+            }
+            crate::execution_core::graph::ResourceAdmissionDecision::Deferred { wait_reason, .. }
+            | crate::execution_core::graph::ResourceAdmissionDecision::Overloaded { wait_reason, .. }
+                if wait_reason == crate::execution_core::graph::ResourceWaitReason::DeadlineExpired =>
+            {
+                expired_waits += 1;
+                if expired_waits > MAX_PROVIDER_ADMISSION_EXPIRY_RETRIES {
+                    return Err(RuntimeError::new(format!(
+                        "provider capacity admission expired {expired_waits} times without a grant"
+                    )));
+                }
+                continue;
+            }
+            crate::execution_core::graph::ResourceAdmissionDecision::Deferred { wait_reason, .. }
+            | crate::execution_core::graph::ResourceAdmissionDecision::Overloaded { wait_reason, .. } => {
+                return Err(RuntimeError::new(format!(
+                    "provider capacity admission did not grant: {wait_reason:?}"
+                )));
+            }
+        }
+    }
+}
+
 /// Record a cut-off frame Runtime salvaged, and tell the model what was lost.
 ///
 /// The provider output ceiling cuts a tool frame off mid-value, which leaves
@@ -1784,40 +1843,29 @@ where
                 .input_total_tokens()
                 .saturating_add(request.budget.protocol_overhead_tokens)
                 .saturating_add(request.budget.requested_output_tokens);
-            let admission = crate::provider_resources::provider_leaf_admission(
-                &resource_handles
-                    .config
-                    .read()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner),
-                self.api_client.provider_name_for_model(model).as_deref(),
-                model,
-                estimated_tokens,
-                self.execution_service_class,
-                self.session_id(),
-                now_ms()
-                    .saturating_add(provider_admission_timeout_ms(self.execution_service_class)),
-            );
-            let acquire = manager.admit(admission);
-            let lease = tokio::select! {
-                () = self.cancellation_token.cancelled() => {
-                    return Err(RuntimeError::new(
-                        "turn cancelled while waiting for provider capacity",
-                    ));
-                }
-                decision = acquire => {
-                    match decision.map_err(|error| RuntimeError::new(format!(
-                        "provider capacity admission failed: {error}"
-                    )))? {
-                        crate::execution_core::graph::ResourceAdmissionDecision::Granted { lease, .. } => lease,
-                        crate::execution_core::graph::ResourceAdmissionDecision::Deferred { wait_reason, .. }
-                        | crate::execution_core::graph::ResourceAdmissionDecision::Overloaded { wait_reason, .. } => {
-                            return Err(RuntimeError::new(format!(
-                                "provider capacity admission did not grant: {wait_reason:?}"
-                            )));
-                        }
-                    }
+            let provider_name = self.api_client.provider_name_for_model(model);
+            let service_class = self.execution_service_class;
+            let session_id = self.session_id();
+            let lease = admit_provider_capacity_until_granted(
+                manager,
+                &self.cancellation_token,
+                || {
+                    crate::provider_resources::provider_leaf_admission(
+                        &resource_handles
+                            .config
+                            .read()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner),
+                        provider_name.as_deref(),
+                        model,
+                        estimated_tokens,
+                        service_class,
+                        session_id,
+                        now_ms()
+                            .saturating_add(provider_admission_timeout_ms(service_class)),
+                    )
                 },
-            };
+            )
+            .await?;
 
             Some(lease)
         } else {
@@ -3667,6 +3715,92 @@ mod provider_admission_tests {
         ] {
             assert_eq!(provider_admission_timeout_ms(class), 300_000);
         }
+    }
+
+    #[tokio::test]
+    async fn an_expired_provider_admission_wait_is_requeued_instead_of_abandoning_the_work() {
+        use crate::execution_core::graph::{
+            ExecutionResourceKind, ExecutionResourceManager, ExecutionServiceClass,
+            ResourceAdmissionDecision, ResourceAdmissionRequest, ResourceQuota,
+        };
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let manager = Arc::new(ExecutionResourceManager::new([(
+            ExecutionResourceKind::Provider,
+            ResourceQuota::new(1, 1, 1).expect("a provider quota of one is valid"),
+        )]));
+        let holder = match manager
+            .admit(ResourceAdmissionRequest::new(
+                ExecutionServiceClass::Foreground,
+                [(ExecutionResourceKind::Provider, 1)],
+            ))
+            .await
+            .expect("the holder admits the only provider slot")
+        {
+            ResourceAdmissionDecision::Granted { lease, .. } => lease,
+            other => panic!("the only provider slot must be granted to the holder: {other:?}"),
+        };
+
+        let cancellation = crate::CancellationToken::new();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&attempts);
+        let waiting = tokio::spawn(async move {
+            admit_provider_capacity_until_granted(&manager, &cancellation, || {
+                let attempt = counter.fetch_add(1, Ordering::SeqCst) + 1;
+                ResourceAdmissionRequest::new(
+                    ExecutionServiceClass::Foreground,
+                    [(ExecutionResourceKind::Provider, 1)],
+                )
+                .with_deadline_at_ms(
+                    now_ms().saturating_add(if attempt == 1 { 1 } else { 5_000 }),
+                )
+            })
+            .await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        drop(holder);
+        let lease = tokio::time::timeout(std::time::Duration::from_secs(10), waiting)
+            .await
+            .expect("an expired provider admission wait must not abandon the work")
+            .expect("the admission task must not panic")
+            .expect("the re-queued admission is granted");
+        assert!(
+            attempts.load(Ordering::SeqCst) >= 2,
+            "the expired wait must be re-queued"
+        );
+        drop(lease);
+    }
+
+    #[tokio::test]
+    async fn a_provider_admission_refusal_that_is_not_an_expired_wait_is_not_requeued() {
+        use crate::execution_core::graph::{
+            ExecutionResourceKind, ExecutionResourceManager, ExecutionServiceClass,
+            ResourceAdmissionRequest, ResourceQuota,
+        };
+
+        let manager = ExecutionResourceManager::new([(
+            ExecutionResourceKind::Provider,
+            ResourceQuota::new(1, 1, 1).expect("a provider quota of one is valid"),
+        )]);
+        let cancellation = crate::CancellationToken::new();
+        let error = match admit_provider_capacity_until_granted(
+            &manager,
+            &cancellation,
+            || {
+                ResourceAdmissionRequest::new(
+                    ExecutionServiceClass::Foreground,
+                    [(ExecutionResourceKind::Provider, 1)],
+                )
+                .with_scope("provider:infeasible", false)
+            },
+        )
+        .await
+        {
+            Ok(_) => panic!("an infeasible provider scope must not be granted"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("did not grant"));
     }
 }
 
