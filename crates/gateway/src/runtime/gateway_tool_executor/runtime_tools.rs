@@ -2296,10 +2296,15 @@ impl GatewayToolExecutor {
 /// owner, have that owner authorize it, or issue it on a non-delegated path.
 /// It deliberately does not reuse the `read_ref` delegation refusal's
 /// "call X directly" remedy, which belongs to a routing problem and would
-/// point at the wrong next step here. The error stays an Unknown: no
-/// capability is granted, nothing is dispatched and nothing is re-queued.
+/// point at the wrong next step here. The error is a refusal before any
+/// effect: no capability is granted, nothing is dispatched, and the runtime
+/// settles the call as refused instead of leaving it in flight. It must not be
+/// an Unknown - that class claims the original effect may have committed and
+/// keeps the tool_batch node Blocked, which ends the agent turn with "no
+/// terminal turn result" (live_tool_evidence / live_one_team_execution on
+/// 0.10.49, `state_inspect` called on its own).
 pub(crate) fn single_call_capability_refusal(tool_name: &str) -> ToolError {
-    ToolError::unknown(format!(
+    ToolError::refused_before_effect(format!(
         "`{tool_name}` is an Agent action and this call carries no original owner's action \
          capability: replay the action under the original owner, have that owner authorize it, \
          or use a non-delegated path"
@@ -2590,6 +2595,25 @@ mod single_call_refusal_tests {
         assert!(
             !refusal.contains("directly"),
             "the routing remedy of the read_ref refusal must not be copied here: {refusal}"
+        );
+    }
+
+    /// Nothing was dispatched, so nothing can have committed: the refusal must
+    /// settle the call as refused (a terminal, model-visible refusal) instead of
+    /// leaving it in flight. An `unknown` error keeps the tool_batch node
+    /// Blocked with an uncertain completion, and the agent turn then ends with
+    /// "execution graph produced no terminal turn result" (live_one_team_execution
+    /// and live_tool_evidence on 0.10.49: `state_inspect` called on its own).
+    #[test]
+    fn single_call_capability_refusal_is_a_refusal_before_effect_not_an_unknown() {
+        let refusal = single_call_capability_refusal("state_inspect");
+        assert!(
+            !refusal.is_unknown(),
+            "an un-dispatched refusal must not stay unresolved: {refusal}"
+        );
+        assert!(
+            refusal.is_refusal_before_effect(),
+            "the runtime settles it as refused: {refusal}"
         );
     }
 }
