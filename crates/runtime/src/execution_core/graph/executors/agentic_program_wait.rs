@@ -471,6 +471,90 @@ pub async fn resolve_agentic_program_wait(
     .await
 }
 
+/// The four conditions a barrier node must satisfy before the resolver may
+/// release it, counted per node and reported as totals.
+///
+/// A barrier that stays parked has to be diagnosable from the durable record
+/// alone: without these counters the artifact can only say that the barrier
+/// was not released, never which condition was false.
+fn barrier_condition_report(
+    graph: &ExecutionGraph,
+    request: &AgenticProgramWaitRequest,
+) -> serde_json::Value {
+    let mut is_verify = 0usize;
+    let mut is_waiting_external = 0usize;
+    let mut payload_matches = 0usize;
+    let mut all_conditions = 0usize;
+    let mut barrier_nodes = 0usize;
+    let rejections = graph
+        .nodes
+        .iter()
+        .filter(|node| node.executor_kind == AgenticProgramWaitExecutor::KIND)
+        .map(|node| {
+            barrier_nodes += 1;
+            let status = graph
+                .node_statuses
+                .get(&node.id)
+                .map(|status| format!("{status:?}"))
+                .unwrap_or_else(|| "absent".to_string());
+            let node_payload_matches =
+                serde_json::from_str::<AgenticProgramWaitRequest>(&node.payload_ref).is_ok_and(
+                    |candidate| {
+                        candidate.program_id == request.program_id
+                            && candidate.root_execution_id == request.root_execution_id
+                    },
+                );
+            let node_is_verify = node.kind == ExecutionNodeKind::Verify;
+            let node_is_waiting_external = status == "WaitingExternal";
+            is_verify += usize::from(node_is_verify);
+            is_waiting_external += usize::from(node_is_waiting_external);
+            payload_matches += usize::from(node_payload_matches);
+            all_conditions += usize::from(
+                node_is_verify && node_is_waiting_external && node_payload_matches,
+            );
+            serde_json::json!({
+                "node_id": node.id,
+                "kind": format!("{:?}", node.kind),
+                "status": status,
+                "payload_matches": node_payload_matches,
+                "is_verify": node_is_verify,
+                "is_waiting_external": node_is_waiting_external,
+            })
+        })
+        .collect::<Vec<_>>();
+    serde_json::json!({
+        "loaded_graph_revision": graph.revision,
+        "loaded_graph_nodes": graph.nodes.len(),
+        "loaded_graph_kinds": graph
+            .nodes
+            .iter()
+            .map(|node| format!("{:?}:{}", node.kind, node.executor_kind))
+            .collect::<Vec<_>>(),
+        "condition_counts": {
+            "barrier_nodes": barrier_nodes,
+            "is_verify": is_verify,
+            "is_waiting_external": is_waiting_external,
+            "payload_matches": payload_matches,
+            "all_conditions": all_conditions,
+        },
+        "rejections": rejections,
+    })
+}
+
+async fn load_barrier_condition_report(
+    state_store: &ExecutionGraphStateStore,
+    root_execution_id: &str,
+    request: &AgenticProgramWaitRequest,
+) -> serde_json::Value {
+    match state_store
+        .load_current_async(root_execution_id.to_string())
+        .await
+    {
+        Ok(graph) => barrier_condition_report(&graph, request),
+        Err(_) => serde_json::Value::Null,
+    }
+}
+
 /// One durable line saying what the barrier resolver decided and what it read. See
 /// `AgentActionService::record_wait_disposition` for why this exists.
 fn record(
@@ -583,7 +667,9 @@ async fn resolve_wait_once(
     // another pass resolved it can still be counted.
     let mut releasing_node: Option<String> = None;
     const MAX_GRAPH_CAS_ATTEMPTS: usize = 8;
-    if strand_exhausted {
+    if strand_exhausted || disposition == "wait" {
+        let barrier_rejections =
+            load_barrier_condition_report(state_store, root_execution_id, &request).await;
         record(
             actions,
             &projection,
@@ -594,22 +680,7 @@ async fn resolve_wait_once(
             0,
             0,
             0,
-            &serde_json::Value::Null,
-        );
-        return Ok(0);
-    }
-    if disposition == "wait" {
-        record(
-            actions,
-            &projection,
-            program_id,
-            root_execution_id,
-            disposition,
-            reason,
-            0,
-            0,
-            0,
-            &serde_json::Value::Null,
+            &barrier_rejections,
         );
         return Ok(0);
     }
@@ -655,40 +726,7 @@ async fn resolve_wait_once(
             // of every run while the durable stream showed the node reaching
             // `waiting_external`, so exactly one of the four conditions below was
             // false and nothing said which.
-            barrier_rejections = serde_json::json!({
-                "loaded_graph_revision": graph.revision,
-                "loaded_graph_nodes": graph.nodes.len(),
-                "loaded_graph_kinds": graph
-                    .nodes
-                    .iter()
-                    .map(|node| format!("{:?}:{}", node.kind, node.executor_kind))
-                    .collect::<Vec<_>>(),
-                "rejections": graph
-                    .nodes
-                    .iter()
-                    .filter(|node| node.executor_kind == AgenticProgramWaitExecutor::KIND)
-                .map(|node| {
-                    let status = graph
-                        .node_statuses
-                        .get(&node.id)
-                        .map(|status| format!("{status:?}"))
-                        .unwrap_or_else(|| "absent".to_string());
-                    let payload_matches =
-                        serde_json::from_str::<AgenticProgramWaitRequest>(&node.payload_ref)
-                            .is_ok_and(|candidate| {
-                                candidate.program_id == request.program_id
-                                    && candidate.root_execution_id == request.root_execution_id
-                            });
-                    serde_json::json!({
-                        "node_id": node.id,
-                        "kind": format!("{:?}", node.kind),
-                        "status": status,
-                        "payload_matches": payload_matches,
-                        "is_verify": node.kind == ExecutionNodeKind::Verify,
-                    })
-                })
-                .collect::<Vec<_>>(),
-            });
+            barrier_rejections = barrier_condition_report(&graph, &request);
             break;
         };
         releasing_node = Some(node.id.clone());
