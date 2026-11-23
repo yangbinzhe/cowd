@@ -113,6 +113,17 @@ impl WorkspacePathIdentityResolver {
         path == Path::new(".") || path == self.workspace_root
     }
 
+    /// The workspace root named by its own absolute path is the same target as
+    /// `.`: a glob or grep over the whole workspace names the root directory,
+    /// and it must resolve to the root identity instead of being refused as an
+    /// escape (the empty remainder after stripping the root is not a relative
+    /// path, but it is the root).
+    fn is_workspace_root_path(&self, path: &str) -> bool {
+        Path::new(path)
+            .strip_prefix(&self.workspace_root)
+            .is_ok_and(|relative| relative.as_os_str().is_empty())
+    }
+
     pub(crate) fn physical_file_identity_at_admission(
         &self,
         identity: &WorkspacePathIdentity,
@@ -183,7 +194,7 @@ impl WorkspacePathIdentityResolver {
         &self,
         path: &str,
     ) -> Result<WorkspacePathIdentity, WorkspacePathIdentityError> {
-        if matches!(path.trim(), "." | "./") {
+        if matches!(path.trim(), "." | "./") || self.is_workspace_root_path(path.trim()) {
             if self.repositories.len() != 1 || !self.repositories[0].workspace_prefix.is_empty() {
                 return Err(WorkspacePathIdentityError::Ambiguous {
                     path: path.to_string(),
@@ -1345,6 +1356,28 @@ pub(crate) fn untrusted_process_observation_283() -> ObservedEvidence {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_workspace_root_itself_resolves_to_the_same_directory_identity_as_dot() {
+        use super::*;
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join(".git")).unwrap();
+        std::fs::write(root.path().join("lib.rs"), "pub fn f() {}\n").unwrap();
+        let resolver = WorkspacePathIdentityResolver::discover(root.path()).unwrap();
+        let via_dot = resolver.resolve_existing(".").unwrap();
+        let canonical_root = root.path().canonicalize().unwrap();
+        let via_root = resolver
+            .resolve_existing(&canonical_root.display().to_string())
+            .expect("the workspace root named by its absolute path is the workspace root");
+        assert_eq!(via_root, via_dot);
+        assert_eq!(via_root.object_kind, WorkspaceObjectKind::Directory);
+        assert_eq!(via_root.workspace_relative_path, ".");
+        let parent = canonical_root.parent().unwrap().canonicalize().unwrap();
+        assert!(
+            resolver.resolve_existing(&parent.display().to_string()).is_err(),
+            "the parent of the workspace root still escapes the workspace"
+        );
+    }
+
     #[test]
     fn bounded_process_target_never_satisfies_workspace_or_network_283() {
         use super::*;
