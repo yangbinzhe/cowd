@@ -5434,7 +5434,7 @@ impl ExecutionGraphRunner {
         }
         if !matches!(
             current.node_statuses.get(node_id),
-            Some(ExecutionNodeStatus::Ready | ExecutionNodeStatus::Running)
+            Some(ExecutionNodeStatus::Planned | ExecutionNodeStatus::Ready | ExecutionNodeStatus::Running)
         ) {
             return Ok(());
         }

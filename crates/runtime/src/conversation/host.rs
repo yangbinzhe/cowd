@@ -1050,9 +1050,16 @@ fn prepare_initial_conversation_graph(
                 generation: ingress.session_generation.max(1),
             },
         );
-        graph
-            .node_statuses
-            .insert(graph.nodes[0].id.clone(), ExecutionNodeStatus::Planned);
+        // Every node needs a status: the wave only picks up a node whose
+        // status is Ready, and a node without a status entry is invisible to
+        // it forever. Restoring only the first node left the rest of the
+        // compiled turn graph unrunnable, so the turn never reached a terminal
+        // result.
+        for node in &graph.nodes {
+            graph
+                .node_statuses
+                .insert(node.id.clone(), ExecutionNodeStatus::Planned);
+        }
         let root_id = graph.nodes[0].id.clone();
         let dispatch_id = format!("{}:session-dispatch", graph.id);
         let mut dispatch = ExecutionNodeSpec::new(
