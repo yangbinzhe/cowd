@@ -128,7 +128,7 @@ fn lifecycle_locks_serialize_same_key_without_serializing_other_keys() {
 }
 
 #[test]
-#[ignore = "run tests/performance-v0.9.711/run.sh"]
+#[ignore = "run tests/performance/run.sh"]
 fn active_session_register_remove_microbench_gate() {
     use std::collections::HashMap;
     use std::time::Instant;

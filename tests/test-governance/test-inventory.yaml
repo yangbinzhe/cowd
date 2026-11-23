@@ -97,8 +97,8 @@ ignored_tests:
     marker: scripts/test/runtime-execution-performance.sh
     runner: scripts/validate.sh manual runtime-execution-performance
   architecture_performance:
-    marker: tests/performance-v0.9.711/run.sh
-    runner: tests/performance-v0.9.711/run.sh candidate
+    marker: tests/performance/run.sh
+    runner: tests/performance/run.sh candidate
   reference_app:
     marker: scripts/test/reference-app.sh
     runner: scripts/test/reference-app.sh
@@ -131,7 +131,7 @@ surface_gates:
     capability: app.bundle.invoke_stream_tui
 
 manual_suites:
-  - path: tests/performance-v0.9.711/run.sh
+  - path: tests/performance/run.sh
     capability: architecture.performance_comparison
   - path: crates/harness-eval/templates/certification-manifest-v1.json
     capability: harness.terminal-certification
