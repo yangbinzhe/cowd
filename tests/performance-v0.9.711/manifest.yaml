@@ -10,7 +10,7 @@ environment:
     - crates/xtask/src/main.rs
     - crates/xtask/src/architecture/
     - tests/performance-v0.9.711/
-    - tests/test-governance/capability-baseline-v0.9.710.json
+    - tests/test-governance/capability-baseline.json
     - tests/test-governance/duplicate-capability-allowlist.yaml
     - tests/test-governance/state-authority-registry.yaml
     - tests/test-governance/test-inventory.yaml

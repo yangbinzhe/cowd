@@ -148,7 +148,7 @@ fn account_exhaustion_is_distinct_from_transient_rate_limit() {
 #[test]
 fn paid_provider_replay_manifest_covers_every_observed_failure_family() {
     let manifest: serde_json::Value = serde_json::from_str(include_str!(
-        "../../../tests/test-governance/provider-failure-replay-v0.9.711.json"
+        "../../../tests/test-governance/provider-failure-replay.json"
     ))
     .expect("provider replay manifest JSON");
     assert_eq!(
