@@ -405,7 +405,7 @@ evidence_support.rs[EW7L]: F:证据支持：工作区访问模式与前态、证
 reality_tools.rs[EW6T]: F:现实类工具的实现挂载点 | R:code:crates/gateway/src/runtime/gateway_tool_executor.rs | A:作为 impl 扩展实现现实工具 | S:工具结果以摘要绑定，便于事后校验
 runtime_host_impl.rs[EW8L]: F:运行时执行宿主实现：GatewayToolExecutor 作为 RuntimeExecutionHost | R:code:crates/gateway/src/runtime/gateway_tool_executor.rs | A:实现 runtime::RuntimeExecutionHost | S:宿主只暴露运行时需要的端口，不泄漏网关内部状态
 runtime_introspection.rs[EW7M]: F:运行时自省工具：查询运行时状态与配置的只读工具实现 | R:code:crates/gateway/src/runtime/gateway_tool_executor.rs | A:作为 impl 扩展提供自省工具 | S:只读，不改变运行时状态
-runtime_tools.rs[EW9L]: F:运行时工具集：字段强制转换、构造与绑定、Agent 动作批执行与能力拒绝 | R:code:crates/gateway/src/runtime/gateway_tool_executor/authorized_execution.rs | A:CoercedField 记录字段搬迁；execute_agent_action_batch 走授权路径 | S:批执行不得授予直接调用会被拒绝的权限；能力缺失时既不派发也不重排
+runtime_tools.rs[EW9L]: F:运行时工具集：字段强制转换、构造与绑定、Agent 动作批执行与能力拒绝 | R:code:crates/gateway/src/runtime/gateway_tool_executor/authorized_execution.rs | A:CoercedField 记录字段搬迁；execute_agent_action_batch 走授权路径 | S:批执行不得授予直接调用会被拒绝的权限；能力缺失时既不派发也不重排；同一不可变引用的重复读取必须回同一份持久信封（kind/available/chunks/bytes 原样保留），只把 already_served 与 notice 并进去，否则取不到 body seal、评审会被拒
 tests.rs[TQ5T]: F:工具执行器的测试挂载点 | R:code:crates/gateway/src/runtime/gateway_tool_executor.rs | A:单行 use super::* | S:-
 tool_executor_impl.rs[EW8M]: F:ToolExecutor trait 的网关实现 | R:code:crates/gateway/src/runtime/gateway_tool_executor.rs | A:实现 runtime::ToolExecutor | S:实现只做适配，授权与效果解析仍走执行器内部路径
 
