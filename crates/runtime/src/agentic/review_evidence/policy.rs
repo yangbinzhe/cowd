@@ -3512,14 +3512,107 @@ fn collect_actual_acquisition(
         )?;
         Ok(())
     })();
-    if result.is_err() {
-        tracing::warn!(sources = actual.sources.len(), material_events = actual.material_events.len(),
-            canonical_facts = actual.canonical_facts.len(), window_groups = windows.len(),
-            disposition = "incomplete_snapshot_not_published",
-            frame_cleanup = if readers.process_inputs.is_some() { "owned_by_frame" } else { "no_frame" },
-            "review acquisition rejected before snapshot publication");
+    let result: Result<(), super::results::ReviewEvidenceError> = result;
+    if let Err(error) = &result {
+        record_review_acquisition_rejection(
+            store,
+            program,
+            primary,
+            actual,
+            windows.len(),
+            readers.process_inputs.is_some(),
+            &error.to_string(),
+        );
     }
     result
+}
+
+/// Persist a refused review acquisition on its own stream.
+///
+/// The review turn is charged for an attempt it could not complete: the actual
+/// input is refused because the read carries no original physical extent, and
+/// the attempt is charged to the model instead of to the structural fault. The
+/// durable record is the only place that says which read lacked the extent.
+///
+/// It observes. The stream is its own - never the semantic lane's - and nothing
+/// is re-armed by it.
+fn record_review_acquisition_rejection(
+    store: &std::sync::Arc<RuntimeEventStore>,
+    program: &AgenticProgramProjection,
+    primary: &crate::DurableRuntimeEvent,
+    actual: &ActualInputSnapshot,
+    window_groups: usize,
+    frame_owned: bool,
+    reason: &str,
+) {
+    let stream_id = format!(
+        "agentic-review-acquisition-rejected:{}",
+        program.program_id
+    );
+    let payload = serde_json::json!({
+        "program_id": program.program_id,
+        "session_id": program.session_id,
+        "disposition": "incomplete_snapshot_not_published",
+        "reason": reason,
+        "sources": actual.sources.len(),
+        "material_events": actual.material_events.len(),
+        "canonical_facts": actual.canonical_facts.len(),
+        "window_groups": window_groups,
+        "frame_cleanup": if frame_owned { "owned_by_frame" } else { "no_frame" },
+        "primary_event_id": primary.event_id,
+    });
+    let request = crate::AppendTransactionRequest {
+        transaction_id: format!(
+            "agentic-review-acquisition-rejected:{}:{}:{}",
+            program.program_id,
+            primary.event_id,
+            if frame_owned { "owned_by_frame" } else { "no_frame" }
+        ),
+        expected_streams: Vec::new(),
+        events: vec![crate::RuntimeTransactionEventInput {
+            event: crate::RuntimeEventInput {
+                stream_id: stream_id.clone(),
+                scope: RuntimeEventScope::Relation,
+                kind: "agentic.review_acquisition_rejected".into(),
+                status: Some("incomplete_snapshot_not_published".into()),
+                actor: Some(program.session_id.clone()),
+                refs: Vec::new(),
+                payload,
+            },
+            idempotency_key: None,
+            schema_version: 1,
+        }],
+    };
+    // The store refuses a transaction that does not declare the current
+    // revision of every stream it writes, so the fence is read and retried.
+    // The write itself is never retried.
+    let mut attempt = 0_u8;
+    loop {
+        let expected = store.stream_revision(&stream_id).unwrap_or_default();
+        let request = crate::AppendTransactionRequest {
+            transaction_id: request.transaction_id.clone(),
+            expected_streams: vec![crate::ExpectedStreamRevision {
+                stream_id: stream_id.clone(),
+                expected_revision: expected,
+            }],
+            events: request.events.clone(),
+        };
+        match store.append_transaction(request) {
+            Ok(_) => return,
+            Err(error) if attempt < 8 && error.to_string().contains("revision") => {
+                attempt = attempt.saturating_add(1);
+                continue;
+            }
+            Err(error) => {
+                tracing::debug!(
+                    program_id = program.program_id,
+                    %error,
+                    "review acquisition rejection not appended"
+                );
+                return;
+            }
+        }
+    }
 }
 
 fn collect_actual_acquisition_candidate(
@@ -9396,8 +9489,27 @@ mod tests {
             ))
             .unwrap_err();
         let trace = trace_events.lock().unwrap().join("\n");
-        assert!(trace.contains("incomplete_snapshot_not_published") && trace.contains("no_frame"));
         assert!(!trace.contains("file://workspace/report.txt"));
+        // The refusal is durable now. The disposition and the frame ownership
+        // are named in the record, on their own stream: the log line is gone,
+        // but nothing about the refusal became less diagnosable.
+        let refusal_stream = format!(
+            "agentic-review-acquisition-rejected:{}",
+            program.program_id
+        );
+        let refusal_events = store.list_stream(&refusal_stream).unwrap();
+        assert_eq!(
+            refusal_events.len(),
+            1,
+            "the refusal is persisted once on its own stream: {refusal_events:?}"
+        );
+        let refusal_record = &refusal_events[0];
+        assert_eq!(refusal_record.kind, "agentic.review_acquisition_rejected");
+        assert_eq!(
+            refusal_record.payload["disposition"],
+            "incomplete_snapshot_not_published"
+        );
+        assert_eq!(refusal_record.payload["frame_cleanup"], "no_frame");
 
         // The same rejected acquisition with an original frame must remain
         // an error; the frame, not a published snapshot, owns its cleanup.
@@ -9420,10 +9532,60 @@ mod tests {
         assert!(frame_error.review_ticket("t1-control", 1).is_none());
         assert!(rejection.review_ticket("t1-control", 1).is_none());
         assert!(with_frame.canonical_facts.is_empty() && frame_windows.is_empty());
-        assert_eq!(store.all_events(10_000).unwrap().len(), before_events.len(), "a refused local snapshot publishes no event");
+        let after_events = store.all_events(10_000).unwrap();
+        let count_on = |events: &[crate::DurableRuntimeEvent], stream: &str| {
+            events.iter().filter(|event| event.stream_id == stream).count()
+        };
+        let mut changed = Vec::new();
+        for stream in before_events
+            .iter()
+            .map(|event| event.stream_id.clone())
+            .collect::<std::collections::BTreeSet<_>>()
+        {
+            if stream != refusal_stream
+                && count_on(&before_events, &stream) != count_on(&after_events, &stream)
+            {
+                changed.push(stream);
+            }
+        }
+        assert!(
+            changed.is_empty(),
+            "a refused local snapshot publishes nothing outside its own refusal stream: {changed:?}"
+        );
+        let refusal_events = store.list_stream(&refusal_stream).unwrap();
+        assert!(
+            refusal_events
+                .iter()
+                .all(|event| event.payload["disposition"]
+                    == "incomplete_snapshot_not_published"),
+            "every refusal record names the disposition: {refusal_events:?}"
+        );
+        assert!(
+            refusal_events
+                .iter()
+                .any(|event| event.payload["frame_cleanup"] == "no_frame"),
+            "the frame-less refusal is persisted: {refusal_events:?}"
+        );
         let frame_trace = frame_trace.lock().unwrap().join("\n");
-        assert!(frame_trace.contains("incomplete_snapshot_not_published") && frame_trace.contains("owned_by_frame"));
         assert!(!frame_trace.contains("file://workspace/report.txt"));
+        let frame_events = store.list_stream(&refusal_stream).unwrap();
+        let frame_record = frame_events.last().unwrap();
+        assert!(
+            frame_events
+                .iter()
+                .any(|event| event.payload["frame_cleanup"] == "no_frame"),
+            "the frame-less refusal is persisted too: {frame_events:?}"
+        );
+        assert_eq!(
+            frame_record.payload["disposition"],
+            "incomplete_snapshot_not_published"
+        );
+        assert!(
+            frame_events
+                .iter()
+                .any(|event| event.payload["frame_cleanup"] == "owned_by_frame"),
+            "the frame-owned refusal is persisted: {frame_events:?}"
+        );
         // 034 GB-1 (batch 1 acceptance): the fragmented gate's original
         // wording stays verbatim inside the gate's envelope; the envelope adds
         // the code and what each proof strategy was missing.

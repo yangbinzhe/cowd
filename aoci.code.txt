@@ -405,7 +405,7 @@ evidence_support.rs[EW7L]: F:证据支持：工作区访问模式与前态、证
 reality_tools.rs[EW6T]: F:现实类工具的实现挂载点 | R:code:crates/gateway/src/runtime/gateway_tool_executor.rs | A:作为 impl 扩展实现现实工具 | S:工具结果以摘要绑定，便于事后校验
 runtime_host_impl.rs[EW8L]: F:运行时执行宿主实现：GatewayToolExecutor 作为 RuntimeExecutionHost | R:code:crates/gateway/src/runtime/gateway_tool_executor.rs | A:实现 runtime::RuntimeExecutionHost | S:宿主只暴露运行时需要的端口，不泄漏网关内部状态
 runtime_introspection.rs[EW7M]: F:运行时自省工具：查询运行时状态与配置的只读工具实现 | R:code:crates/gateway/src/runtime/gateway_tool_executor.rs | A:作为 impl 扩展提供自省工具 | S:只读，不改变运行时状态
-runtime_tools.rs[EW9L]: F:运行时工具集：字段强制转换、构造与绑定、Agent 动作批执行与能力拒绝 | R:code:crates/gateway/src/runtime/gateway_tool_executor/authorized_execution.rs | A:CoercedField 记录字段搬迁；execute_agent_action_batch 走授权路径 | S:批执行不得授予直接调用会被拒绝的权限；能力缺失时既不派发也不重排
+runtime_tools.rs[EW9L]: F:运行时工具集：字段强制转换、构造与绑定、Agent 动作批执行与能力拒绝 | R:code:crates/gateway/src/runtime/gateway_tool_executor/authorized_execution.rs | A:CoercedField 记录字段搬迁；execute_agent_action_batch 走授权路径 | S:批执行不得授予直接调用会被拒绝的权限；能力缺失时既不派发也不重排；同一不可变引用的重复读取必须回同一份持久信封（kind/available/chunks/bytes 原样保留），只把 already_served 与 notice 并进去，否则取不到 body seal、评审会被拒
 tests.rs[TQ5T]: F:工具执行器的测试挂载点 | R:code:crates/gateway/src/runtime/gateway_tool_executor.rs | A:单行 use super::* | S:-
 tool_executor_impl.rs[EW8M]: F:ToolExecutor trait 的网关实现 | R:code:crates/gateway/src/runtime/gateway_tool_executor.rs | A:实现 runtime::ToolExecutor | S:实现只做适配，授权与效果解析仍走执行器内部路径
 
@@ -1098,7 +1098,7 @@ current_review.rs[DW9L]: F:当前评审控制调用的精确身份：评审动�
 current_review_applied_tests.rs[TQ6S]: F:当前评审已应用路径的测试 | R:code:crates/runtime/src/agentic/review_evidence/current_review.rs | A:测试模块 | S:覆盖已应用评审无存活调用的分支
 current_review_retirement.rs[DW8L]: F:评审退役：图尾部保留业务证据或判定为自身评审退役 | R:code:crates/runtime/src/agentic/review_evidence/current_review.rs | A:graph_tail_preserves_work 与 graph_tail_is_own_review_retirement | S:退役只对原始单评审节点保留证据，源修订 CAS 仍推进到实际头
 identity.rs[DW7T]: F:评审证据身份：材料身份与辅助引用、评审结果身份 | R:code:crates/runtime/src/agentic/review_evidence.rs | A:review_result_identity 为唯一身份构造 | S:身份按材料引用派生，不按文本
-policy.rs[DW9L]: F:评审策略快照：读既有运行时策略与工具日志，推导根评审策略、证明输入快照与历史会话切面 | R:code:crates/runtime/src/agentic/review_evidence/current_review.rs | A:禁止自造策略；历史切面只接受真实窗口 | S:伪造窗口或截断流必须拒绝；execution 一侧的归属比较一律走 execution_ids_agree（run: 前缀与裸 graph id 等价），覆盖 source 归属、unsealed acquisition 与 7750 处的 Agent tool output 三类位置；Provider 分支比 packet.run_id()、Process 分支比 packet.graph_id()，而 identity.run_ref 与 session/turn 必须保持精确比较，规范化它们会掩盖真实的 run 拼写不一致
+policy.rs[DW9L]: F:评审策略快照：读既有运行时策略与工具日志，推导根评审策略、证明输入快照与历史会话切面 | R:code:crates/runtime/src/agentic/review_evidence/current_review.rs | A:禁止自造策略；历史切面只接受真实窗口 | S:伪造窗口或截断流必须拒绝；execution 一侧的归属比较一律走 execution_ids_agree（run: 前缀与裸 graph id 等价），覆盖 source 归属、unsealed acquisition 与 7750 处的 Agent tool output 三类位置；Provider 分支比 packet.run_id()、Process 分支比 packet.graph_id()，而 identity.run_ref 与 session/turn 必须保持精确比较，规范化它们会掩盖真实的 run 拼写不一致；评审实际输入被拒时，disposition 与 frame 归属必须落成 durable event 写在独立 stream 上
 policy_control_identity_tests.rs[TQ6S]: F:策略控制身份测试 | R:code:crates/runtime/src/agentic/review_evidence/policy.rs | A:测试模块 | S:覆盖控制身份解析
 read_source.rs[DW7S]: F:读认证来源端口：原始存储边界与测试用键覆盖源 | R:code:crates/runtime/src/agentic/review_evidence.rs | A:ReadAuthSource trait | S:事件发现留给调用方，端口不承诺预算或切面
 reason_code.rs[DR7S]: F:评审拒绝码：六类稳定拒绝码与句子前缀映射 | R:code:crates/runtime/src/agentic/review_evidence.rs | A:REVIEW_REFUSAL_CODES 固定六项 | S:拒绝必须按码计数，不能按句子形状
@@ -1107,7 +1107,7 @@ results.rs[DW9L]: F:结果解析：经既有 Artifact/Program/Tool 所有者解�
 work_contract_tests.rs[TQ6S]: F:工作契约测试 | R:code:crates/runtime/src/agentic/review_evidence/policy.rs | A:测试模块 | S:覆盖工作契约校验
 
 ===/<repository>/crates/runtime/src/agentic/review_evidence/policy/===
-s1_fixture.rs[TQ7S]: F:S1 内核夹具：一次委托子读取加一次评审实际读回执 | R:code:crates/runtime/src/agentic/review_evidence/policy.rs | A:夹具重建子回执未结算与未知效果提升两条链 | S:夹具走真实工具面路径
+s1_fixture.rs[TQ7S]: F:S1 内核夹具：一次委托子读取加一次评审实际读回执 | R:code:crates/runtime/src/agentic/review_evidence/policy.rs | A:夹具重建子回执未结算与未知效果提升两条链 | S:夹具走真实工具面路径；被拒的评审实际输入落在 agentic-review-acquisition-rejected stream 上，可断言其 disposition 与 frame 归属
 
 ===/<repository>/crates/runtime/src/approval/===
 approval_queue.rs[DW9L]: F:运行时全局审批队列：待处理请求、决定、超时策略与结果来源，含证明审批控制与准备态成员审批 | R:code:crates/runtime/src/approval/coordinator.rs | A:PreparedMemberApproval 不消耗或变更授权 | S:待处理与决定必须与来源绑定；准备不等于消费

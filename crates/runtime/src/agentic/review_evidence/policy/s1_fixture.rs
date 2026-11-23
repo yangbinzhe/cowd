@@ -406,3 +406,78 @@ fn s1_delegated_child_read_of_a_durable_record_settles_the_review_actual_input()
         actual.canonical_facts
     );
 }
+
+/// The refusal has to survive the turn.
+///
+/// The review actual input is refused because the read carries no original
+/// physical extent, and the attempt is charged to the model instead of to the
+/// structural fault. The durable record is the only place that says which
+/// read lacked the extent, so the refusal is written on its own stream - never
+/// the semantic lane's, and nothing is re-armed by it.
+#[test]
+fn a_refused_review_acquisition_is_persisted_on_its_own_stream() {
+    let store = Arc::new(RuntimeEventStore::for_test());
+    let session = "s1-session";
+    let graph_id = "s1-graph";
+    let node_id = "s1-node";
+    let call_id = "s1-call";
+    let key = "s1-effect-key";
+    let (primary, index) = delegated_child_read(
+        &store,
+        "read_ref",
+        call_id,
+        key,
+        session,
+        graph_id,
+        node_id,
+        serde_json::json!({}),
+    );
+    let boundary = review_boundary(&store, session, key, graph_id, node_id, call_id);
+    let mut refused = empty_actual();
+    let mut refused_windows = std::collections::BTreeMap::new();
+    let error = super::collect_actual_acquisition(
+        &store,
+        &program(session),
+        &primary,
+        &index,
+        Some(&serde_json::json!({"reference": "file://workspace/report.txt"})),
+        &[],
+        &boundary,
+        readers(),
+        &mut refused,
+        &mut refused_windows,
+    )
+    .expect_err("a workspace read without an acquisition seal cannot authenticate an actual input");
+    assert!(
+        error.to_string().contains("extent"),
+        "the refusal still names the missing extent: {error}"
+    );
+    let stream_id = "agentic-review-acquisition-rejected:s1-program";
+    let events = store
+        .list_stream(stream_id)
+        .expect("the refusal stream is readable");
+    assert_eq!(
+        events.len(),
+        1,
+        "the refusal is persisted exactly once on its own stream: {events:?}"
+    );
+    let event = &events[0];
+    assert_eq!(event.kind, "agentic.review_acquisition_rejected");
+    assert_eq!(
+        event.payload["disposition"],
+        "incomplete_snapshot_not_published"
+    );
+    assert!(
+        event.payload["reason"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("extent"),
+        "the record names the missing extent: {}",
+        event.payload
+    );
+    assert!(
+        !event.stream_id.contains("agentic-program:"),
+        "the record observes on its own stream and never the semantic lane: {}",
+        event.stream_id
+    );
+}
