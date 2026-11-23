@@ -192,6 +192,7 @@ pub fn render_example(schema: &Value) -> ExampleRender {
     let mut state = RenderState {
         rendered: 0,
         lost: Vec::new(),
+        path_form: false,
     };
     let example = example_for(schema, defs, 0, &mut state, "value");
     if state.lost.is_empty() {
@@ -220,6 +221,7 @@ pub fn example_for_path(schema: &Value, path: &str) -> Option<Value> {
     let mut state = RenderState {
         rendered: 0,
         lost: Vec::new(),
+        path_form: true,
     };
     example_for(node, defs, 0, &mut state, field_name)
 }
@@ -388,6 +390,8 @@ pub fn normalize_schema_literal(schema_node: &Value, value: &Value) -> Option<Va
 struct RenderState {
     rendered: usize,
     lost: Vec<String>,
+    /// The example is for one violated path (not the whole call).
+    path_form: bool,
 }
 
 fn degraded_marker(degraded: &DegradedExample) -> Value {
@@ -504,7 +508,12 @@ fn object_example(
     // every optional field instead would teach a model to send what it may omit -
     // `state_inspect` would be exemplified with all six of its optional filters,
     // when the common correct call is `{}`.
-    if required.is_empty() {
+    // A violated nested path whose object carries a default on every field has no
+    // mandatory field, and `{}` would be shown for it: the model cannot repair a type
+    // violation (live: `block_index: "0"` against `integer`) against an empty object.
+    // The path form therefore exemplifies the non-nullable fields instead.
+    let exemplify_non_nullable = required.is_empty() && state.path_form;
+    if required.is_empty() && !exemplify_non_nullable {
         return Value::Object(Map::new());
     }
     let mut example = Map::new();
@@ -516,7 +525,8 @@ fn object_example(
         // `required` list omits it, and an example without it shows the model a
         // variant it cannot actually send.
         let is_discriminator = field_schema.get("const").is_some();
-        if !required.iter().any(|name| name == field) && !is_discriminator {
+        let non_nullable = !matches!(field_schema.get("type"), Some(Value::Array(choices)) if choices.iter().any(|choice| choice == "null"));
+        if !required.iter().any(|name| name == field) && !is_discriminator && !(exemplify_non_nullable && non_nullable) {
             continue;
         }
         match example_for(field_schema, defs, depth + 1, state, field) {

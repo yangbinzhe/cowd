@@ -1992,6 +1992,57 @@ fn bound_step_decodes_only_complete_strict_batch_arrays() {
         .unwrap_err().to_string().contains("step_origin_source_rejected"));
 }
 
+/// The live task_submit refusal on 0.10.49 (live_one_team_execution): the model sent a
+/// `deliverable` that failed the pinned `anyOf` and the way_out was the whole-call
+/// fallback `{"task_ref":"<task_ref>"}` - a shape with no deliverable at all - followed
+/// by "Send the same intended action again in the exact shape above". The model cannot
+/// repair against that. The way_out must show the violated field's shape.
+#[test]
+fn task_submit_deliverable_violation_shows_the_deliverable_shape_not_a_bare_task_ref() {
+    let registry = GatewayToolRegistry::builtin()
+        .with_runtime_tools(crate::runtime_bootstrap::runtime_capability_tool_definitions())
+        .expect("runtime tools");
+    let executor = GatewayToolExecutor::new(None, false, registry);
+    let frame = json!({
+        "task_ref": "task:5f1e44e20353348db43c142b",
+        "deliverable": {"block_index": "0", "kind": "source_fact",
+            "title": "crates/runtime/src/lib.rs — runtime_event_store 在互斥 cfg 门控下双重声明"},
+        "evidence_refs": ["tool://tool-raw-call_cb29b09df5554931929356b7-ee6a87"]
+    })
+    .to_string();
+    let refused = executor
+        .validate_tool_input("task_submit", &frame)
+        .expect_err("the live shape violates the pinned deliverable anyOf");
+    let envelope: serde_json::Value =
+        serde_json::from_str(&refused.to_string()).expect("the unbound refusal is a JSON envelope");
+    let message = envelope["error"]["message"].as_str().expect("error message").to_string();
+    assert!(message.contains("$.deliverable"), "{message}");
+    let example_text = message
+        .split_once("Send it shaped like this: ")
+        .expect("the refusal carries a way_out")
+        .1;
+    // The path form shows the violated field's own shape (the established
+    // `violated_path` contract), so the example IS the deliverable object.
+    let example: serde_json::Value =
+        serde_json::from_str(example_text).expect("complete JSON example");
+    assert!(example.is_object(), "the way_out must be the deliverable's shape: {example_text}");
+    assert!(
+        example["block_index"].is_u64(),
+        "block_index is a usize, the live model sent `\"0\"`: {example_text}"
+    );
+    assert!(example["kind"].is_string() && example["title"].is_string(), "{example_text}");
+    assert!(example.get("task_ref").is_none(), "a bare task_ref is not the deliverable's shape: {example_text}");
+    let repaired = json!({
+        "task_ref": "task:5f1e44e20353348db43c142b",
+        "deliverable": example,
+        "evidence_refs": ["tool://tool-raw-call_cb29b09df5554931929356b7-ee6a87"]
+    })
+    .to_string();
+    executor
+        .validate_tool_input("task_submit", &repaired)
+        .expect("the shown deliverable shape must satisfy the same pinned schema");
+}
+
 /// Production uses the bound Step validator, not the unbound CLI validator.
 /// Reproduce the observed actions:string / malformed inner entries; this is a
 /// controlled shape counterexample, not a claim of replaying an entire HTTP frame.

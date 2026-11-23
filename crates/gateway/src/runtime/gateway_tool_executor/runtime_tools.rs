@@ -350,7 +350,19 @@ impl GatewayToolExecutor {
     /// can show the legal form of that path instead of the whole call.
     fn violated_path(error: &str) -> Option<&str> {
         let head = error.split_once(':').map(|(head, _)| head.trim())?;
-        head.starts_with('$').then_some(head)
+        if head.starts_with('$') {
+            return Some(head);
+        }
+        // The bound pinned-schema validator prefixes the pointer: `tool `X` input
+        // violates its pinned schema: $.deliverable: value does not satisfy …`.
+        // Reading only the text before the first colon lost that pointer, and the
+        // way_out fell back to the whole-call example - for a `$.deliverable`
+        // violation that showed `{"task_ref":"<task_ref>"}`, a call with no
+        // deliverable at all (live_one_team_execution on 0.10.49). Runtime's own
+        // defect signature reads the pointer after the same prefix.
+        let rest = error.split_once("pinned schema: ")?.1.trim_start();
+        let pointer = rest.split_once(':').map(|(pointer, _)| pointer.trim()).unwrap_or(rest.trim());
+        pointer.starts_with('$').then_some(pointer)
     }
 
     /// The field a violated path names.
