@@ -853,23 +853,48 @@ where
         // `bus.current_execution_context()` is the ROOT's execution while the
         // admitted step below belongs to this agent. Comparing them rejects every
         // delegated native call. The identity that describes this runtime is
-        // `self.execution_identity`; that is what the step has to match.
-        let Some(identity) = self.execution_identity.as_ref() else {
-            return Ok(());
-        };
-        let Some(expected_graph_id) = identity.graph_id().map(str::to_string) else {
-            return Ok(());
+        // `self.execution_identity`; that is what the step has to match. A root
+        // Session runtime whose turn has no Program carries no checkpoint identity:
+        // its own execution is exactly the one the bus exposes, so only a runtime
+        // without an identity falls back to the bus context.
+        let root_context;
+        let (expected_graph_id, own_execution, expected_turn_id): (
+            String,
+            crate::CowdExecutionContext,
+            Option<String>,
+        ) = match self.execution_identity.as_ref() {
+            Some(identity) => {
+                let Some(expected_graph_id) = identity.graph_id().map(str::to_string) else {
+                    return Ok(());
+                };
+                let own_execution = crate::CowdExecutionContext {
+                    execution_id: expected_graph_id.clone(),
+                    session_id: identity
+                        .session_id()
+                        .map(str::to_string)
+                        .unwrap_or_else(|| self.session_id().to_string()),
+                    turn_id: identity.turn_id().unwrap_or_default().to_string(),
+                };
+                (
+                    expected_graph_id,
+                    own_execution,
+                    identity.turn_id().map(str::to_string),
+                )
+            }
+            None => match bus.current_execution_context() {
+                Some(context) => {
+                    root_context = context;
+                    (
+                        root_context.execution_id.clone(),
+                        root_context.clone(),
+                        Some(root_context.turn_id.clone()),
+                    )
+                }
+                None => return Ok(()),
+            },
         };
         let expected_execution_id =
             crate::execution_core::graph::graph_id_for_lookup(&expected_graph_id);
-        let own_execution = crate::CowdExecutionContext {
-            execution_id: expected_graph_id.clone(),
-            session_id: identity
-                .session_id()
-                .map(str::to_string)
-                .unwrap_or_else(|| self.session_id().to_string()),
-            turn_id: identity.turn_id().unwrap_or_default().to_string(),
-        };
         let mut sources = self
             .turn_native_tool_sources
             .lock()
@@ -888,8 +913,7 @@ where
                 .as_deref()
                 .map(crate::execution_core::graph::graph_id_for_lookup);
             if binding.snapshot.identity.session_id != self.session_id()
-                || Some(binding.snapshot.identity.turn_id.as_str())
-                    != identity.turn_id()
+                || Some(binding.snapshot.identity.turn_id.as_str()) != expected_turn_id.as_deref()
                 || admitted_execution_id.as_deref() != Some(expected_execution_id.as_ref())
                 || binding.origin.origin_step_id != binding.snapshot.identity.step_id
                 || binding.origin.call_id != call.id
@@ -4284,6 +4308,39 @@ mod immutable_native_acquisition_tests {
                     "a delegated agent must be judged against its own execution identity, not the \
                      root execution the shared bus currently exposes",
                 );
+            let root_bus = crate::CowdEventBus::new();
+            let root_without_checkpoint = ConversationRuntime::new(
+                {
+                    let mut session = Session::new();
+                    session.session_id = "scope2-session".into();
+                    session
+                },
+                AcquisitionApi,
+                crate::StaticToolExecutor::new(),
+                PermissionPolicy::new(crate::PermissionMode::DangerFullAccess),
+                vec![],
+            )
+            .without_memory()
+            .with_cowd_event_bus(root_bus.clone())
+            .with_runtime_event_store(store.clone());
+            let _root_execution = root_bus.enter_execution(crate::CowdExecutionContext {
+                execution_id: "scope2-graph".into(),
+                session_id: "scope2-session".into(),
+                turn_id: "scope2-turn".into(),
+            });
+            root_without_checkpoint
+                .remember_native_tool_calls(std::slice::from_ref(&original))
+                .expect("a root Session runtime carries no checkpoint identity when its turn has no Program");
+            assert!(
+                root_without_checkpoint
+                    .turn_native_tool_sources
+                    .lock()
+                    .unwrap()
+                    .contains_key(&original.id),
+                "the root's own native read source must be remembered against its own bus execution, or no \
+                 model observation can ever be confirmed for a root-turn read (live_tool_evidence on 0.10.49: \
+                 every read_file candidate ended as no_source_or_body)"
+            );
             assert_eq!(runtime.turn_native_tool_sources.lock().unwrap()[&original.id].call, original);
             let source = NativeToolSource {
                 call: ModelToolCall {
