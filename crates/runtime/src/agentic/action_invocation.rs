@@ -60,6 +60,25 @@ pub(crate) struct DelegatedSingleCheckedInputs<'a> {
     _seal: (),
 }
 
+pub(crate) fn original_consumption_refusal(tool_name: &str, input: &str) -> String {
+    if tool_name != "read_ref" {
+        return "original provider lease consumption unavailable".to_string();
+    }
+    let reference = serde_json::from_str::<serde_json::Value>(input)
+        .ok()
+        .and_then(|input| {
+            input.get("reference").and_then(serde_json::Value::as_str).map(str::to_string)
+        })
+        .unwrap_or_default();
+    format!(
+        "read_ref cannot read `{reference}`: the reference names no original provider call to replay. \
+         cause: read_ref serves `tool://` call references and `artifact://` selectors only; `task://`, \
+         `team://`, `goal://`, `topic://` and `issue://` objects are not tool output. way_out: use the \
+         Task statement already returned by your task_claim, or reference a `tool://tool-raw-call_...` \
+         id from an earlier call's output."
+    )
+}
+
 impl DelegatedOriginalSessionOwner {
     /// Process facts are emitted by the original negotiator before dispatch.
     /// Their lookup key is only a selector: all producer, packet, request,
@@ -84,7 +103,9 @@ impl DelegatedOriginalSessionOwner {
             || request.parent_execution.as_ref().is_none_or(|parent| parent.execution_id != self.ticket.graph_id || parent.node_id != self.ticket.node_id)
             || request.parent_execution_attempt != Some(self.ticket.attempt)
         { return Err("original provider owner mismatch".into()); }
-        let consumption = producer.original_consumption(auth).ok_or("original provider lease consumption unavailable")?;
+        let consumption = producer
+            .original_consumption(auth)
+            .ok_or_else(|| original_consumption_refusal(&request.tool_name, &request.input))?;
         if consumption.lease != auth.authorization_lease
             || !crate::authorization_negotiator::consumed_transition_matches_original_execution(&consumption.transition, auth) {
             return Err("original provider lease producer mismatch".into());
@@ -800,5 +821,30 @@ mod tests {
         assert!(check(&physical, "call", &input, Some(0)).is_err());
         capability.scope.active.store(false, std::sync::atomic::Ordering::Release);
         assert!(check(&physical, "call", &input, None).is_err());
+    }
+
+    /// live_one_team_execution / live_tool_evidence (0.10.49): every delegated
+    /// `read_ref` of a `task://`, `team://`, `goal://`, `topic://` or `issue://`
+    /// reference was refused with the bare internal phrase below and the agent
+    /// retried it for 21 rounds; only `tool://` and `artifact://` ever resolved.
+    #[test]
+    fn read_ref_without_an_original_provider_call_names_the_reference_and_the_way_out() {
+        let refusal = super::original_consumption_refusal(
+            "read_ref",
+            r#"{"reference":"task://task:e28e445ba304da0e35ef1b02"}"#,
+        );
+        assert!(refusal.starts_with("read_ref "), "{refusal}");
+        assert!(refusal.contains("task://task:e28e445ba304da0e35ef1b02"), "{refusal}");
+        assert!(refusal.contains("cause:"), "{refusal}");
+        assert!(refusal.contains("way_out:"), "{refusal}");
+        assert!(refusal.contains("tool://") && refusal.contains("artifact://"), "{refusal}");
+        assert!(refusal.contains("task_claim"), "{refusal}");
+        assert_ne!(refusal, "original provider lease consumption unavailable");
+
+        let other = super::original_consumption_refusal(
+            "state_inspect",
+            r#"{"selector":"task://task:e28e445ba304da0e35ef1b02"}"#,
+        );
+        assert_eq!(other, "original provider lease consumption unavailable");
     }
 }
