@@ -3214,6 +3214,64 @@ fn original_glob_discovery(
         "bytes":output.len(), "reported_scan_complete":complete})))
 }
 
+/// A grep over a workspace path is the other discovery read a review input can
+/// carry. Its receipt is the durable record of an actually executed search, so
+/// a complete, untruncated, single-page result proves the input was acquired
+/// the same way a glob page does; a truncated, omitted or continued page proves
+/// nothing and is refused. Content reads still need an acquisition seal.
+fn original_grep_discovery(
+    primary: &crate::DurableRuntimeEvent,
+    descriptor: &ToolEffectDescriptor,
+    input: Option<&serde_json::Value>,
+) -> Result<Option<serde_json::Value>, String> {
+    if primary.payload["tool_name"] != "grep_search" {
+        return Ok(None);
+    }
+    if descriptor.tool_id != "grep_search" || descriptor.effect_kind != ToolEffectKind::Read
+        || descriptor.uses_network || descriptor.spawns_process
+        || descriptor.mutates_packages || descriptor.mutates_system
+        || primary.payload["outcome_truncated"] == true
+    {
+        return Err("original discovery has invalid effect or incomplete output".into());
+    }
+    let scope = super::results::require_original_effect_scope(
+        &primary.payload["resolved_effect_scope"], descriptor,
+    )?;
+    if !crate::context_evidence::original_read_file_domain(descriptor, &scope) {
+        return Err("original discovery File domain is incomplete".into());
+    }
+    let input = input.ok_or("original discovery input unavailable")?;
+    let output = primary.payload["outcome"]["output"].as_str()
+        .ok_or("original discovery output unavailable")?;
+    let value: serde_json::Value = serde_json::from_str(output)
+        .map_err(|_| "original discovery output is not JSON")?;
+    let complete = validate_original_grep_page(input, &value)?;
+    Ok(Some(serde_json::json!({"scope":scope, "sha256":crate::context_evidence::read_sha256(output.as_bytes()),
+        "bytes":output.len(), "reported_scan_complete":complete})))
+}
+
+fn validate_original_grep_page(input: &serde_json::Value, value: &serde_json::Value) -> Result<bool, String> {
+    if input.get("searches").is_some() {
+        return Err("original grep discovery batch is not a single complete page".into());
+    }
+    if !value["basePath"].is_string()
+        || !value["filenames"].is_array()
+        || !value["numFiles"].is_u64()
+        || !matches!(value["mode"].as_str(), Some("content" | "files_with_matches" | "count"))
+    {
+        return Err("original grep discovery page shape is invalid".into());
+    }
+    if value["scanComplete"] != true
+        || value["truncated"] == true
+        || (!value["omissions"].is_null() && value["omissions"] != serde_json::json!([]))
+        || (!value["nextRequest"].is_null() && value["nextRequest"] != serde_json::json!({}))
+        || !value["continuationCursor"].is_null()
+    {
+        return Err("original grep discovery page is incomplete".into());
+    }
+    Ok(true)
+}
+
 fn validate_original_glob_pages(input: &serde_json::Value, value: &serde_json::Value) -> Result<bool, String> {
     let patterns = match input.get("patterns") {
         Some(value) => value.as_array().filter(|items| !items.is_empty())
@@ -3677,6 +3735,9 @@ fn collect_actual_acquisition_candidate(
         // Primary and index remain in the audited material set above. A
         // discovery page proves neither file contents nor current absence.
         if original_glob_discovery(primary, &descriptor, original_input)?.is_some() {
+            return Ok(AcquisitionCandidate::Proven(harness_contract::refusal_codes::FactAdmissionStrategy::Discovery));
+        }
+        if original_grep_discovery(primary, &descriptor, original_input)?.is_some() {
             return Ok(AcquisitionCandidate::Proven(harness_contract::refusal_codes::FactAdmissionStrategy::Discovery));
         }
         if !immutable_receipt_without_workspace_extent(primary, &descriptor, original_input)? {
@@ -9661,6 +9722,80 @@ mod tests {
             Some(&serde_json::json!({"pattern":"different"}))).is_err());
         glob_primary.payload["outcome_truncated"] = serde_json::json!(true);
         assert!(original_glob_discovery(&glob_primary, &discovery_effect, Some(&discovery_input)).is_err());
+
+        // A grep page is the other discovery read a reviewer's input can
+        // carry: live_one_team_execution on 0.10.49 refused every task_review
+        // with "the read named a workspace path and its receipt carries no
+        // acquisition seal" because only glob_search counted as a discovery.
+        let mut grep_effect = effect.clone();
+        grep_effect.tool_id = "grep_search".into();
+        let mut grep_target = actual_dependency_fixture().target;
+        grep_target.path.object_kind = harness_contract::context::WorkspaceObjectKind::File;
+        grep_target.exact = true;
+        grep_target.alias_checked = true;
+        grep_target.physical_identity = Some("unix-file:66309:2809327".into());
+        grep_target.declared_scope = grep_effect.scopes[0].clone();
+        let grep_scope = harness_contract::goal::ProofEffectScope {
+            version: 2, descriptor_hash: grep_effect.descriptor_hash.clone(),
+            complete: true, targets: vec![grep_target],
+            scope_purposes: vec![harness_contract::goal::ProofEffectScopePurpose {
+                declared_scope: grep_effect.scopes[0].clone(),
+                purpose: harness_contract::goal::ProofEffectPurpose::InputRead,
+            }],
+        };
+        let grep_page = |scan_complete: bool, truncated: bool, next_request: bool| serde_json::json!({
+            "basePath":"crates/runtime/src/lib.rs", "scanComplete":scan_complete, "mode":"content",
+            "numFiles":1, "filenames":["crates/runtime/src/lib.rs"],
+            "content":"crates/runtime/src/lib.rs:1:pub fn f() {}", "truncated":truncated, "omissions":[],
+            "nextRequest": if next_request { serde_json::json!({"pattern":"pub fn f"}) } else { serde_json::Value::Null },
+        });
+        let mut grep_primary = primary.clone();
+        let mut grep_index = index.clone();
+        grep_primary.payload["tool_name"] = serde_json::json!("grep_search");
+        grep_primary.payload["effect"] = serde_json::to_value(&grep_effect).unwrap();
+        grep_primary.payload["replay"]["invocation"]["effect"] = serde_json::to_value(&grep_effect).unwrap();
+        grep_primary.payload["outcome"]["tool_name"] = serde_json::json!("grep_search");
+        grep_primary.payload["outcome"]["output"] = serde_json::json!(grep_page(true, false, false).to_string());
+        grep_primary.payload["outcome_truncated"] = serde_json::json!(false);
+        grep_primary.payload["resolved_effect_scope"] = serde_json::to_value(&grep_scope).unwrap();
+        grep_index.payload["outcome"] = grep_primary.payload["outcome"].clone();
+        grep_index.payload["effect"] = grep_primary.payload["effect"].clone();
+        grep_index.payload["resolved_effect_scope"] = grep_primary.payload["resolved_effect_scope"].clone();
+        let grep_input = serde_json::json!({"pattern":"pub fn f", "path":"crates/runtime/src/lib.rs"});
+        let mut grep_actual = ActualInputSnapshot {
+            file_dependencies: Vec::new(), immutable_inputs: Vec::new(),
+            sources: std::collections::BTreeMap::new(), material_events: Vec::new(), canonical_facts: Vec::new(),
+        };
+        let mut grep_windows = std::collections::BTreeMap::new();
+        crate::agentic::fact_admission::take_test_admissions();
+        collect_actual_acquisition(&store, &program, &grep_primary, &grep_index,
+            Some(&grep_input), &[], &boundary,
+            super::super::ResultContentReaders { artifacts: None, history: None, process_inputs: None },
+            &mut grep_actual, &mut grep_windows).expect("an authenticated complete grep page is admitted");
+        assert!(crate::agentic::fact_admission::take_test_admissions().iter().any(|strategy| strategy.code() == "discovery"),
+            "a complete grep page must pass the admission gate as a discovery");
+        assert!(grep_actual.canonical_facts.is_empty());
+        for (scan_complete, truncated, next_request) in [(false, false, false), (true, true, false), (true, false, true)] {
+            let mut partial = grep_primary.clone();
+            let mut partial_index = grep_index.clone();
+            partial.payload["outcome"]["output"] = serde_json::json!(grep_page(scan_complete, truncated, next_request).to_string());
+            partial_index.payload["outcome"] = partial.payload["outcome"].clone();
+            let mut partial_actual = ActualInputSnapshot {
+                file_dependencies: Vec::new(), immutable_inputs: Vec::new(),
+                sources: std::collections::BTreeMap::new(), material_events: Vec::new(), canonical_facts: Vec::new(),
+            };
+            let mut partial_windows = std::collections::BTreeMap::new();
+            crate::agentic::fact_admission::take_test_admissions();
+            let outcome = collect_actual_acquisition(&store, &program, &partial, &partial_index,
+                Some(&grep_input), &[], &boundary,
+                super::super::ResultContentReaders { artifacts: None, history: None, process_inputs: None },
+                &mut partial_actual, &mut partial_windows);
+            assert!(
+                !crate::agentic::fact_admission::take_test_admissions().iter().any(|strategy| strategy.code() == "discovery")
+                    && outcome.is_err(),
+                "an incomplete grep page (scan_complete={scan_complete} truncated={truncated} next_request={next_request}) is not a discovery proof: {outcome:?}"
+            );
+        }
 
         // A composite without the original complete child ledger cannot be
         // treated as an empty or successful acquisition.
