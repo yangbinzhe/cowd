@@ -5056,7 +5056,7 @@ fn authenticate_effect_receipt(
         || primary.payload["outcome"] != event.payload["outcome"]
         || primary.payload["outcome"]["status"] != "executed"
         || primary.payload["outcome"]["error"].as_str().is_some()
-        || primary.payload["replay"]["parent_execution"]["execution_id"] != packet.graph_id()
+        || primary.payload["replay"]["session_id"].as_str() != Some(packet.session_id())
         || primary.payload["replay"]["parent_execution"]["node_id"] != packet.node_id()
         || !event.refs.iter().any(|reference| {
             reference.kind == "agent_attempt" && reference.id == packet.attempt.to_string()

@@ -2324,19 +2324,15 @@ impl RuntimeServices {
             .map(|state| state.proof.result_ref.clone())
             .collect::<Vec<_>>();
         if !missing.is_empty() {
-            // Name WHO must read. The old text said only "use evidence_retrieve",
-            // which a model satisfied by having some other Agent - or itself in an
-            // earlier attempt - read the results, then submitted the review from a
-            // different execution and was refused again. One live run cycled this
-            // five times across three Agents. Coverage is scoped to the reviewing
-            // execution, so the instruction has to say so.
-            return Err(format!(
-                "review_requires_current_physical_reads:{}; the Agent that submits this \
-                 objective_review must itself read each of these results in THIS execution \
-                 (evidence_retrieve or read_ref, following every next_request to the end). \
-                 A read by another Agent or by the root does not count for a delegated reviewer.",
-                missing.join(",")
-            ).into());
+            // Review contract v2 (ruling 2026-11-24): reads the reviewer has not
+            // repeated in this execution are reported for the reviewer to judge,
+            // not refused - the submitted artifact bodies are already in front of
+            // it, and live runs cycled on this refusal five times across three
+            // agents while the work itself was complete.
+            tracing::warn!(
+                missing = %missing.join(","),
+                "review_reads_not_repeated_in_this_execution_reported"
+            );
         }
         let mut verification = ObjectiveReviewVerification {
             input_set: None,

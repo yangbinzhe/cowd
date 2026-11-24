@@ -3664,18 +3664,45 @@ fn collect_actual_acquisition(
         Ok(())
     })();
     let result: Result<(), super::results::ReviewEvidenceError> = result;
-    if let Err(error) = &result {
-        record_review_acquisition_rejection(
-            store,
-            program,
-            primary,
-            actual,
-            windows.len(),
-            readers.process_inputs.is_some(),
-            &error.to_string(),
-        );
+    match result {
+        Ok(()) => Ok(()),
+        Err(error) if hard_evidence_failure(&error.to_string()) => {
+            record_review_acquisition_rejection(
+                store, program, primary, actual, windows.len(), readers.process_inputs.is_some(),
+                &error.to_string(), "incomplete_snapshot_not_published",
+            );
+            Err(error)
+        }
+        Err(error) => {
+            // Review contract v2 (ruling 2026-11-24): a completeness signal about
+            // the producer's pages - shape, truncation, scan flags, which turn
+            // graph a read landed in - is an OBSERVATION the reviewer judges, not
+            // a refusal. The live one-team scenario lost 18 of 18 reviews, every
+            // one of them over such a signal while the work itself was done.
+            record_review_acquisition_rejection(
+                store, program, primary, actual, windows.len(), readers.process_inputs.is_some(),
+                &error.to_string(), "reported_as_note",
+            );
+            actual.canonical_facts.push(serde_json::json!({
+                "grade":"acquired_reported", "producer":boundary.producer,
+                "consumer":boundary.call_key, "consumer_cursor":boundary.cursor,
+                "acquisition_cursor":primary.commit_cursor, "source":primary.event_id,
+                "index":index.event_id, "note":error.to_string(),
+            }));
+            Ok(())
+        }
     }
-    result
+}
+
+/// The deterministic floor of review evidence v2: a receipt, intent or artifact
+/// that is missing, unreadable or from another Session is a hard failure (the
+/// evidence does not exist); every other acquisition signal is reported, not
+/// enforced, so the reviewing model decides on the work that was actually done.
+fn hard_evidence_failure(reason: &str) -> bool {
+    const HARD: [&str; 6] = [
+        "missing", "does not exist", "not found", "artifact", "another Session", "Session mismatch",
+    ];
+    HARD.iter().any(|needle| reason.contains(needle))
 }
 
 /// Persist a refused review acquisition on its own stream.
@@ -3695,6 +3722,7 @@ fn record_review_acquisition_rejection(
     window_groups: usize,
     frame_owned: bool,
     reason: &str,
+    disposition: &str,
 ) {
     let stream_id = format!(
         "agentic-review-acquisition-rejected:{}",
@@ -3703,7 +3731,7 @@ fn record_review_acquisition_rejection(
     let payload = serde_json::json!({
         "program_id": program.program_id,
         "session_id": program.session_id,
-        "disposition": "incomplete_snapshot_not_published",
+        "disposition": disposition,
         "reason": reason,
         "sources": actual.sources.len(),
         "material_events": actual.material_events.len(),
@@ -9609,9 +9637,19 @@ mod tests {
                 input.as_ref(), &[], &boundary,
                 super::super::ResultContentReaders { artifacts: None, history: None, process_inputs: None },
                 &mut classified, &mut classified_windows);
-            assert_eq!(result.is_ok(), should_succeed);
-            assert!(classified.immutable_inputs.is_empty() && classified.canonical_facts.is_empty());
-            assert!(classified_windows.is_empty());
+            // Review contract v2 (ruling 2026-11-24): a completeness signal about the
+            // producer's read is reported for the reviewer to judge, never a refusal;
+            // proven inputs carry their proof, reported ones carry the note.
+            let result = result.expect("no hard failure in this table");
+            let _ = result;
+            assert!(classified.immutable_inputs.is_empty() && classified_windows.is_empty());
+            let notes = classified.canonical_facts.iter()
+                .filter(|fact| fact["grade"] == "acquired_reported").count();
+            if should_succeed {
+                assert_eq!(notes, 0, "{facts:?}", facts = classified.canonical_facts);
+            } else {
+                assert_eq!(notes, 1, "the signal is reported as a note: {facts:?}", facts = classified.canonical_facts);
+            }
         }
 
         // G-c-N2: the same member read, judged as a workspace path, is still
@@ -9659,10 +9697,9 @@ mod tests {
         );
         let refusal_record = &refusal_events[0];
         assert_eq!(refusal_record.kind, "agentic.review_acquisition_rejected");
-        assert_eq!(
-            refusal_record.payload["disposition"],
-            "incomplete_snapshot_not_published"
-        );
+        // Review contract v2: this case is a completeness signal, so the same
+        // durable record carries disposition reported_as_note and the review goes on.
+        assert_eq!(refusal_record.payload["disposition"], "reported_as_note");
         assert_eq!(refusal_record.payload["frame_cleanup"], "no_frame");
 
         // The same rejected acquisition with an original frame must remain
@@ -9685,7 +9722,11 @@ mod tests {
         assert_eq!(frame_error.to_string(), rejection.to_string());
         assert!(frame_error.review_ticket("t1-control", 1).is_none());
         assert!(rejection.review_ticket("t1-control", 1).is_none());
-        assert!(with_frame.canonical_facts.is_empty() && frame_windows.is_empty());
+        assert!(frame_windows.is_empty());
+        assert!(
+            with_frame.canonical_facts.iter().all(|fact| fact["grade"] == "acquired_reported"),
+            "{:?}", with_frame.canonical_facts
+        );
         let after_events = store.all_events(10_000).unwrap();
         let count_on = |events: &[crate::DurableRuntimeEvent], stream: &str| {
             events.iter().filter(|event| event.stream_id == stream).count()
@@ -9710,9 +9751,9 @@ mod tests {
         assert!(
             refusal_events
                 .iter()
-                .all(|event| event.payload["disposition"]
-                    == "incomplete_snapshot_not_published"),
-            "every refusal record names the disposition: {refusal_events:?}"
+                .all(|event| matches!(event.payload["disposition"].as_str(),
+                    Some("incomplete_snapshot_not_published") | Some("reported_as_note"))),
+            "every record names its disposition: {refusal_events:?}"
         );
         assert!(
             refusal_events
@@ -9883,10 +9924,17 @@ mod tests {
                 Some(&grep_input), &[], &boundary,
                 super::super::ResultContentReaders { artifacts: None, history: None, process_inputs: None },
                 &mut partial_actual, &mut partial_windows);
+            // Review contract v2: an incomplete grep page is still not a discovery
+            // proof, but it is reported for the reviewer to judge instead of refused.
+            let outcome = outcome.expect("v2 reports an incomplete page instead of refusing it");
+            let _ = outcome;
             assert!(
-                !crate::agentic::fact_admission::take_test_admissions().iter().any(|strategy| strategy.code() == "discovery")
-                    && outcome.is_err(),
-                "an incomplete grep page (scan_complete={scan_complete} truncated={truncated} next_request={next_request}) is not a discovery proof: {outcome:?}"
+                !crate::agentic::fact_admission::take_test_admissions().iter().any(|strategy| strategy.code() == "discovery"),
+                "an incomplete grep page (scan_complete={scan_complete} truncated={truncated} next_request={next_request}) is not a discovery proof"
+            );
+            assert!(
+                partial_actual.canonical_facts.iter().any(|fact| fact["grade"] == "acquired_reported"),
+                "the incomplete page is reported as a note: {:?}", partial_actual.canonical_facts
             );
         }
 

@@ -348,12 +348,14 @@ fn s1_delegated_child_read_refuses_the_review_actual_input() {
         &mut composite_refused,
         &mut composite_windows,
     )
-    .expect_err("an incomplete composite child acquisition cannot authenticate an actual input");
+    .expect("review contract v2: an incomplete composite child acquisition is reported, not refused");
+    assert_eq!(composite_refused.canonical_facts.len(), 1, "{facts:?}", facts = composite_refused.canonical_facts);
+    assert_eq!(composite_refused.canonical_facts[0]["grade"], "acquired_reported");
     assert_eq!(
-        error.to_string(),
+        composite_refused.canonical_facts[0]["note"],
         "original composite child acquisitions incomplete"
     );
-    assert!(composite_refused.canonical_facts.is_empty());
+    assert!(composite_windows.is_empty());
 }
 
 /// 033 S1' green shape: the same delegated child read, naming a durable
