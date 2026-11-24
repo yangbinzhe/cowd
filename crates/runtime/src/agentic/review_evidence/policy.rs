@@ -3183,6 +3183,39 @@ pub(super) fn read_original_scope(
 
 /// Authenticate the original directory-discovery result as a historical
 /// operation. It never proves file contents or the current directory state.
+/// `outcome_truncated` says the 16 KiB receipt preview stopped early; whether the
+/// TOOL's page was complete is recorded separately in `outcome_page_flags`
+/// (commit pipeline, fix14). A truncated preview whose page is complete keeps its
+/// full body as the `delegated_outcome_content_v1` artifact; callers that hash the
+/// body must hash that artifact's identity, never the preview.
+fn truncated_preview_full_body(primary: &crate::DurableRuntimeEvent) -> Result<Option<(String, u64)>, String> {
+    if primary.payload["outcome_truncated"] != true {
+        return Ok(None);
+    }
+    let flags = &primary.payload["outcome_page_flags"];
+    let page_complete = |page: &serde_json::Value| {
+        page["scanComplete"] != false
+            && page["truncated"] != true
+            && page["nextRequest"] != true
+            && page["nextOffset"] != true
+            && page["continuationCursor"] != true
+    };
+    let complete = match flags["kind"].as_str() {
+        Some("page") => page_complete(&flags["page"]),
+        Some("batch") => flags["members"].as_array().is_some_and(|members| {
+            !members.is_empty() && members.iter().all(|member| page_complete(&member["page"]))
+        }),
+        _ => false,
+    };
+    if !complete {
+        return Err("the receipt preview is truncated and the tool's page is incomplete or its completeness is unknown".into());
+    }
+    let artifact = &primary.payload["delegated_outcome_content_v1"];
+    let sha256 = artifact["sha256"].as_str().filter(|value| !value.is_empty()).ok_or("truncated preview without its retained full-body artifact")?;
+    let bytes = artifact["bytes"].as_u64().ok_or("retained full-body artifact without its byte length")?;
+    Ok(Some((sha256.to_string(), bytes)))
+}
+
 fn original_glob_discovery(
     primary: &crate::DurableRuntimeEvent,
     descriptor: &ToolEffectDescriptor,
@@ -3194,9 +3227,18 @@ fn original_glob_discovery(
     if descriptor.tool_id != "glob_search" || descriptor.effect_kind != ToolEffectKind::Read
         || descriptor.uses_network || descriptor.spawns_process
         || descriptor.mutates_packages || descriptor.mutates_system
-        || primary.payload["outcome_truncated"] == true
     {
         return Err("original discovery has invalid effect or incomplete output".into());
+    }
+    if let Some((sha256, bytes)) = truncated_preview_full_body(primary)? {
+        let scope = super::results::require_original_effect_scope(
+            &primary.payload["resolved_effect_scope"], descriptor,
+        )?;
+        if !crate::context_evidence::original_read_file_domain(descriptor, &scope) {
+            return Err("original discovery File domain is incomplete".into());
+        }
+        return Ok(Some(serde_json::json!({"scope":scope, "sha256":sha256, "bytes":bytes,
+            "reported_scan_complete":true, "completeness":"outcome_page_flags"})));
     }
     let scope = super::results::require_original_effect_scope(
         &primary.payload["resolved_effect_scope"], descriptor,
@@ -3230,9 +3272,18 @@ fn original_grep_discovery(
     if descriptor.tool_id != "grep_search" || descriptor.effect_kind != ToolEffectKind::Read
         || descriptor.uses_network || descriptor.spawns_process
         || descriptor.mutates_packages || descriptor.mutates_system
-        || primary.payload["outcome_truncated"] == true
     {
         return Err("original discovery has invalid effect or incomplete output".into());
+    }
+    if let Some((sha256, bytes)) = truncated_preview_full_body(primary)? {
+        let scope = super::results::require_original_effect_scope(
+            &primary.payload["resolved_effect_scope"], descriptor,
+        )?;
+        if !crate::context_evidence::original_read_file_domain(descriptor, &scope) {
+            return Err("original discovery File domain is incomplete".into());
+        }
+        return Ok(Some(serde_json::json!({"scope":scope, "sha256":sha256, "bytes":bytes,
+            "reported_scan_complete":true, "completeness":"outcome_page_flags"})));
     }
     let scope = super::results::require_original_effect_scope(
         &primary.payload["resolved_effect_scope"], descriptor,
@@ -3801,18 +3852,17 @@ fn collect_actual_acquisition_candidate(
         let output = primary.payload["outcome"]["output"]
             .as_str()
             .ok_or("actual immutable input has no original body")?;
-        if primary.payload["outcome_truncated"] == true {
-            return Err(
-                "actual immutable input body is truncated without an acquisition seal".into(),
-            );
-        }
+        let (sha256, bytes) = match truncated_preview_full_body(primary)? {
+            Some(full_body) => (full_body.0, full_body.1 as usize),
+            None => (crate::context_evidence::read_sha256(output.as_bytes()), output.len()),
+        };
         actual.canonical_facts.push(serde_json::json!({
             "grade":"acquired_immutable_receipt", "producer":boundary.producer,
             "consumer":boundary.call_key, "consumer_cursor":boundary.cursor,
             "acquisition_cursor":primary.commit_cursor,
             "source":primary.event_id, "index":index.event_id,
             "scope":primary.payload["resolved_effect_scope"],
-            "sha256":crate::context_evidence::read_sha256(output.as_bytes()), "bytes":output.len(),
+            "sha256":sha256, "bytes":bytes,
         }));
         return Ok(AcquisitionCandidate::Proven(harness_contract::refusal_codes::FactAdmissionStrategy::Immutable));
     }
@@ -5444,11 +5494,12 @@ fn immutable_receipt_without_workspace_extent(
     }
     if primary.payload["outcome"]["status"] != "executed"
         || primary.payload["outcome"]["error"].as_str().is_some()
-        || primary.payload["outcome_truncated"] == true
         || primary.payload["outcome"]["output"].as_str().is_none()
     {
         return Err("actual immutable receipt lacks its complete original acquired body".into());
     }
+    truncated_preview_full_body(primary)
+        .map_err(|_| "actual immutable receipt lacks its complete original acquired body".to_string())?;
     if !primary.payload["resolved_effect_scope"].is_null() {
         super::results::require_original_effect_scope(
             &primary.payload["resolved_effect_scope"],
@@ -12149,6 +12200,68 @@ mod read_auth_boundary_tests {
 #[cfg(test)]
 mod s1_fixture;
 
+
+#[cfg(test)]
+mod truncated_preview_tests {
+    use crate::{DurableRuntimeEvent, RuntimeEventScope};
+    use serde_json::Value;
+
+    fn receipt(truncated: bool, flags: Option<Value>, artifact: Option<Value>) -> DurableRuntimeEvent {
+        let mut payload = serde_json::json!({
+            "tool_name": "read_file",
+            "outcome_truncated": truncated,
+            "outcome": {"status": "executed", "output": "preview"},
+        });
+        if let Some(flags) = flags {
+            payload["outcome_page_flags"] = flags;
+        }
+        if let Some(artifact) = artifact {
+            payload["delegated_outcome_content_v1"] = artifact;
+        }
+        DurableRuntimeEvent {
+            event_id: "event-preview-1".into(),
+            stream_id: "execution-effect:call".into(),
+            sequence: 1,
+            scope: RuntimeEventScope::ExecutionNode,
+            kind: "execution.read.receipt".into(),
+            status: Some("completed".into()),
+            actor: Some("governed_tool".into()),
+            refs: vec![],
+            payload,
+            created_at_ms: 0,
+            commit_cursor: 1,
+            transaction_id: "tx-1".into(),
+            transaction_index: 0,
+            schema_version: 1,
+            idempotency_key: None,
+        }
+    }
+
+    /// Live level 9 (2026-11-24): a complete 40 KB `read_file` landed as a receipt
+    /// whose 16 KiB preview is flagged truncated, and the review path refused it as
+    /// "incomplete output" although the tool's page was complete and its full body
+    /// was retained. The tool's own flags decide completeness; the preview does not.
+    #[test]
+    fn a_truncated_preview_with_complete_page_flags_proves_the_retained_full_body() {
+        let complete = Some(serde_json::json!({"kind":"page", "page":{"scanComplete":null, "truncated":false,
+            "nextRequest":false, "nextOffset":false, "continuationCursor":false}}));
+        let artifact = Some(serde_json::json!({"sha256":"sha256:abc", "bytes":40_000}));
+        let proven = super::truncated_preview_full_body(&receipt(true, complete.clone(), artifact.clone())).unwrap();
+        assert_eq!(proven, Some(("sha256:abc".to_string(), 40_000)));
+
+        assert_eq!(super::truncated_preview_full_body(&receipt(false, complete, artifact.clone())).unwrap(), None);
+
+        let windowed = Some(serde_json::json!({"kind":"page", "page":{"truncated":true, "nextOffset":true}}));
+        assert!(super::truncated_preview_full_body(&receipt(true, windowed, None)).is_err(), "a page the tool itself truncated still refuses");
+
+        assert!(super::truncated_preview_full_body(&receipt(true, None, None)).is_err(), "a legacy receipt without flags is not proven complete");
+
+        let batch = Some(serde_json::json!({"kind":"batch", "count":2, "members":[
+            {"index":0, "page":{"scanComplete":true, "truncated":false, "nextRequest":false}},
+            {"index":1, "page":{"scanComplete":false, "truncated":true, "nextRequest":true}}]}));
+        assert!(super::truncated_preview_full_body(&receipt(true, batch, artifact.clone())).is_err(), "one incomplete batch member refuses the batch");
+    }
+}
 
 #[cfg(test)]
 mod grep_batch_page_tests {

@@ -409,6 +409,7 @@ pub(super) fn root_index_receipt_event(
                 "effect_scope":request.authorization.as_ref().map(|authorization| &authorization.scope),
                 "authorized_scopes":request.authorized_scopes,
                 "outcome_truncated":tool_effect_outcome_requires_truncation(outcome),
+                "outcome_page_flags":tool_effect_outcome_page_flags(outcome),
                 "outcome":bounded_tool_effect_outcome(outcome),
             }),
         },
@@ -454,6 +455,7 @@ pub(super) fn delegated_agent_receipt_event(
                 "effect_scope": request.authorization.as_ref().map(|authorization| &authorization.scope),
                 "authorized_scopes": request.authorized_scopes,
                 "outcome_truncated": tool_effect_outcome_requires_truncation(outcome),
+                "outcome_page_flags": tool_effect_outcome_page_flags(outcome),
                 "outcome": bounded_tool_effect_outcome(outcome),
             }),
         },
@@ -483,6 +485,38 @@ pub(crate) fn bounded_tool_effect_outcome(
         .error
         .map(|error| error.chars().take(MAX_TOOL_EFFECT_RECEIPT_CHARS).collect());
     bounded
+}
+
+/// The tool's own completeness judgement, taken from the FULL output before the
+/// receipt preview is bounded. `outcome_truncated` says the 16 KiB receipt
+/// preview stopped early; it says nothing about whether the tool's page was
+/// complete. Live level 9 (2026-11-24): a complete 40 KB `read_file` was refused
+/// as "incomplete output" because the review path only saw the preview flag.
+/// Members of a batch carry their own flags in `members`.
+pub(crate) fn tool_effect_outcome_page_flags(outcome: &crate::RuntimeToolExecutionOutcome) -> serde_json::Value {
+    let Some(output) = outcome.output.as_deref() else { return serde_json::Value::Null };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(output) else { return serde_json::Value::Null };
+    let page_flags = |page: &serde_json::Value| -> serde_json::Value {
+        let continuation = |key: &str| {
+            page.get(key).is_some_and(|next| !next.is_null() && next.as_object().is_some_and(|map| !map.is_empty()))
+        };
+        serde_json::json!({
+            "scanComplete": page.get("scanComplete").and_then(serde_json::Value::as_bool),
+            "truncated": page.get("truncated").and_then(serde_json::Value::as_bool),
+            "nextRequest": continuation("nextRequest"),
+            "nextOffset": page.get("nextOffset").is_some_and(|next| !next.is_null()),
+            "continuationCursor": continuation("continuationCursor"),
+        })
+    };
+    if let Some(results) = value.get("results").and_then(serde_json::Value::as_array) {
+        let members: Vec<serde_json::Value> = results
+            .iter()
+            .map(|member| serde_json::json!({"index": member.get("index"), "status": member.get("status"),
+                "page": member.get("output").map(&page_flags).unwrap_or(serde_json::Value::Null)}))
+            .collect();
+        return serde_json::json!({"kind": "batch", "count": results.len(), "members": members});
+    }
+    serde_json::json!({"kind": "page", "page": page_flags(&value)})
 }
 
 pub(crate) fn tool_effect_outcome_requires_truncation(

@@ -5448,6 +5448,7 @@ impl ExecutionCommitService {
                     "replay": receipt_replay_contract(request)?,
                     "input_sha256": format!("sha256:{:x}", Sha256::digest(request.input.as_bytes())),
                     "outcome_truncated": tool_effect_outcome_requires_truncation(outcome),
+                    "outcome_page_flags": tool_effect_outcome_page_flags(outcome),
                     "outcome": bounded_tool_effect_outcome(outcome),
                     "resolved_effect_scope":scope,
                     "read_acquisition_v1": acquisition,
@@ -8699,6 +8700,7 @@ impl ExecutionCommitService {
                         ),
                         "descriptor_hash": effect.descriptor_hash,
                         "outcome_truncated": tool_effect_outcome_requires_truncation(outcome),
+                        "outcome_page_flags": tool_effect_outcome_page_flags(outcome),
                         "outcome": bounded_tool_effect_outcome(outcome),
                         "process_admission_ref": matches!(authority,
                             ProcessTerminalAuthority::BoundedProcess(_) | ProcessTerminalAuthority::HostProcess(_))
