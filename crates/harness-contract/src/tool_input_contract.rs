@@ -19,6 +19,14 @@ use serde_json::{Map, Value};
 #[must_use]
 pub fn input_shape_correction(tool: &str, reason: &str, schema: &Value) -> Option<&'static str> {
     let reason = reason.split_once("pinned schema: ").map_or(reason, |(_, bare)| bare);
+    // Local level 9 (Qwen3.8-Flash-Next, 2026-11-24): task_submit refused twice for
+    // `$: unexpected field `reason``. Read before the closed-schema guards below, which
+    // describe task_review's shape and would otherwise reject a task_submit schema.
+    if tool == "task_submit" && reason == "$: unexpected field `reason`" {
+        return Some(
+            "task_submit takes no `reason`; a submission is the deliverable plus its evidence_refs.",
+        );
+    }
     if tool == "membership_update" && reason == "$: unexpected field `reason`"
         && ["$ref", "oneOf", "anyOf", "allOf"].iter().all(|key| schema.get(*key).is_none())
         && schema["additionalProperties"] == false && schema["properties"].get("reason").is_none()
@@ -48,7 +56,9 @@ pub fn input_shape_correction(tool: &str, reason: &str, schema: &Value) -> Optio
         return None;
     }
     match reason {
-        "$: missing required field `reason`" => Some("task_review requires a string `reason`; supply your own reason text."),
+        "$: missing required field `reason`" if tool == "task_review" => Some("task_review requires a string `reason`; supply your own reason text."),
+        // Local level 9 (Qwen3.8-Flash-Next, 2026-11-24): task_submit refused twice for
+        // `$: unexpected field `reason`` - handled above, before the closed-schema guards.
         "$: unexpected field `reason_ref`"
             if schema["additionalProperties"] == false && schema["properties"].get("reason_ref").is_none() =>
             Some("task_review requires a string `reason`; `reason_ref` is not a task_review field. Supply your own reason text."),
@@ -1095,6 +1105,10 @@ mod tests {
             &schema
         )
         .is_some());
+        let submit = serde_json::json!({"type":"object", "properties":{"task_ref":{"type":"string"}},
+            "additionalProperties":false});
+        assert!(hint("task_submit", "$: unexpected field `reason`", &submit).is_some());
+        assert!(hint("other", "$: unexpected field `reason`", &submit).is_none());
         let mut open = schema.clone();
         open["additionalProperties"] = true.into();
         assert!(hint("task_review", "$: unexpected field `reason_ref`", &open).is_none());
