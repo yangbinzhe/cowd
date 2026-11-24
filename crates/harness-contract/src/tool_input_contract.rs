@@ -18,6 +18,7 @@ use serde_json::{Map, Value};
 /// A short correction only when this exact schema proves the statement.
 #[must_use]
 pub fn input_shape_correction(tool: &str, reason: &str, schema: &Value) -> Option<&'static str> {
+    let reason = reason.split_once("pinned schema: ").map_or(reason, |(_, bare)| bare);
     if tool == "membership_update" && reason == "$: unexpected field `reason`"
         && ["$ref", "oneOf", "anyOf", "allOf"].iter().all(|key| schema.get(*key).is_none())
         && schema["additionalProperties"] == false && schema["properties"].get("reason").is_none()
@@ -1078,6 +1079,22 @@ mod tests {
         assert!(hint("task_review", "$: unexpected field `reason_ref`", &schema).is_some());
         assert!(hint("other", "$: unexpected field `reason_ref`", &schema).is_none());
         assert!(hint("task_review", "$.other: unexpected field `reason_ref`", &schema).is_none());
+        // The runtime composes `tool.call.rejected_before_dispatch` reasons from the
+        // production validator text, which carries the tool prefix; live_one_team_execution
+        // (0.10.49) refused task_review three times for `reason_ref` with no hint because
+        // the lookup below only ever saw the bare spelling.
+        assert!(hint(
+            "task_review",
+            "tool `task_review` input violates its pinned schema: $: unexpected field `reason_ref`",
+            &schema
+        )
+        .is_some());
+        assert!(hint(
+            "task_review",
+            "tool `task_review` input violates its pinned schema: $: missing required field `reason`",
+            &schema
+        )
+        .is_some());
         let mut open = schema.clone();
         open["additionalProperties"] = true.into();
         assert!(hint("task_review", "$: unexpected field `reason_ref`", &open).is_none());

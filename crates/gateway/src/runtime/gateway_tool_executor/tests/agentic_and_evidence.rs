@@ -2043,6 +2043,54 @@ fn task_submit_deliverable_violation_shows_the_deliverable_shape_not_a_bare_task
         .expect("the shown deliverable shape must satisfy the same pinned schema");
 }
 
+/// live_one_team_execution (0.10.49 + six fixes, 2026-11-24): task_review was refused
+/// three times for `unexpected field `reason_ref`` and the refusal carried no hint that
+/// `reason_ref` belongs to other actions and task_review takes a text `reason`.
+#[test]
+fn task_review_reason_ref_refusal_carries_the_shape_correction_hint() {
+    let registry = GatewayToolRegistry::builtin()
+        .with_runtime_tools(crate::runtime_bootstrap::runtime_capability_tool_definitions())
+        .expect("runtime tools");
+    let executor = GatewayToolExecutor::new(None, false, registry);
+    let frame = json!({
+        "task_ref": "task:5f1e44e20353348db43c142b",
+        "decision": "accept",
+        "reason": "the diff matches the Task statement",
+        "reason_ref": "tool://tool-raw-call_cb29b09df5554931929356b7-ee6a87"
+    })
+    .to_string();
+    let refused = executor
+        .validate_tool_input("task_review", &frame)
+        .expect_err("reason_ref is not a task_review field");
+    let message = refused.to_string();
+    assert!(message.contains("unexpected field `reason_ref`"), "{message}");
+    assert!(
+        message.contains("task_review requires a string `reason`"),
+        "the refusal must name the replacement field: {message}"
+    );
+
+    let mut request = runtime::RuntimeToolExecutionRequest::from_tool_request(
+        &runtime::tool_dispatch::ToolRequest {
+            tool_use_id: "bound-refused-review".into(),
+            tool_name: "task_review".into(),
+            input: frame.clone(),
+            depends_on: vec![],
+        },
+    );
+    request.session_id = Some("bound-feedback-session".into());
+    attach_gateway_step(&executor, &mut request);
+    let binding = request.step_binding.as_ref().unwrap();
+    let bound = executor
+        .validate_step_tool_input(Some(binding), "task_review", &frame)
+        .expect_err("the bound Step validator refuses the extra field too");
+    let bound_message = bound.to_string();
+    assert!(
+        bound_message.contains("unexpected field `reason_ref`")
+            && bound_message.contains("task_review requires a string `reason`"),
+        "the bound Step refusal (production path) must carry the same hint: {bound_message}"
+    );
+}
+
 /// Production uses the bound Step validator, not the unbound CLI validator.
 /// Reproduce the observed actions:string / malformed inner entries; this is a
 /// controlled shape counterexample, not a claim of replaying an entire HTTP frame.
