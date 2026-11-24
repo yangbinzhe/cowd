@@ -3251,9 +3251,37 @@ fn original_grep_discovery(
 }
 
 fn validate_original_grep_page(input: &serde_json::Value, value: &serde_json::Value) -> Result<bool, String> {
-    if input.get("searches").is_some() {
-        return Err("original grep discovery batch is not a single complete page".into());
+    // A batched grep is one call carrying several complete pages; glob batches are
+    // already read that way (validate_original_glob_pages). Refusing the batch shape
+    // outright told a reviewer that its complete multi-search page was "not a single
+    // complete page" and left it no way to evidence the inputs (local level 9,
+    // 2026-11-24: 3x `$: unexpected field query` then 3x this refusal).
+    if let Some(searches) = input.get("searches").and_then(serde_json::Value::as_array) {
+        if searches.is_empty() {
+            return Err("original discovery batch missing".into());
+        }
+        let results = value["results"].as_array().ok_or("original discovery batch missing")?;
+        if value["type"] != "grep_search" || results.len() != searches.len()
+            || value["count"].as_u64() != Some(results.len() as u64)
+        {
+            return Err("original discovery batch differs from request".into());
+        }
+        for (position, result) in results.iter().enumerate() {
+            if result["index"].as_u64() != Some(position as u64)
+                || result["status"] != "success" || !result["error"].is_null()
+            {
+                return Err("original discovery batch member unavailable".into());
+            }
+            let page = result.get("output").ok_or("original discovery page missing")?;
+            validate_original_grep_page_page(page)?;
+        }
+        return Ok(true);
     }
+    validate_original_grep_page_page(value)?;
+    Ok(true)
+}
+
+fn validate_original_grep_page_page(value: &serde_json::Value) -> Result<(), String> {
     if !value["basePath"].is_string()
         || !value["filenames"].is_array()
         || !value["numFiles"].is_u64()
@@ -3269,7 +3297,7 @@ fn validate_original_grep_page(input: &serde_json::Value, value: &serde_json::Va
     {
         return Err("original grep discovery page is incomplete".into());
     }
-    Ok(true)
+    Ok(())
 }
 
 fn validate_original_glob_pages(input: &serde_json::Value, value: &serde_json::Value) -> Result<bool, String> {
@@ -12106,3 +12134,39 @@ mod read_auth_boundary_tests {
 
 #[cfg(test)]
 mod s1_fixture;
+
+
+#[cfg(test)]
+mod grep_batch_page_tests {
+    fn page(scan_complete: bool, truncated: bool) -> serde_json::Value {
+        serde_json::json!({"basePath":"crates/runtime/src", "scanComplete":scan_complete,
+            "mode":"files_with_matches", "numFiles":1, "filenames":["crates/runtime/src/lib.rs"],
+            "omissions":[], "nextRequest":serde_json::Value::Null, "truncated":truncated,
+            "continuationCursor":serde_json::Value::Null})
+    }
+
+    fn batch(members: &[(bool, bool)]) -> serde_json::Value {
+        let results: Vec<serde_json::Value> = members
+            .iter()
+            .enumerate()
+            .map(|(index, (scan, truncated))| {
+                serde_json::json!({"index":index, "status":"success", "error":serde_json::Value::Null,
+                    "output": page(*scan, *truncated)})
+            })
+            .collect();
+        serde_json::json!({"type":"grep_search", "count":results.len(), "results":results})
+    }
+
+    #[test]
+    fn a_complete_grep_batch_proves_acquisition_like_the_glob_batch() {
+        let input = serde_json::json!({"searches":[{"pattern":"a"},{"pattern":"b"}]});
+        let complete = super::validate_original_grep_page(&input, &batch(&[(true, false), (true, false)]));
+        assert_eq!(complete.ok(), Some(true), "a fully complete batch must prove acquisition");
+
+        let truncated = super::validate_original_grep_page(&input, &batch(&[(true, false), (true, true)]));
+        assert!(truncated.is_err(), "a truncated member still refuses");
+
+        let short = super::validate_original_grep_page(&input, &batch(&[(true, false)]));
+        assert!(short.is_err(), "a batch shorter than the request still refuses");
+    }
+}
