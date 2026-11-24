@@ -418,13 +418,20 @@ fn run_read_file(lease: &ToolHostLease, input: ReadFileInput) -> Result<String, 
         .path_policy()
         .resolve(&input.path)
         .map_err(io_to_string)?;
+    // A plain `read_file {path}` reads the whole file (bounded by the tool's size
+    // cap); a window is read only when the caller asks for one with `offset` or
+    // `limit`. The old 1,000-line default made every larger file a truncated first
+    // page that the model then treated as the whole file (level 9, 2026-11-24:
+    // 4 of 11 read_file receipts truncated, the producer side of each
+    // "page is incomplete" review refusal).
+    let complete = input.complete.unwrap_or(input.offset.is_none() && input.limit.is_none());
     let operation = || {
         read_file(
             lease.path_policy(),
             &input.path,
             input.offset,
             input.limit,
-            input.complete,
+            complete,
         )
         .map_err(io_to_string)
     };
@@ -434,7 +441,7 @@ fn run_read_file(lease: &ToolHostLease, input: ReadFileInput) -> Result<String, 
     // A windowed read fingerprints at most 16 KiB; an explicit whole-file
     // (`complete`) read keeps the full content hash so an EOF receipt stays
     // bound to the exact bytes.
-    let fingerprint = file_fingerprint(&resolved, input.complete);
+    let fingerprint = file_fingerprint(&resolved, complete);
     let scope = file_cache_scope(&resolved);
     let cache_input = serde_json::to_string(
         &json!({"input":input,"fingerprint":fingerprint,"authority":authority}),
@@ -458,7 +465,7 @@ fn run_read_file(lease: &ToolHostLease, input: ReadFileInput) -> Result<String, 
             }
             let token = lease.cache().epoch_token(&scope);
             let output = to_pretty_json(operation()?)?;
-            if file_fingerprint(&resolved, input.complete) == fingerprint {
+            if file_fingerprint(&resolved, complete) == fingerprint {
                 if let Some(token) = token {
                     lease.cache().put_if_current(
                         lease.workspace_id(),
@@ -1251,10 +1258,57 @@ fn run_glob_search(lease: &ToolHostLease, input: GlobSearchInputValue) -> Result
 }
 
 #[allow(clippy::needless_pass_by_value)]
+/// Pages one `grep_search` call follows on its own before it hands the model an
+/// explicit continuation. Live level 9 (2026-11-24): producer and reviewer agents
+/// stopped at the first truncated page, so a complete search read as "incomplete
+/// evidence" on both sides. The tool now finishes the search itself within these
+/// bounds and surfaces `next_request` only past them.
+const MAX_GREP_FOLLOW_PAGES: usize = 16;
+const MAX_GREP_FOLLOW_BYTES: usize = 512 * 1024;
+
+fn merge_grep_page(page: &mut crate::file_ops::GrepSearchOutput, more: crate::file_ops::GrepSearchOutput) {
+    for name in more.filenames {
+        if !page.filenames.contains(&name) {
+            page.filenames.push(name);
+        }
+    }
+    page.num_files = page.filenames.len();
+    if let Some(content) = more.content {
+        page.content = Some(match page.content.take() {
+            Some(existing) => existing + "\n" + &content,
+            None => content,
+        });
+    }
+    page.num_lines = page.num_lines.zip(more.num_lines).map(|(a, b)| a + b).or(more.num_lines).or(page.num_lines);
+    page.num_matches = page.num_matches.zip(more.num_matches).map(|(a, b)| a + b).or(more.num_matches).or(page.num_matches);
+    for omission in more.omissions {
+        if !page.omissions.contains(&omission) {
+            page.omissions.push(omission);
+        }
+    }
+    page.scan_complete = more.scan_complete;
+    page.truncated = more.truncated;
+    page.continuation_cursor = more.continuation_cursor;
+    page.next_request = more.next_request;
+    page.applied_limit = more.applied_limit;
+    page.applied_offset = more.applied_offset;
+}
+
 fn run_grep_search(lease: &ToolHostLease, input: GrepSearchInput, original: &Value) -> Result<String, String> {
-    let (page, windows) = crate::file_ops::grep_search_with_windows(lease.path_policy(), &input, lease.captures_reads(), lease.grep_bounded_root()).map_err(io_to_string)?;
+    let (mut page, windows) = crate::file_ops::grep_search_with_windows(lease.path_policy(), &input, lease.captures_reads(), lease.grep_bounded_root()).map_err(io_to_string)?;
     let windows = if page.scan_complete && !page.truncated && page.omissions.is_empty()
         && input.cursor.is_none() && input.offset.unwrap_or(0) == 0 { windows } else { None };
+    let mut followed_pages = 1usize;
+    let mut followed_bytes = page.content.as_deref().map_or(0, str::len) + page.filenames.iter().map(String::len).sum::<usize>();
+    let follow = input.head_limit.is_none() && input.cursor.is_none() && input.offset.unwrap_or(0) == 0;
+    while follow && page.truncated && followed_pages < MAX_GREP_FOLLOW_PAGES && followed_bytes < MAX_GREP_FOLLOW_BYTES {
+        let Some(next) = page.next_request.as_ref() else { break };
+        let next_input: GrepSearchInput = serde_json::from_value(next.clone()).map_err(|error| format!("grep continuation is not a valid request: {error}"))?;
+        let (more, _) = crate::file_ops::grep_search_with_windows(lease.path_policy(), &next_input, lease.captures_reads(), lease.grep_bounded_root()).map_err(io_to_string)?;
+        followed_bytes += more.content.as_deref().map_or(0, str::len) + more.filenames.iter().map(String::len).sum::<usize>();
+        followed_pages += 1;
+        merge_grep_page(&mut page, more);
+    }
     let output = to_pretty_json(page)?;
     // Auxiliary evidence failure cannot replace a successful business result.
     let _ = lease.record_grep_windows(original, &output, windows);
@@ -1785,7 +1839,7 @@ struct ReadFileInput {
     offset: Option<usize>,
     limit: Option<usize>,
     #[serde(default)]
-    complete: bool,
+    complete: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]

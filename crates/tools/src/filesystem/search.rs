@@ -1069,6 +1069,45 @@ mod tests {
     }
 
     #[test]
+    fn plain_read_file_reads_the_whole_file_by_default_and_a_window_only_on_request() {
+        let fixture = Fixture::new();
+        fixture.write("big.txt", &(1..=2_500).map(|n| format!("line {n}\n")).collect::<String>());
+        let host = crate::ToolHost::builtin("complete-read-default", &fixture.0);
+        let lease = host.pin_snapshot();
+        let whole: serde_json::Value = serde_json::from_str(
+            &crate::executor::execute_with_lease(&lease, "read_file", &serde_json::json!({"path":"big.txt"})).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(whole["truncated"], serde_json::json!(false), "a plain read is the whole file: {whole}");
+        assert_eq!(whole["file"]["numLines"], serde_json::json!(2_500));
+        assert!(whole["nextOffset"].is_null());
+        let window: serde_json::Value = serde_json::from_str(
+            &crate::executor::execute_with_lease(&lease, "read_file", &serde_json::json!({"path":"big.txt","offset":10,"limit":5})).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(window["file"]["numLines"], serde_json::json!(5), "an explicit window stays a window");
+        assert_eq!(window["truncated"], serde_json::json!(true));
+    }
+
+    #[test]
+    fn grep_search_follows_its_own_pages_until_the_scan_completes() {
+        let fixture = Fixture::new();
+        for index in 0..130 {
+            fixture.write(&format!("dir/f{index:03}.txt"), "needle\n");
+        }
+        let host = crate::ToolHost::builtin("grep-follow", &fixture.0);
+        let lease = host.pin_snapshot();
+        let output: serde_json::Value = serde_json::from_str(
+            &crate::executor::execute_with_lease(&lease, "grep_search", &serde_json::json!({"pattern":"needle","output_mode":"files_with_matches","path":"dir"})).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(output["scanComplete"], serde_json::json!(true), "{output}");
+        assert_eq!(output["truncated"], serde_json::json!(false), "{output}");
+        assert!(output["nextRequest"].is_null(), "{output}");
+        assert_eq!(output["numFiles"], serde_json::json!(130), "{output}");
+    }
+
+    #[test]
     fn search_next_requests_pass_real_tool_schema_and_do_not_reuse_stale_cache() {
         let fixture = Fixture::new();
         fixture.write("one.txt", "needle\nneedle\nneedle\n");
