@@ -1263,8 +1263,8 @@ fn run_glob_search(lease: &ToolHostLease, input: GlobSearchInputValue) -> Result
 /// stopped at the first truncated page, so a complete search read as "incomplete
 /// evidence" on both sides. The tool now finishes the search itself within these
 /// bounds and surfaces `next_request` only past them.
-const MAX_GREP_FOLLOW_PAGES: usize = 16;
-const MAX_GREP_FOLLOW_BYTES: usize = 512 * 1024;
+const MAX_GREP_FOLLOW_PAGES: usize = 64;
+const MAX_GREP_FOLLOW_BYTES: usize = 2 * 1024 * 1024;
 
 fn merge_grep_page(page: &mut crate::file_ops::GrepSearchOutput, more: crate::file_ops::GrepSearchOutput) {
     for name in more.filenames {

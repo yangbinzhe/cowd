@@ -17,7 +17,7 @@ const MAX_READ_SIZE: u64 = 10 * 1024 * 1024;
 /// result instead of holding a required Agent branch indefinitely.
 const MAX_SEARCH_ENTRIES: usize = 100_000;
 const MAX_SEARCH_DEPTH: usize = 20;
-const MAX_SEARCH_DURATION_MS: u128 = 10_000;
+const MAX_SEARCH_DURATION_MS: u128 = 30_000;
 const MAX_SEARCH_RESULTS: usize = 100;
 
 /// Default line window used when callers omit an explicit read limit.
