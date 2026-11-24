@@ -27,6 +27,13 @@ pub fn input_shape_correction(tool: &str, reason: &str, schema: &Value) -> Optio
             "task_submit takes no `reason`; a submission is the deliverable plus its evidence_refs.",
         );
     }
+    // Local level 9 (Qwen3.8-Flash-Next, 2026-11-24): state_inspect refused once for
+    // `$: unexpected field `limit`` - StateInspectInput pages with `page_cursor` only.
+    if tool == "state_inspect" && reason == "$: unexpected field `limit`" {
+        return Some(
+            "state_inspect has no `limit`; it pages with `page_cursor` taken from the previous result.",
+        );
+    }
     if tool == "membership_update" && reason == "$: unexpected field `reason`"
         && ["$ref", "oneOf", "anyOf", "allOf"].iter().all(|key| schema.get(*key).is_none())
         && schema["additionalProperties"] == false && schema["properties"].get("reason").is_none()
@@ -1109,6 +1116,8 @@ mod tests {
             "additionalProperties":false});
         assert!(hint("task_submit", "$: unexpected field `reason`", &submit).is_some());
         assert!(hint("other", "$: unexpected field `reason`", &submit).is_none());
+        assert!(hint("state_inspect", "$: unexpected field `limit`", &submit).is_some());
+        assert!(hint("state_inspect", "$: unexpected field `other`", &submit).is_none());
         let mut open = schema.clone();
         open["additionalProperties"] = true.into();
         assert!(hint("task_review", "$: unexpected field `reason_ref`", &open).is_none());
