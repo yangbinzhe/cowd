@@ -920,7 +920,9 @@ impl SharedPolicyOwner {
                 step.lease().validate_authorization(auth, &request.tool_name, &input).map_err(|error| error.to_string())?;
                 let original_consumption = self.assessment.authorization_negotiator
                     .original_consumption(&auth.authorization_lease, &auth.request_id)
-                    .ok_or("original single-call lease consumption unavailable")?;
+                    .ok_or_else(|| crate::agentic::action_invocation::original_consumption_refusal(
+                        &request.tool_name, &request.input,
+                    ))?;
                 if !original_consumption.belongs_to(&self.assessment.authorization_negotiator)
                     || original_consumption.lease != auth.authorization_lease {
                     return Err("original single-call lease producer mismatch".into());
