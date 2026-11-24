@@ -301,7 +301,11 @@ pub(crate) fn glob_search_page(
     Ok(GlobSearchOutput {
         base_path: base.to_string_lossy().into_owned(),
         pattern: pattern.into(),
-        scan_complete: !truncated && omissions.is_empty(),
+        // `symlink_not_followed` is the walker's by-design skip (`.follow_links(false)`),
+        // recorded honestly but not a gap in the scan: live level 9 (2026-11-24) had
+        // every grep page flagged incomplete for it alone, and the review refused each
+        // one as "the producer's scan did not complete". Every other omission stays a gap.
+        scan_complete: !truncated && omissions.iter().all(|omission| omission == "symlink_not_followed"),
         duration_ms: started.elapsed().as_millis(),
         num_files: filenames.len(),
         filenames,
@@ -794,7 +798,11 @@ pub(crate) fn grep_search_with_windows(
     let truncated = next_cursor.is_some();
     Ok((GrepSearchOutput {
         base_path: base.to_string_lossy().into_owned(),
-        scan_complete: !truncated && omissions.is_empty(),
+        // `symlink_not_followed` is the walker's by-design skip (`.follow_links(false)`),
+        // recorded honestly but not a gap in the scan: live level 9 (2026-11-24) had
+        // every grep page flagged incomplete for it alone, and the review refused each
+        // one as "the producer's scan did not complete". Every other omission stays a gap.
+        scan_complete: !truncated && omissions.iter().all(|omission| omission == "symlink_not_followed"),
         mode: Some(mode.into()),
         num_files: filenames.len(),
         filenames,
@@ -1087,6 +1095,21 @@ mod tests {
         .unwrap();
         assert_eq!(window["file"]["numLines"], serde_json::json!(5), "an explicit window stays a window");
         assert_eq!(window["truncated"], serde_json::json!(true));
+    }
+
+    #[test]
+    fn a_symlink_the_walker_skips_by_design_does_not_make_the_page_incomplete() {
+        let fixture = Fixture::new();
+        fixture.write("dir/real.txt", "needle\n");
+        std::os::unix::fs::symlink(fixture.0.join("dir/real.txt"), fixture.0.join("dir/link.txt")).expect("symlink");
+        let output = grep_search(
+            &WorkspacePathPolicy::new(&fixture.0),
+            &request(serde_json::json!({"pattern":"needle","output_mode":"files_with_matches","path":"dir"})),
+        )
+        .unwrap();
+        assert!(output.omissions.contains(&"symlink_not_followed".to_string()), "{output:?}");
+        assert!(output.scan_complete, "a by-design symlink skip is not an incomplete scan: {output:?}");
+        assert!(!output.truncated);
     }
 
     #[test]
