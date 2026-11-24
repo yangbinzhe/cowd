@@ -3295,7 +3295,21 @@ fn validate_original_grep_page_page(value: &serde_json::Value) -> Result<(), Str
         || (!value["nextRequest"].is_null() && value["nextRequest"] != serde_json::json!({}))
         || !value["continuationCursor"].is_null()
     {
-        return Err("original grep discovery page is incomplete".into());
+        // The reviewer is refused over the PRODUCER's page here (level 9, 2026-11-24:
+        // 2x this refusal, then 3x review_requires_current_physical_reads). Name the
+        // gap and the way out: the producer's page stopped early, so the reviewer must
+        // read the target itself to the end before its review can count.
+        let cause = if value["truncated"] == true {
+            "the producer's page was truncated"
+        } else if value["scanComplete"] != true {
+            "the producer's scan did not complete"
+        } else {
+            "the producer's page carries omissions or a continuation"
+        };
+        return Err(format!(
+            "original grep discovery page is incomplete: {cause}; way_out: read the same target yourself \
+             (read_file or evidence_retrieve, following every next_request to the end) before reviewing"
+        ));
     }
     Ok(())
 }
@@ -12164,9 +12178,18 @@ mod grep_batch_page_tests {
         assert_eq!(complete.ok(), Some(true), "a fully complete batch must prove acquisition");
 
         let truncated = super::validate_original_grep_page(&input, &batch(&[(true, false), (true, true)]));
-        assert!(truncated.is_err(), "a truncated member still refuses");
+        let truncated = truncated.expect_err("a truncated member still refuses");
+        assert!(truncated.starts_with("original grep discovery page is incomplete"), "{truncated}");
+        assert!(truncated.contains("way_out:"), "the refusal names the way out: {truncated}");
 
         let short = super::validate_original_grep_page(&input, &batch(&[(true, false)]));
         assert!(short.is_err(), "a batch shorter than the request still refuses");
+
+        let single = super::validate_original_grep_page(&serde_json::json!({"pattern":"a"}), &page(false, false));
+        let single = single.expect_err("a page whose scan did not complete still refuses");
+        assert!(
+            single.contains("the producer's scan did not complete") && single.contains("read the same target yourself"),
+            "{single}"
+        );
     }
 }
